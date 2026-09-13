@@ -1,6 +1,6 @@
 {
   "name": "@hncode/hncode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "hncode — A cyan-blue TUI AI coding agent with zero runtime dependencies.",
   "type": "module",
   "main": "src/index.js",
@@ -12,6 +12,7 @@
     "src/",
     "LICENSE",
     "README.md",
+    "README_CN.md",
     "package.json"
   ],
   "scripts": {
