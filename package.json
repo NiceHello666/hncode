@@ -1,0 +1,26 @@
+{
+  "name": "hncode",
+  "version": "0.1.0",
+  "description": "hncode — a kimi-code-cli-style CLI coding agent. Cyan-blue TUI, OpenAI + Anthropic streaming, MCP-style toolbelt (Edit, Read, Write, Bash, Glob, Grep, TodoList, ...). Zero runtime dependencies.",
+  "type": "module",
+  "bin": {
+    "hncode": "bin/hncode"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "hncode",
+  "keywords": [
+    "cli",
+    "agent",
+    "coding",
+    "mcp",
+    "tui"
+  ],
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "iconv-lite": "^0.7.3",
+    "wcwidth": "^1.0.1"
+  }
+}

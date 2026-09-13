@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Config and data
+.hncode/
+*.toml
+sessions/
+export/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build output (if we add build steps later)
+dist/
+build/

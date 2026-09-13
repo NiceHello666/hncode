@@ -1,0 +1,449 @@
+// Dual-protocol (OpenAI + Anthropic) chat client with streaming + non-streaming.
+// Normalizes both providers into a common event stream consumed by the agent:
+//   {type:'data', text}            assistant text delta
+//   {type:'tool_start', id, name}  a tool call began
+//   {type:'tool_args', id, chunk}  partial JSON argument chunk
+//   {type:'tool_end', id}          tool call arguments complete
+//   {type:'end'}                   assistant turn finished
+//   {type:'error', error}          fatal error
+
+import { llmTools } from './tools/index.js';
+import { effortWire } from './config.js';
+
+export function openAiToolDefs(tools) {
+  return tools.map((t) => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    },
+  }));
+}
+
+export function anthropicToolDefs(tools) {
+  return tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.parameters,
+  }));
+}
+
+// Internal canonical messages -> OpenAI request shape.
+export function toOpenAi(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (m.role === 'system') out.push({ role: 'system', content: m.content });
+    else if (m.role === 'user') out.push({ role: 'user', content: m.content });
+    else if (m.role === 'assistant') {
+      const hasText = typeof m.content === 'string' && m.content.trim();
+      const hasCalls = Array.isArray(m.toolCalls) && m.toolCalls.length;
+      if (!hasText && !hasCalls) continue; // 上游不允许空 assistant，直接丢弃
+      const msg = { role: 'assistant', content: m.content || null };
+      if (hasCalls) {
+        msg.tool_calls = m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.args) },
+        }));
+      }
+      out.push(msg);
+    } else if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.toolCallId, content: m.content });
+    }
+  }
+  return out;
+}
+
+// Internal canonical messages -> Anthropic request shape. Returns {system, messages}.
+export function toAnthropic(messages) {
+  const sys = [];
+  const out = [];
+  for (const m of messages) {
+    if (m.role === 'system') { sys.push(m.content); continue; }
+    if (m.role === 'user') { out.push({ role: 'user', content: [{ type: 'text', text: m.content }] }); continue; }
+    if (m.role === 'tool') {
+      out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.toolCallId, content: m.content }] });
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const blocks = [];
+      if (m.content) blocks.push({ type: 'text', text: m.content });
+      for (const tc of (m.toolCalls || [])) {
+        blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.args });
+      }
+      out.push({ role: 'assistant', content: blocks });
+    }
+  }
+  return { system: sys.join('\n\n').trim(), messages: out };
+}
+
+function authHeaders(cfg) {
+  const h = { 'content-type': 'application/json' };
+  if (cfg.apiKey) {
+    if (cfg.protocol === 'anthropic') {
+      h['x-api-key'] = cfg.apiKey;
+      h['anthropic-version'] = '2023-06-01';
+    } else {
+      h['authorization'] = `Bearer ${cfg.apiKey}`;
+    }
+  }
+  return h;
+}
+
+function buildBody(cfg, messages, streaming = true) {
+  const common = { stream: streaming, max_tokens: cfg.maxOutputTokens };
+  if (cfg.temperature != null) common.temperature = cfg.temperature;
+  // Thinking / reasoning. The wire form depends on the protocol and the chosen
+  // effort (see config.effortWire): OpenAI-compatible sends `reasoning_effort`,
+  // Anthropic sends a `thinking` budget. Models that think by default need no
+  // flag, so nothing is sent when the effort is off/unset.
+  const wire = effortWire(cfg, cfg.effort) || {};
+  if (cfg.protocol === 'anthropic') {
+    const { system, messages: am } = toAnthropic(messages);
+    return JSON.stringify({ model: cfg.innerModel, system, messages: am, tools: anthropicToolDefs(llmToolsList), ...common, ...wire });
+  }
+  return JSON.stringify({ model: cfg.innerModel, messages: toOpenAi(messages), tools: openAiToolDefs(llmToolsList), ...common, ...wire });
+}
+
+// tool list used for defs (injected via setTools)
+let llmToolsList = [];
+export function setToolsList(list) { llmToolsList = list; }
+
+export class LLM {
+  constructor(cfg) { this.cfg = cfg; this.controller = null; }
+
+  // Abort an in-flight request (Esc / Ctrl-C while the agent is running).
+  abort() {
+    if (this.controller) { try { this.controller.abort(); } catch {} }
+  }
+
+  // Simple non-streaming text request — used for internal tasks (e.g. context
+  // summarization during compaction) that should not surface a tool plan to the
+  // user. Returns the assistant's text content or null on failure.
+  async requestText(messages) {
+    const cfg = this.cfg;
+    this.controller = new AbortController();
+    try {
+      const res = await fetch(cfg.endpoint, {
+        method: 'POST',
+        headers: authHeaders(cfg),
+        body: buildBody(cfg, messages, false),
+        signal: this.controller.signal,
+      });
+      if (!res || !res.ok) {
+        let t = '';
+        try { if (res) t = await res.text(); } catch {}
+        const status = res ? res.status : 'network';
+        return null;
+      }
+      const json = await res.json();
+      let text = '';
+      if (cfg.protocol === 'anthropic') {
+        for (const cb of (json.content || [])) {
+          if (cb.type === 'text' && cb.text) text += cb.text;
+        }
+      } else {
+        const msg = json.choices && json.choices[0] && json.choices[0].message;
+        if (msg && msg.content) text = msg.content;
+      }
+      return text || null;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return null;
+      return null;
+    }
+  }
+
+  async request(messages, onEvent) {
+    const cfg = this.cfg;
+    let res = null;
+    let lastError = null;
+    let lastStatus = 0;
+    let attempts = 0;
+
+    // Retry the HTTP round-trip up to 3 times. Any non-200 response is treated
+    // as a problem and retried (5xx, 429, and unexpected 4xx alike), as is a
+    // network/connection error. The only exceptions are aborts (Esc/Ctrl-C) —
+    // those end the turn — and a response that is not ok on the final attempt.
+    const RETRIES = 3;
+
+    for (let attempt = 1; attempt <= RETRIES; attempt++) {
+      attempts = attempt;
+      // Fresh controller per attempt so an abort aborts this specific request
+      // and the retry loop stops.
+      this.controller = new AbortController();
+      const signal = this.controller.signal;
+      try {
+        res = await fetch(cfg.endpoint, {
+          method: 'POST',
+          headers: authHeaders(cfg),
+          body: buildBody(cfg, messages),
+          signal,
+        });
+      } catch (e) {
+        // An abort is a normal way to end a turn, not an error to report.
+        if (e && e.name === 'AbortError') { onEvent({ type: 'aborted' }); return; }
+        lastError = e;
+        lastStatus = 0; // network error
+      }
+      if (res && res.ok) break;
+      if (res) lastStatus = res.status;
+      if (attempt < RETRIES) {
+        // Small exponential backoff (200ms, 400ms). If the user hit Esc during
+        // the wait, stop retrying.
+        const tryingSignal = this.controller.signal;
+        await new Promise((r) => {
+          const timer = setTimeout(r, 200 * attempt);
+          tryingSignal.addEventListener('abort', () => { clearTimeout(timer); r(); }, { once: true });
+        });
+        if (tryingSignal.aborted) { onEvent({ type: 'aborted' }); return; }
+      }
+    }
+
+    if (lastError && !res) {
+      onEvent({ type: 'error', error: lastError });
+      return;
+    }
+    if (!res || !res.ok) {
+      let t = '';
+      try { if (res) t = await res.text(); } catch {}
+      const tries = lastStatus ? `${res.status}` : 'network';
+      onEvent({ type: 'error', error: new Error(`LLM request failed after ${attempts} attempt(s) (${tries}): ${truncate(t)}`) });
+      return;
+    }
+    if (cfg.stream === false) {
+      const json = await res.json();
+      return consumeNonStreaming(cfg.protocol, json, onEvent);
+    }
+    if (!res.body) { onEvent({ type: 'end' }); return; }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    const state = { tools: new Map(), indexToId: {}, doneEmitted: false };
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line || line.startsWith(':')) continue;
+          const s = line.startsWith('data: ') ? line.slice(6) : (line.startsWith('data:') ? line.slice(5) : line);
+          if (s === '[DONE]') { finish(state, onEvent); return; }
+          if (processEvent(cfg.protocol, s, onEvent, state) === 'end') { finish(state, onEvent); return; }
+        }
+      }
+    } catch (e) {
+      // Aborting mid-stream (Esc) also lands here.
+      if (e && e.name === 'AbortError') { onEvent({ type: 'aborted' }); return; }
+      onEvent({ type: 'error', error: e });
+      return;
+    } finally {
+      reader.releaseLock?.();
+    }
+    finish(state, onEvent);
+  }
+}
+
+// ---- inline reasoning tags -------------------------------------------------
+// Some OpenAI-compatible servers do not send a separate `reasoning_content`
+// field: they put the chain of thought INLINE in `content`, wrapped in a tag
+// such as ` thinking…<｜end▁of▁thinking｜>` or `<thinking>…</thinking>`. Without splitting
+// those out, the raw tags and the whole reasoning trace are rendered as the
+// assistant's answer (and counted as output tokens). This is a streaming state
+// machine: a tag can be split across chunks, so a trailing partial tag is held
+// back until the next chunk decides what it is.
+const THINK_OPEN_TAGS = [' thinking', '<thinking>'];
+// Closing tags. If none of these appear, the block stays in think mode to EOI.
+const THINK_CLOSE_TAGS = ['<｜end▁of▁thinking｜>', '</thinking>'];
+
+// Longest suffix of `buf` that is a proper prefix of one of `tags`.
+// A single trailing space is deliberately NOT a candidate: `' '` is a prefix of
+// `' thinking'`, but holding it back would stall every sentence-ending space
+// (and its neighbour letter could be anything). Only hold at least 2 chars,
+// which makes the tag unambiguous even split across chunks.
+function partialTagSuffixLen(buf, tags) {
+  let best = 0;
+  for (const tag of tags) {
+    const max = Math.min(tag.length - 1, buf.length);
+    for (let len = Math.max(2, 1); len <= max; len++) { // len>=2 only
+      if (buf.endsWith(tag.slice(0, len))) { if (len > best) best = len; break; }
+    }
+  }
+  return best;
+}
+
+function feedContent(text, onEvent, state) {
+  let buf = (state.tagPending || '') + String(text || '');
+  state.tagPending = '';
+  let inThink = !!state.inThink;
+  while (buf.length > 0) {
+    const tags = inThink ? THINK_CLOSE_TAGS : THINK_OPEN_TAGS;
+    let best = -1, bestTag = null;
+    for (const tag of tags) {
+      const i = buf.indexOf(tag);
+      if (i >= 0 && (best === -1 || i < best)) { best = i; bestTag = tag; }
+    }
+    if (best === -1) {
+      const keep = partialTagSuffixLen(buf, tags);
+      const emit = buf.slice(0, buf.length - keep);
+      if (emit) onEvent({ type: inThink ? 'think' : 'data', text: emit });
+      state.tagPending = keep ? buf.slice(buf.length - keep) : '';
+      state.inThink = inThink;
+      return;
+    }
+    const before = buf.slice(0, best);
+    if (before) onEvent({ type: inThink ? 'think' : 'data', text: before });
+    inThink = !inThink;
+    buf = buf.slice(best + bestTag.length);
+  }
+  state.inThink = inThink;
+}
+
+// Emit whatever is still held back (a dangling partial tag is plain text).
+function flushContent(onEvent, state) {
+  if (state.tagPending) {
+    onEvent({ type: state.inThink ? 'think' : 'data', text: state.tagPending });
+    state.tagPending = '';
+  }
+}
+
+function finish(state, onEvent) {
+  // close any tool calls that started but never got an explicit end
+  if (state.doneEmitted) return;
+  flushContent(onEvent, state);
+  for (const [, t] of state.tools) {
+    if (!t.done) onEvent({ type: 'tool_end', id: t.id });
+  }
+  state.doneEmitted = true;
+  onEvent({ type: 'end' });
+}
+
+function processEvent(protocol, raw, onEvent, state) {
+  let d;
+  try { d = JSON.parse(raw); } catch { return 'continue'; }
+  if (protocol === 'anthropic') return processAnthropic(d, onEvent, state);
+  return processOpenAI(d, onEvent, state);
+}
+
+function processOpenAI(d, onEvent, state) {
+  const delta = d.choices && d.choices[0] && d.choices[0].delta;
+  if (!delta) {
+    if (d.choices && d.choices[0] && d.choices[0].finish_reason) {
+      onEvent({ type: 'end' });
+      return 'end';
+    }
+    return 'continue';
+  }
+  // Reasoning tokens, matching kimi's `extractReasoning` / `extractReasoningDetails`.
+  // Different servers name the field differently — `reasoning_content`
+  // (vLLM/DeepSeek/hy3), `reasoning` (newer vLLM), or `reasoning_details`. The
+  // first observed key is remembered so the output stays consistent.
+  if (state.reasoningKey === undefined) {
+    state.reasoningKey = ['reasoning_content', 'reasoning_details', 'reasoning']
+      .find((k) => typeof delta[k] === 'string' || Array.isArray(delta[k]));
+  }
+  const key = state.reasoningKey;
+  if (key === 'reasoning_details' && Array.isArray(delta.reasoning_details)) {
+    // e.g. [{type:'summary'|'encrypted', summary?, encrypted?}]. Only the
+    // plain-URL summary is meaningful to hncode — encrypted tokens are opaque.
+    for (const el of delta.reasoning_details) {
+      if (el && typeof el.summary === 'string') onEvent({ type: 'think', text: el.summary });
+    }
+  } else if (key && typeof delta[key] === 'string' && delta[key]) {
+    onEvent({ type: 'think', text: delta[key] });
+  }
+  // Content may carry INLINE  thinking…<｜end▁of▁thinking｜> reasoning (hy3/DeepSeek
+  // style); feedContent splits it out as think events. Otherwise it would be
+  // rendered as part of the answer.
+  if (delta.content) feedContent(delta.content, onEvent, state);
+  if (delta.tool_calls) {
+    for (const tc of delta.tool_calls) {
+      // First chunk of a tool call carries `id`; later chunks only repeat `index`.
+      if (tc.id) state.indexToId[tc.index] = tc.id;
+      const id = tc.id || state.indexToId[tc.index];
+      if (!id) continue;
+      if (!state.tools.has(id)) {
+        state.tools.set(id, { id, name: tc.function && tc.function.name, argsJson: '', done: false });
+        onEvent({ type: 'tool_start', id, name: tc.function && tc.function.name });
+      }
+      if (tc.function && tc.function.arguments) {
+        const t = state.tools.get(id); t.argsJson += tc.function.arguments;
+        onEvent({ type: 'tool_args', id, chunk: tc.function.arguments });
+      }
+    }
+  }
+  return 'continue';
+}
+
+function processAnthropic(d, onEvent, state) {
+  const t = d.type;
+  if (t === 'message_start' || t === 'message_delta' || t === 'message_stop') {
+    if (t === 'message_stop') { onEvent({ type: 'end' }); return 'end'; }
+    return 'continue';
+  }
+  if (t === 'content_block_start') {
+    const cb = d.content_block;
+    if (cb && cb.type === 'tool_use') {
+      const id = cb.id; const name = cb.name;
+      state.tools.set(d.index, { id, name, argsJson: '', done: false });
+      onEvent({ type: 'tool_start', id, name });
+    }
+    return 'continue';
+  }
+  if (t === 'content_block_delta') {
+    const delta = d.delta || {};
+    if (delta.type === 'text_delta') feedContent(delta.text || '', onEvent, state);
+    else if (delta.type === 'thinking_delta') onEvent({ type: 'think', text: delta.thinking || '' });
+    else if (delta.type === 'input_json') {
+      const blk = state.tools.get(d.index);
+      if (blk) { blk.argsJson += delta.partial_json || ''; onEvent({ type: 'tool_args', id: blk.id, chunk: delta.partial_json || '' }); }
+    }
+    return 'continue';
+  }
+  if (t === 'content_block_stop') {
+    const blk = state.tools.get(d.index);
+    if (blk && !blk.done) { blk.done = true; onEvent({ type: 'tool_end', id: blk.id }); }
+    return 'continue';
+  }
+  return 'continue';
+}
+
+// --- Non-streaming path ---
+export function consumeNonStreaming(protocol, json, onEvent) {
+  const state = { tagPending: '', inThink: false };
+  if (protocol === 'anthropic') {
+    const content = json.content || [];
+    for (const cb of content) {
+      if (cb.type === 'text' && cb.text) feedContent(cb.text, onEvent, state);
+      else if (cb.type === 'tool_use') {
+        onEvent({ type: 'tool_start', id: cb.id, name: cb.name });
+        onEvent({ type: 'tool_args', id: cb.id, chunk: JSON.stringify(cb.input || {}) });
+        onEvent({ type: 'tool_end', id: cb.id });
+      }
+    }
+  } else {
+    const msg = json.choices && json.choices[0] && json.choices[0].message;
+    if (!msg) { onEvent({ type: 'error', error: new Error('empty LLM response') }); return; }
+    if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) onEvent({ type: 'think', text: msg.reasoning_content });
+    else if (typeof msg.reasoning === 'string' && msg.reasoning) onEvent({ type: 'think', text: msg.reasoning });
+    else if (Array.isArray(msg.reasoning_details)) {
+      for (const el of msg.reasoning_details) if (el && typeof el.summary === 'string') onEvent({ type: 'think', text: el.summary });
+    }
+    if (msg.content) feedContent(msg.content, onEvent, state);
+    if (msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        const id = tc.id; const name = tc.function && tc.function.name; const args = tc.function && tc.function.arguments;
+        onEvent({ type: 'tool_start', id, name });
+        if (args) onEvent({ type: 'tool_args', id, chunk: args });
+        onEvent({ type: 'tool_end', id });
+      }
+    }
+  }
+  flushContent(onEvent, state);
+  onEvent({ type: 'end' });
+}
+
+function truncate(s, n = 300) { return s.length > n ? s.slice(0, n) + '...' : s; }
