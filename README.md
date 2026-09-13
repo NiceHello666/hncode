@@ -20,14 +20,24 @@ A cyan-blue TUI coding agent inspired by kimi-code-cli, with OpenAI + Anthropic 
 
 ## 🚀 Installation
 
+### Global Installation (Recommended)
+
 ```bash
-npm install -g hncode
+npm install -g @hncode/hncode
 ```
 
-Or use directly:
+Then run:
 ```bash
-npx hncode
+hncode
 ```
+
+### Using npx (No installation required)
+
+```bash
+npx @hncode/hncode
+```
+
+This will download and run the latest version without installing it globally.
 
 ---
 
