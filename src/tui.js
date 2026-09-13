@@ -4262,7 +4262,7 @@ export async function startTUI(opts) {
   }
   // Async so the notice can be painted BEFORE the clipboard read: a cold
   // PowerShell took ~3s, which read as "the shortcut does nothing".
-  async function pasteFromClipboard() {
+  async function pasteFromClipboard(fastPathOnly = false) {
     notice('Pasting…', 'info');
     const imgBase64 = readImage();
     if (imgBase64) {
@@ -4272,10 +4272,26 @@ export async function startTUI(opts) {
       renderFrame();
       return;
     }
-    const { text, via } = await readText();
+    
+    let text = '';
+    let via = 'none';
+    
+    // Try fast path first (oneshot)
+    try {
+      ({ text, via } = { text: readOnce(), via: 'oneshot' });
+    } catch {}
+    
+    // If fast path failed and we need to try slow path
+    if (!text && !fastPathOnly) {
+      const result = await readText();
+      text = result.text;
+      via = result.via;
+    }
+    
     if (!text) { notice('Clipboard empty or unavailable', 'error'); renderFrame(); return; }
     insertComposerPaste(text);
-    if (via === 'oneshot') notice(`Pasted (slow path: ${via}); retry for instant paste`, 'info');
+    if (via === 'helper') notice(`Pasted via helper (${via})`, 'info');
+    else if (via === 'oneshot') notice('Pasted instantly!', 'info');
     renderFrame();
   }
   // Ctrl-S: inject the queued messages (plus the current draft) into the RUNNING

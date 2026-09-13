@@ -1,5 +1,7 @@
 # hncode — AI 编程助手命令行工具
 
+[English](./README.md) | 简体中文
+
 > **这是我 Vibe Coding 的产物，可能不是特别好，但是如果有什么建议的话也欢迎提 issue**
 
 一个基于命令行终端的 AI 编程助手，灵感源自 [Kimi Code CLI](https://github.com/MoonshotAI/kimi-code)。它提供青色蓝调 (Cyan-blue) 的 TUI 界面，支持 OpenAI 和 Anthropic 双协议，配备 MCP 风格的工具集和智能上下文管理。
@@ -182,5 +184,4 @@ hncode 从以下几个优秀项目中汲取了灵感：
 ---
 
 **NPM 包**: [@hncode/hncode](https://www.npmjs.com/package/@hncode/hncode)  
-**GitHub**: [NiceHello666/hncode](https://github.com/NiceHello666/hncode)  
-**English Version**: [README.md](./README.md)
+**GitHub**: [NiceHello666/hncode](https://github.com/NiceHello666/hncode)

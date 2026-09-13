@@ -1,5 +1,7 @@
 # hncode — AI Coding Agent CLI
 
+English | [简体中文](./README_CN.md)
+
 > **This is a product of my Vibe Coding session. It may not be perfect, but if you have any suggestions, feel free to open an issue.**
 
 A cyan-blue TUI coding agent inspired by [Kimi Code CLI](https://github.com/MoonshotAI/kimi-code), with OpenAI + Anthropic support, MCP-style toolbelt, and intelligent context management.
@@ -193,5 +195,4 @@ This project is licensed under the [GNU General Public License v3.0](LICENSE).
 ---
 
 **NPM Package**: [@hncode/hncode](https://www.npmjs.com/package/@hncode/hncode)  
-**GitHub**: [NiceHello666/hncode](https://github.com/NiceHello666/hncode)  
-**Chinese Version**: [README_CN.md](./README_CN.md)
+**GitHub**: [NiceHello666/hncode](https://github.com/NiceHello666/hncode)
