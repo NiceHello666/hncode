@@ -38,7 +38,7 @@ const VERSION = '0.1.0';
 export const COMMANDS = [
   { name: 'yolo', aliases: ['yes'], desc: 'Ask When Needed mode: anything inside the workspace (edits, writes, commands) runs automatically; paths outside it, destructive commands, questions and plans still ask.', priority: 101 },
   { name: 'permission', desc: 'Select permission mode', priority: 100 },
-  { name: 'settings', aliases: ['config'], desc: 'Open settings (model / permission / theme / statusline)', priority: 100 },
+  { name: 'settings', aliases: ['config'], desc: 'Open settings (model / permission / statusline)', priority: 100 },
   { name: 'plan', desc: 'Toggle plan mode', priority: 100, argumentHint: '[on|off|clear]' },
   { name: 'focus', desc: 'Toggle Focus mode (minimal tools first, full tools after)', priority: 98, argumentHint: '[on|off]' },
   { name: 'auto', desc: 'Never Ask mode: never interrupts you; everything runs and is decided automatically.', priority: 99 },
@@ -2562,7 +2562,6 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
           { label: 'effort', sub: 'switch thinking effort' },
           { label: 'permission', sub: 'select permission mode' },
           { label: 'provider', sub: 'manage AI providers' },
-          { label: 'theme', sub: 'set the terminal UI theme' },
           { label: 'statusline', sub: 'configure status line items' },
           { label: 'add-dir', sub: 'add an additional workspace directory' },
         ],
