@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import cp from 'node:child_process';
 import {
-  C, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, setTheme, THEME_NAMES, lerpColor,
+  C, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, THEME_NAMES, lerpColor,
 } from './colors.js';
 import { copyText, readText, warmClipboard, readImage } from './clipboard.js';
 import { visualWidth, estimateTokens, estimateMessagesTokens, expandTabs } from './term.js';
@@ -707,14 +707,15 @@ export function isFailureResult(text) {
 
 function msgColorFor(role, text) {
   if (role === 'system' && typeof text === 'string' && text.startsWith('[turn took')) return C.gray;
-  if (role === 'system') return C.green;
+  if (role === 'system') return C.teal;
   if (role === 'user') return C.cyan;
   if (role === 'warn') return C.orange;    // unfinished-turn warning
   if (role === 'queued') return C.gray;    // pending, not yet sent
   if (role === 'steer') return C.yellow;   // injected into the running turn
-  if (role === 'tool') return C.white;
+  if (role === 'tool') return C.blue;
   if (role === 'tool_result') return C.gray;
-  return C.white;
+  // Default foreground color based on theme
+  return C.fg;
 }
 
 // ---- tool call display: "Using Name (keyArg)" / "Used Name (keyArg) ----
@@ -2400,7 +2401,7 @@ export function makeState({ cfg, session, opts }) {
     planPath: (session && session.planPath) || null,
     focus: !!(session && session.focus),
     effort: (session && session.effort) || cfg.effort || (cfg.reasoning ? 'on' : 'off'),
-    theme: (cfg.raw && cfg.raw.theme) || 'auto',
+    // Theme removed - forced dark only
     addDirs: [],
     tasks: {},
     slMode: true, slModel: true, slEffort: true, slCwd: true, slTasks: true, slTips: true,
@@ -3161,6 +3162,18 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
             : `theme = "${name}"\n` + txt;
           fs.writeFileSync(f, next, 'utf8');
         } catch { }
+        
+        // Force a complete screen refresh with new theme colors
+        // We need to access stdout from the host context
+        if (host && typeof host.renderFrame === 'function') {
+          // Trigger immediate re-render which will use new theme colors
+          host.renderFrame();
+        } else {
+          // Fallback: just show message and let normal flow handle it
+          app(`Theme set to "${name}".`);
+          return true;
+        }
+        
         app(`Theme set to "${name}".`);
         return true;
       };
@@ -5422,7 +5435,7 @@ export async function startTUI(opts) {
     session.planPath = state.planPath || null;
     session.focus = !!state.focus;
     session.effort = state.effort || '';
-    session.theme = state.theme || 'auto';
+    // Theme removed - forced dark only
     session.steps = state.steps || 0;
     session.rounds = state.rounds || 0;
     if (state.lastTurnMs) session.lastTurnMs = state.lastTurnMs;

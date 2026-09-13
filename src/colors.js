@@ -33,9 +33,23 @@ export const BORDER = rgb(70, 130, 180);
 // terminal's own palette show through for everything else; `dark`/`light` pick
 // accent triples that stay readable on that background.
 const THEMES = {
-  auto: { teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], hover: [190, 245, 255] },
-  dark: { teal: [0, 200, 230], cyan: [90, 225, 255], blue: [90, 150, 255], border: [80, 140, 190], hover: [190, 245, 255] },
-  light: { teal: [0, 120, 160], cyan: [0, 140, 200], blue: [40, 90, 200], border: [120, 160, 200], hover: [0, 80, 110] },
+  auto: { 
+    fg: [0, 184, 219], bg: [0, 18, 26], 
+    teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
+    hover: [190, 245, 255], selBg: [0, 70, 84] 
+  },
+  dark: { 
+    fg: [0, 200, 230], bg: [0, 18, 26], 
+    teal: [0, 200, 230], cyan: [90, 225, 255], blue: [90, 150, 255], border: [80, 140, 190], 
+    hover: [190, 245, 255], selBg: [0, 70, 84] 
+  },
+  light: {
+    fg: [26, 26, 26], bg: [255, 255, 255],
+    teal: [0, 102, 128], cyan: [0, 122, 153], blue: [10, 77, 158], border: [138, 155, 176],
+    hover: [0, 78, 102], selBg: [200, 230, 239],
+    red: [179, 38, 30], green: [30, 122, 60], yellow: [160, 120, 0], orange: [178, 90, 0],
+    white: [26, 26, 26], gray: [85, 85, 85],
+  },
 };
 export const THEME_NAMES = Object.keys(THEMES);
 
@@ -101,19 +115,54 @@ export function lerpColor(r1, g1, b1, r2, g2, b2, t) {
 export function setTheme(name) {
   const t = THEMES[name];
   if (!t) return false;
+  
+  // Update foreground colors
   C.teal = rgb(...t.teal);
-  C.fg = C.teal;
+  C.fg = rgb(...t.fg);
   C.cyan = rgb(...t.cyan);
   C.blue = rgb(...t.blue);
   C.border = rgb(...t.border);
+  
+  // Update background colors
+  C.bg = brgb(...t.bg);
   C.bgTeal = brgb(...t.teal);
+  C.bgPanel = brgb(...t.bg);
+  C.selBg = brgb(...t.selBg);
+  
+  // Scrollbar colors - adjust based on theme brightness
+  const isLight = t.bg[0] > 128; // Simple brightness check
+  C.scrollTrack = isLight ? '\x1b[90m' : '\x1b[90m'; // dim gutter (works for both)
+  C.scrollThumb = rgb(...t.teal);
+  C.scrollThumbHover = rgb(...t.hover);
+  C.scrollThumbActive = rgb(t.teal[0] * 0.7, t.teal[1] * 0.7, t.teal[2] * 0.7);
+
   // Hover stays visible on this theme's background (bright on dark, dark on light).
   C.hover = '\x1b[1m' + rgb(...(t.hover || [190, 245, 255]));
+
+  // Semantic colors — swap to deep versions on light backgrounds.
+  if (t.white)  C.white  = rgb(...t.white);
+  if (t.gray)   C.gray   = rgb(...t.gray);
+  if (t.red)    C.red    = rgb(...t.red);
+  if (t.green)  C.green  = rgb(...t.green);
+  if (t.yellow) C.yellow = rgb(...t.yellow);
+  if (t.orange) C.orange = rgb(...t.orange);
+
   return true;
 }
 
 export function clearScreen() {
   return '\x1b[3J\x1b[H\x1b[2J';
+}
+
+// Clear screen and set background color based on current theme
+export function clearAndSetBg() {
+  // Reset all attributes first
+  const reset = '\x1b[0m';
+  // Clear screen
+  const clear = '\x1b[3J\x1b[H\x1b[2J';
+  // Set background color using current C.bg value
+  const bg = C.bg || '\x1b[48;2;0;18;26m'; // Default dark background
+  return reset + clear + bg;
 }
 export function eraseLine() {
   return '\x1b[2K';
