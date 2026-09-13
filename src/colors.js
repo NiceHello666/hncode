@@ -39,8 +39,8 @@ const THEMES = {
     hover: [190, 245, 255], selBg: [0, 70, 84] 
   },
   dark: { 
-    fg: [0, 200, 230], bg: [0, 18, 26], 
-    teal: [0, 200, 230], cyan: [90, 225, 255], blue: [90, 150, 255], border: [80, 140, 190], 
+    fg: [255, 255, 255], bg: [0, 18, 26], // White foreground for normal text
+    teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
     hover: [190, 245, 255], selBg: [0, 70, 84] 
   },
   light: {

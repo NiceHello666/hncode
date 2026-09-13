@@ -55,7 +55,7 @@ export const COMMANDS = [
   { name: 'init', desc: 'Analyze the codebase and generate AGENTS.md', priority: 70 },
   { name: 'fork', desc: 'Fork the current session into a copy without switching to it', priority: 80 },
   { name: 'undo', desc: 'Withdraw the last prompt from the transcript', priority: 80, argumentHint: '[count]' },
-  { name: 'title', aliases: ['rename'], desc: 'Set or show session title', priority: 60, argumentHint: '<title>' },
+  { name: 'title', aliases: ['rename'], desc: 'Set or show session title (also sets window title)', priority: 60, argumentHint: '<title>' },
   { name: 'status', desc: 'Show current session and runtime status', priority: 60 },
   { name: 'usage', desc: 'Show session tokens + context window', priority: 60 },
   { name: 'mcp', desc: 'Show MCP server status', priority: 60 },
@@ -1278,8 +1278,8 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
     for (const w of wrapWords(t, width)) out.push(col(inlineMarkdown(w, codeFg), fg));
     return out;
   }
-  // Plain
-  for (const w of wrapWords(t, width)) out.push(w);
+  // Plain - apply default foreground color
+  for (const w of wrapWords(t, width)) out.push(col(w, fg));
   return out;
 }
 
@@ -1714,7 +1714,6 @@ export function composeFrame(state, cols, rows) {
     const hint = ed.hint || 'Ctrl+S save · Esc cancel · Enter newline';
     lines.push(col(hint, C.gray));
     lines.push('');
-    const viewH = Math.max(1, bodyH - (ed.notice ? 6 : 5));
     // Keep the caret row in view.
     let top = Math.max(0, ed.top || 0);
     if (ed.caretRow < top) top = ed.caretRow;
@@ -2498,7 +2497,7 @@ function ensureMenuVisible(state) {
 }
 
 // ---- command dispatch ----
-async function dispatch(cmdRaw, arg, state, cfg, session, h) {
+async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrame) {
   const { addChat, openPicker, openForm, notice, sendPrompt, quit, saveSession, openEditor } = h;
   const entry = findCommand(cmdRaw);
   const cmd = entry ? entry.name : String(cmdRaw || '').replace(/^\//, '');
@@ -2565,7 +2564,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
           { label: 'statusline', sub: 'configure status line items' },
           { label: 'add-dir', sub: 'add an additional workspace directory' },
         ],
-        onPick: (it) => { dispatch(it.label, '', state, cfg, session, h); return true; },
+        onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
       });
       return;
 
@@ -2756,18 +2755,60 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
                     return true;
                   }
                   openForm({
-                    title: `Add ${pit.label}`,
+                    title: `Edit ${pit.label}`,
                     fields: [
-                      { key: 'api_key', label: 'API Key', kind: 'mask' },
+                      { key: 'name', label: 'Provider Name', value: pit.name },
                       { key: 'base_url', label: 'Base URL', value: pit.base_url },
+                      { key: 'api_key', label: 'API Key', kind: 'mask', value: pit.api_key || '' },
+                      { key: 'type', label: 'Type', options: ['OpenAI', 'Anthropic'], value: pit.type || (pit.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') },
                     ],
                     type: null,
-                    hint: 'Tab next field · Enter save · Esc cancel (base URL prefilled)',
-                    onSubmit: (values) => {
-                      const name = pit.providerId;
-                      const baseUrl = values.base_url || pit.base_url;
-                      const protocol = /anthropic/i.test(baseUrl) ? 'anthropic' : 'openai';
-                      registerProvider(state, cfg, h, name, baseUrl, values.api_key, protocol, protocol === 'anthropic' ? 'Anthropic' : 'OpenAI');
+                    hint: 'Tab next field · Enter save · Esc cancel',
+                    onSubmit: async (values) => {
+                      if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
+                      const protocol = values.type === 'Anthropic' ? 'anthropic' : 'openai';
+                      registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, values.type);
+                      
+                      // Auto-fetch models and configure context/thinking settings
+                      try {
+                        const models = await fetchModels({ 
+                          baseUrl: values.base_url, 
+                          apiKey: values.api_key, 
+                          protocol 
+                        });
+                        
+                        if (models.length > 0) {
+                          // Add each model with its configuration
+                          for (const m of models) {
+                            const key = modelKey(values.name, m.id);
+                            if (!cfg.raw.models[key]) {
+                              addModel(values.name, m.id, {
+                                display_name: m.display,
+                                contextLength: m.contextLength,
+                                maxTokens: m.maxTokens,
+                              });
+                              
+                              // Configure model entry in raw config
+                              if (!cfg.raw.models) cfg.raw.models = {};
+                              cfg.raw.models[key] = {
+                                provider: values.name,
+                                model: m.id,
+                                display_name: m.display,
+                                context_length: m.contextLength,
+                                max_tokens: m.maxTokens,
+                                reasoning: m.reasoning,
+                                efforts: m.efforts,
+                              };
+                            }
+                          }
+                          
+                          app(`Added ${models.length} model(s) with auto-configured context windows and thinking capabilities.`);
+                        } else {
+                          app(`Provider added. No models found at this endpoint.`);
+                        }
+                      } catch (error) {
+                        app(`Provider added. Failed to fetch models: ${error.message}`);
+                      }
                     },
                   });
                   return true;
@@ -2815,10 +2856,21 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
     }
 
     case 'new':
+      // Save current session's todos before switching
+      if (session && Array.isArray(state.todos)) {
+        session.todos = state.todos.slice();
+        saveSession(session);
+      }
+      
       state.chat = [];
       Object.assign(session, { id: sess.newId(), title: '', messages: [], createdAt: Date.now(), rounds: 0, steps: 0, lastTurnMs: 0 });
       state.objective = '';
       state.rounds = 0; state.steps = 0; state.lastTurnMs = 0;
+      // New session starts with empty TODO list
+      state.todos = [];
+      session.todos = [];
+      // Set terminal window title to default (Untitled)
+      stdout.write('\x1b]0;Untitled\x07');
       // A fresh session has no history, so the context gauge must go back to 0
       // (otherwise it kept showing the PREVIOUS session's usage until the next
       // turn reported a new estimate). The window size is a property of the
@@ -2916,8 +2968,17 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
       return;
     }
     case 'title': {
-      if (raw) { session.title = raw.slice(0, 200); saveSession(session); app(`Session title set to: ${session.title}`); }
-      else app(`Session title: ${session.title || 'not set'}`);
+      if (raw) {
+        session.title = raw.slice(0, 200);
+        saveSession(session);
+        // Set terminal window title - use OSC sequence
+        // Only show "Untitled" prefix if user hasn't set a custom title
+        const displayTitle = session.title || 'Untitled';
+        stdout.write(`\x1b]0;${displayTitle}\x07`);
+        app(`Session title set to: "${displayTitle}"`);
+      } else {
+        app(`Session title: ${session.title || 'not set'}`);
+      }
       return;
     }
     case 'compact': {
@@ -3430,10 +3491,8 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h) {
           return;
         }
       }
-      // Unknown command: treat as plain text and send to AI.
-      // Remove the leading / so it's sent as regular text.
-      const textToSend = '/' + raw;
-      submit(textToSend);
+      // Unknown command: show error message
+      appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
       return;
   }
 }
@@ -3717,7 +3776,8 @@ export async function startTUI(opts) {
   
   const state = makeState({ cfg, session, opts });
   cfg.effort = state.reasoning ? state.effort : '';
-  setTheme(state.theme);
+  // Force dark theme (theme removed from state)
+  setTheme('dark');
   
   // Calculate initial context usage from loaded session
   if (session && session.messages && session.messages.length) {
@@ -3999,7 +4059,7 @@ export async function startTUI(opts) {
         if (cmd) {
           state.menuOpen = false; state.menuList = []; state.menuSel = 0; state.menuOffset = 0;
           state.input = ''; state.caret = 0;
-          dispatch(cmd.name, '', state, cfg, session, host);
+          dispatch(cmd.name, '', state, cfg, session, host, submit, stdout);
           if (state._quit) { quit(); return true; }
           renderFrame();
         }
@@ -4017,6 +4077,16 @@ export async function startTUI(opts) {
         // Store mousedown position for potential drag selection in the composer.
         state._composerMouseDown = { row: hb.rowIdx, col: idx, caret: idx };
         state.composerSel = null;
+        renderFrame();
+        return true;
+      }
+      case 'editor': {
+        if (!state.editor) return false;
+        const ed = state.editor;
+        const ls = ed.text.split('\n');
+        // Set caret to clicked position
+        ed.caretRow = hb.row;
+        ed.caretCol = Math.min((ls[ed.caretRow] || '').length, 1000); // Cap at reasonable length
         renderFrame();
         return true;
       }
@@ -4285,25 +4355,29 @@ export async function startTUI(opts) {
       return;
     }
     
-    let text = '';
-    let via = 'none';
-    
-    // Try fast path first (oneshot)
+    // Always try fast path first (readOnce is instant)
     try {
-      ({ text, via } = { text: readOnce(), via: 'oneshot' });
+      const text = readOnce();
+      if (text) {
+        insertComposerPaste(text);
+        notice('Pasted instantly!', 'info');
+        renderFrame();
+        return;
+      }
     } catch {}
     
-    // If fast path failed and we need to try slow path
-    if (!text && !fastPathOnly) {
-      const result = await readText();
-      text = result.text;
-      via = result.via;
+    // Fast path failed - only use slow path for Ctrl+Shift+V, not for right-click
+    if (fastPathOnly) {
+      notice('Clipboard empty or unavailable (fast path only)', 'error');
+      renderFrame();
+      return;
     }
     
-    if (!text) { notice('Clipboard empty or unavailable', 'error'); renderFrame(); return; }
-    insertComposerPaste(text);
-    if (via === 'helper') notice(`Pasted via helper (${via})`, 'info');
-    else if (via === 'oneshot') notice('Pasted instantly!', 'info');
+    // Slow path for Ctrl+Shift+V
+    const result = await readText();
+    if (!result.text) { notice('Clipboard empty or unavailable', 'error'); renderFrame(); return; }
+    insertComposerPaste(result.text);
+    notice(`Pasted via ${result.via}`, 'info');
     renderFrame();
   }
   // Ctrl-S: inject the queued messages (plus the current draft) into the RUNNING
@@ -5114,6 +5188,7 @@ export async function startTUI(opts) {
     state.historyIdx = -1;
     if (!text) { renderFrame(); return; }
     if (!state.running) state.turnStart = Date.now();
+    
     if (state.history[state.history.length - 1] !== text) state.history.push(text);
     // Commands are handled immediately, never queued: queuing them delayed a
     // /plan or /model until the running turn finished, which is not what
@@ -5122,7 +5197,7 @@ export async function startTUI(opts) {
       const sp = text.indexOf(' ');
       const c = sp === -1 ? text : text.slice(0, sp);
       const arg = sp === -1 ? '' : text.slice(sp + 1).trim();
-      dispatch(c, arg, state, cfg, session, host);
+      dispatch(c, arg, state, cfg, session, host, submit, stdout);
       if (state._quit) { quit(); return; }
       renderFrame();
       return;
@@ -5157,6 +5232,12 @@ export async function startTUI(opts) {
     //     model stops narrating what it is about to do and why.
     const basePrompt = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
     let sysText = basePrompt;
+    
+    // Auto-generate title on first turn (if not already set)
+    if (!session.title && session.messages && session.messages.length === 0) {
+      sysText += '\n\n[IMPORTANT: Please generate a concise, descriptive title for this conversation based on the user\'s request. Return ONLY the title text, nothing else. Example: Fix color rendering issue or Implement plugin system]';
+    }
+    
     if (cfg.calmMode) {
       sysText += '\n\n' + CALM_MODE_INSTRUCTION;
     }
@@ -5473,6 +5554,24 @@ export async function startTUI(opts) {
     } else {
       state.chat.push({ role: 'assistant', text: text || '' });
     }
+    
+    // Check if this is the first assistant response and we need to parse title
+    if (!state.running && !session.title && state.chat.some(m => m.role === 'assistant')) {
+      // Look for title in the assistant's response
+      const assistantMsg = state.chat.find(m => m.role === 'assistant');
+      if (assistantMsg && assistantMsg.text) {
+        const text = assistantMsg.text.trim();
+        // More lenient heuristic: short text (< 80 chars), no newlines, optional ending punctuation
+        const cleanText = text.replace(/[.!?]$/, '').trim();
+        if (cleanText.length < 80 && !text.includes('\n') && cleanText.length > 2) {
+          session.title = cleanText;
+          saveSession(session);
+          stdout.write(`\x1b]0;${cleanText}\x07`);
+          app(`Auto-generated title: "${cleanText}"`);
+        }
+      }
+    }
+    
     anchorScroll();
   }
 
