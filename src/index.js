@@ -11,7 +11,7 @@ import { setToolsList } from './llm.js';
 
 export const VERSION = '0.1.0';
 
-const HELP = `hncode ${VERSION} — a kimi-code-cli-style coding agent.
+const HELP = `hncode ${VERSION} — a Kimi Code-style coding agent.
 
 Usage: hncode [options] [command]
 

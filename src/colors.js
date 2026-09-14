@@ -81,11 +81,14 @@ export const C = {
   selBg: TRUECOLOR ? brgb(0, 70, 84) : '\x1b[48;5;23m', // Original dark cyan background
   scrollTrack: '\x1b[90m',          // dim gutter
   scrollThumb: TRUECOLOR ? rgb(0, 184, 219) : '\x1b[38;5;37m', // brand cyan-blue
-  // Scrollbar interaction states. hover: a touch whiter/brighter than the brand
-  // colour; active (pressed/dragging): a touch darker. Idle returns to
-  // scrollThumb (the brand colour) — the caller swaps back automatically.
+  // Scrollbar interaction states:
+  //   hover  -> a touch whiter/brighter than the brand colour
+  //   active -> BOLD + the brand colour (pressed/dragging)
+  // The pressed state used to be a DARKER colour, which on a dark background
+  // read as "the thumb disappeared". Making it bold-and-bright means a press is
+  // always unmistakably visible. Idle swaps back to scrollThumb automatically.
   scrollThumbHover: TRUECOLOR ? rgb(120, 226, 245) : '\x1b[38;5;123m',
-  scrollThumbActive: TRUECOLOR ? rgb(0, 140, 168) : '\x1b[38;5;31m',
+  scrollThumbActive: '\x1b[1m' + (TRUECOLOR ? rgb(0, 220, 255) : '\x1b[38;5;51m'),
   // Hover highlight for clickable rows (menu items, picker options, form
   // fields, composer rows). An explicit bright foreground + BOLD rather than a
   // bare BOLD: BOLD only brightens the 16-colour palette (it does nothing to a
@@ -129,12 +132,17 @@ export function setTheme(name) {
   C.bgPanel = brgb(...t.bg);
   C.selBg = brgb(...t.selBg);
   
-  // Scrollbar colors - adjust based on theme brightness
-  const isLight = t.bg[0] > 128; // Simple brightness check
-  C.scrollTrack = isLight ? '\x1b[90m' : '\x1b[90m'; // dim gutter (works for both)
+  // Scrollbar colours. The active (pressed/dragging) thumb is BOLD + a brighter
+  // shade of the theme colour. It used to be a DARKER shade, which on a dark
+  // background read as "the thumb vanished" mid-drag.
+  C.scrollTrack = '\x1b[90m'; // dim gutter
   C.scrollThumb = rgb(...t.teal);
   C.scrollThumbHover = rgb(...t.hover);
-  C.scrollThumbActive = rgb(t.teal[0] * 0.7, t.teal[1] * 0.7, t.teal[2] * 0.7);
+  C.scrollThumbActive = '\x1b[1m' + rgb(
+    Math.min(255, Math.round(t.teal[0] * 0.6 + 255 * 0.4)),
+    Math.min(255, Math.round(t.teal[1] * 0.6 + 255 * 0.4)),
+    Math.min(255, Math.round(t.teal[2] * 0.6 + 255 * 0.4)),
+  );
 
   // Hover stays visible on this theme's background (bright on dark, dark on light).
   C.hover = '\x1b[1m' + rgb(...(t.hover || [190, 245, 255]));

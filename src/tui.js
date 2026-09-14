@@ -20,7 +20,7 @@ import cp from 'node:child_process';
 import {
   C, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, THEME_NAMES, lerpColor,
 } from './colors.js';
-import { copyText, readText, warmClipboard, readImage } from './clipboard.js';
+import { copyText, readText, warmClipboard, readClipboardContentAsync } from './clipboard.js';
 import { visualWidth, estimateTokens, estimateMessagesTokens, expandTabs } from './term.js';
 import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { LLM } from './llm.js';
@@ -60,7 +60,6 @@ export const COMMANDS = [
   { name: 'usage', desc: 'Show session tokens + context window', priority: 60 },
   { name: 'mcp', desc: 'Show MCP server status', priority: 60 },
   { name: 'mcp-config', desc: 'Configure MCP servers (list / add / remove)', priority: 60 },
-  { name: 'theme', desc: 'Set the terminal UI theme', priority: 60, argumentHint: '[auto|dark|light|<name>]' },
   { name: 'statusline', desc: 'Configure which items appear in the status line', priority: 60 },
   
   { name: 'export-md', aliases: ['export'], desc: 'Export current session as a Markdown file', priority: 40, argumentHint: '[output-path]' },
@@ -140,7 +139,6 @@ export const TIPS = [
   '/compact [ratio] AI-summarizes older history and keeps the most recent 20%',
   '/tasks lists background Bash jobs started with run_in_background',
   '/status prints the current model, provider, endpoint, and session id',
-  '/theme switches between the auto / dark / light colour palettes',
   '/statusline toggles which items appear in the bottom status bar',
   '/add-dir grants the agent access to another directory for this session',
   '/reload re-reads config.toml without restarting hncode',
@@ -210,74 +208,90 @@ const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', 
 // Rotating status messages for the "Working..." line — all mean "the agent is
 // thinking / working", but vary the wording so it doesn't look stuck.
 const WORKING_MESSAGES = [
-  'Thinking…', 'Working…', 'Crunching…', 'Processing…', 'Analyzing…',
-  'Pondering…', 'Mulling…', 'Considering…', 'Reasoning…', 'Deliberating…',
-  'Reflecting…', 'Ruminating…', 'Planning…', 'Mapping…', 'Sketching…',
-  'Outlining…', 'Structuring…', 'Organizing…', 'Sorting…', 'Ordering…',
-  'Prioritizing…', 'Focusing…', 'Concentrating…', 'Diving…', 'Digging…',
-  'Delving…', 'Probing…', 'Examining…', 'Inspecting…', 'Studying…',
-  'Reviewing…', 'Checking…', 'Verifying…', 'Validating…', 'Confirming…',
-  'Building…', 'Assembling…', 'Constructing…', 'Composing…', 'Crafting…',
-  'Creating…', 'Shaping…', 'Forming…', 'Forging…', 'Welding…',
-  'Stitching…', 'Weaving…', 'Knitting…', 'Threading…', 'Patching…',
-  'Fixing…', 'Repairing…', 'Rebuilding…', 'Reworking…', 'Refactoring…',
-  'Restructuring…', 'Solving…', 'Untangling…', 'Unraveling…', 'Detangling…',
-  'Deciphering…', 'Decoding…', 'Cracking…', 'Piecing…', 'Fitting…',
-  'Hunting…', 'Chasing…', 'Tracking…', 'Tracing…', 'Sniffing…',
-  'Writing…', 'Drafting…', 'Editing…', 'Revising…', 'Rewriting…',
-  'Proofreading…', 'Polishing…', 'Refining…', 'Honing…', 'Tuning…',
-  'Sharpening…', 'Tightening…', 'Trimming…', 'Pruning…', 'Cutting…',
-  'Merging…', 'Splicing…', 'Searching…', 'Scanning…', 'Sifting…',
-  'Filtering…', 'Collecting…', 'Gathering…', 'Compiling…', 'Indexing…',
-  'Fetching…', 'Retrieving…', 'Loading…', 'Unpacking…', 'Computing…',
-  'Calculating…', 'Measuring…', 'Estimating…', 'Calibrating…', 'Aligning…',
-  'Balancing…', 'Optimizing…', 'Streamlining…', 'Smoothing…', 'Cleaning…',
-  'Sweeping…', 'Tidying…', 'Clearing…', 'Expanding…', 'Growing…',
-  'Blooming…', 'Walking…', 'Strolling…', 'Marching…', 'Hiking…',
-  'Trekking…', 'Journeying…', 'Sailing…', 'Cruising…', 'Gliding…',
-  'Flying…', 'Soaring…', 'Floating…', 'Drifting…', 'Wandering…',
-  'Exploring…', 'Roaming…', 'Venturing…', 'Discovering…', 'Uncovering…',
-  'Unveiling…', 'Revealing…', 'Exposing…', 'Spinning…', 'Whirling…',
-  'Twirling…', 'Rotating…', 'Swirling…', 'Churning…', 'Turning…',
-  'Rolling…', 'Rocking…', 'Swaying…', 'Flowing…', 'Streaming…',
-  'Cascading…', 'Rippling…', 'Bubbling…', 'Sparkling…', 'Cooking…',
-  'Simmering…', 'Boiling…', 'Stewing…', 'Roasting…', 'Baking…',
-  'Grilling…', 'Frying…', 'Whisking…', 'Beating…', 'Stirring…',
-  'Mixing…', 'Blending…', 'Kneading…', 'Proofing…', 'Rising…',
-  'Fermenting…', 'Brewing…', 'Steeping…', 'Infusing…', 'Seasoning…',
-  'Garnishing…', 'Plating…', 'Serving…', 'Tasting…', 'Adjusting…',
-  'Perfecting…', 'Glazing…', 'Painting…', 'Drawing…', 'Designing…',
-  'Orchestrating…', 'Conducting…', 'Dancing…', 'Jigging…', 'Jiving…',
-  'Boogying…', 'Shimmying…', 'Grooving…', 'Bouncing…', 'Hopping…',
-  'Skipping…', 'Nurturing…', 'Tending…', 'Gardening…', 'Planting…',
-  'Seeding…', 'Sprouting…', 'Rooting…', 'Branching…', 'Watering…',
-  'Flourishing…', 'Thriving…', 'Sneaking…', 'Tiptoeing…', 'Creeping…',
-  'Gliding…', 'Charging…', 'Gunning…', 'Ramping…', 'Revving…',
-  'Warming…', 'Powering…', 'Igniting…', 'Kindling…', 'Sparking…',
-  'Blazing…', 'Burning…', 'Glowing…', 'Illuminating…', 'Enlightening…',
-  'Brightening…', 'Dawning…', 'Breaking…', 'Leaping…', 'Jumping…',
-  'Bounding…', 'Springing…', 'Launching…', 'Propelling…', 'Accelerating…',
-  'Waiting…', 'Holding…', 'Steadying…', 'Progressing…', 'Advancing…',
-  'Continuing…', 'Persisting…', 'Persevering…', 'Standing…', 'Readying…',
-  'Preparing…', 'Sussing…', 'Sleuthing…', 'Orienting…', 'Locating…',
-  'Targeting…', 'Acquiring…', 'Syncing…', 'Harmonizing…', 'Lining…',
-  'Wrapping…', 'Finalizing…', 'Landing…', 'Nailing…', 'Sealing…',
-  'Rethinking…', 'Reassessing…', 'Revisiting…', 'Retracing…', 'Replaying…',
-  'Rehearsing…', 'Simulating…', 'Modeling…', 'Prototyping…', 'Testing…',
-  'Iterating…', 'Rendering…', 'Repainting…', 'Compositing…', 'Wiring…',
-  'Linking…', 'Bundling…', 'Packing…', 'Shipping…', 'Deploying…',
-  'Calculating…', 'Crunching…', 'Juggling…', 'Balancing…', 'Weighing…',
-  'Distilling…', 'Extracting…', 'Parsing…', 'Formatting…', 'Normalizing…',
-  'Sanitizing…', 'Validating…', 'Locking…', 'Securing…', 'Guarding…',
-  'Watching…', 'Monitoring…', 'Surveying…', 'Scouting…', 'Reconnoitering…',
-  'Brewing…', 'Concocting…', 'Devising…', 'Inventing…', 'Imagining…',
-  'Envisioning…', 'Visualizing…', 'Picturing…', 'Dreaming…', 'Wondering…',
-  'Marveling…', 'Admiring…', 'Appreciating…', 'Enjoying…', 'Savoring…',
-  'Relishing…', 'Loving…', 'Cherishing…', 'Treasure-hunting…', 'Questing…',
-  'Seeking…', 'Striving…', 'Endeavoring…', 'Attempting…', 'Trying…',
-  'Experimenting…', 'Innovating…', 'Pioneering…', 'Trailblazing…', 'Pathfinding…',
-  'Navigating…', 'Steering…', 'Guiding…', 'Directing…', 'Captaining…',
-  'Piloting…', 'Commanding…', 'Leading…', 'Spearheading…', 'Championing…',
+  'Thinking...', 'Working...', 'Crunching...', 'Processing...', 'Analyzing...', 'Pondering...', 'Mulling...', 'Considering...', 'Reasoning...', 'Deliberating...',
+  'Reflecting...', 'Ruminating...', 'Planning...', 'Mapping...', 'Sketching...', 'Outlining...', 'Structuring...', 'Organizing...', 'Sorting...', 'Ordering...',
+  'Prioritizing...', 'Focusing...', 'Concentrating...', 'Diving...', 'Digging...', 'Delving...', 'Probing...', 'Examining...', 'Inspecting...', 'Studying...',
+  'Reviewing...', 'Checking...', 'Verifying...', 'Validating...', 'Confirming...', 'Building...', 'Assembling...', 'Constructing...', 'Composing...', 'Crafting...',
+  'Creating...', 'Shaping...', 'Forming...', 'Forging...', 'Welding...', 'Stitching...', 'Weaving...', 'Knitting...', 'Threading...', 'Patching...',
+  'Fixing...', 'Repairing...', 'Rebuilding...', 'Reworking...', 'Refactoring...', 'Restructuring...', 'Solving...', 'Untangling...', 'Unraveling...', 'Detangling...',
+  'Deciphering...', 'Decoding...', 'Cracking...', 'Piecing...', 'Fitting...', 'Hunting...', 'Chasing...', 'Tracking...', 'Tracing...', 'Sniffing...',
+  'Writing...', 'Drafting...', 'Editing...', 'Revising...', 'Rewriting...', 'Proofreading...', 'Polishing...', 'Refining...', 'Honing...', 'Tuning...',
+  'Sharpening...', 'Tightening...', 'Trimming...', 'Pruning...', 'Cutting...', 'Merging...', 'Splicing...', 'Searching...', 'Scanning...', 'Sifting...',
+  'Filtering...', 'Collecting...', 'Gathering...', 'Compiling...', 'Indexing...', 'Fetching...', 'Retrieving...', 'Loading...', 'Unpacking...', 'Computing...',
+  'Calculating...', 'Measuring...', 'Estimating...', 'Calibrating...', 'Aligning...', 'Balancing...', 'Optimizing...', 'Streamlining...', 'Smoothing...', 'Cleaning...',
+  'Sweeping...', 'Tidying...', 'Clearing...', 'Expanding...', 'Growing...', 'Blooming...', 'Walking...', 'Strolling...', 'Marching...', 'Hiking...',
+  'Trekking...', 'Journeying...', 'Sailing...', 'Cruising...', 'Gliding...', 'Flying...', 'Soaring...', 'Floating...', 'Drifting...', 'Wandering...',
+  'Exploring...', 'Roaming...', 'Venturing...', 'Discovering...', 'Uncovering...', 'Unveiling...', 'Revealing...', 'Exposing...', 'Spinning...', 'Whirling...',
+  'Twirling...', 'Rotating...', 'Swirling...', 'Churning...', 'Turning...', 'Rolling...', 'Rocking...', 'Swaying...', 'Flowing...', 'Streaming...',
+  'Cascading...', 'Rippling...', 'Bubbling...', 'Sparkling...', 'Cooking...', 'Simmering...', 'Boiling...', 'Stewing...', 'Roasting...', 'Baking...',
+  'Grilling...', 'Frying...', 'Whisking...', 'Beating...', 'Stirring...', 'Mixing...', 'Blending...', 'Kneading...', 'Proofing...', 'Rising...',
+  'Fermenting...', 'Brewing...', 'Steeping...', 'Infusing...', 'Seasoning...', 'Garnishing...', 'Plating...', 'Serving...', 'Tasting...', 'Adjusting...',
+  'Perfecting...', 'Glazing...', 'Painting...', 'Drawing...', 'Designing...', 'Orchestrating...', 'Conducting...', 'Dancing...', 'Jigging...', 'Jiving...',
+  'Boogying...', 'Shimmying...', 'Grooving...', 'Bouncing...', 'Hopping...', 'Skipping...', 'Nurturing...', 'Tending...', 'Gardening...', 'Planting...',
+  'Seeding...', 'Sprouting...', 'Rooting...', 'Branching...', 'Watering...', 'Flourishing...', 'Thriving...', 'Sneaking...', 'Tiptoeing...', 'Creeping...',
+  'Charging...', 'Gunning...', 'Ramping...', 'Revving...', 'Warming...', 'Powering...', 'Igniting...', 'Kindling...', 'Sparking...', 'Blazing...',
+  'Burning...', 'Glowing...', 'Illuminating...', 'Enlightening...', 'Brightening...', 'Dawning...', 'Breaking...', 'Leaping...', 'Jumping...', 'Bounding...',
+  'Springing...', 'Launching...', 'Propelling...', 'Accelerating...', 'Waiting...', 'Holding...', 'Steadying...', 'Progressing...', 'Advancing...', 'Continuing...',
+  'Persisting...', 'Persevering...', 'Standing...', 'Readying...', 'Preparing...', 'Sussing...', 'Sleuthing...', 'Orienting...', 'Locating...', 'Targeting...',
+  'Acquiring...', 'Syncing...', 'Harmonizing...', 'Lining...', 'Wrapping...', 'Finalizing...', 'Landing...', 'Nailing...', 'Sealing...', 'Rethinking...',
+  'Reassessing...', 'Revisiting...', 'Retracing...', 'Replaying...', 'Rehearsing...', 'Simulating...', 'Modeling...', 'Prototyping...', 'Testing...', 'Iterating...',
+  'Rendering...', 'Repainting...', 'Compositing...', 'Wiring...', 'Linking...', 'Bundling...', 'Packing...', 'Shipping...', 'Deploying...', 'Juggling...',
+  'Weighing...', 'Distilling...', 'Extracting...', 'Parsing...', 'Formatting...', 'Normalizing...', 'Sanitizing...', 'Locking...', 'Securing...', 'Guarding...',
+  'Watching...', 'Monitoring...', 'Surveying...', 'Scouting...', 'Reconnoitering...', 'Concocting...', 'Devising...', 'Inventing...', 'Imagining...', 'Envisioning...',
+  'Visualizing...', 'Picturing...', 'Dreaming...', 'Wondering...', 'Marveling...', 'Admiring...', 'Appreciating...', 'Enjoying...', 'Savoring...', 'Relishing...',
+  'Loving...', 'Cherishing...', 'Treasure-hunting...', 'Questing...', 'Seeking...', 'Striving...', 'Endeavoring...', 'Attempting...', 'Trying...', 'Experimenting...',
+  'Innovating...', 'Pioneering...', 'Trailblazing...', 'Pathfinding...', 'Navigating...', 'Steering...', 'Guiding...', 'Directing...', 'Captaining...', 'Piloting...',
+  'Commanding...', 'Leading...', 'Spearheading...', 'Championing...', 'Absorbing...', 'Accenting...', 'Acclaiming...', 'Accommodating...', 'Accounting...', 'Accrediting...',
+  'Accumulating...', 'Achieving...', 'Acknowledging...', 'Activating...', 'Adapting...', 'Adding...', 'Addressing...', 'Adhering...', 'Administering...', 'Adopting...',
+  'Adorning...', 'Advising...', 'Affirming...', 'Aggregating...', 'Agreing...', 'Aiming...', 'Airbrushing...', 'Alerting...', 'Allocating...', 'Allowing...',
+  'Altering...', 'Amalgamating...', 'Amending...', 'Amplifying...', 'Amusing...', 'Anchoring...', 'Animating...', 'Annexing...', 'Announcing...', 'Answering...',
+  'Anticipating...', 'Appealing...', 'Appending...', 'Applying...', 'Appointing...', 'Appraising...', 'Approaching...', 'Approving...', 'Archiving...', 'Arguing...',
+  'Arming...', 'Arranging...', 'Arraying...', 'Arresting...', 'Arriving...', 'Articulating...', 'Ascending...', 'Asserting...', 'Assessing...', 'Assigning...',
+  'Assimilating...', 'Assisting...', 'Assuring...', 'Astonishing...', 'Attaching...', 'Attacking...', 'Attaining...', 'Attending...', 'Attesting...', 'Attracting...',
+  'Auditing...', 'Augmenting...', 'Authenticating...', 'Authoring...', 'Authorizing...', 'Automating...', 'Averting...', 'Awakening...', 'Awarding...', 'Babbling...',
+  'Backing...', 'Backtracking...', 'Badging...', 'Baging...', 'Baiting...', 'Ballooning...', 'Banding...', 'Banking...', 'Bartering...', 'Basing...',
+  'Batching...', 'Bearing...', 'Bedazzling...', 'Befriending...', 'Begining...', 'Beholding...', 'Believing...', 'Belonging...', 'Bending...', 'Benefiting...',
+  'Beseeching...', 'Bestowing...', 'Beting...', 'Biding...', 'Billowing...', 'Binding...', 'Blasting...', 'Bleaching...', 'Bleeding...', 'Bleeping...',
+  'Blessing...', 'Blinking...', 'Blistering...', 'Blocking...', 'Bloting...', 'Blowing...', 'Bluring...', 'Boarding...', 'Boasting...', 'Bobing...',
+  'Bolstering...', 'Bombarding...', 'Bonding...', 'Booming...', 'Boosting...', 'Bootstraping...', 'Bordering...', 'Borrowing...', 'Botching...', 'Bottling...',
+  'Bowing...', 'Bowling...', 'Boxing...', 'Bracing...', 'Brainstorming...', 'Braising...', 'Branding...', 'Braving...', 'Breaching...', 'Breathing...',
+  'Breezing...', 'Bricking...', 'Bridging...', 'Briefing...', 'Bringing...', 'Bristling...', 'Broadening...', 'Brokering...', 'Bronzing...', 'Brooding...',
+  'Browsing...', 'Brushing...', 'Buckling...', 'Budgeting...', 'Buffering...', 'Buffing...', 'Bulking...', 'Bulletproofing...', 'Bumping...', 'Bunching...',
+  'Buoying...', 'Bursting...', 'Burying...', 'Busting...', 'Buttering...', 'Buzzing...', 'Caching...', 'Cadencing...', 'Cajoling...', 'Caking...',
+  'Calling...', 'Calming...', 'Camping...', 'Canceling...', 'Canoodling...', 'Canvasing...', 'Capitalizing...', 'Captioning...', 'Capturing...', 'Carbonizing...',
+  'Caring...', 'Carving...', 'Cashing...', 'Casting...', 'Cataloging...', 'Catapulting...', 'Catching...', 'Categorizing...', 'Catering...', 'Cautioning...',
+  'Ceasing...', 'Celebrating...', 'Cementing...', 'Censoring...', 'Centralizing...', 'Certifying...', 'Chaining...', 'Chairing...', 'Chalking...', 'Challenging...',
+  'Channeling...', 'Chanting...', 'Charting...', 'Chating...', 'Cheering...', 'Chewing...', 'Chilling...', 'Chiming...', 'Chiping...', 'Chirping...',
+  'Chiseling...', 'Choosing...', 'Choping...', 'Choreographing...', 'Chronicling...', 'Chuging...', 'Ciphering...', 'Circling...', 'Circulating...', 'Citing...',
+  'Civilizing...', 'Clamping...', 'Clanging...', 'Claping...', 'Clarifying...', 'Clashing...', 'Classifying...', 'Clawing...', 'Cleansing...', 'Cleaving...',
+  'Climbing...', 'Clinching...', 'Cliping...', 'Cloaking...', 'Clocking...', 'Cloning...', 'Closing...', 'Clouding...', 'Clustering...', 'Clutching...',
+  'Coaching...', 'Coalescing...', 'Coating...', 'Coaxing...', 'Cocooning...', 'Codifying...', 'Coercing...', 'Coexisting...', 'Cogitating...', 'Cohering...',
+  'Coiling...', 'Coinciding...', 'Collaborating...', 'Collapsing...', 'Collating...', 'Colliding...', 'Colonizing...', 'Coloring...', 'Combing...', 'Combining...',
+  'Comforting...', 'Commemorating...', 'Commencing...', 'Commenting...', 'Commissioning...', 'Commiting...', 'Communing...', 'Communicating...', 'Commuting...', 'Compacting...',
+  'Comparing...', 'Compassing...', 'Compeling...', 'Compensating...', 'Competing...', 'Complementing...', 'Completing...', 'Complicating...', 'Complimenting...', 'Comprehending...',
+  'Compressing...', 'Comprising...', 'Compromising...', 'Concealing...', 'Conceding...', 'Conceiving...', 'Conceptualizing...', 'Concerning...', 'Concluding...', 'Concuring...',
+  'Condensing...', 'Conditioning...', 'Condoning...', 'Confering...', 'Confessing...', 'Configuring...', 'Confining...', 'Confiscating...', 'Conflating...', 'Confronting...',
+  'Confusing...', 'Congealing...', 'Congratulating...', 'Conjuring...', 'Connecting...', 'Conquering...', 'Consecrating...', 'Consenting...', 'Conserving...', 'Consigning...',
+  'Consisting...', 'Consoling...', 'Consolidating...', 'Conspiring...', 'Constituting...', 'Constraining...', 'Consulting...', 'Consuming...', 'Contacting...', 'Containing...',
+  'Contemplating...', 'Contending...', 'Contenting...', 'Contesting...', 'Contracting...', 'Contrasting...', 'Contributing...', 'Contriving...', 'Controling...', 'Convening...',
+  'Converging...', 'Conversing...', 'Converting...', 'Conveying...', 'Convincing...', 'Convoying...', 'Cooling...', 'Cooperating...', 'Coordinating...', 'Copying...',
+  'Coring...', 'Corking...', 'Correlating...', 'Corresponding...', 'Corroborating...', 'Corraling...', 'Correcting...', 'Corrugating...', 'Cosseting...', 'Counseling...',
+  'Counting...', 'Coupling...', 'Coursing...', 'Covering...', 'Coveting...', 'Cradling...', 'Cranking...', 'Crashing...', 'Crawling...', 'Creasing...',
+  'Crediting...', 'Cresting...', 'Critiquing...', 'Crocheting...', 'Crooning...', 'Crossing...', 'Crowding...', 'Crowning...', 'Crumbing...', 'Crusading...',
+  'Crystallizing...', 'Cubing...', 'Cuddling...', 'Culling...', 'Cultivating...', 'Curbing...', 'Curating...', 'Curling...', 'Currying...', 'Cushioning...',
+  'Customizing...', 'Cuting...', 'Cycling...', 'Dabbling...', 'Daming...', 'Dampening...', 'Daring...', 'Darting...', 'Dashing...', 'Dating...',
+  'Dawdling...', 'Dazzling...', 'Deactivating...', 'Debuging...', 'Debuting...', 'Decanting...', 'Decelerating...', 'Decentralizing...', 'Decking...', 'Declaring...',
+  'Declining...', 'Decomposing...', 'Decorating...', 'Decoupling...', 'Decreasing...', 'Dedicating...', 'Deducing...', 'Deepening...', 'Defeating...', 'Defending...',
+  'Defering...', 'Defining...', 'Deflecting...', 'Deforming...', 'Defragmenting...', 'Defusing...', 'Degreasing...', 'Dehydrating...', 'Delegating...', 'Deleting...',
+  'Delivering...', 'Demanding...', 'Demarcating...', 'Demisting...', 'Demystifying...', 'Denoting...', 'Denouncing...', 'Densifying...', 'Departing...', 'Depending...',
+  'Depositing...', 'Depressurizing...', 'Deputing...', 'Deriving...', 'Descending...', 'Describing...', 'Deserting...', 'Desiring...', 'Despatching...', 'Detecting...',
+  'Detering...', 'Detoxing...', 'Devaluing...', 'Developing...', 'Deviating...', 'Devoting...', 'Diping...', 'Disabling...', 'Disarming...', 'Disassembling...',
+  'Disbursing...', 'Discarding...', 'Discerning...', 'Discharging...', 'Disciplining...', 'Disclosing...', 'Disconnecting...', 'Discontinuing...', 'Discounting...', 'Discoursing...',
+  'Discrediting...', 'Discriminating...', 'Discussing...', 'Disembarking...', 'Disentangling...', 'Disguising...', 'Disinfecting...', 'Disliking...', 'Dismantling...', 'Dismissing...',
+  'Dispatching...', 'Dispeling...', 'Dispensing...', 'Dispersing...', 'Displaying...', 'Disposing...', 'Disproving...', 'Dissecting...', 'Disseminating...', 'Dissipating...',
+  'Dissolving...', 'Distinguishing...', 'Distracting...', 'Distributing...', 'Disturbing...', 'Diverting...', 'Divining...', 'Dividing...', 'Divulging...', 'Docking...',
+  'Documenting...', 'Dodging...', 'Domesticating...', 'Dominating...', 'Donating...', 'Doodling...', 'Dosing...', 'Doting...', 'Doubling...', 'Doubting...',
+  'Downgrading...', 'Downloading...', 'Draging...', 'Draining...',
 ];
 
 // ---- ANSI helpers ----
@@ -696,13 +710,44 @@ export function composerTextIndexAt(layout, rowIdx, colInside) {
 // A Bash result is a FAILURE when the command exited non-zero or the spawn
 // itself errored. Detected from the tool-result text (the only place the code
 // survives for the UI, since the exit-code line is hidden from display).
-export function isFailureResult(text) {
+// Failure prefixes that the built-in tools actually return (verified against
+// src/tools/*.js). Any result starting with one of these is a FAILED call:
+//   "Error: old_string not found in …"      (Edit)
+//   "Error reading/writing <path>: …"       (Read/Write/Edit)
+//   "Cannot read: <path> appears to be …"   (Read)
+//   "Edit rejected: …"                      (Edit staleness / read guards)
+//   "Command cannot be empty."              (Bash)
+// resolvePath throws are surfaced verbatim as `e.message`, e.g.
+//   "Path outside workspace: …" / "ENOENT: no such file or directory …".
+const FAIL_PREFIX = /^(Error\b|\[error:|Cannot read:|Edit rejected:|Command cannot be empty\b|Path outside workspace\b|ENOENT\b|EACCES\b|EPERM\b|EISDIR\b|ENOTDIR\b)/i;
+
+export function isFailureResult(text, toolName) {
   const s = String(text == null ? '' : text);
-  if (/^\[error:/m.test(s.trim())) return true;
+  const trimmed = s.trim();
+  if (FAIL_PREFIX.test(trimmed)) return true;
+  // A non-zero Bash exit code marks the call as failed (red status bullet). The
+  // `[exit code: N]` LINE itself is never shown to the user — it is bookkeeping
+  // for the model only (see messageLines).
   const m = /\[exit code:\s*([^\]]+)\]/.exec(s);
   if (!m) return false;
   const v = m[1].trim();
   return v !== '0';
+}
+
+// Extract the human-readable failure reason from a tool result, or '' when the
+// result should not render an extra "why it failed" line. The reason is shown
+// in red under the tool call for non-Bash tools (Edit / Read / Write / …); Bash
+// failures are already obvious from the command's own output, so they return ''.
+export function failureReason(text, toolName) {
+  const name = String(toolName || '').toLowerCase();
+  if (name === 'bash') return '';
+  const s = String(text == null ? '' : text);
+  const trimmed = s.trim();
+  if (!FAIL_PREFIX.test(trimmed)) return '';
+  // Collapse to a single line and drop the `[error: …]` wrapper.
+  let line = trimmed.split('\n')[0].trim();
+  line = line.replace(/^\[error:\s*/i, '').replace(/\]$/, '').trim();
+  return line;
 }
 
 function msgColorFor(role, text) {
@@ -1228,9 +1273,10 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
   let m = /^(\s*)(#{1,6})\s+(.*)$/.exec(t);
   if (m && !isContinuation) {
     const hashCount = m[2].length;
+    // h1 is bold white, h2 is plain white, h3+ is gray. Only h1 carries BOLD.
     const size = hashCount === 1 ? C.white + C.bold : hashCount === 2 ? C.white : C.gray;
     for (const w of wrapWords(m[3], width)) {
-      out.push('\x1b[1m' + (hashCount === 1 ? C.bold : '') + w + '\x1b[0m');
+      out.push(col(w, size));
     }
     return out;
   }
@@ -1254,7 +1300,7 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
     if (task && !isContinuation) {
       const checked = task[3] !== ' ';
       const box = checked ? col('✓', C.green) : col('○', C.gray);
-      const content = col(' ' + inlineMarkdown(task[4], codeFg), fg);
+      const content = col(' ' + inlineMarkdown(task[4], codeFg, fg), fg);
       for (const w of wrapWords(task[4], Math.max(1, width - 4))) {
         out.push(col('  ', C.gray) + box + (w === task[4] ? content : col(' ' + w, fg)));
       }
@@ -1266,7 +1312,7 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
       const bullet = isOrdered ? col(li[2], C.cyan) : col('•', C.cyan);
       const pad = isOrdered ? ' '.repeat(visualCol(li[2])) + ' ' : '  ';
       let first = true;
-      for (const w of wrapWords(inlineMarkdown(li[3], codeFg), Math.max(1, width - 2))) {
+      for (const w of wrapWords(inlineMarkdown(li[3], codeFg, fg), Math.max(1, width - 2))) {
         out.push((first ? col('', C.gray) + bullet + ' ' : col(pad, C.gray)) + col(w, fg));
         first = false;
       }
@@ -1275,7 +1321,7 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
   }
   // Inline styles: **bold**, *italic*, `code`, [text](url)
   if (/[*`\[]/.test(t)) {
-    for (const w of wrapWords(t, width)) out.push(col(inlineMarkdown(w, codeFg), fg));
+    for (const w of wrapWords(t, width)) out.push(col(inlineMarkdown(w, codeFg, fg), fg));
     return out;
   }
   // Plain - apply default foreground color
@@ -1285,18 +1331,23 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
 
 // Apply inline markdown to a single line: `code`, **bold**, *italic*, ~~strike~~,
 // [text](url). Order matters so inner tokens are handled safely.
-function inlineMarkdown(s, codeFg) {
+// `base` is the surrounding foreground colour; every inline style re-asserts it
+// after its own reset, otherwise the bare `\e[0m` would cancel the base colour
+// for the REST of the line (plain text after a **bold** run used to lose its
+// colour and fall back to the terminal default).
+function inlineMarkdown(s, codeFg, base) {
+  const fb = base || '';
   let r = s;
   // Inline code first so it is not mangled by * [] ~.
-  r = r.replace(/`([^`]+)`/g, (_, c) => col(c, codeFg));
+  r = r.replace(/`([^`]+)`/g, (_, c) => col(c, codeFg) + fb);
   // Bold
-  r = r.replace(/\*\*([^*]+)\*\*/g, (_, c) => C.bold + c + C.reset);
+  r = r.replace(/\*\*([^*]+)\*\*/g, (_, c) => C.bold + c + C.reset + fb);
   // Strikethrough
   r = r.replace(/~~([^~]+)~~/g, (_, c) => '\x1b[9m' + c + '\x1b[29m');
   // Italic
   r = r.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, (_, pre, c) => pre + '\x1b[3m' + c + '\x1b[23m');
   // Links: [text](url) -> text (cyan); autolink bare http(s) urls
-  r = r.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, txt) => col(txt, C.cyan));
+  r = r.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, txt) => col(txt, C.cyan) + fb);
   r = r.replace(/(^|\s)(https?:\/\/[^\s]+)/g, (_, pre, url) => pre + col(url, C.cyan));
   return r;
 }
@@ -1714,6 +1765,8 @@ export function composeFrame(state, cols, rows) {
     const hint = ed.hint || 'Ctrl+S save · Esc cancel · Enter newline';
     lines.push(col(hint, C.gray));
     lines.push('');
+    // Viewport height for the editor body
+    const viewH = Math.max(1, bodyH - (ed.notice ? 6 : 5));
     // Keep the caret row in view.
     let top = Math.max(0, ed.top || 0);
     if (ed.caretRow < top) top = ed.caretRow;
@@ -1723,6 +1776,8 @@ export function composeFrame(state, cols, rows) {
       const idx = top + i;
       const txt = idx < textLines.length ? expandTabs(textLines[idx]) : '';
       lines.push(col(fitAnsi(txt, w), C.white));
+      // Mouse click on this body row moves the caret to that line.
+      addHit(lines.length - 1, 0, w - 1, { kind: 'editor', row: idx });
     }
     lines.push(col(fitAnsi(`  line ${ed.caretRow + 1}/${textLines.length} · ${textLines.length} lines`, w), C.gray));
     if (ed.notice) lines.push(col(fitAnsi('  ' + ed.notice, w), ed.noticeKind === 'error' ? C.red : C.green));
@@ -1975,13 +2030,23 @@ export function composeFrame(state, cols, rows) {
     if (state.finishAnim) {
       const DUR = 500;
       const t = Math.min(1, (Date.now() - state.finishAnim.start) / DUR);
-      const from = state.finishAnim.from;
-      const to = state.finishAnim.to;
-      const n = Math.max(from.length, to.length);
-      const head = Math.round(t * n);           // how many chars are "new"
-      let mixStr = '';
-      for (let i = 0; i < n; i++) {
-        mixStr += (i < head) ? (to[i] ?? '') : (from[i] ?? '');
+      const wordFrom = state.finishAnim.wordFrom || '';
+      const wordTo = state.finishAnim.wordTo || 'turn took';
+      const tail = state.finishAnim.tail || '';   // ` <duration>]`, never changes
+      // SWEEP: start from the LIVE word (`Working...`), pad it on the right to
+      // the wider of the two words, then overwrite it left → right, one
+      // character per step. Characters the sweep has not reached keep their OLD
+      // value, so each `.` disappears on its own turn:
+      //   [Working... 59s] → [turn to... 59s] → [turn too.. 59s] → [turn took 59s]
+      // Width = the LONGER word, otherwise a longer old word gets truncated and
+      // its trailing dots vanish at once.
+      const width = Math.max(wordFrom.length, wordTo.length);
+      const from = wordFrom.padEnd(width, '.');
+      const toPadded = wordTo.padEnd(width, '');
+      const done = t >= 1 ? width : Math.floor(t * width);   // chars overwritten so far
+      let word = '';
+      for (let i = 0; i < width; i++) {
+        word += (i < done) ? (toPadded[i] || '') : from[i];
       }
       // Colour: orange → grey over the animation.
       const ORANGE = [255, 140, 0];
@@ -1990,7 +2055,7 @@ export function composeFrame(state, cols, rows) {
       const g = Math.round(ORANGE[1] + (GREY[1] - ORANGE[1]) * t);
       const b = Math.round(ORANGE[2] + (GREY[2] - ORANGE[2]) * t);
       const animColor = lerpColor(r, g, b, r, g, b, 0);
-      lines.push(col(frame, animColor) + ' ' + col(mixStr, animColor) + elapsed);
+      lines.push(col(frame, animColor) + ' ' + col(`[${word}${tail}`, animColor));
     } else {
 
       // Timing (spinner ticks every 80ms, so 0.5s ≈ 6 ticks):
@@ -2009,7 +2074,7 @@ export function composeFrame(state, cols, rows) {
     // Colours as plain RGB triples (never ANSI strings).
     const ORANGE = [255, 140, 0];
     const YELLOW = [255, 240, 120];
-    const RED    = [255, 85, 20];    // midway between pure red and the warm orange-red
+    const RED    = [255, 0, 0];    // pure red
     const target = phase === 0 ? YELLOW : RED;
 
     const chars = workMsg;
@@ -3210,47 +3275,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       return;
     }
 
-    case 'theme': {
-      const applyTheme = (name) => {
-        if (!setTheme(name)) return false;
-        state.theme = name;
-        try {
-          const f = hncodeConfigFile();
-          const txt = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
-          const next = /^theme\s*=.*$/m.test(txt)
-            ? txt.replace(/^theme\s*=.*$/m, `theme = "${name}"`)
-            : `theme = "${name}"\n` + txt;
-          fs.writeFileSync(f, next, 'utf8');
-        } catch { }
-        
-        // Force a complete screen refresh with new theme colors
-        // We need to access stdout from the host context
-        if (host && typeof host.renderFrame === 'function') {
-          // Trigger immediate re-render which will use new theme colors
-          host.renderFrame();
-        } else {
-          // Fallback: just show message and let normal flow handle it
-          app(`Theme set to "${name}".`);
-          return true;
-        }
-        
-        app(`Theme set to "${name}".`);
-        return true;
-      };
-      if (raw) {
-        if (!THEME_NAMES.includes(raw)) { appErr(`Theme "${raw}" could not be loaded. Expected: ${THEME_NAMES.join(' / ')}`); return; }
-        applyTheme(raw); return;
-      }
-      openPicker({
-        title: 'Set the terminal UI theme',
-        items: THEME_NAMES.map((t) => ({ label: t, sub: t === 'auto' ? 'track the terminal' : `${t} palette`, current: (state.theme || 'auto') === t })),
-        sel: Math.max(0, THEME_NAMES.indexOf(state.theme || 'auto')),
-        searchable: false,
-        onPick: (it) => { applyTheme(it.label); return true; },
-      });
-      return;
-    }
-    case 'statusline':
+case 'statusline':
       openPicker({
         title: 'Status line items',
         items: [
@@ -4346,34 +4371,23 @@ export async function startTUI(opts) {
   // PowerShell took ~3s, which read as "the shortcut does nothing".
   async function pasteFromClipboard(fastPathOnly = false) {
     notice('Pasting…', 'info');
-    const imgBase64 = readImage();
-    if (imgBase64) {
-      state.pendingImage = imgBase64;
-      insertComposerPaste('[Image pasted - will send as multimodal]');
-      notice('Image pasted', 'info');
+    // One probe handles every clipboard shape: copied FILES (→ paths), plain
+    // TEXT (→ text), or an IMAGE (→ a temp .png path). The async version runs it
+    // on the PRE-WARMED helper (~10ms) instead of a cold spawn (~2.9s).
+    const { text, via } = await readClipboardContentAsync();
+    if (text) {
+      insertComposerPaste(text);
+      notice(via === 'text' ? 'Pasted' : `Pasted ${via} as path`, 'info');
       renderFrame();
       return;
     }
-    
-    // Always try fast path first (readOnce is instant)
-    try {
-      const text = readOnce();
-      if (text) {
-        insertComposerPaste(text);
-        notice('Pasted instantly!', 'info');
-        renderFrame();
-        return;
-      }
-    } catch {}
-    
-    // Fast path failed - only use slow path for Ctrl+Shift+V, not for right-click
+    // Fast path failed — only fall back to the slow warm-helper reader when this
+    // is a full paste (Ctrl+Shift+V), not a right-click quick paste.
     if (fastPathOnly) {
-      notice('Clipboard empty or unavailable (fast path only)', 'error');
+      notice('Clipboard empty or unavailable', 'error');
       renderFrame();
       return;
     }
-    
-    // Slow path for Ctrl+Shift+V
     const result = await readText();
     if (!result.text) { notice('Clipboard empty or unavailable', 'error'); renderFrame(); return; }
     insertComposerPaste(result.text);
@@ -4564,18 +4578,18 @@ export async function startTUI(opts) {
       }
     }
 
-    if (t.key === 'c-s') {
+    if (t.key === 'c-s' && !state.editor) {
       steerAll();
       return;
     }
 
-    if (t.key === 'c-t') {
+    if (t.key === 'c-t' && !state.editor) {
       state.todosExpanded = !state.todosExpanded;
       renderFrame();
       return;
     }
 
-    if (t.key === 'c-o') {
+    if (t.key === 'c-o' && !state.editor) {
       state.expanded = !state.expanded;
       notice(state.expanded ? 'Expanded tool output' : 'Collapsed tool output', 'info');
       renderFrame();
@@ -4588,7 +4602,7 @@ export async function startTUI(opts) {
     // agent is running, so the idle-only branch that used to hold this was
     // unreachable dead code and ↑ scrolled the chat instead.
     {
-      const overlay = state.picker || state.form || state.panel || state.menuOpen;
+      const overlay = state.picker || state.form || state.panel || state.menuOpen || state.editor;
       const cur = state.input || '';
       if (!overlay && cur === '' && t.key === 'up' && (state.queued || []).length) {
         recallQueued();
@@ -4623,7 +4637,7 @@ export async function startTUI(opts) {
     }
     else {
       if (t.key === 'up' || t.key === 'down') {
-        const overlay = state.picker || state.form || state.panel || state.menuOpen;
+        const overlay = state.picker || state.form || state.panel || state.menuOpen || state.editor;
         const cur = state.input || '';
         if (!overlay && cur === '' && state.history.length) {
           if (state.historyIdx === -1) state.historyIdx = state.history.length;
@@ -5433,9 +5447,18 @@ export async function startTUI(opts) {
             || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
           // A failed run must be visible on the TOOL line too: the status bullet
           // turns red (see messageLines).
-          const failedRun = isFailureResult(e.content);
+          const failedRun = isFailureResult(e.content, e.name);
           if (entry) { entry.pending = false; entry.id = undefined; entry.failed = failedRun; }
-          if (e.name !== 'Edit' && e.name !== 'Write') addChat({ role: 'tool_result', text: e.content, failed: failedRun });
+          const reason = failureReason(e.content, e.name);
+          const isEditLike = e.name === 'Edit' || e.name === 'Write';
+          if (!isEditLike) {
+            // Non-Edit tools show their raw result underneath.
+            addChat({ role: 'tool_result', text: e.content, failed: failedRun });
+          } else if (reason) {
+            // Edit/Write hide their body (the diff already shows the change), so
+            // surface a failure reason as its own red line under the tool call.
+            addChat({ role: 'tool_result', text: reason, failed: true });
+          }
           // NOTE: queued input is deliberately NOT drained into the running turn
           // here. A message typed while the agent works is a NEW turn, so it waits
           // for this turn to finish (see the drain after `agent.run()`). Ctrl-S
@@ -5470,16 +5493,17 @@ export async function startTUI(opts) {
     session.focus = !!state.focus;
     sess.saveSession(session);
     const turnMs = state.turnStart ? Date.now() - state.turnStart : 0;
-    const finalText = `[turn took ${fmtDuration(turnMs)}]`;
-
-    // Play the 0.5s morph before the Working row disappears. Keep `running`
-    // true during the animation so `workingH` stays 1. Repaint every 20ms so
-    // the morph is smooth (~25 frames over 500ms) rather than the 80ms spinner
-    // tick (which would give only ~6 chunky steps).
+    const dur = fmtDuration(turnMs);
+    // The live row is `<phrase> <gray>[<dur>]`. At the end we keep the same row
+    // shape — `[<word> <dur>]` — and only rewrite the word, so the brackets and
+    // the duration stay put and the time is never repeated. `…` is part of the
+    // phrase and is preserved.
+    const wordFrom = String(state.workMsg || WORKING_MESSAGES[0]);
     state.finishAnim = {
       start: Date.now(),
-      from: (state.workMsg || WORKING_MESSAGES[0]),
-      to: finalText,
+      wordFrom,
+      wordTo: 'turn took',
+      tail: ` ${dur}]`,   // fixed right-hand side, e.g. " 59s]"
     };
     const animStart = Date.now();
     while (Date.now() - animStart < 520) {
@@ -5493,7 +5517,8 @@ export async function startTUI(opts) {
       state.lastTurnMs = turnMs;
       session.lastTurnMs = turnMs;
       sess.saveSession(session);
-      addChat({ role: 'system', text: finalText });
+      // Same shape the sweep animated into: `[turn took <dur>]`.
+      addChat({ role: 'system', text: `[turn took ${dur}]` });
     }
     renderFrame();
     if (state.queued.length) {
@@ -5587,7 +5612,13 @@ export async function startTUI(opts) {
   }
 
   function normalizeMsg(m) {
-    return { role: m && m.role ? m.role : 'system', text: m && m.text != null ? String(m.text) : '' };
+    // Keep `failed`: a failed tool result must render in RED. Dropping it here
+    // made every failure look like ordinary gray output.
+    return {
+      role: m && m.role ? m.role : 'system',
+      text: m && m.text != null ? String(m.text) : '',
+      failed: !!(m && m.failed),
+    };
   }
 
   let stopped = false;
