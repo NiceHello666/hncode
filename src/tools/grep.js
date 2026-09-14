@@ -144,9 +144,12 @@ function emitContext(out, file, idx, lines, a) {
 
 function paginate(raw, args) {
   if (raw === '' || raw === undefined || raw === null) return 'No matches found.';
-  let lines = raw.split('\n').filter((l) => l.length > 0);
+  // Split on either newline style and drop the trailing empty element a final
+  // CRLF leaves behind — `rg` always ends with one, and it rendered as a stray
+  // blank line under the last match.
+  let lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
   if (args.offset) lines = lines.slice(args.offset);
   if (args.head_limit) lines = lines.slice(0, args.head_limit);
   if (lines.length === 0) return 'No matches found.';
-  return lines.join('\n');
+  return lines.join('\n').replace(/\r/g, '');
 }

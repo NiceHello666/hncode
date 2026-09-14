@@ -5230,6 +5230,10 @@ export async function startTUI(opts) {
 
   async function runAgent(text) {
     addChat({ role: 'user', text });
+    // A message the user JUST SENT should always bring the newest content into
+    // view, even if they were scrolled up reading history. (Queue/steer do NOT
+    // come through here, so they keep the view exactly where the user left it.)
+    state.scroll = 0;
     state.running = true;
     // Pick the Working… wording ONCE for this turn, so it does not change while
     // the gradient loops. The next turn picks a new one.
