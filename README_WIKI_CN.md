@@ -13,6 +13,9 @@ hncode 的完整文档 —— 一个运行在终端用户界面（TUI）里的 A
 3. [安装](#3-安装)
 4. [首次运行](#4-首次运行)
 5. [配置](#5-配置)
+   - [5.1 基础：全部在 TUI 里配置](#51-基础全部在-tui-里配置)
+   - [5.2 进阶：手写 config.toml](#52-进阶手写-configtoml)
+   - [5.3 环境变量](#53-环境变量)
 6. [命令行接口](#6-命令行接口)
 7. [斜杠命令](#7-斜杠命令)
 8. [快捷键](#8-快捷键)
@@ -91,8 +94,10 @@ npm link          # 全局暴露 `hncode` 命令
 ## 4. 首次运行
 
 1. 启动 `hncode`。首次运行时安装脚本已创建 `~/.hncode/config.toml`。
-2. 如果你已设置 `HNCODE_API_KEY`（见下），即可直接使用；否则打开配置加入服务商与密钥。
+2. **在 TUI 里**添加服务商：运行 `/provider`，挑选已知服务商（或添加自定义服务商），粘贴你的 API Key。模型会自动登记。（如果你已设置 `HNCODE_API_KEY`，此步可跳过。）
 3. 输入任务，按 **Enter**。
+
+详见[配置](#5-配置)。
 
 界面分为：
 
@@ -108,7 +113,73 @@ npm link          # 全局暴露 `hncode` 命令
 
 hncode **只**读取 `~/.hncode/config.toml`（以及 `HNCODE_*` 环境变量），不会读取其他产品的配置。
 
-### 环境变量
+**通常你不需要手写这个文件。** 服务商和模型都可以在 TUI 里配置，hncode 会替你写入 `config.toml`。直接编辑 TOML 属于*进阶*用法 —— 适合脚本化部署、特殊端点，或向导没暴露的设置。
+
+### 5.1 基础：全部在 TUI 里配置
+
+在 hncode 打开时运行这些斜杠命令：
+
+| 命令 | 作用 |
+|------|------|
+| `/provider` | 管理服务商 —— **添加**、**编辑**或**删除**。 |
+| `/model` | 选择模型，或在已添加的模型之间切换。 |
+| `/effort [off\|on\|high\|medium\|low]` | 设置当前模型的思考强度。 |
+
+**添加服务商**（`/provider` → Add）：
+
+- 从 [models.dev](https://models.dev) 目录挑选**已知服务商** —— base URL 会自动预填，或
+- 添加**自定义服务商** —— 你自己提供名称、base URL、API Key 和协议（`OpenAI` 或 `Anthropic`）。
+
+保存后，hncode 会调用该服务商的 `/models` 端点并**自动登记所有模型**，同时记录各自的上下文窗口和思考能力。你事先不需要知道这些。
+
+**编辑服务商**（`/provider` → 在某个服务商上按 Enter）可以修改它的名称、base URL、API Key 和协议类型。
+
+所有改动都会立即持久化到 `~/.hncode/config.toml`，重启后依然有效。
+
+### 5.2 进阶：手写 `config.toml`
+
+`~/.hncode/config.toml` 包含三部分：顶层默认值、`[providers.*]` 和 `[models.*]`。
+
+最小示例：
+
+```toml
+default_model = "gpt-4o-mini"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+
+[models.gpt-4o-mini]
+provider = "openai"
+model = "gpt-4o-mini"
+```
+
+**服务商** —— `[providers.<name>]`：
+
+| 键 | 含义 |
+|----|------|
+| `base_url` | Base URL。hncode 会追加 `/chat/completions`（OpenAI）或 `/messages`（Anthropic）。 |
+| `api_key` | 该服务商的密钥。 |
+| `protocol` | `openai`（默认）或 `anthropic`。 |
+
+**模型** —— `[models.<alias>]`：
+
+| 键 | 含义 |
+|----|------|
+| `provider` | 该模型所属的服务商。 |
+| `model` | 发送给 API 的字面模型 id。 |
+| `display_name` | 界面上显示的友好名称。 |
+| `context_length` | 上下文窗口（token），用于驱动上下文计量。 |
+| `max_tokens` | 最大输出 token。 |
+| `efforts` | 可选思考强度数组，例如 `["low","medium","high"]`。 |
+| `reasoning` | `true`/`false`，模型是否能思考。 |
+| `always_thinking` | 为 `true` 时思考无法关闭。 |
+
+改完文件后运行 `/reload` 即可生效，无需重启。
+
+### 5.3 环境变量
+
+下面的每一项都会**覆盖** `config.toml` 里的同名设置 —— 适合 CI，或避免把密钥写进文件：
 
 | 变量 | 含义 |
 |------|------|
@@ -126,62 +197,6 @@ hncode **只**读取 `~/.hncode/config.toml`（以及 `HNCODE_*` 环境变量）
 | `HNCODE_CONFIG` | 备用配置文件路径（供 `doctor config` 使用）。 |
 | `HNCODE_SESSIONS_DIR` | 会话保存目录。 |
 | `HNCODE_PLUGINS` | 插件目录。 |
-
-环境变量优先级高于配置文件。
-
-### 最小配置
-
-```toml
-default_model = "gpt-4o-mini"
-
-[providers.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-..."
-
-[models.gpt-4o-mini]
-provider = "openai"
-model = "gpt-4o-mini"
-```
-
-### 服务商 Providers
-
-在 `[providers.<name>]` 下声明：
-
-| 键 | 含义 |
-|----|------|
-| `base_url` | Base URL。hncode 会追加 `/chat/completions`（OpenAI）或 `/messages`（Anthropic）。 |
-| `api_key` | 该服务商的密钥。 |
-| `protocol` | `openai`（默认）或 `anthropic`。 |
-
-### 模型 Models
-
-在 `[models.<alias>]` 下声明：
-
-| 键 | 含义 |
-|----|------|
-| `provider` | 该模型所属的服务商。 |
-| `model` | 发送给 API 的字面模型 id。 |
-| `display_name` | 界面上显示的友好名称。 |
-| `context_length` | 上下文窗口（token），用于驱动上下文计量。 |
-| `max_tokens` | 最大输出 token。 |
-| `efforts` | 可选思考强度数组，例如 `["low","medium","high"]`。 |
-| `reasoning` | `true`/`false`，模型是否能思考。 |
-| `always_thinking` | 为 `true` 时思考无法关闭。 |
-
-### `/provider` 向导
-
-无需手写 TOML，直接在 TUI 里运行 `/provider`。它可以：
-
-- 从 [models.dev](https://models.dev) 目录挑选**已知服务商**（自动预填 base URL），或
-- 添加**自定义服务商**，或
-- **编辑**已有服务商（名称、base URL、API Key、协议类型），或
-- **删除**服务商。
-
-保存已知/自定义服务商后，hncode 会自动从它的 `/models` 端点拉取模型列表，并为每个模型登记发现到的上下文窗口和思考能力。
-
-### 主题
-
-主题**固定为深色**，没有主题切换。配色即青色蓝调设计。
 
 ---
 
@@ -405,7 +420,7 @@ token 估算采用与 Kimi Code 相同的启发式：`ceil(ASCII 字符数 / 4) 
 - `hncode --continue` 恢复**当前目录**最近的会话。
 - `/move <path>` 把会话迁移到另一个目录。
 - `/new` 新建会话（并清空待办面板）。
-- 模式标志（权限 / plan / focus / effort / 主题）随会话持久化。
+- 模式标志（权限 / plan / focus / effort）随会话持久化。
 
 ---
 
@@ -479,7 +494,7 @@ src/
   session.js    会话存储
   plugin.js     插件宿主与注册表
   tools/        每个工具一个文件
-  colors.js     主题 / ANSI 辅助
+  colors.js     ANSI 颜色辅助
   term.js       token 估算、宽度计算、换行
 ```
 

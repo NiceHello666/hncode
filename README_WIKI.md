@@ -13,6 +13,9 @@ Complete documentation for hncode — an AI coding agent that runs as a terminal
 3. [Installation](#3-installation)
 4. [First run](#4-first-run)
 5. [Configuration](#5-configuration)
+   - [5.1 Basic: configure everything from the TUI](#51-basic-configure-everything-from-the-tui)
+   - [5.2 Advanced: edit `config.toml` by hand](#52-advanced-edit-configtoml-by-hand)
+   - [5.3 Environment variables](#53-environment-variables)
 6. [Command-line interface](#6-command-line-interface)
 7. [Slash commands](#7-slash-commands)
 8. [Keyboard shortcuts](#8-keyboard-shortcuts)
@@ -91,8 +94,10 @@ npm link          # exposes the `hncode` command globally
 ## 4. First run
 
 1. Launch `hncode`. On first run the install script has created `~/.hncode/config.toml`.
-2. If you already set `HNCODE_API_KEY` (see below), it will just work. Otherwise open the config and add a provider + key.
+2. Add a provider **from inside the TUI**: run `/provider`, pick a known provider (or add a custom one), and paste your API key. Models are registered automatically. (If you already set `HNCODE_API_KEY`, this is unnecessary.)
 3. Type your task and press **Enter**.
+
+See [Configuration](#5-configuration) for the details.
 
 The TUI is split into:
 
@@ -108,7 +113,72 @@ The TUI is split into:
 
 hncode reads **only** `~/.hncode/config.toml` (plus `HNCODE_*` environment variables). It does not read any other product's config.
 
-### Environment variables
+**You usually don't need to edit this file by hand.** Providers and models can be configured entirely from inside the TUI, and the resulting `config.toml` is written for you. Editing the TOML directly is an *advanced* option — useful for scripted setups, unusual endpoints, or settings the wizard does not expose.
+
+### 5.1 Basic: configure everything from the TUI
+
+Run these slash commands while hncode is open:
+
+| Command | What it does |
+|---------|--------------|
+| `/provider` | Manage providers — **add**, **edit**, or **delete**. |
+| `/model` | Pick a model, or switch between models you already added. |
+| `/effort [off\|on\|high\|medium\|low]` | Set the thinking effort for the current model. |
+
+**Adding a provider** (`/provider` → Add):
+
+- pick a **known provider** from the [models.dev](https://models.dev) catalog — the base URL is pre-filled, or
+- add a **custom provider** — you supply the name, base URL, API key, and protocol (`OpenAI` or `Anthropic`).
+
+After you save it, hncode calls that provider's `/models` endpoint and **registers every model automatically**, recording each one's context window and thinking capability. You do not need to know any of that up front.
+
+**Editing a provider** (`/provider` → Enter on a provider) lets you change its name, base URL, API key, and protocol type.
+
+Everything is persisted to `~/.hncode/config.toml` immediately, so it survives a restart.
+
+### 5.2 Advanced: edit `config.toml` by hand
+
+`.hncode/config.toml` holds three things: top-level defaults, `[providers.*]`, and `[models.*]`.
+
+A minimal file:
+
+```toml
+default_model = "gpt-4o-mini"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+
+[models.gpt-4o-mini]
+provider = "openai"
+model = "gpt-4o-mini"
+```
+
+**Providers** — `[providers.<name>]`:
+
+| Key | Meaning |
+|-----|---------|
+| `base_url` | Base URL. hncode appends `/chat/completions` (OpenAI) or `/messages` (Anthropic). |
+| `api_key` | API key for this provider. |
+| `protocol` | `openai` (default) or `anthropic`. |
+
+**Models** — `[models.<alias>]`:
+
+| Key | Meaning |
+|-----|---------|
+| `provider` | Which provider this model belongs to. |
+| `model` | The literal model id sent to the API. |
+| `display_name` | Friendly name shown in the UI. |
+| `context_length` | Context window in tokens (drives the context gauge). |
+| `max_tokens` | Max output tokens. |
+| `efforts` | Array of selectable thinking efforts, e.g. `["low","medium","high"]`. |
+| `reasoning` | `true`/`false` — whether the model can think. |
+| `always_thinking` | `true` if thinking cannot be turned off. |
+
+After editing the file, run `/reload` to apply it without restarting.
+
+### 5.3 Environment variables
+Every value below **overrides** its `config.toml` counterpart — handy for CI or for keeping a key out of the file:
 
 | Variable | Meaning |
 |----------|---------|
@@ -126,62 +196,6 @@ hncode reads **only** `~/.hncode/config.toml` (plus `HNCODE_*` environment varia
 | `HNCODE_CONFIG` | Path to an alternate config file (used by `doctor config`). |
 | `HNCODE_SESSIONS_DIR` | Alternate directory for saved sessions. |
 | `HNCODE_PLUGINS` | Alternate plugin directory. |
-
-Environment variables win over the config file.
-
-### A minimal config
-
-```toml
-default_model = "gpt-4o-mini"
-
-[providers.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-..."
-
-[models.gpt-4o-mini]
-provider = "openai"
-model = "gpt-4o-mini"
-```
-
-### Providers
-
-Providers are declared under `[providers.<name>]`:
-
-| Key | Meaning |
-|-----|---------|
-| `base_url` | Base URL. hncode appends `/chat/completions` (OpenAI) or `/messages` (Anthropic). |
-| `api_key` | API key for this provider. |
-| `protocol` | `openai` (default) or `anthropic`. |
-
-### Models
-
-Models are declared under `[models.<alias>]`:
-
-| Key | Meaning |
-|-----|---------|
-| `provider` | Which provider this model belongs to. |
-| `model` | The literal model id sent to the API. |
-| `display_name` | Friendly name shown in the UI. |
-| `context_length` | Context window in tokens (drives the context gauge). |
-| `max_tokens` | Max output tokens. |
-| `efforts` | Array of selectable thinking efforts, e.g. `["low","medium","high"]`. |
-| `reasoning` | `true`/`false` — whether the model can think. |
-| `always_thinking` | `true` if thinking cannot be turned off. |
-
-### The `/provider` wizard
-
-Instead of editing TOML by hand, run `/provider` inside the TUI. It can:
-
-- pick a **known provider** from the [models.dev](https://models.dev) catalog (pre-fills the base URL), or
-- add a **custom provider**, or
-- **edit** an existing provider (name, base URL, API key, and protocol type), or
-- **delete** a provider.
-
-After saving a known/custom provider, hncode automatically fetches the model list from its `/models` endpoint and registers each model with its discovered context window and thinking capabilities.
-
-### Theme
-
-The theme is **fixed to dark**; there is no theme switch. Colours are cyan-blue by design.
 
 ---
 
@@ -405,7 +419,7 @@ A session records `id`, `title`, `workspace`, `model`, `messages`, `rounds`, `st
 - `hncode --continue` resumes the most recent session **for the current directory**.
 - `/move <path>` relocates a session to another directory.
 - `/new` starts a fresh one (and clears the todo panel).
-- Mode flags (permission / plan / focus / effort / theme) are persisted with the session.
+- Mode flags (permission / plan / focus / effort) are persisted with the session.
 
 ---
 
@@ -479,7 +493,7 @@ src/
   session.js    session store
   plugin.js     plugin host + registry
   tools/        one file per tool
-  colors.js     themes / ANSI helpers
+  colors.js     ANSI colour helpers
   term.js       token estimation, width math, wrapping
 ```
 
