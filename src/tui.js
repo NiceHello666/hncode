@@ -795,8 +795,8 @@ function keyArgument(name, args, workspace) {
     }
     if (text.length > MAX_ARG) {
       text = (k === 'path' || k === 'file_path')
-        ? '…' + text.slice(text.length - (MAX_ARG - 1))
-        : text.slice(0, MAX_ARG - 1) + '…';
+          ? '…' + text.slice(text.length - (MAX_ARG - 1))
+          : text.slice(0, MAX_ARG - 1) + '…';
     }
     // Display paths with forward slashes (consistent across platforms).
     if (k === 'path' || k === 'file_path') text = text.replace(/\\/g, '/');
@@ -807,10 +807,74 @@ function keyArgument(name, args, workspace) {
 // "● Using Read (src/tui.js)" while running, "● Used Read (src/tui.js)" when done.
 // The verb is plain (white) / green once finished; the tool NAME is always the
 // theme (cyan) colour; the key argument is dim/gray.
-export function formatToolLine(msg, workspace) {
+export function formatToolLine(msg, workspace, spin) {
   const name = msg.toolName || '';
   const arg = keyArgument(name, msg.toolArgs, workspace);
   const verb = msg.pending ? 'Using' : 'Used';
+  // Pending tool calls have a sweep animation (like "Working...")
+  // Once the tool finishes (pending=false) the name shows in plain cyan.
+  let nameDisplay;
+  if (msg.pending) {
+    // Multi-stage sweep animation for tool names (like the "Working..." line):
+    //   0.5s l→c sweep (pale cyan → cyan),       0.5s c→l fade back
+    //   0.5s c→b sweep (cyan → cyan-blue),       0.5s b→c fade back
+    // → loops straight back to l→c. ~2s per full cycle.
+    const SWEEP = 6;                 // 0.5s
+    const HALF  = SWEEP + SWEEP;     // 12 ticks per colour pair (sweep + sweep back)
+    const CYCLE = HALF * 2;          // 24 ticks for the full loop (~2s)
+    const inCycle = spin % CYCLE;
+    const inHalf  = inCycle % HALF;       // 0..23 within this colour pair's half
+    const phase   = inCycle < HALF ? 0 : 1; // 0 = l↔c, 1 = c↔b
+
+    // Colours as plain RGB triples (mirroring Working's orange→yellow/red pattern):
+    // Base cyan (c), pale cyan (l = c + 25% toward white), cyan-blue (b = c with reduced green)
+    const c = [0, 215, 255];      // pure cyan (like ORANGE base)
+    const l = [64, 239, 255];     // pale cyan (like YELLOW: c + white)
+    const b = [0, 180, 255];      // cyan-blue (like RED: c with less green)
+    const base = c;                       // always cyan, like Working's constant ORANGE
+    const target = phase === 0 ? l : b;   // pale cyan, then cyan-blue
+
+    const chars = name;
+    const n = chars.length;
+
+    // A character fades over a band this many characters wide.
+    const BAND_CHARS = Math.max(2, Math.min(4, n / 3));
+    const BAND = BAND_CHARS / n;
+
+    // Interpolate base ↔ target by `t` (0 = base, 1 = target).
+    const mix = (t) => {
+      const k = Math.max(0, Math.min(1, t));
+      return lerpColor(
+          base[0] + (target[0] - base[0]) * k,
+          base[1] + (target[1] - base[1]) * k,
+          base[2] + (target[2] - base[2]) * k,
+          base[0] + (target[0] - base[0]) * k,
+          base[1] + (target[1] - base[1]) * k,
+          base[2] + (target[2] - base[2]) * k,
+          0,
+      );
+    };
+
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const charAt = n > 0 ? i / n : 0;
+      let t; // 0 = base, 1 = target
+      if (inHalf < SWEEP) {
+        // Sweep in: base → target, left to right.
+        const head = (inHalf + 1) / SWEEP;   // 1/SWEEP … 1
+        t = (head - charAt) / BAND;
+      } else {
+        // Sweep back: target → base, left to right.
+        const head = (inHalf - SWEEP + 1) / SWEEP;  // 1/SWEEP … 1
+        t = 1 - (head - charAt) / BAND;
+      }
+      out.push(col(chars[i], mix(t)));
+    }
+    nameDisplay = out.join('');
+  } else {
+    // Non-pending: show in plain cyan
+    nameDisplay = col(name, C.cyan);
+  }
   // Show streamed size for Write tool
   let sizeStr = '';
   if (name === 'Write' && typeof msg.streamContent === 'string' && msg.streamContent.length) {
@@ -832,7 +896,7 @@ export function formatToolLine(msg, workspace) {
   // so the verb itself stays plain white and the tool name keeps the theme
   // colour.
   const argText = arg ? ' ' + col(`(${arg})`, C.gray) : '';
-  return col(verb, C.white) + ' ' + col(name, C.cyan) + argText + col(sizeStr, C.gray) + diffStr;
+  return col(verb, C.white) + ' ' + nameDisplay + argText + col(sizeStr, C.gray) + diffStr;
 }
 
 // ---- live TODO panel (kimi-code's todo-panel) ----
@@ -915,24 +979,63 @@ function renderTodoPanel(state, w, hoverTop, dragTop) {
 // One rule line, one line per queued message, one dim hint line. Queued input is
 // held while the agent is streaming and is injected by Ctrl-S (or by the agent
 // itself at the next tool boundary).
-function renderQueuePanel(state, w) {
+// Supports auto-collapse and drag-to-resize like the todo panel.
+const QUEUE_MAX_VISIBLE = 5;
+function renderQueuePanel(state, w, hoverTop, dragTop) {
   const queued = state.queued || [];
   if (!queued.length) return [];
-  const out = [col('─'.repeat(w), C.border)];
-  for (const text of queued) {
+  
+  const out = [];
+  const ruleColor = dragTop ? C.scrollThumbActive : (hoverTop ? C.hover : C.border);
+  out.push(col('─'.repeat(w), ruleColor));
+  out.push(col('  Queue', C.cyan + C.bold));
+  
+  const want = queueRowCount(state);
+  const rows = queued.slice(0, want);
+  for (const text of rows) {
     // Collapse to a single line, like kimi's queue pane does.
     const single = String(text).replace(/\s+/g, ' ').trim();
     out.push(col('  ', C.cyan) + col('❯ ', C.cyan) + col(fitAnsi(single, Math.max(1, w - 6)), C.white));
   }
-  const hint = state.running ? '↑ to edit · ctrl-s to steer immediately' : '↑ to edit · will send now';
-  out.push(col('  ' + hint, C.gray));
+  
+  const hidden = queued.length - rows.length;
+  if (hidden > 0) {
+    const hint = state.running 
+      ? `… +${hidden} more · ↑ to edit · ctrl-s to steer immediately · drag top rule to resize`
+      : `… +${hidden} more · ↑ to edit · will send now · drag top rule to resize`;
+    out.push(col('  ' + hint, C.gray));
+  } else {
+    const hint = state.running ? '↑ to edit · ctrl-s to steer immediately' : '↑ to edit · will send now';
+    out.push(col('  ' + hint, C.gray));
+  }
+  
   return out;
 }
 
-// Height (in rows) the queue pane will occupy, for layout math.
-function queuePanelHeight(state) {
-  const n = (state.queued || []).length;
-  return n ? n + 2 : 0; // rule + items + hint
+// How many queue ROWS the panel shows.
+//   * `state.queueRows` (set by dragging the top rule) wins when present;
+//   * otherwise show all items up to QUEUE_MAX_VISIBLE.
+// Always clamped to [1, queued.length]: at least ONE row, never more than exist.
+export function queueRowCount(state) {
+  const queued = state.queued || [];
+  if (!queued.length) return 0;
+  const manual = state.queueRows;
+  let rows;
+  if (typeof manual === 'number' && Number.isFinite(manual)) {
+    rows = Math.round(manual);
+  } else {
+    rows = Math.min(queued.length, QUEUE_MAX_VISIBLE);
+  }
+  return Math.max(1, Math.min(queued.length, rows));
+}
+
+// Height (in rows) the queue panel will occupy, for layout math.
+export function queuePanelHeight(state) {
+  const queued = state.queued || [];
+  if (!queued.length) return 0;
+  const rows = queueRowCount(state);
+  const extra = queued.length > rows ? 1 : 0; // the "… +N more" hint
+  return 2 + rows + extra; // rule + heading + rows (+ hint)
 }
 
 // How many todo ROWS the panel shows.
@@ -963,11 +1066,11 @@ export function todoPanelHeight(state) {
 
 // Render one chat message into display lines.
 // Returns { lines: [{text, ind, color}] } (ind = indent string for continuation).
-function messageLines(msg, width, workspace, expanded) {
+function messageLines(msg, width, workspace, expanded, spin) {
   // Tool calls render as a single "● Using/Used Name (arg)" line (kimi style).
   // The body already carries its own ANSI colours, so mark it pre-colored.
   if (msg.role === 'tool') {
-    const body = formatToolLine(msg, workspace);
+    const body = formatToolLine(msg, workspace, spin);
     // Red bullet for a failed call (a Bash non-zero exit / [error: …]).
     const failed = msg.failed === true || (msg.role === 'tool' && msg.failed === true);
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
@@ -1452,11 +1555,11 @@ function renderChatLines(state, w) {
     // The row WIDTH is keyed (not `w`) because the rows are laid out to it:
     // `boxText` for a bordered message (inside the box padding), `innerW` otherwise.
     const rowW = bordered ? boxText : innerW;
-    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${msg.pending ? 1 : 0}\u0000${msg.text || ''}\u0000${msg.streamContent || ''}`
-      + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${JSON.stringify(msg.toolArgs || null)}`;
+    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${msg.pending ? (state.spin || 0) : 0}\u0000${msg.text || ''}\u0000${msg.streamContent || ''}`
+        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${JSON.stringify(msg.toolArgs || null)}`;
     let cached = msg._cache;
     if (!cached || cached.key !== key) {
-      const rows = messageLines(msg, rowW, state.cwd, expanded);
+      const rows = messageLines(msg, rowW, state.cwd, expanded, state.spin);
       cached = { key, rows: rows.map(rowToLine) };
       msg._cache = cached;
     }
@@ -1533,11 +1636,11 @@ function fmtDuration(ms) {
   const mon = Math.floor(ms / 2592000000) % 12;
   const year = Math.floor(ms / 31536000000);
   const parts = [];
-  if (year) parts.push(year + 'year' + (year > 1 ? 's' : ''));
-  if (mon) parts.push(mon + 'mon' + (mon > 1 ? 's' : '') + ' ');
-  if (day) parts.push(day + 'day' + (day > 1 ? 's' : '') + ' ');
-  if (hour) parts.push(hour + 'hour' + (hour > 1 ? 's' : '') + ' ');
-  if (min) parts.push(min + 'min' + (min > 1 ? 's' : '') + ' ');
+  if (year) parts.push(year + 'y' + (year > 1 ? 's' : ''));
+  if (mon) parts.push(mon + 'm' + (mon > 1 ? 's' : '') + ' ');
+  if (day) parts.push(day + 'd' + (day > 1 ? 's' : '') + ' ');
+  if (hour) parts.push(hour + 'h' + (hour > 1 ? 's' : '') + ' ');
+  if (min) parts.push(min + 'm' + (min > 1 ? 's' : '') + ' ');
   // Seconds are always shown (at least "0s").
   parts.push(sec + 's');
   return parts.join('');
@@ -2023,11 +2126,66 @@ export function composeFrame(state, cols, rows) {
     const workMsg = state.workMsg || WORKING_MESSAGES[0];
     const spin = state.spin || 0;
 
-    // ---- turn-finish animation ----
+    // ---- turn-start animation ----
+    // 0.5s: type out "Working..." in grey (chars appear left→right)
+    // 0.5s: fill with orange (chars change colour left→right)
+    // After 1s total: start the normal pulse animation (yellow/red cycle)
+    if (state.startAnim) {
+      // 1s total: 0.5s types `Working... [0s]` out in grey, then 0.5s sweeps the
+      // PHRASE grey → orange. The `[0s]` tail types out WITH the phrase but is
+      // EXCLUDED from the colour sweep — it stays grey the whole time.
+      const DUR = 1000;
+      const t = Math.min(1, (Date.now() - state.startAnim.start) / DUR);
+      const phase = t < 0.5 ? 'type' : 'color';
+      const phaseT = t < 0.5 ? t * 2 : (t - 0.5) * 2; // 0→1 within each phase
+
+      const phrase = workMsg;
+      const tailText = state.turnStart ? ` [${fmtDuration(Date.now() - state.turnStart)}]` : '';
+      const totalChars = phrase.length + tailText.length;
+      const out = [];
+
+      if (phase === 'type') {
+        // Type the WHOLE row (phrase + tail) left → right, all grey.
+        const typedCount = Math.floor(phaseT * totalChars);
+        for (let i = 0; i < phrase.length; i++) {
+          out.push(i < typedCount ? col(phrase[i], C.gray) : ' ');
+        }
+        const tailTyped = Math.max(0, typedCount - phrase.length);
+        for (let i = 0; i < tailText.length; i++) {
+          out.push(i < tailTyped ? col(tailText[i], C.gray) : ' ');
+        }
+        // The tail is already inside `out`, so do NOT append `elapsed` here.
+        lines.push(col(frame, C.orange) + ' ' + out.join(''));
+      } else {
+        // Colour sweep: only the PHRASE goes grey → orange. The tail stays grey
+        // (it is appended as the colored `elapsed` chunk after `out`).
+        const BAND_CHARS = Math.max(2, Math.min(4, phrase.length / 3));
+        const BAND = BAND_CHARS / phrase.length;
+        // head sweeps from just left of the phrase (0) to just right of it (1),
+        // extended by BAND on both ends so every char crosses the band smoothly.
+        const head = -BAND + phaseT * (1 + 2 * BAND);
+        const GREY = [150, 150, 150];
+        const ORANGE = [255, 140, 0];
+        for (let i = 0; i < phrase.length; i++) {
+          const charAt = i / phrase.length;
+          let tChar = (head - charAt) / BAND;
+          tChar = Math.max(0, Math.min(1, tChar));
+          const r = Math.round(GREY[0] + (ORANGE[0] - GREY[0]) * tChar);
+          const g = Math.round(GREY[1] + (ORANGE[1] - GREY[1]) * tChar);
+          const b = Math.round(GREY[2] + (ORANGE[2] - GREY[2]) * tChar);
+          out.push(col(phrase[i], lerpColor(r, g, b, r, g, b, 0)));
+        }
+        lines.push(col(frame, C.orange) + ' ' + out.join('') + elapsed);
+      }
+      if ((Date.now() - state.startAnim.start) >= 1000) {
+        state.startAnim = null;
+      }
+    }
+        // ---- turn-finish animation ----
     // 0.5s morph: `[turn took 1s]` grows in from the LEFT, covering the working
     // phrase one character at a time; once the phrase is fully covered, the
     // rest of the final text is simply appended. The whole row fades to grey.
-    if (state.finishAnim) {
+    else if (state.finishAnim) {
       const DUR = 500;
       const t = Math.min(1, (Date.now() - state.finishAnim.start) / DUR);
       const wordFrom = state.finishAnim.wordFrom || '';
@@ -2055,7 +2213,7 @@ export function composeFrame(state, cols, rows) {
       const g = Math.round(ORANGE[1] + (GREY[1] - ORANGE[1]) * t);
       const b = Math.round(ORANGE[2] + (GREY[2] - ORANGE[2]) * t);
       const animColor = lerpColor(r, g, b, r, g, b, 0);
-      lines.push(col(frame, animColor) + ' ' + col(`[${word}${tail}`, animColor));
+      lines.push(col(frame, animColor) + ' ' + col('[', animColor) + col(word, animColor) + col(tail, C.gray));
     } else {
 
       // Timing (spinner ticks every 80ms, so 0.5s ≈ 6 ticks):
@@ -2122,7 +2280,7 @@ export function composeFrame(state, cols, rows) {
     }
   }
 
-  if (state.todos && state.todos.length) {
+  if (!dialog && state.todos && state.todos.length) {
     // The panel's top rule is a DRAG HANDLE. Record its screen row as a hitbox so
     // the mouse handler can hover/press it; the row offset is corrected to final
     // screen coordinates by composeFrame's hitbox pass (like every other hit).
@@ -2133,7 +2291,13 @@ export function composeFrame(state, cols, rows) {
 
   // Queued (not yet sent) messages, directly above the composer: these are what
   // Ctrl-S steers into the running turn. See renderQueuePanel.
-  for (const l of renderQueuePanel(state, w)) lines.push(l);
+  if (!dialog && state.queued && state.queued.length) {
+    // The panel's top rule is a DRAG HANDLE. Record its screen row as a hitbox so
+    // the mouse handler can hover/press it.
+    const queueTopRow = lines.length;
+    addHit(queueTopRow, 0, w - 1, { kind: 'queueResize' });
+    for (const l of renderQueuePanel(state, w, state.queueResizeHover, state.queueResizeDrag)) lines.push(l);
+  }
 
     // Approval pending overlay - same width as the composer, placed above it.
   // The border characters are coloured INDIVIDUALLY and each content row is
@@ -2441,6 +2605,16 @@ export function makeState({ cfg, session, opts }) {
     todoResizeHover: false,
     todoResizeDrag: false,
     todoResizeStart: null,
+    // Queue panel resize: the top rule is a drag handle. `queueRows` is the
+    // manual row count (undefined = automatic), and the two flags drive its
+    // hover/press styling.
+    queueRows: undefined,
+    queueResizeHover: false,
+    queueResizeDrag: false,
+    queueResizeStart: null,
+    // Turn-start animation: while non-null, the Working row renders the typing
+    // and color-fill animation for 1s before starting the normal pulse cycle.
+    startAnim: null,   // { start }
     hoverHit: null,
     input: '',
     caret: 0,
@@ -2778,107 +2952,124 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
         },
         onPick: (it) => {
           if (it.action === 'add') {
-            app('Loading provider list…');
-            fetchCatalog().then((catalog) => {
-              const entries = catalog
-                ? Object.values(catalog)
-                    .filter((p) => p && p.id && p.api)
-                    .map((p) => ({ id: p.id, name: p.name || p.id, api: p.api, doc: p.doc || '' }))
-                    .sort((a, b) => String(a.name).localeCompare(String(b.name)))
-                : [];
-              const items = entries.map((p) => ({
-                label: p.name,
-                sub: p.api.replace(/^https?:\/\//, ''),
-                providerId: p.id,
-                base_url: p.api,
-                action: 'pickKnown',
-              }));
-              items.push({ label: '＋ Custom provider…', sub: 'enter base URL, key and protocol yourself', action: 'custom' });
-              openPicker({
-                title: 'Add a provider',
-                items,
-                searchable: true,
-                hint: '↑↓ navigate · type to search · Enter select · Esc cancel',
-                onPick: (pit) => {
-                  if (pit.action === 'custom') {
-                    openForm({
-                      title: 'Add A Custom Provider',
-                      fields: [
-                        { key: 'name', label: 'Provider Name' },
-                        { key: 'base_url', label: 'Base URL' },
-                        { key: 'api_key', label: 'API Key', kind: 'mask' },
-                      ],
-                      type: null,
-                      hint: 'Tab next field · ↑/↓ field · ←/→ type · Enter save · Esc cancel',
-                      onSubmit: (values, type) => {
-                        if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
-                        if (!type) { appErr('Cancelled: choose a Type (OpenAI / Anthropic).'); return; }
-                        const protocol = type === 'Anthropic' ? 'anthropic' : 'openai';
-                        registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, type);
-                      },
-                    });
-                    return true;
-                  }
+            // Show a submenu to choose between known providers and custom
+            openPicker({
+              title: 'Add a provider',
+              items: [
+                { label: 'Known provider', sub: 'browse models.dev catalog', action: 'known' },
+                { label: 'Custom provider', sub: 'enter base URL, key and protocol yourself', action: 'custom' },
+              ],
+              searchable: false,
+              hint: '↑↓ navigate · Enter select · Esc cancel',
+              onPick: (subIt) => {
+                if (subIt.action === 'custom') {
                   openForm({
-                    title: `Edit ${pit.label}`,
+                    title: 'Add A Custom Provider',
                     fields: [
-                      { key: 'name', label: 'Provider Name', value: pit.name },
-                      { key: 'base_url', label: 'Base URL', value: pit.base_url },
-                      { key: 'api_key', label: 'API Key', kind: 'mask', value: pit.api_key || '' },
-                      { key: 'type', label: 'Type', options: ['OpenAI', 'Anthropic'], value: pit.type || (pit.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') },
+                      { key: 'name', label: 'Provider Name' },
+                      { key: 'base_url', label: 'Base URL' },
+                      { key: 'api_key', label: 'API Key', kind: 'mask' },
                     ],
                     type: null,
-                    hint: 'Tab next field · Enter save · Esc cancel',
-                    onSubmit: async (values) => {
+                    hint: 'Tab next field · ↑/↓ field · ←/→ type · Enter save · Esc cancel',
+                    onSubmit: (values, type) => {
                       if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
-                      const protocol = values.type === 'Anthropic' ? 'anthropic' : 'openai';
-                      registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, values.type);
-                      
-                      // Auto-fetch models and configure context/thinking settings
-                      try {
-                        const models = await fetchModels({ 
-                          baseUrl: values.base_url, 
-                          apiKey: values.api_key, 
-                          protocol 
-                        });
-                        
-                        if (models.length > 0) {
-                          // Add each model with its configuration
-                          for (const m of models) {
-                            const key = modelKey(values.name, m.id);
-                            if (!cfg.raw.models[key]) {
-                              addModel(values.name, m.id, {
-                                display_name: m.display,
-                                contextLength: m.contextLength,
-                                maxTokens: m.maxTokens,
-                              });
-                              
-                              // Configure model entry in raw config
-                              if (!cfg.raw.models) cfg.raw.models = {};
-                              cfg.raw.models[key] = {
-                                provider: values.name,
-                                model: m.id,
-                                display_name: m.display,
-                                context_length: m.contextLength,
-                                max_tokens: m.maxTokens,
-                                reasoning: m.reasoning,
-                                efforts: m.efforts,
-                              };
-                            }
-                          }
-                          
-                          app(`Added ${models.length} model(s) with auto-configured context windows and thinking capabilities.`);
-                        } else {
-                          app(`Provider added. No models found at this endpoint.`);
-                        }
-                      } catch (error) {
-                        app(`Provider added. Failed to fetch models: ${error.message}`);
-                      }
+                      if (!type) { appErr('Cancelled: choose a Type (OpenAI / Anthropic).'); return; }
+                      const protocol = type === 'Anthropic' ? 'anthropic' : 'openai';
+                      registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, type);
                     },
                   });
                   return true;
-                },
-              });
+                }
+                // Known provider: load catalog and show list
+                app('Loading provider list…');
+                fetchCatalog().then((catalog) => {
+                  const entries = catalog
+                    ? Object.values(catalog)
+                        .filter((p) => p && p.id && p.api)
+                        .map((p) => ({ id: p.id, name: p.name || p.id, api: p.api, doc: p.doc || '' }))
+                        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+                    : [];
+                  const items = entries.map((p) => ({
+                    label: p.name,
+                    sub: p.api.replace(/^https?:\/\//, ''),
+                    providerId: p.id,
+                    base_url: p.api,
+                    action: 'pickKnown',
+                  }));
+                  if (!items.length) {
+                    appErr('No known providers found in catalog.');
+                    return;
+                  }
+                  openPicker({
+                    title: 'Select a known provider',
+                    items,
+                    searchable: true,
+                    hint: '↑↓ navigate · type to search · Enter select · Esc cancel',
+                    onPick: (pit) => {
+                      openForm({
+                        title: `Edit ${pit.label}`,
+                        fields: [
+                          { key: 'name', label: 'Provider Name', value: pit.name },
+                          { key: 'base_url', label: 'Base URL', value: pit.base_url },
+                          { key: 'api_key', label: 'API Key', kind: 'mask', value: pit.api_key || '' },
+                          { key: 'type', label: 'Type', options: ['OpenAI', 'Anthropic'], value: pit.type || (pit.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') },
+                        ],
+                        type: null,
+                        hint: 'Tab next field · Enter save · Esc cancel',
+                        onSubmit: async (values) => {
+                          if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
+                          const protocol = values.type === 'Anthropic' ? 'anthropic' : 'openai';
+                          registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, values.type);
+                          
+                          // Auto-fetch models and configure context/thinking settings
+                          try {
+                            const models = await fetchModels({ 
+                              baseUrl: values.base_url, 
+                              apiKey: values.api_key, 
+                              protocol 
+                            });
+                            
+                            if (models.length > 0) {
+                              // Add each model with its configuration
+                              for (const m of models) {
+                                const key = modelKey(values.name, m.id);
+                                if (!cfg.raw.models[key]) {
+                                  addModel(values.name, m.id, {
+                                    display_name: m.display,
+                                    contextLength: m.contextLength,
+                                    maxTokens: m.maxTokens,
+                                  });
+                                  
+                                  // Configure model entry in raw config
+                                  if (!cfg.raw.models) cfg.raw.models = {};
+                                  cfg.raw.models[key] = {
+                                    provider: values.name,
+                                    model: m.id,
+                                    display_name: m.display,
+                                    context_length: m.contextLength,
+                                    max_tokens: m.maxTokens,
+                                    reasoning: m.reasoning,
+                                    efforts: m.efforts,
+                                  };
+                                }
+                              }
+                              
+                              app(`Added ${models.length} model(s) with auto-configured context windows and thinking capabilities.`);
+                            } else {
+                              app(`Provider added. No models found at this endpoint.`);
+                            }
+                          } catch (error) {
+                            app(`Provider added. Failed to fetch models: ${error.message}`);
+                          }
+                        },
+                      });
+                      return true;
+                    },
+                  });
+                });
+                return true;
+              },
             });
             return true;
           }
@@ -4186,6 +4377,14 @@ export async function startTUI(opts) {
         renderFrame();
         return;
       }
+      // The queue panel's top rule is also a resize handle.
+      const hitQueue = hitAt(t);
+      if (hitQueue && hitQueue.kind === 'queueResize') {
+        state.queueResizeDrag = true;
+        state.queueResizeStart = { row: t.row, rows: queueRowCount(state) };
+        renderFrame();
+        return;
+      }
       // Don't start selection on single click, wait for drag.
       const cell = mouseToCell(t);
       // Pressing the padding above the transcript must NOT arm a selection:
@@ -4207,6 +4406,9 @@ export async function startTUI(opts) {
       // The todo resize handle gets its own hover flag so its rule lights up.
       const onTodoRule = !!(hb && hb.kind === 'todoResize');
       if (onTodoRule !== state.todoResizeHover) { state.todoResizeHover = onTodoRule; renderFrame(); }
+      // The queue resize handle also gets a hover flag.
+      const onQueueRule = !!(hb && hb.kind === 'queueResize');
+      if (onQueueRule !== state.queueResizeHover) { state.queueResizeHover = onQueueRule; renderFrame(); }
       // The composer rows stay click targets (mousedown places the caret), but
       // they are NOT highlighted on hover — tinting the prompt you are typing
       // is noise, not feedback.
@@ -4227,6 +4429,16 @@ export async function startTUI(opts) {
         const total = (state.todos || []).length;
         const clamped = Math.max(1, Math.min(total || 1, want));
         if (clamped !== state.todoRows) { state.todoRows = clamped; renderFrame(); }
+        return;
+      }
+      // Dragging the queue rule resizes the panel: moving UP shows more rows.
+      if (state.queueResizeDrag) {
+        const start = state.queueResizeStart || { row: t.row, rows: queueRowCount(state) };
+        const delta = start.row - (t.row || 1);          // up = positive = more rows
+        const want = start.rows + delta;
+        const total = (state.queued || []).length;
+        const clamped = Math.max(1, Math.min(total || 1, want));
+        if (clamped !== state.queueRows) { state.queueRows = clamped; renderFrame(); }
         return;
       }
       // Composer text selection: drag from a composer mousedown.
@@ -4268,6 +4480,14 @@ export async function startTUI(opts) {
         state.todoResizeDrag = false;
         state.todoResizeStart = null;
         state.todoResizeHover = !!(hitAt(t) && hitAt(t).kind === 'todoResize');
+        renderFrame();
+        return;
+      }
+      if (state.queueResizeDrag) {
+        // Finish the resize. Keep the hover flag in sync with where the pointer is.
+        state.queueResizeDrag = false;
+        state.queueResizeStart = null;
+        state.queueResizeHover = !!(hitAt(t) && hitAt(t).kind === 'queueResize');
         renderFrame();
         return;
       }
@@ -5201,7 +5421,11 @@ export async function startTUI(opts) {
     state.menuOpen = false; state.menuList = []; state.menuSel = 0;
     state.historyIdx = -1;
     if (!text) { renderFrame(); return; }
-    if (!state.running) state.turnStart = Date.now();
+    if (!state.running) {
+      state.turnStart = Date.now();
+      // Start animation: 0.5s type out + 0.5s fill with orange = 1s total
+      state.startAnim = { start: Date.now() };
+    }
     
     if (state.history[state.history.length - 1] !== text) state.history.push(text);
     // Commands are handled immediately, never queued: queuing them delayed a
@@ -5515,6 +5739,8 @@ export async function startTUI(opts) {
       await new Promise((r) => setTimeout(r, 20));
     }
     state.finishAnim = null;
+    // Also clear startAnim if it's still active (should be cleared already by composeFrame)
+    state.startAnim = null;
     state.running = false;
 
     if (turnMs > 0) {

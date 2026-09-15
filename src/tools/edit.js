@@ -129,7 +129,7 @@ function checkStale(p, normContent, normOld, ctx) {
   //     (no region covers it). Tell the AI to read the target lines first.
   if (curFileHash === entry.fileHash) {
     const ranges = entry.regions.map((r) => `${r.start}-${r.end}`).join(', ') || 'none';
-    return `Edit rejected: you have not read the lines you are editing in ${p} (Read so far: lines ${ranges}). Read the target lines first (Read with line_offset / n_lines), then Edit.`;
+    return `Edit rejected: you have not read the lines you are editing in ${p}. Read the target lines first (Read with line_offset / n_lines), then Edit.`;
   }
 
   // (3) The file changed on disk since it was Read and the edit target is not in
