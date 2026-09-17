@@ -62,6 +62,124 @@ export function hncodeConfigFile() {
   return process.env.HNCODE_CONFIG || path.join(home, '.hncode', 'config.toml');
 }
 
+// ---- personal preferences (/personal) ----
+// Free-form markdown the user wants applied on EVERY turn ("reply in Chinese",
+// "I use pnpm", "never add a trailing newline", …). Two scopes are merged, the
+// project one LAST so it can refine the global one:
+//   * global  — ~/.hncode/PERSONAL.md      (every workspace)
+//   * project — <workspace>/.hncode/PERSONAL.md  (this workspace only)
+// Both are OPTIONAL; a missing/empty file injects nothing. The files are read
+// fresh on each turn, so an edit through /personal takes effect immediately.
+export function personalPromptFile(scope, workspace) {
+  if (scope === 'global') return path.join(home, '.hncode', 'PERSONAL.md');
+  return path.join(workspace || process.cwd(), '.hncode', 'PERSONAL.md');
+}
+
+// Header placed before the injected preferences, so the model knows where the
+// text came from and how much authority it has.
+export const PERSONAL_PROMPT_HEADER =
+  'USER PERSONAL PREFERENCES (persistent notes from the user; follow them unless\n'
+  + 'the current request says otherwise):';
+
+// Raw file content for one scope (no header) — used by /personal's editor.
+export function readPersonalPromptRaw(scope, workspace) {
+  try { return fs.readFileSync(personalPromptFile(scope, workspace), 'utf8'); } catch { return ''; }
+}
+
+// Save one scope. Empty text REMOVES the file (so nothing is injected).
+export function writePersonalPrompt(scope, workspace, text) {
+  const file = personalPromptFile(scope, workspace);
+  const value = String(text == null ? '' : text);
+  if (!value.trim()) {
+    try { fs.unlinkSync(file); } catch { /* already gone */ }
+    return file;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, value.replace(/\s+$/, '') + '\n', 'utf8');
+  return file;
+}
+
+export function readPersonalPrompt(workspace) {
+  const parts = [];
+  for (const scope of ['global', 'project']) {
+    try {
+      const t = fs.readFileSync(personalPromptFile(scope, workspace), 'utf8').trim();
+      if (t) parts.push(t);
+    } catch { /* no file for this scope: nothing to inject */ }
+  }
+  if (!parts.length) return '';
+  return PERSONAL_PROMPT_HEADER + '\n' + parts.join('\n\n');
+}
+
+// ---- AGENTS.md --------------------------------------------------------------
+// Project instruction files, mirroring codex's AGENTS.md spec
+// (codex-rs/core/gpt_5_2_prompt.md, "AGENTS.md spec"):
+//   * a file's scope is the whole directory tree rooted where it sits;
+//   * for every file you touch you must obey the AGENTS.md whose scope covers it;
+//   * more-deeply-nested files take precedence on conflict;
+//   * direct system/user instructions outrank all of them.
+// Files are therefore collected from the workspace root DOWN to the working
+// directory and injected outermost-first, so the deepest one is read last and
+// naturally wins — the same precedence, without a merge step.
+//
+// This closes a real gap: /init WRITES an AGENTS.md and the prompt advertises it
+// as "smarter agent context", but nothing ever read it back.
+const AGENTS_MAX_BYTES = 32 * 1024;
+const AGENTS_FILENAMES = ['AGENTS.md', 'agents.md', 'AGENTS.override.md'];
+
+export const AGENTS_PROMPT_HEADER =
+  'PROJECT INSTRUCTIONS (AGENTS.md). The scope of each file is the directory it sits in,\n'
+  + 'so a deeper file is more specific and takes precedence over a shallower one. They apply\n'
+  + 'to every file you touch under that directory. The current request and the user\'s direct\n'
+  + 'instructions still outrank anything here.'
+
+// Every applicable AGENTS.md, outermost first. `dir` keeps the scope visible.
+export function agentsFilesFor(cwd, workspaceRoot) {
+  const start = path.resolve(cwd || process.cwd());
+  const root = path.resolve(workspaceRoot || start);
+  const dirs = [];
+  let dir = start;
+  for (;;) {
+    dirs.push(dir);
+    const parent = path.dirname(dir);
+    // Stop at the filesystem root, or once we have walked past the workspace.
+    if (parent === dir || dir === root) break;
+    dir = parent;
+  }
+  dirs.reverse();                     // outermost first
+  const found = [];
+  for (const d of dirs) {
+    for (const name of AGENTS_FILENAMES) {
+      const p = path.join(d, name);
+      try {
+        if (!fs.statSync(p).isFile()) continue;
+        found.push({ path: p, dir: d });
+        break;                        // one instruction file per directory
+      } catch { /* not present here */ }
+    }
+  }
+  return found;
+}
+
+// The block injected into the system prompt, or '' when the project has none.
+export function readAgentsMd(cwd, workspaceRoot) {
+  const files = agentsFilesFor(cwd, workspaceRoot);
+  if (!files.length) return '';
+  const parts = [];
+  for (const f of files) {
+    try {
+      let text = fs.readFileSync(f.path, 'utf8').trim();
+      if (!text) continue;
+      if (Buffer.byteLength(text, 'utf8') > AGENTS_MAX_BYTES) {
+        text = Buffer.from(text, 'utf8').subarray(0, AGENTS_MAX_BYTES).toString('utf8') + '\n[truncated]';
+      }
+      parts.push(`--- ${f.path} ---\n${text}`);
+    } catch { /* unreadable: skip rather than fail the turn */ }
+  }
+  if (!parts.length) return '';
+  return AGENTS_PROMPT_HEADER + '\n\n' + parts.join('\n\n');
+}
+
 function loadBaseToml() {
   // Only hncode's own config file participates.
   const f = hncodeConfigFile();
@@ -146,9 +264,19 @@ export function resolveConfig() {
       // Backwards-compat: read legacy cool_mode key if calm_mode is not set.
       : (root.calm_mode === true || root.calm_mode === 'true'
          || root.cool_mode === true || root.cool_mode === 'true'),
+    // SUBAGENT MODEL (/swarm-sub-agent): the model each subagent runs on. Empty
+    // (the default) means "follow this session's model", which is what the Agent
+    // and AgentSwarm tools fall back to. Set from config.toml so it persists.
+    subagentModel: process.env.HNCODE_SUBAGENT_MODEL || root.subagent_model || '',
     // Plugin directory (default: ~/.hncode/plugins). Set to "" or "false" to
     // disable plugin loading entirely.
     pluginDir: process.env.HNCODE_PLUGINS || root.plugins_dir || '',
+    // AUTO-UPDATE (/auto-update): when true, hncode checks npm for a newer
+    // version at startup and then every 30 minutes, installing in the background
+    // without interrupting the session.
+    autoUpdate: process.env.HNCODE_AUTO_UPDATE
+      ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_UPDATE)
+      : (root.auto_update === true || root.auto_update === 'true'),
     raw: root,
   };
 }

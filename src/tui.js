@@ -25,8 +25,15 @@ import { visualWidth, estimateTokens, estimateMessagesTokens, expandTabs } from 
 import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { LLM } from './llm.js';
 import * as sess from './session.js';
-import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString } from './config.js';
+import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor } from './config.js';
 import { pluginCommands } from './plugin.js';
+import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
+import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
+import * as upd from './update.js';
+import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
+import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
+import { renderSwarmProgress } from './swarm-progress.js';
+import { sortedTasks, getTask, settleTask, STATUS_LABEL } from './agent-task.js';
 
 const ESC = '\x1b';
 const VERSION = '0.1.0';
@@ -49,10 +56,12 @@ export const COMMANDS = [
   { name: 'help', aliases: ['h', '?'], desc: 'Show available commands and shortcuts', priority: 80 },
   { name: 'new', aliases: ['clear'], desc: 'Start a fresh session in the current workspace', priority: 80 },
   { name: 'sessions', aliases: ['resume'], desc: 'Browse and resume sessions', priority: 80 },
-  { name: 'tasks', aliases: ['task'], desc: 'Browse background tasks', priority: 80 },
+  { name: 'tasks', aliases: ['task'], desc: 'Browse background tasks (full-screen panel)', priority: 80 },
+  { name: 'swarm', desc: 'Toggle swarm mode: decompose work across parallel subagents', priority: 80, argumentHint: '[on|off]' },
+  { name: 'swarm-sub-agent', aliases: ['sub-agent-model'], desc: 'Choose the model subagents run on (default = this session\u2019s model)', priority: 79, argumentHint: '[model|default]' },
   { name: 'compact', desc: 'Compact the conversation context (AI summary + keep last 20%)', priority: 80, argumentHint: '[ratio]' },
   { name: 'goal', aliases: ['objective'], desc: 'Start or manage an autonomous goal', priority: 80, argumentHint: '[status|pause|resume|cancel] | <objective>' },
-  { name: 'init', desc: 'Analyze the codebase and generate AGENTS.md', priority: 70 },
+  { name: 'init', desc: 'Generate or update AGENTS.md from the codebase', priority: 70, argumentHint: '[instructions]' },
   { name: 'fork', desc: 'Fork the current session into a copy without switching to it', priority: 80 },
   { name: 'undo', desc: 'Withdraw the last prompt from the transcript', priority: 80, argumentHint: '[count]' },
   { name: 'title', aliases: ['rename'], desc: 'Set or show session title (also sets window title)', priority: 60, argumentHint: '<title>' },
@@ -65,7 +74,8 @@ export const COMMANDS = [
   { name: 'export-md', aliases: ['export'], desc: 'Export current session as a Markdown file', priority: 40, argumentHint: '[output-path]' },
   { name: 'import-session', aliases: ['import'], desc: 'Attach a Markdown file to the prompt so the AI reads it without a tool call', priority: 40, argumentHint: '<file.md>' },
   { name: 'copy', desc: 'Copy the last assistant message to the clipboard', priority: 40 },
-  { name: 'set-system-prompt', aliases: ['system-prompt'], desc: 'Edit and save the system prompt (persisted to config.toml)', priority: 60 },
+  { name: 'set-system-prompt', aliases: ['system-prompt'], desc: 'Edit the system prompt, or load one of the model-family presets', priority: 60 },
+  { name: 'personal', aliases: ['preferences'], desc: 'Edit personal preferences injected into every prompt (global or per-project)', priority: 60, argumentHint: '[global|project]' },
   { name: 'calm-mode', desc: 'Terse replies: stop the model narrating what it will do and why unless asked', priority: 60, argumentHint: '[on|off]' },
   { name: 'add-dir', desc: 'Add or list an additional workspace directory', priority: 60, argumentHint: '[list] | <path>' },
   { name: 'move', desc: 'Move current session to another directory (must exist)', priority: 60, argumentHint: '<path>' },
@@ -73,6 +83,8 @@ export const COMMANDS = [
   { name: 'plugins', desc: 'List loaded plugins and their status', priority: 60 },
   { name: 'logout', aliases: ['disconnect'], desc: 'Log out of a configured provider', priority: 40 },
   { name: 'feedback', aliases: ['bug'], desc: 'Send feedback to the maintainers', priority: 60 },
+  { name: 'update', desc: 'Check for and install a newer version', priority: 40, argumentHint: '[-y]' },
+  { name: 'auto-update', desc: 'Toggle automatic background updates (check at startup + every 30 min)', priority: 40, argumentHint: '[on|off]' },
   { name: 'version', desc: 'Show version information', priority: 20 },
   { name: 'exit', aliases: ['quit', 'q'], desc: 'Exit the application', priority: 20 },
 ].sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.name.localeCompare(b.name));
@@ -110,6 +122,71 @@ export const CALM_MODE_INSTRUCTION =
   + '- Just do the work and report the OUTCOME, briefly. Keep tool calls as normal.\n'
   + '- Explain reasoning only if the user explicitly asks for it, or if a genuine\n'
   + '  blocker/decision needs their input.';
+
+// Appended to the system prompt while PLAN MODE is on (/plan). Without this the
+// mode only removed the write tools, leaving the model with no idea what it was
+// supposed to PRODUCE — it just read files and stopped. The instruction gives it
+// the deliverable and the exact shape it must arrive in.
+export const SWARM_MODE_INSTRUCTION =
+  'SWARM MODE is ON. The user expects large parallel decomposition.\n'
+  + '- First do a SMALL amount of exploratory work to decide how to split the task.\n'
+  + '- Then do not handle the main work yourself. Use AgentSwarm with a\n'
+  + '  prompt_template containing the {{item}} placeholder and an items array\n'
+  + '  partitioning the problem, so each subagent gets a distinct part.\n'
+  + '- Give each subagent a distinct scope; avoid duplicating work or assigning\n'
+  + '  conflicting changes.\n'
+  + '- Do not conserve agents: AgentSwarm queues launches automatically. Decompose\n'
+  + '  as finely as the work allows while keeping scopes non-conflicting.\n'
+  + '- This mode IS the explicit permission to delegate: the rule against spawning\n'
+  + '  subagents unprompted still applies everywhere else.\n'
+  + '- If after exploring you conclude no subagent is needed, say why and stop.';
+
+export const PLAN_MODE_INSTRUCTION =
+  'PLAN MODE is ON. You are in a read-only planning phase.\n'
+  + '- The write tools (Write, Edit, Bash, ...) are NOT available. Investigate with\n'
+  + '  the read-only tools you do have, then produce a PLAN.\n'
+  + '- Do NOT try to make the changes. Your job this turn is the plan, not the code.\n'
+  + '- End your reply with the plan wrapped in <plan> and </plan> tags, on their own\n'
+  + '  lines. Everything between them is shown to the user verbatim and is what they\n'
+  + '  approve. Only the LAST such block is used.\n'
+  + '- Inside the block, use short Markdown: a heading per step, and bullets for the\n'
+  + '  files to touch and why. Be concrete enough that the plan can be executed as\n'
+  + '  written — name files, functions and commands.\n'
+  + '- Keep any text OUTSIDE the tags to a one-line summary of what you found.\n'
+  + '- Once the plan is approved the mode turns off and you get the write tools, so\n'
+  + '  the plan must stand on its own.\n'
+  + '\n'
+  + 'Example shape:\n'
+  + '<plan>\n'
+  + '## Add the /personal command\n'
+  + '- `src/config.js`: add readPersonalPrompt() merging global + project files.\n'
+  + '- `src/tui.js`: register /personal, inject the text each turn.\n'
+  + '## Verify\n'
+  + '- Write a temp workspace, check both scopes merge in order.\n'
+  + '</plan>';
+
+// Sent back to the model once the user approves a plan. Plan mode is off by then,
+// so it has the write tools; this frames the approved text as an instruction
+// rather than as another question, and forbids re-planning.
+export const PLAN_EXECUTE_PREFIX =
+  'The user approved the plan. Plan mode is OFF — you now have the write tools.\n'
+  + 'Execute the plan you produced. Do not produce another plan and do not re-ask\n'
+  + 'for approval; if a step turns out to be impossible, do the rest and report\n'
+  + 'plainly what you could not do.\n\n';
+
+// Pull the LAST <plan>…</plan> block out of an assistant reply. Returns null when
+// there is none, so callers can tell "no plan offered" from "empty plan".
+export function extractPlan(text) {
+  const s = String(text || '');
+  const open = /<plan>\s*/gi;
+  let match = null, m;
+  while ((m = open.exec(s)) !== null) match = m;
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const close = s.indexOf('</plan>', start);
+  const body = (close === -1 ? s.slice(start) : s.slice(start, close)).trim();
+  return body || null;
+}
 
 export const TIPS = [
   'Press Esc to interrupt the current turn at any time',
@@ -161,7 +238,7 @@ export const TIPS = [
   'Shift+Arrow selects text in the composer; Backspace or Delete removes it',
   'Ctrl+J inserts a newline without sending the message',
   'Ctrl+T expands or collapses the todo panel',
-  'Ctrl+O expands or collapses tool output and thinking blocks',
+  'Ctrl+O expands or collapses tool output, thinking blocks and Edit diffs',
   'Ctrl+B moves a long-running foreground Bash command to the background',
   'Ctrl+Shift+V pastes the clipboard as a bracketed paste',
   'Ctrl+Shift+C copies the mouse selection, or the last answer',
@@ -204,94 +281,301 @@ const MAX_PICKER = 12;            // max picker list rows shown at once
 const TIP_INTERVAL = 15000;
 // Braille spinner frames for the "Working" indicator (orange).
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// Stand-in for the LIVE spinner glyph inside a CACHED row. A pending thinking
+// block must not be re-wrapped by the 80ms spin tick (see renderChatLines), so
+// its preview is cached with this sentinel and the real frame is substituted in
+// afterwards. It occupies 0 columns, so the swap never disturbs the layout.
+const SPIN_PLACEHOLDER = '\u0000';
+// How long a foreground Bash command runs before its card advertises Ctrl+B, and
+// the hint text itself. Mirrors kimi-code's tool-call card (DETACH_HINT_*).
+const DETACH_HINT_DELAY_MS = 10_000;
+const DETACH_HINT_TEXT = 'Press Ctrl+B to run in background';
 
 // Rotating status messages for the "Working..." line — all mean "the agent is
 // thinking / working", but vary the wording so it doesn't look stuck.
 const WORKING_MESSAGES = [
-  'Thinking...', 'Working...', 'Crunching...', 'Processing...', 'Analyzing...', 'Pondering...', 'Mulling...', 'Considering...', 'Reasoning...', 'Deliberating...',
-  'Reflecting...', 'Ruminating...', 'Planning...', 'Mapping...', 'Sketching...', 'Outlining...', 'Structuring...', 'Organizing...', 'Sorting...', 'Ordering...',
-  'Prioritizing...', 'Focusing...', 'Concentrating...', 'Diving...', 'Digging...', 'Delving...', 'Probing...', 'Examining...', 'Inspecting...', 'Studying...',
-  'Reviewing...', 'Checking...', 'Verifying...', 'Validating...', 'Confirming...', 'Building...', 'Assembling...', 'Constructing...', 'Composing...', 'Crafting...',
-  'Creating...', 'Shaping...', 'Forming...', 'Forging...', 'Welding...', 'Stitching...', 'Weaving...', 'Knitting...', 'Threading...', 'Patching...',
-  'Fixing...', 'Repairing...', 'Rebuilding...', 'Reworking...', 'Refactoring...', 'Restructuring...', 'Solving...', 'Untangling...', 'Unraveling...', 'Detangling...',
-  'Deciphering...', 'Decoding...', 'Cracking...', 'Piecing...', 'Fitting...', 'Hunting...', 'Chasing...', 'Tracking...', 'Tracing...', 'Sniffing...',
-  'Writing...', 'Drafting...', 'Editing...', 'Revising...', 'Rewriting...', 'Proofreading...', 'Polishing...', 'Refining...', 'Honing...', 'Tuning...',
-  'Sharpening...', 'Tightening...', 'Trimming...', 'Pruning...', 'Cutting...', 'Merging...', 'Splicing...', 'Searching...', 'Scanning...', 'Sifting...',
-  'Filtering...', 'Collecting...', 'Gathering...', 'Compiling...', 'Indexing...', 'Fetching...', 'Retrieving...', 'Loading...', 'Unpacking...', 'Computing...',
-  'Calculating...', 'Measuring...', 'Estimating...', 'Calibrating...', 'Aligning...', 'Balancing...', 'Optimizing...', 'Streamlining...', 'Smoothing...', 'Cleaning...',
-  'Sweeping...', 'Tidying...', 'Clearing...', 'Expanding...', 'Growing...', 'Blooming...', 'Walking...', 'Strolling...', 'Marching...', 'Hiking...',
-  'Trekking...', 'Journeying...', 'Sailing...', 'Cruising...', 'Gliding...', 'Flying...', 'Soaring...', 'Floating...', 'Drifting...', 'Wandering...',
-  'Exploring...', 'Roaming...', 'Venturing...', 'Discovering...', 'Uncovering...', 'Unveiling...', 'Revealing...', 'Exposing...', 'Spinning...', 'Whirling...',
-  'Twirling...', 'Rotating...', 'Swirling...', 'Churning...', 'Turning...', 'Rolling...', 'Rocking...', 'Swaying...', 'Flowing...', 'Streaming...',
-  'Cascading...', 'Rippling...', 'Bubbling...', 'Sparkling...', 'Cooking...', 'Simmering...', 'Boiling...', 'Stewing...', 'Roasting...', 'Baking...',
-  'Grilling...', 'Frying...', 'Whisking...', 'Beating...', 'Stirring...', 'Mixing...', 'Blending...', 'Kneading...', 'Proofing...', 'Rising...',
-  'Fermenting...', 'Brewing...', 'Steeping...', 'Infusing...', 'Seasoning...', 'Garnishing...', 'Plating...', 'Serving...', 'Tasting...', 'Adjusting...',
-  'Perfecting...', 'Glazing...', 'Painting...', 'Drawing...', 'Designing...', 'Orchestrating...', 'Conducting...', 'Dancing...', 'Jigging...', 'Jiving...',
-  'Boogying...', 'Shimmying...', 'Grooving...', 'Bouncing...', 'Hopping...', 'Skipping...', 'Nurturing...', 'Tending...', 'Gardening...', 'Planting...',
-  'Seeding...', 'Sprouting...', 'Rooting...', 'Branching...', 'Watering...', 'Flourishing...', 'Thriving...', 'Sneaking...', 'Tiptoeing...', 'Creeping...',
-  'Charging...', 'Gunning...', 'Ramping...', 'Revving...', 'Warming...', 'Powering...', 'Igniting...', 'Kindling...', 'Sparking...', 'Blazing...',
-  'Burning...', 'Glowing...', 'Illuminating...', 'Enlightening...', 'Brightening...', 'Dawning...', 'Breaking...', 'Leaping...', 'Jumping...', 'Bounding...',
-  'Springing...', 'Launching...', 'Propelling...', 'Accelerating...', 'Waiting...', 'Holding...', 'Steadying...', 'Progressing...', 'Advancing...', 'Continuing...',
-  'Persisting...', 'Persevering...', 'Standing...', 'Readying...', 'Preparing...', 'Sussing...', 'Sleuthing...', 'Orienting...', 'Locating...', 'Targeting...',
-  'Acquiring...', 'Syncing...', 'Harmonizing...', 'Lining...', 'Wrapping...', 'Finalizing...', 'Landing...', 'Nailing...', 'Sealing...', 'Rethinking...',
-  'Reassessing...', 'Revisiting...', 'Retracing...', 'Replaying...', 'Rehearsing...', 'Simulating...', 'Modeling...', 'Prototyping...', 'Testing...', 'Iterating...',
-  'Rendering...', 'Repainting...', 'Compositing...', 'Wiring...', 'Linking...', 'Bundling...', 'Packing...', 'Shipping...', 'Deploying...', 'Juggling...',
-  'Weighing...', 'Distilling...', 'Extracting...', 'Parsing...', 'Formatting...', 'Normalizing...', 'Sanitizing...', 'Locking...', 'Securing...', 'Guarding...',
-  'Watching...', 'Monitoring...', 'Surveying...', 'Scouting...', 'Reconnoitering...', 'Concocting...', 'Devising...', 'Inventing...', 'Imagining...', 'Envisioning...',
-  'Visualizing...', 'Picturing...', 'Dreaming...', 'Wondering...', 'Marveling...', 'Admiring...', 'Appreciating...', 'Enjoying...', 'Savoring...', 'Relishing...',
-  'Loving...', 'Cherishing...', 'Treasure-hunting...', 'Questing...', 'Seeking...', 'Striving...', 'Endeavoring...', 'Attempting...', 'Trying...', 'Experimenting...',
-  'Innovating...', 'Pioneering...', 'Trailblazing...', 'Pathfinding...', 'Navigating...', 'Steering...', 'Guiding...', 'Directing...', 'Captaining...', 'Piloting...',
-  'Commanding...', 'Leading...', 'Spearheading...', 'Championing...', 'Absorbing...', 'Accenting...', 'Acclaiming...', 'Accommodating...', 'Accounting...', 'Accrediting...',
-  'Accumulating...', 'Achieving...', 'Acknowledging...', 'Activating...', 'Adapting...', 'Adding...', 'Addressing...', 'Adhering...', 'Administering...', 'Adopting...',
-  'Adorning...', 'Advising...', 'Affirming...', 'Aggregating...', 'Agreing...', 'Aiming...', 'Airbrushing...', 'Alerting...', 'Allocating...', 'Allowing...',
-  'Altering...', 'Amalgamating...', 'Amending...', 'Amplifying...', 'Amusing...', 'Anchoring...', 'Animating...', 'Annexing...', 'Announcing...', 'Answering...',
-  'Anticipating...', 'Appealing...', 'Appending...', 'Applying...', 'Appointing...', 'Appraising...', 'Approaching...', 'Approving...', 'Archiving...', 'Arguing...',
-  'Arming...', 'Arranging...', 'Arraying...', 'Arresting...', 'Arriving...', 'Articulating...', 'Ascending...', 'Asserting...', 'Assessing...', 'Assigning...',
-  'Assimilating...', 'Assisting...', 'Assuring...', 'Astonishing...', 'Attaching...', 'Attacking...', 'Attaining...', 'Attending...', 'Attesting...', 'Attracting...',
-  'Auditing...', 'Augmenting...', 'Authenticating...', 'Authoring...', 'Authorizing...', 'Automating...', 'Averting...', 'Awakening...', 'Awarding...', 'Babbling...',
-  'Backing...', 'Backtracking...', 'Badging...', 'Baging...', 'Baiting...', 'Ballooning...', 'Banding...', 'Banking...', 'Bartering...', 'Basing...',
-  'Batching...', 'Bearing...', 'Bedazzling...', 'Befriending...', 'Begining...', 'Beholding...', 'Believing...', 'Belonging...', 'Bending...', 'Benefiting...',
-  'Beseeching...', 'Bestowing...', 'Beting...', 'Biding...', 'Billowing...', 'Binding...', 'Blasting...', 'Bleaching...', 'Bleeding...', 'Bleeping...',
-  'Blessing...', 'Blinking...', 'Blistering...', 'Blocking...', 'Bloting...', 'Blowing...', 'Bluring...', 'Boarding...', 'Boasting...', 'Bobing...',
-  'Bolstering...', 'Bombarding...', 'Bonding...', 'Booming...', 'Boosting...', 'Bootstraping...', 'Bordering...', 'Borrowing...', 'Botching...', 'Bottling...',
-  'Bowing...', 'Bowling...', 'Boxing...', 'Bracing...', 'Brainstorming...', 'Braising...', 'Branding...', 'Braving...', 'Breaching...', 'Breathing...',
-  'Breezing...', 'Bricking...', 'Bridging...', 'Briefing...', 'Bringing...', 'Bristling...', 'Broadening...', 'Brokering...', 'Bronzing...', 'Brooding...',
-  'Browsing...', 'Brushing...', 'Buckling...', 'Budgeting...', 'Buffering...', 'Buffing...', 'Bulking...', 'Bulletproofing...', 'Bumping...', 'Bunching...',
-  'Buoying...', 'Bursting...', 'Burying...', 'Busting...', 'Buttering...', 'Buzzing...', 'Caching...', 'Cadencing...', 'Cajoling...', 'Caking...',
-  'Calling...', 'Calming...', 'Camping...', 'Canceling...', 'Canoodling...', 'Canvasing...', 'Capitalizing...', 'Captioning...', 'Capturing...', 'Carbonizing...',
-  'Caring...', 'Carving...', 'Cashing...', 'Casting...', 'Cataloging...', 'Catapulting...', 'Catching...', 'Categorizing...', 'Catering...', 'Cautioning...',
-  'Ceasing...', 'Celebrating...', 'Cementing...', 'Censoring...', 'Centralizing...', 'Certifying...', 'Chaining...', 'Chairing...', 'Chalking...', 'Challenging...',
-  'Channeling...', 'Chanting...', 'Charting...', 'Chating...', 'Cheering...', 'Chewing...', 'Chilling...', 'Chiming...', 'Chiping...', 'Chirping...',
-  'Chiseling...', 'Choosing...', 'Choping...', 'Choreographing...', 'Chronicling...', 'Chuging...', 'Ciphering...', 'Circling...', 'Circulating...', 'Citing...',
-  'Civilizing...', 'Clamping...', 'Clanging...', 'Claping...', 'Clarifying...', 'Clashing...', 'Classifying...', 'Clawing...', 'Cleansing...', 'Cleaving...',
-  'Climbing...', 'Clinching...', 'Cliping...', 'Cloaking...', 'Clocking...', 'Cloning...', 'Closing...', 'Clouding...', 'Clustering...', 'Clutching...',
-  'Coaching...', 'Coalescing...', 'Coating...', 'Coaxing...', 'Cocooning...', 'Codifying...', 'Coercing...', 'Coexisting...', 'Cogitating...', 'Cohering...',
-  'Coiling...', 'Coinciding...', 'Collaborating...', 'Collapsing...', 'Collating...', 'Colliding...', 'Colonizing...', 'Coloring...', 'Combing...', 'Combining...',
-  'Comforting...', 'Commemorating...', 'Commencing...', 'Commenting...', 'Commissioning...', 'Commiting...', 'Communing...', 'Communicating...', 'Commuting...', 'Compacting...',
-  'Comparing...', 'Compassing...', 'Compeling...', 'Compensating...', 'Competing...', 'Complementing...', 'Completing...', 'Complicating...', 'Complimenting...', 'Comprehending...',
-  'Compressing...', 'Comprising...', 'Compromising...', 'Concealing...', 'Conceding...', 'Conceiving...', 'Conceptualizing...', 'Concerning...', 'Concluding...', 'Concuring...',
-  'Condensing...', 'Conditioning...', 'Condoning...', 'Confering...', 'Confessing...', 'Configuring...', 'Confining...', 'Confiscating...', 'Conflating...', 'Confronting...',
-  'Confusing...', 'Congealing...', 'Congratulating...', 'Conjuring...', 'Connecting...', 'Conquering...', 'Consecrating...', 'Consenting...', 'Conserving...', 'Consigning...',
-  'Consisting...', 'Consoling...', 'Consolidating...', 'Conspiring...', 'Constituting...', 'Constraining...', 'Consulting...', 'Consuming...', 'Contacting...', 'Containing...',
-  'Contemplating...', 'Contending...', 'Contenting...', 'Contesting...', 'Contracting...', 'Contrasting...', 'Contributing...', 'Contriving...', 'Controling...', 'Convening...',
-  'Converging...', 'Conversing...', 'Converting...', 'Conveying...', 'Convincing...', 'Convoying...', 'Cooling...', 'Cooperating...', 'Coordinating...', 'Copying...',
-  'Coring...', 'Corking...', 'Correlating...', 'Corresponding...', 'Corroborating...', 'Corraling...', 'Correcting...', 'Corrugating...', 'Cosseting...', 'Counseling...',
-  'Counting...', 'Coupling...', 'Coursing...', 'Covering...', 'Coveting...', 'Cradling...', 'Cranking...', 'Crashing...', 'Crawling...', 'Creasing...',
-  'Crediting...', 'Cresting...', 'Critiquing...', 'Crocheting...', 'Crooning...', 'Crossing...', 'Crowding...', 'Crowning...', 'Crumbing...', 'Crusading...',
-  'Crystallizing...', 'Cubing...', 'Cuddling...', 'Culling...', 'Cultivating...', 'Curbing...', 'Curating...', 'Curling...', 'Currying...', 'Cushioning...',
-  'Customizing...', 'Cuting...', 'Cycling...', 'Dabbling...', 'Daming...', 'Dampening...', 'Daring...', 'Darting...', 'Dashing...', 'Dating...',
-  'Dawdling...', 'Dazzling...', 'Deactivating...', 'Debuging...', 'Debuting...', 'Decanting...', 'Decelerating...', 'Decentralizing...', 'Decking...', 'Declaring...',
-  'Declining...', 'Decomposing...', 'Decorating...', 'Decoupling...', 'Decreasing...', 'Dedicating...', 'Deducing...', 'Deepening...', 'Defeating...', 'Defending...',
-  'Defering...', 'Defining...', 'Deflecting...', 'Deforming...', 'Defragmenting...', 'Defusing...', 'Degreasing...', 'Dehydrating...', 'Delegating...', 'Deleting...',
-  'Delivering...', 'Demanding...', 'Demarcating...', 'Demisting...', 'Demystifying...', 'Denoting...', 'Denouncing...', 'Densifying...', 'Departing...', 'Depending...',
-  'Depositing...', 'Depressurizing...', 'Deputing...', 'Deriving...', 'Descending...', 'Describing...', 'Deserting...', 'Desiring...', 'Despatching...', 'Detecting...',
-  'Detering...', 'Detoxing...', 'Devaluing...', 'Developing...', 'Deviating...', 'Devoting...', 'Diping...', 'Disabling...', 'Disarming...', 'Disassembling...',
-  'Disbursing...', 'Discarding...', 'Discerning...', 'Discharging...', 'Disciplining...', 'Disclosing...', 'Disconnecting...', 'Discontinuing...', 'Discounting...', 'Discoursing...',
-  'Discrediting...', 'Discriminating...', 'Discussing...', 'Disembarking...', 'Disentangling...', 'Disguising...', 'Disinfecting...', 'Disliking...', 'Dismantling...', 'Dismissing...',
-  'Dispatching...', 'Dispeling...', 'Dispensing...', 'Dispersing...', 'Displaying...', 'Disposing...', 'Disproving...', 'Dissecting...', 'Disseminating...', 'Dissipating...',
-  'Dissolving...', 'Distinguishing...', 'Distracting...', 'Distributing...', 'Disturbing...', 'Diverting...', 'Divining...', 'Dividing...', 'Divulging...', 'Docking...',
-  'Documenting...', 'Dodging...', 'Domesticating...', 'Dominating...', 'Donating...', 'Doodling...', 'Dosing...', 'Doting...', 'Doubling...', 'Doubting...',
-  'Downgrading...', 'Downloading...', 'Draging...', 'Draining...',
+  // ---- A (100) ----
+  'Accelerating...', 'Accessing...', 'Acclaiming...', 'Acclimating...', 'Accommodating...', 'Accompanying...', 'Accomplishing...', 'Accounting...', 'Accrediting...', 'Accruing...',
+  'Accumulating...', 'Achieving...', 'Acknowledging...', 'Acquainting...', 'Acquiring...', 'Acting...', 'Activating...', 'Actualizing...', 'Adapting...', 'Adding...',
+  'Addressing...', 'Adhering...', 'Adjusting...', 'Administering...', 'Admiring...', 'Adopting...', 'Adorning...', 'Advancing...', 'Advocating...', 'Affirming...',
+  'Affording...', 'Aggregating...', 'Agreeing...', 'Aiding...', 'Aiming...', 'Aligning...', 'Alleviating...', 'Allocating...', 'Allowing...', 'Alluring...',
+  'Altering...', 'Amalgamating...', 'Amassing...', 'Amending...', 'Amplifying...', 'Analyzing...', 'Anchoring...', 'Animating...', 'Annotating...', 'Announcing...',
+  'Answering...', 'Anticipating...', 'Appealing...', 'Applauding...', 'Applying...', 'Appointing...', 'Appraising...', 'Appreciating...', 'Approaching...', 'Approving...',
+  'Architecting...', 'Archiving...', 'Arranging...', 'Articulating...', 'Ascending...', 'Ascertaining...', 'Aspiring...', 'Assembling...', 'Asserting...', 'Assessing...',
+  'Assigning...', 'Assimilating...', 'Assisting...', 'Assuring...', 'Astonishing...', 'Attaining...', 'Attempting...', 'Attending...', 'Attracting...', 'Auditing...',
+  'Augmenting...', 'Authenticating...', 'Authoring...', 'Authorizing...', 'Automating...', 'Awakening...', 'Awarding...', 'Attuning...', 'Absorbing...', 'Accenting...',
+  'Acquiescing...', 'Adjudicating...', 'Adventuring...', 'Alerting...', 'Ameliorating...', 'Allying...', 'Annexing...', 'Aping...', 'Availing...', 'Averaging...',
+  // ---- B (100) ----
+  'Babbling...', 'Backing...', 'Backtracking...', 'Balancing...', 'Ballooning...', 'Banking...', 'Bargaining...', 'Bartering...', 'Basing...', 'Basking...',
+  'Batching...', 'Bathing...', 'Battling...', 'Beaching...', 'Beaming...', 'Bearing...', 'Beating...', 'Beautifying...', 'Beckoning...', 'Becoming...',
+  'Bedazzling...', 'Befriending...', 'Beginning...', 'Behaving...', 'Beholding...', 'Believing...', 'Belonging...', 'Benchmarking...', 'Bending...', 'Benefiting...',
+  'Bequeathing...', 'Beseeching...', 'Bestowing...', 'Bettering...', 'Bidding...', 'Biding...', 'Billowing...', 'Binding...', 'Birthing...', 'Biting...',
+  'Blasting...', 'Blazing...', 'Bleaching...', 'Bleeding...', 'Blending...', 'Blessing...', 'Blinking...', 'Blooming...', 'Blossoming...', 'Blowing...',
+  'Blurring...', 'Blushing...', 'Boarding...', 'Boasting...', 'Boiling...', 'Bolstering...', 'Bonding...', 'Booking...', 'Booming...', 'Boosting...',
+  'Bootstrapping...', 'Borrowing...', 'Bottling...', 'Bouncing...', 'Bounding...', 'Bowing...', 'Bowling...', 'Boxing...', 'Bracing...', 'Brainstorming...',
+  'Braiding...', 'Branching...', 'Branding...', 'Braving...', 'Breaking...', 'Breathing...', 'Breeding...', 'Breezing...', 'Brewing...', 'Bridging...',
+  'Briefing...', 'Brightening...', 'Bringing...', 'Broadcasting...', 'Broadening...', 'Bronzing...', 'Browsing...', 'Brushing...', 'Bubbling...', 'Budding...',
+  'Budgeting...', 'Buffering...', 'Building...', 'Bulking...', 'Bundling...', 'Buoying...', 'Burnishing...', 'Bustling...', 'Buying...', 'Buzzing...',
+  // ---- C (100) ----
+  'Caching...', 'Cajoling...', 'Caking...', 'Calibrating...', 'Calling...', 'Calming...', 'Campaigning...', 'Camping...', 'Canceling...', 'Canoodling...',
+  'Canvasing...', 'Capitalizing...', 'Captioning...', 'Captivating...', 'Capturing...', 'Caring...', 'Carving...', 'Cascading...', 'Cashing...', 'Casting...',
+  'Cataloging...', 'Catapulting...', 'Catching...', 'Categorizing...', 'Catering...', 'Cautioning...', 'Ceasing...', 'Celebrating...', 'Cementing...', 'Centralizing...',
+  'Certifying...', 'Chaining...', 'Chairing...', 'Chalking...', 'Challenging...', 'Championing...', 'Channeling...', 'Chanting...', 'Chaperoning...', 'Charging...',
+  'Charting...', 'Chasing...', 'Chatting...', 'Cheering...', 'Cherishing...', 'Chewing...', 'Chilling...', 'Chiming...', 'Chipping...', 'Chirping...',
+  'Chiseling...', 'Choosing...', 'Chopping...', 'Choreographing...', 'Chronicling...', 'Chugging...', 'Ciphering...', 'Circling...', 'Circulating...', 'Citing...',
+  'Civilizing...', 'Clamping...', 'Clanging...', 'Clapping...', 'Clarifying...', 'Clashing...', 'Classifying...', 'Clawing...', 'Cleaning...', 'Cleansing...',
+  'Clearing...', 'Cleaving...', 'Climbing...', 'Clinching...', 'Clipping...', 'Cloaking...', 'Clocking...', 'Cloning...', 'Closing...', 'Clouding...',
+  'Clustering...', 'Clutching...', 'Coaching...', 'Coalescing...', 'Coating...', 'Coaxing...', 'Cocooning...', 'Codifying...', 'Coexisting...', 'Cogitating...',
+  'Cohering...', 'Coiling...', 'Coinciding...', 'Collaborating...', 'Collapsing...', 'Collating...', 'Collecting...', 'Coloring...', 'Combining...', 'Comforting...',
+  // ---- D (100) ----
+  'Dabbling...', 'Dampening...', 'Dancing...', 'Daring...', 'Darting...', 'Dashing...', 'Dating...', 'Dawdling...', 'Dazzling...', 'Deactivating...',
+  'Debugging...', 'Debuting...', 'Decanting...', 'Decelerating...', 'Decentralizing...', 'Deciding...', 'Deciphering...', 'Decking...', 'Declaring...', 'Decoding...',
+  'Decomposing...', 'Decorating...', 'Decoupling...', 'Dedicating...', 'Deducing...', 'Deepening...', 'Defeating...', 'Defending...', 'Deferring...', 'Defining...',
+  'Deflecting...', 'Defragmenting...', 'Defusing...', 'Degreasing...', 'Dehydrating...', 'Delegating...', 'Deliberating...', 'Delighting...', 'Delivering...', 'Delving...',
+  'Demanding...', 'Demarcating...', 'Demonstrating...', 'Demystifying...', 'Denoting...', 'Densifying...', 'Departing...', 'Depending...', 'Deploying...', 'Depicting...',
+  'Depositing...', 'Depressurizing...', 'Deriving...', 'Descending...', 'Describing...', 'Desiring...', 'Despatching...', 'Detailing...', 'Detecting...', 'Deterring...',
+  'Determining...', 'Detoxing...', 'Devaluing...', 'Developing...', 'Deviating...', 'Devising...', 'Devoting...', 'Diagnosing...', 'Diagramming...', 'Dialing...',
+  'Digesting...', 'Digging...', 'Digitizing...', 'Diluting...', 'Dimensioning...', 'Directing...', 'Disarming...', 'Disbursing...', 'Discarding...', 'Discerning...',
+  'Discharging...', 'Disciplining...', 'Disclosing...', 'Disconnecting...', 'Discounting...', 'Discovering...', 'Discrediting...', 'Discussing...', 'Disentangling...', 'Disguising...',
+  'Disinfecting...', 'Dislodging...', 'Dismantling...', 'Dismissing...', 'Dispatching...', 'Dispensing...', 'Dispersing...', 'Displaying...', 'Disposing...', 'Disproving...',
+  'Dissecting...', 'Disseminating...', 'Dissipating...', 'Dissolving...', 'Distilling...', 'Distinguishing...', 'Distributing...', 'Diversifying...', 'Diverting...', 'Dividing...',
+  'Divining...', 'Divulging...', 'Docking...', 'Documenting...', 'Dodging...', 'Domesticating...', 'Dominating...', 'Donating...', 'Doodling...', 'Dosing...',
+  'Doubling...', 'Dovetailing...', 'Downloading...', 'Drafting...', 'Draining...', 'Dramatizing...', 'Drawing...', 'Dreaming...', 'Dredging...', 'Dressing...',
+  'Drifting...', 'Drilling...', 'Driving...', 'Dropping...', 'Drumming...', 'Drying...', 'Ducking...', 'Dusting...', 'Dwelling...', 'Dyeing...',
+  // ---- E (100) ----
+  'Earning...', 'Easing...', 'Echoing...', 'Eclipsing...', 'Economizing...', 'Edging...', 'Editing...', 'Educating...', 'Effecting...', 'Effervescing...',
+  'Elaborating...', 'Elating...', 'Electing...', 'Electrifying...', 'Elevating...', 'Eliciting...', 'Eliminating...', 'Elucidating...', 'Emancipating...', 'Embarking...',
+  'Embedding...', 'Embellishing...', 'Embodying...', 'Embracing...', 'Embroidering...', 'Emerging...', 'Emitting...', 'Empathizing...', 'Emphasizing...', 'Empowering...',
+  'Emulating...', 'Enabling...', 'Enacting...', 'Encapsulating...', 'Enchanting...', 'Encircling...', 'Enclosing...', 'Encoding...', 'Encouraging...', 'Encrypting...',
+  'Endearing...', 'Endeavoring...', 'Endorsing...', 'Endowing...', 'Enduring...', 'Energizing...', 'Enforcing...', 'Engaging...', 'Engineering...', 'Engraving...',
+  'Enhancing...', 'Enjoying...', 'Enlarging...', 'Enlightening...', 'Enlisting...', 'Enlivening...', 'Enriching...', 'Enrolling...', 'Ensuring...', 'Entering...',
+  'Entertaining...', 'Enthralling...', 'Enthusing...', 'Enticing...', 'Entitling...', 'Enumerating...', 'Enveloping...', 'Envisioning...', 'Equipping...', 'Equalizing...',
+  'Erecting...', 'Erasing...', 'Escalating...', 'Escaping...', 'Escorting...', 'Establishing...', 'Esteeming...', 'Estimating...', 'Eulogizing...', 'Evaluating...',
+  'Evaporating...', 'Evolving...', 'Examining...', 'Exceeding...', 'Excelling...', 'Exchanging...', 'Exciting...', 'Excluding...', 'Executing...', 'Exercising...',
+  'Exhaling...', 'Exhibiting...', 'Exhilarating...', 'Existing...', 'Expanding...', 'Expecting...', 'Expediting...', 'Experiencing...', 'Experimenting...', 'Explaining...',
+  'Exploring...', 'Exporting...', 'Exposing...', 'Expressing...', 'Extending...', 'Externalizing...', 'Extracting...', 'Extrapolating...', 'Eyeing...',
+  // ---- F (100) ----
+  'Fabricating...', 'Facilitating...', 'Facing...', 'Factoring...', 'Fading...', 'Farming...', 'Fascinating...', 'Fashioning...', 'Fastening...', 'Fathoming...',
+  'Favoring...', 'Feathering...', 'Featuring...', 'Feeding...', 'Feeling...', 'Fencing...', 'Fermenting...', 'Ferrying...', 'Fertilizing...', 'Fetching...',
+  'Fiddling...', 'Fielding...', 'Figuring...', 'Filing...', 'Filling...', 'Filtering...', 'Financing...', 'Finding...', 'Fingerprinting...', 'Finishing...',
+  'Firing...', 'Firming...', 'Fishing...', 'Fitting...', 'Fixing...', 'Flagging...', 'Flanking...', 'Flashing...', 'Flattening...', 'Flattering...',
+  'Flavoring...', 'Fleshing...', 'Flexing...', 'Flicking...', 'Flinging...', 'Flipping...', 'Floating...', 'Flooding...', 'Flooring...', 'Flourishing...',
+  'Flowing...', 'Flushing...', 'Fluttering...', 'Flying...', 'Foaming...', 'Focusing...', 'Folding...', 'Following...', 'Forging...', 'Forgiving...',
+  'Formalizing...', 'Forming...', 'Formulating...', 'Fortifying...', 'Forwarding...', 'Fostering...', 'Founding...', 'Fragmenting...', 'Framing...', 'Freeing...',
+  'Freezing...', 'Freshening...', 'Frosting...', 'Frying...', 'Fueling...', 'Fulfilling...', 'Functioning...', 'Funding...', 'Furnishing...', 'Furthering...',
+  'Fusing...', 'Fussing...', 'Factorizing...', 'Fantasizing...', 'Faultfinding...', 'Federating...', 'Fending...', 'Ferreting...', 'Filming...', 'Finalizing...',
+  'Finessing...', 'Fireproofing...', 'Fizzing...', 'Flameproofing...', 'Fleecing...', 'Flickering...', 'Flitting...', 'Fluctuating...', 'Fluorescing...', 'Freewheeling...',
+  // ---- G (100) ----
+  'Gaining...', 'Galloping...', 'Galvanizing...', 'Gaming...', 'Gardening...', 'Garlanding...', 'Garnering...', 'Gathering...', 'Gauging...', 'Gazing...',
+  'Gearing...', 'Generalizing...', 'Generating...', 'Gesticulating...', 'Gesturing...', 'Getting...', 'Gifting...', 'Giggling...', 'Gilding...', 'Girding...',
+  'Giving...', 'Glancing...', 'Glazing...', 'Gleaming...', 'Gleaning...', 'Glimmering...', 'Glimpsing...', 'Gliding...', 'Glistening...', 'Glittering...',
+  'Glowing...', 'Glueing...', 'Goading...', 'Gobbling...', 'Golfing...', 'Governing...', 'Grabbing...', 'Graduating...', 'Grafting...', 'Granting...',
+  'Graphing...', 'Grasping...', 'Gratifying...', 'Grating...', 'Greasing...', 'Greeting...', 'Gridding...', 'Grilling...', 'Grinding...', 'Gripping...',
+  'Grooving...', 'Grooming...', 'Grounding...', 'Grouping...', 'Growing...', 'Guaranteeing...', 'Guarding...', 'Guessing...', 'Guiding...', 'Gushing...',
+  'Gusting...', 'Gutting...', 'Guzzling...', 'Gamboling...', 'Gating...', 'Gazetting...', 'Gelling...', 'Gentrifying...', 'Germinating...', 'Gestating...',
+  'Ghosting...', 'Glaciating...', 'Gladdening...', 'Globalizing...', 'Glorifying...', 'Glossing...', 'Gonging...', 'Gouging...', 'Grandstanding...', 'Granulating...',
+  'Gravitating...', 'Grazing...', 'Greening...', 'Grimacing...', 'Grubbing...', 'Gurgling...', 'Gyrating...', 'Gabbing...', 'Gaffing...', 'Gallivanting...',
+  'Galumphing...', 'Garbling...', 'Garrisoning...', 'Gasping...', 'Gentling...', 'Geotagging...', 'Gimballing...', 'Glinting...', 'Gorging...', 'Grinning...',
+  // ---- H (100) ----
+  'Habilitating...', 'Hacking...', 'Haggling...', 'Hailing...', 'Halting...', 'Hammering...', 'Handcrafting...', 'Handing...', 'Handling...', 'Hanging...',
+  'Happening...', 'Harboring...', 'Hardening...', 'Harmonizing...', 'Harnessing...', 'Harvesting...', 'Hashing...', 'Hastening...', 'Hatching...', 'Hauling...',
+  'Having...', 'Heading...', 'Healing...', 'Heaping...', 'Hearing...', 'Heartening...', 'Heating...', 'Heaving...', 'Hedging...', 'Heeding...',
+  'Helping...', 'Heralding...', 'Herding...', 'Hesitating...', 'Hibernating...', 'Hiding...', 'Highlighting...', 'Hiking...', 'Hinging...', 'Hinting...',
+  'Hiring...', 'Hitting...', 'Hoarding...', 'Hoisting...', 'Holding...', 'Hollowing...', 'Homing...', 'Honing...', 'Honoring...', 'Hooking...',
+  'Hopping...', 'Hoping...', 'Horsing...', 'Hosting...', 'Hotfixing...', 'Hovering...', 'Howling...', 'Huddling...', 'Hugging...', 'Hulling...',
+  'Humanizing...', 'Humbling...', 'Humming...', 'Hunting...', 'Hurling...', 'Hurrying...', 'Hushing...', 'Hustling...', 'Hybridizing...', 'Hydrating...',
+  'Hydroplaning...', 'Hymning...', 'Hyping...', 'Hypothesizing...', 'Habituating...', 'Hairdressing...', 'Hallowing...', 'Halving...', 'Handholding...', 'Handpicking...',
+  'Handwriting...', 'Hankering...', 'Hardcoding...', 'Harkening...', 'Hawking...', 'Haymaking...', 'Headhunting...', 'Headlining...', 'Heartwarming...', 'Heightening...',
+  'Heehawing...', 'Homesteading...', 'Homeschooling...', 'Honeying...', 'Hooping...', 'Hornswoggling...', 'Hosing...', 'Hounding...', 'Huckstering...', 'Humoring...',
+  // ---- I (100) ----
+  'Idealizing...', 'Identifying...', 'Igniting...', 'Ignoring...', 'Illuminating...', 'Illustrating...', 'Imagining...', 'Imitating...', 'Immersing...', 'Immortalizing...',
+  'Impacting...', 'Imparting...', 'Impersonating...', 'Implementing...', 'Implicating...', 'Importing...', 'Imposing...', 'Impressing...', 'Imprinting...', 'Improving...',
+  'Improvising...', 'Inaugurating...', 'Incentivizing...', 'Inching...', 'Including...', 'Incorporating...', 'Increasing...', 'Incrementing...', 'Incubating...', 'Incurring...',
+  'Indenting...', 'Indexing...', 'Indicating...', 'Inducting...', 'Indulging...', 'Industrializing...', 'Inferring...', 'Infiltrating...', 'Inflating...', 'Influencing...',
+  'Informing...', 'Infusing...', 'Ingesting...', 'Inhabiting...', 'Inhaling...', 'Inheriting...', 'Inhibiting...', 'Initializing...', 'Initiating...', 'Injecting...',
+  'Injuring...', 'Inking...', 'Innovating...', 'Inoculating...', 'Inquiring...', 'Inscribing...', 'Inserting...', 'Insisting...', 'Inspecting...', 'Inspiring...',
+  'Installing...', 'Instantiating...', 'Instigating...', 'Instilling...', 'Instituting...', 'Instructing...', 'Insulating...', 'Insuring...', 'Integrating...', 'Intending...',
+  'Intensifying...', 'Interacting...', 'Intercepting...', 'Interfacing...', 'Interleaving...', 'Interlinking...', 'Interlacing...', 'Interlocking...', 'Interning...', 'Interpolating...',
+  'Interpreting...', 'Interrogating...', 'Interrupting...', 'Intersecting...', 'Intervening...', 'Interviewing...', 'Interweaving...', 'Intoning...', 'Introducing...', 'Intuiting...',
+  'Inventing...', 'Inventorying...', 'Inverting...', 'Investing...', 'Investigating...', 'Invigorating...', 'Inviting...', 'Involving...', 'Ionizing...', 'Iterating...',
+  // ---- J ----
+  'Jabbing...', 'Jacketing...', 'Jailing...', 'Jamming...', 'Jangling...', 'Jarring...', 'Jaunting...', 'Jazzing...',
+  'Jeering...', 'Jelling...', 'Jeopardizing...', 'Jerking...', 'Jesting...', 'Jettisoning...', 'Jeweling...', 'Jibing...',
+  'Jiggling...', 'Jigsawing...', 'Jilting...', 'Jingling...', 'Jiving...', 'Jobbing...', 'Jockeying...', 'Jogging...',
+  'Joining...', 'Joking...', 'Jollying...', 'Jolting...', 'Jostling...', 'Jotting...', 'Journeying...', 'Jousting...',
+  'Joyriding...', 'Judging...', 'Juggling...', 'Julienning...', 'Jumping...', 'Junketing...', 'Justifying...', 'Jutting...',
+  'Juxtaposing...', 'Jabbering...', 'Jading...', 'Jalousing...', 'Japing...', 'Jargonizing...', 'Jauncing...', 'Jawboning...',
+  'Jawing...', 'Jeopardying...', 'Jellifying...', 'Jemmying...', 'Jettying...', 'Jewelling...', 'Jibbing...', 'Jigging...',
+  'Jitterbugging...', 'Jinxing...', 'Jittering...', 'Jobhunting...', 'Joggling...', 'Joisting...', 'Jokifying...', 'Jollifying...',
+  'Jonesing...', 'Joshing...', 'Jouking...', 'Journalling...', 'Jovializing...', 'Jowing...', 'Joying...', 'Joypopping...',
+  'Jubilating...', 'Juddering...', 'Judoing...', 'Juking...', 'Jumbling...', 'Jumpstarting...', 'Junking...', 'Jurifying...',
+  'Jurying...', 'Justling...', 'Juicing...', 'Jouncing...', 'Javelining...', 'Jocundizing...', 'Japering...', 'Japonicaing...',
+  'Jasperizing...', 'Jazzercising...', 'Jellyfishing...', 'Jerrybuilding...', 'Jerseying...', 'Jessying...', 'Jobseeking...', 'Jointing...',
+  'Junketeering...', 'Jawbreaking...', 'Jaywalking...',
+  // ---- K ----
+  'Keeling...', 'Keening...', 'Keeping...', 'Kenning...', 'Kerbing...', 'Kerneling...', 'Kettling...', 'Keyboarding...',
+  'Keying...', 'Keynoting...', 'Kibitzing...', 'Kicking...', 'Kidding...', 'Kidnapping...', 'Kilning...', 'Kindling...',
+  'Kinging...', 'Kinking...', 'Kissing...', 'Kitting...', 'Kneading...', 'Kneeling...', 'Knifing...', 'Knighting...',
+  'Knitting...', 'Knocking...', 'Knotting...', 'Knowing...', 'Knuckling...', 'Koshering...', 'Kowtowing...', 'Kvetching...',
+  'Karaoking...', 'Kayoing...', 'Kecking...', 'Kedging...', 'Keeking...', 'Kelping...', 'Kenneling...', 'Keratinizing...',
+  'Kerfing...', 'Kernelling...', 'Kibbutzing...', 'Kiboshing...', 'Kickboxing...', 'Kickstarting...', 'Kiddying...', 'Kiltering...',
+  'Kippering...', 'Kiting...', 'Kittening...', 'Klaxoning...', 'Knapping...', 'Kneecapping...', 'Knelling...', 'Knobbling...',
+  'Knolling...', 'Kodaking...', 'Konking...', 'Kooking...', 'Koreanizing...', 'Kremlining...', 'Krumping...', 'Kudosing...',
+  'Kurbling...', 'Kvelling...', 'Kingmaking...', 'Kyanising...', 'Kyboshing...', 'Kything...', 'Kaolinizing...', 'Kaputing...',
+  'Katalysing...', 'Kathoding...', 'Keshing...', 'Keypunching...', 'Khediving...', 'Kalsomining...', 'Kamiing...', 'Kantianing...',
+  'Karaokeing...', 'Karateing...', 'Karstifying...', 'Katabolizing...', 'Kathing...', 'Kazaching...', 'Kebabbing...', 'Kebobbing...',
+  'Keeving...', 'Keelhauling...', 'Keenlying...', 'Keepnetting...', 'Keltering...', 'Kerseying...', 'Ketling...', 'Keyframing...',
+  'Keyseating...', 'Kibbling...', 'Kickboarding...', 'Kickflipping...', 'Kidneystoning...', 'Kieving...', 'Kimchifying...', 'Kimmering...',
+  'Kindergartening...', 'Kinescoping...', 'Kingfishing...', 'Kirkifying...', 'Kirshening...', 'Kitbagging...', 'Kitchening...', 'Kitesurfing...',
+  'Klondiking...', 'Kludging...', 'Knackering...', 'Kneippering...', 'Knobkerrying...', 'Knowledging...', 'Kohlrabiing...', 'Koorifying...',
+  'Kotowing...', 'Kronaing...', 'Krytroning...', 'Kugelhopfing...', 'Kumquating...', 'Kurrajonging...', 'Kyanizing...',
+  // ---- L (100) ----
+  'Labeling...', 'Laboring...', 'Lacing...', 'Laddering...', 'Lading...', 'Lagging...', 'Lambasting...', 'Laminating...', 'Landing...', 'Languishing...',
+  'Lapping...', 'Lapsing...', 'Larding...', 'Lashing...', 'Lasting...', 'Latching...', 'Lathering...', 'Lauding...', 'Laughing...', 'Launching...',
+  'Laundering...', 'Lavishing...', 'Laying...', 'Lazing...', 'Leaching...', 'Leading...', 'Leafing...', 'Leaking...', 'Leaning...', 'Leaping...',
+  'Learning...', 'Leasing...', 'Leathering...', 'Leaving...', 'Lecturing...', 'Ledgering...', 'Leeching...', 'Leering...', 'Legitimizing...', 'Lending...',
+  'Lengthening...', 'Lessening...', 'Letting...', 'Leveling...', 'Leveraging...', 'Levying...', 'Liberating...', 'Licensing...', 'Licking...', 'Lifting...',
+  'Lightening...', 'Lighting...', 'Liking...', 'Limbering...', 'Limiting...', 'Lining...', 'Linking...', 'Lionizing...', 'Liquidating...', 'Lisping...',
+  'Listening...', 'Litigating...', 'Littering...', 'Living...', 'Loading...', 'Loafing...', 'Loaning...', 'Lobbying...', 'Lobing...', 'Localizing...',
+  'Locating...', 'Locking...', 'Lodging...', 'Lofting...', 'Logging...', 'Longing...', 'Looking...', 'Looping...', 'Loosening...', 'Looting...',
+  'Loping...', 'Losing...', 'Lounging...', 'Loving...', 'Lowering...', 'Lubricating...', 'Lugging...', 'Lulling...', 'Lumbering...', 'Lumping...',
+  'Lunching...', 'Lunging...', 'Luring...', 'Lurking...', 'Lustering...', 'Lustrating...', 'Luxuriating...', 'Lying...', 'Lynching...', 'Lyricizing...',
+  // ---- M (100) ----
+  'Machining...', 'Magnetizing...', 'Magnifying...', 'Maintaining...', 'Mainstreaming...', 'Making...', 'Managing...', 'Mandating...',
+  'Maneuvering...', 'Mangling...', 'Manifesting...', 'Manipulating...', 'Manning...', 'Manufacturing...', 'Mapping...', 'Marching...',
+  'Marketing...', 'Marking...', 'Marrying...', 'Marshaling...', 'Marveling...', 'Mashing...', 'Masking...', 'Massaging...',
+  'Massing...', 'Mastering...', 'Matching...', 'Materializing...', 'Matriculating...', 'Mattering...', 'Maximizing...', 'Meaning...',
+  'Measuring...', 'Mediating...', 'Meditating...', 'Meeting...', 'Melding...', 'Mellowing...', 'Melting...', 'Memorizing...',
+  'Mending...', 'Mentioning...', 'Mentoring...', 'Merging...', 'Meriting...', 'Meshing...', 'Mesmerizing...', 'Messaging...',
+  'Metabolizing...', 'Metalworking...', 'Metamorphosing...', 'Metering...', 'Microblogging...', 'Microchipping...', 'Microfilming...', 'Micromanaging...',
+  'Migrating...', 'Milking...', 'Milling...', 'Mimicking...', 'Mincing...', 'Minding...', 'Mingling...', 'Miniaturizing...',
+  'Minimizing...', 'Mining...', 'Ministering...', 'Minting...', 'Mirroring...', 'Misaligning...', 'Miscalculating...', 'Misdiagnosing...',
+  'Misfiring...', 'Misjudging...', 'Mislaying...', 'Mismatching...', 'Misplacing...', 'Misquoting...', 'Misreading...', 'Missing...',
+  'Misspelling...', 'Mistaking...', 'Misting...', 'Misunderstanding...', 'Mitigating...', 'Mixing...', 'Moaning...', 'Mobilizing...',
+  'Mocking...', 'Modeling...', 'Moderating...', 'Modernizing...', 'Modifying...', 'Modularizing...', 'Modulating...', 'Moistening...',
+  'Moisturizing...', 'Molding...', 'Mollifying...', 'Monitoring...', 'Monetizing...', 'Monogramming...', 'Monologuing...', 'Monopolizing...',
+  'Mooring...', 'Moralizing...', 'Morphing...', 'Mortgaging...', 'Moseying...', 'Motivating...', 'Motoring...', 'Mottling...',
+  'Moulding...', 'Mounting...', 'Mountaineering...', 'Mourning...', 'Mousetrapping...', 'Mouthing...', 'Moving...', 'Mowing...',
+  'Muckraking...', 'Muddling...', 'Mudslinging...', 'Muffling...', 'Mulching...', 'Multiplying...', 'Multiplexing...', 'Multitasking...',
+  'Mumbling...', 'Mummifying...', 'Munching...', 'Murmuring...', 'Muscling...', 'Musicalizing...', 'Musing...', 'Musseling...',
+  'Mustering...', 'Mutating...', 'Muting...', 'Mutinying...', 'Muttering...', 'Mutualizing...', 'Muzzling...', 'Mystifying...',
+  'Mailing...', 'Mamboing...', 'Manacling...', 'Manhandling...', 'Manicuring...', 'Mansplaining...', 'Mantling...', 'Marinating...',
+  'Marooning...', 'Marring...', 'Masquerading...', 'Masterminding...', 'Masticating...', 'Mauling...', 'Meandering...', 'Mechanizing...',
+  'Meddling...', 'Meliorating...', 'Melodizing...', 'Memorializing...', 'Menacing...', 'Mercerizing...', 'Merchandising...', 'Metallizing...',
+  'Mildewing...', 'Militating...', 'Mimeographing...', 'Mindmapping...', 'Minesweeping...', 'Misappropriating...', 'Misconstruing...', 'Misrepresenting...',
+  // ---- N (100) ----
+  'Nabbing...', 'Nailing...', 'Naming...', 'Nanosizing...', 'Napping...', 'Narrating...', 'Narrowing...', 'Nattering...',
+  'Naturalizing...', 'Navigating...', 'Neatening...', 'Nebulizing...', 'Necessitating...', 'Necking...', 'Necropsying...', 'Needling...',
+  'Negating...', 'Negotiating...', 'Nerving...', 'Nesting...', 'Nestling...', 'Netting...', 'Nettling...', 'Networking...',
+  'Neutralizing...', 'Newscasting...', 'Nibbling...', 'Nicking...', 'Nicknaming...', 'Nictitating...', 'Niggling...', 'Nipping...',
+  'Nitpicking...', 'Nobbling...', 'Nocking...', 'Nodding...', 'Noising...', 'Nominating...', 'Nonplussing...', 'Noodling...',
+  'Normalizing...', 'Nosediving...', 'Nosing...', 'Notarizing...', 'Notating...', 'Notching...', 'Noticing...', 'Notifying...',
+  'Noting...', 'Nourishing...', 'Novelizing...', 'Nucleating...', 'Nudging...', 'Nuggetting...', 'Nuking...', 'Nullifying...',
+  'Numbering...', 'Numbing...', 'Nursemaiding...', 'Nursing...', 'Nurturing...', 'Nutmegging...', 'Nuzzling...', 'Narrowcasting...',
+  // ---- O (100) ----
+  'Obeying...', 'Objecting...', 'Objectivizing...', 'Obligating...', 'Obliging...', 'Obliterating...', 'Obnubilating...', 'Obscuring...',
+  'Observing...', 'Obsessing...', 'Obsoleting...', 'Obstructing...', 'Obtaining...', 'Obtruding...', 'Obviating...', 'Occasioning...',
+  'Occupying...', 'Occurring...', 'Offering...', 'Officiating...', 'Offloading...', 'Offsetting...', 'Ogling...', 'Oiling...',
+  'Okaying...', 'Ominating...', 'Omitting...', 'Onboarding...', 'Oozing...', 'Opacifying...', 'Opalescing...', 'Opening...',
+  'Operating...', 'Opining...', 'Opposing...', 'Optimizing...', 'Optioning...', 'Orating...', 'Orbiting...', 'Orchestrating...',
+  'Ordaining...', 'Ordering...', 'Organizing...', 'Orienting...', 'Originating...', 'Ornamenting...', 'Orphaning...', 'Oscillating...',
+  'Ossifying...', 'Ostracizing...', 'Outbidding...', 'Outclassing...', 'Outdoing...', 'Outfitting...', 'Outgrowing...', 'Outlasting...',
+  'Outlining...', 'Outmaneuvering...', 'Outpacing...', 'Outperforming...', 'Outreaching...', 'Outsmarting...', 'Outsourcing...', 'Outstripping...',
+  'Outwitting...', 'Overachieving...', 'Overarching...', 'Overbalancing...', 'Overbooking...', 'Overbuilding...', 'Overcoming...', 'Overcompensating...',
+  'Overdelivering...', 'Overdoing...', 'Overeating...', 'Overemphasizing...', 'Overestimating...', 'Overflowing...', 'Overhauling...', 'Overhearing...',
+  'Overheating...', 'Overlaying...', 'Overloading...', 'Overlooking...', 'Overpowering...', 'Overprinting...', 'Overproducing...', 'Overreaching...',
+  'Overriding...', 'Overruling...', 'Overseeing...', 'Overshadowing...', 'Overshooting...', 'Oversimplifying...', 'Oversleeping...', 'Overstating...',
+  'Overstepping...', 'Overstocking...', 'Overstretching...', 'Overtaking...', 'Overthinking...', 'Overthrowing...', 'Overturning...', 'Overvaluing...',
+  'Overwatching...', 'Overwhelming...', 'Owing...', 'Owning...', 'Oxidizing...', 'Oxygenating...', 'Ozonizing...', 'Obolizing...',
+  // ---- P ----
+  'Pacing...', 'Packaging...', 'Packing...', 'Padding...', 'Paddling...', 'Paging...', 'Painting...', 'Pairing...',
+  'Palatalizing...', 'Palling...', 'Palming...', 'Palpating...', 'Pampering...', 'Panelizing...', 'Panicking...', 'Pantomiming...',
+  'Papering...', 'Parachuting...', 'Parading...', 'Paragliding...', 'Paralysing...', 'Paraphrasing...', 'Parceling...', 'Pardoning...',
+  'Parenting...', 'Pariking...', 'Parking...', 'Parleying...', 'Parodying...', 'Paroling...', 'Parrying...', 'Parsing...',
+  'Partaking...', 'Partitioning...', 'Partnering...', 'Partying...', 'Passing...', 'Passivizing...', 'Pasting...', 'Pastoring...',
+  'Patching...', 'Patenting...', 'Patrolling...', 'Patronizing...', 'Patterning...', 'Pausing...', 'Paving...', 'Pawing...',
+  'Paying...', 'Peaking...', 'Pealing...', 'Pecking...', 'Pedaling...', 'Peeking...', 'Peeling...', 'Peering...',
+  'Pegging...', 'Pelting...', 'Penalizing...', 'Penciling...', 'Pending...', 'Penetrating...', 'Pensioning...', 'Peppering...',
+  'Perceiving...', 'Perching...', 'Perfecting...', 'Perforating...', 'Performing...', 'Perfuming...', 'Perishing...', 'Permeating...',
+  'Permitting...', 'Permuting...', 'Perpetuating...', 'Perplexing...', 'Persevering...', 'Persisting...', 'Personalizing...', 'Personifying...',
+  'Persuading...', 'Perving...', 'Pestering...', 'Petitioning...', 'Petrifying...', 'Pettifogging...', 'Phaseing...', 'Philandering...',
+  'Philosophizing...', 'Phoneing...', 'Photocopying...', 'Photographing...', 'Photosynthesizing...', 'Phrasing...', 'Picking...', 'Picnicking...',
+  'Picturing...', 'Piecing...', 'Piercing...', 'Piggybacking...', 'Pilfering...', 'Piloting...', 'Pinching...', 'Pinging...',
+  'Pinning...', 'Pioneering...', 'Piping...', 'Pitching...', 'Pitying...', 'Pivoting...', 'Placating...', 'Placing...',
+  'Plagiarizing...', 'Plaiting...', 'Planning...', 'Planting...', 'Plastering...', 'Plating...', 'Playing...', 'Pleading...',
+  'Pleasuring...', 'Pledging...', 'Plodding...', 'Plotting...', 'Ploughing...', 'Plowing...', 'Plucking...', 'Plugging...',
+  'Plumbing...', 'Plummeting...', 'Plumping...', 'Plundering...', 'Plunging...', 'Pluralizing...', 'Plying...', 'Poaching...',
+  'Pocketing...', 'Podcasting...', 'Poeticizing...', 'Pointing...', 'Poising...', 'Poisoning...', 'Poking...', 'Polarizing...',
+  'Policing...', 'Polishing...', 'Politicizing...', 'Pollinating...', 'Polling...', 'Pondering...', 'Pooling...', 'Popping...',
+  'Popularizing...', 'Populating...', 'Poring...', 'Porting...', 'Portioning...', 'Portraying...', 'Posing...', 'Positioning...',
+  'Positing...', 'Possessing...', 'Posting...', 'Postponing...', 'Postulating...', 'Posturing...', 'Potting...', 'Pouncing...',
+  'Pounding...', 'Pouring...', 'Pouting...', 'Powdering...', 'Powering...', 'Practicing...', 'Praising...', 'Prancing...',
+  'Prattling...', 'Praying...', 'Preaching...', 'Preambleing...', 'Preceding...', 'Precipitating...', 'Precluding...', 'Precooking...',
+  'Predicting...', 'Predisposing...', 'Prefacing...', 'Preferring...', 'Prefiguring...', 'Prefixing...', 'Preheating...', 'Prejudging...',
+  'Preluding...', 'Premising...', 'Preoccupying...', 'Preordaining...', 'Preparing...', 'Prepaving...', 'Prepaying...', 'Preponderating...',
+  'Prerecording...', 'Prescribing...', 'Presenting...', 'Preserving...', 'Presetting...', 'Presiding...', 'Pressuring...', 'Pressurizing...',
+  'Prestressing...', 'Presuming...', 'Pretending...', 'Prettifying...', 'Prevailing...', 'Preventing...', 'Previewing...', 'Preying...',
+  'Pricing...', 'Pricking...', 'Pridiing...', 'Priming...', 'Printing...', 'Prioritizing...', 'Privatizing...', 'Privileging...',
+  'Prizing...', 'Probing...', 'Proceeding...', 'Processing...', 'Proclaiming...', 'Procrastinating...', 'Procuring...', 'Prodding...',
+  'Producing...', 'Profaning...', 'Professing...', 'Profiling...', 'Profiting...', 'Programming...', 'Progressing...', 'Prohibiting...',
+  'Projecting...', 'Proliferating...', 'Prolonging...', 'Promenading...', 'Promising...', 'Promoting...', 'Prompting...', 'Promulgating...',
+  'Pronouncing...', 'Proofing...', 'Proofreading...', 'Propagating...', 'Propelling...', 'Prophesying...', 'Proposing...', 'Propping...',
+  'Proroguing...', 'Prosecuting...', 'Proselytizing...', 'Prospecting...', 'Prospering...', 'Protecting...', 'Protesting...', 'Protruding...',
+  'Proving...', 'Providing...', 'Provisioning...', 'Provoking...', 'Prowling...', 'Pruning...', 'Psyching...', 'Publicizing...',
+  'Publishing...', 'Puckering...', 'Puffing...', 'Pulling...', 'Pulping...', 'Pulsating...', 'Pulverizing...', 'Pummeling...',
+  'Pumping...', 'Punching...', 'Puncturing...', 'Punishing...', 'Punning...', 'Purging...', 'Purifying...', 'Purloining...',
+  'Purporting...', 'Purring...', 'Pursuing...', 'Pushing...', 'Putting...', 'Puzzling...', 'Pyramiding...',
+  // ---- Q ----
+  'Quacking...', 'Quadrupling...', 'Quaffing...', 'Quailing...', 'Qualifying...', 'Quantifying...', 'Quarreling...', 'Quarrying...',
+  'Quartering...', 'Quashing...', 'Quavering...', 'Queening...', 'Quelling...', 'Quenching...', 'Querying...', 'Questing...',
+  'Questioning...', 'Queueing...', 'Quickening...', 'Quieting...', 'Quilting...', 'Quipping...', 'Quivering...', 'Quizzing...',
+  'Quoting...',
+  // ---- R ----
+  'Racing...', 'Racking...', 'Radiating...', 'Raffling...', 'Rafting...', 'Raging...', 'Raining...', 'Raising...',
+  'Rallying...', 'Rambling...', 'Ramifying...', 'Ramping...', 'Ransacking...', 'Ransoming...', 'Ranting...', 'Rapping...',
+  'Rapproching...', 'Rapturing...', 'Raring...', 'Rasping...', 'Ratifying...', 'Rating...', 'Rationalizing...',
+  'Rationing...', 'Rattling...', 'Ravaging...', 'Raving...', 'Reaching...', 'Reacting...', 'Readjusting...', 'Readying...',
+  'Realigning...', 'Realizing...', 'Reallocating...', 'Reanimating...', 'Reaping...', 'Reappearing...', 'Reapplying...', 'Rearranging...',
+  'Reasoning...', 'Reassembling...', 'Reasserting...', 'Reassessing...', 'Reassigning...', 'Reassuring...', 'Rebalancing...', 'Rebating...',
+  'Rebelling...', 'Rebooting...', 'Rebounding...', 'Rebranding...', 'Rebuilding...', 'Rebuking...', 'Recalculating...', 'Recalibrating...',
+  'Recalling...', 'Recanting...', 'Recapping...', 'Recapturing...', 'Receding...', 'Receiving...', 'Recentering...', 'Recharging...',
+  'Rechecking...', 'Rechristening...', 'Recirculating...', 'Reciting...', 'Reclaiming...', 'Reclassifying...', 'Reclining...', 'Recognizing...',
+  'Recoiling...', 'Recollecting...', 'Recommending...', 'Recommissioning...', 'Recompiling...', 'Reconciling...', 'Reconfiguring...', 'Reconnecting...',
+  'Reconsidering...', 'Reconstituting...', 'Reconstructing...', 'Recording...', 'Recounting...', 'Recouping...', 'Recovering...', 'Recreating...',
+  'Recruiting...', 'Rectifying...', 'Recuperating...', 'Recurring...', 'Recycling...', 'Redacting...', 'Redefining...', 'Redeploying...',
+  'Redesigning...', 'Redeveloping...', 'Redialing...', 'Redirecting...', 'Rediscovering...', 'Redistributing...', 'Redoing...', 'Redoubling...',
+  'Redrafting...', 'Reducing...', 'Reeling...', 'Refactoring...', 'Referencing...', 'Referring...', 'Refilling...', 'Refinancing...',
+  'Refining...', 'Refitting...', 'Reflecting...', 'Reformatting...', 'Reforming...', 'Refracting...', 'Refraining...', 'Refreshing...',
+  'Refueling...', 'Refunding...', 'Refurbishing...', 'Refusing...', 'Refuting...', 'Regaining...', 'Regaling...', 'Regarding...',
+  'Regenerating...', 'Registering...', 'Regressing...', 'Regretting...', 'Regrouping...', 'Regulating...', 'Rehabilitating...', 'Rehearsing...',
+  'Reigning...', 'Reimbursing...', 'Reinforcing...', 'Reining...', 'Reinstalling...', 'Reinstating...', 'Reintegrating...', 'Reinterpreting...',
+  'Reintroducing...', 'Reinventing...', 'Reinvesting...', 'Reissuing...', 'Reiterating...', 'Rejecting...', 'Rejoicing...', 'Rejoining...',
+  'Rejuvenating...', 'Rekindling...', 'Relating...', 'Relaxing...', 'Relaying...', 'Releasing...', 'Relegating...', 'Relenting...',
+  'Relieving...', 'Relighting...', 'Relishing...', 'Reliving...', 'Reloading...', 'Relocating...', 'Relying...', 'Remaining...',
+  'Remanding...', 'Remarking...', 'Remarrying...', 'Remastering...', 'Remedying...', 'Remembering...', 'Reminding...', 'Reminiscing...',
+  'Remitting...', 'Remodeling...', 'Remolding...', 'Remonstrating...', 'Removing...', 'Rendering...', 'Rendezvousing...', 'Reneging...',
+  'Renegotiating...', 'Renewing...', 'Renouncing...', 'Renovating...', 'Renting...', 'Reopening...', 'Reorganizing...', 'Repacking...',
+  'Repairing...', 'Repaying...', 'Repealing...', 'Repeating...', 'Repelling...', 'Repenting...', 'Repercussing...', 'Replacing...',
+  'Replaying...', 'Replenishing...', 'Replicating...', 'Replying...', 'Repointing...', 'Reporting...', 'Reposing...', 'Repositioning...',
+  'Representing...', 'Repressing...', 'Reprimanding...', 'Reprinting...', 'Reproaching...', 'Reprocessing...', 'Reproducing...', 'Reprogramming...',
+  'Reproving...', 'Repulsing...', 'Repurposing...', 'Requesting...', 'Requiring...', 'Requisitioning...', 'Requiting...', 'Rescinding...',
+  'Rescuing...', 'Researching...', 'Reselling...', 'Resembling...', 'Resenting...', 'Reserving...', 'Resetting...', 'Resettling...',
+  'Reshaping...', 'Residing...', 'Resigning...', 'Resisting...', 'Reskilling...', 'Resoling...', 'Resolving...', 'Resonating...',
+  'Resorting...', 'Resounding...', 'Respecting...', 'Respiring...', 'Responding...', 'Restarting...', 'Restating...', 'Resting...',
+  'Restocking...', 'Restoring...', 'Restraining...', 'Restricting...', 'Restructuring...', 'Resulting...', 'Resuming...', 'Resurfacing...',
+  'Resurging...', 'Resurrecting...', 'Retailing...', 'Retaining...', 'Retaliating...', 'Retelling...', 'Rethinking...', 'Retiring...',
+  'Retorting...', 'Retouching...', 'Retracing...', 'Retracting...', 'Retraining...', 'Retranslating...', 'Retreating...', 'Retrieving...',
+  'Retrofitting...', 'Retrying...', 'Returning...', 'Reunifying...', 'Reuniting...', 'Reusing...', 'Revealing...', 'Reveling...',
+  'Revenging...', 'Reverberating...', 'Revering...', 'Reversing...', 'Reverting...', 'Reviewing...', 'Reviling...', 'Revising...',
+  'Revisiting...', 'Revitalizing...', 'Reviving...', 'Revoking...', 'Revolting...', 'Revolutionizing...', 'Revolving...', 'Rewarding...',
+  'Rewiring...', 'Rewording...', 'Reworking...', 'Rewriting...', 'Rhapsodizing...', 'Rhyming...', 'Ribbing...', 'Ridding...',
+  'Riding...', 'Riffling...', 'Rifling...', 'Rigging...', 'Righting...', 'Rimming...', 'Ringing...', 'Rinsing...',
+  'Rioting...', 'Ripping...', 'Rippling...', 'Rising...', 'Risking...', 'Rivaling...', 'Riveting...', 'Roaming...',
+  'Roaring...', 'Roasting...', 'Robbing...', 'Robing...', 'Rocking...', 'Rolling...', 'Romancing...', 'Romanticizing...',
+  'Roofing...', 'Rooming...', 'Rooting...', 'Roping...', 'Rorting...', 'Rostering...', 'Rotating...', 'Roting...',
+  'Roughening...', 'Rounding...', 'Rousing...', 'Rousting...', 'Roving...', 'Rowing...', 'Rubbing...', 'Ruining...',
+  'Ruling...', 'Rumbling...', 'Ruminating...', 'Rummaging...', 'Running...', 'Ruptioning...', 'Rushing...', 'Rusticating...',
+  'Rustling...', 'Reticulating...',
 ];
 
 // ---- ANSI helpers ----
@@ -301,6 +585,39 @@ function stripAnsi(s) {
     .replace(/\x1b\[[0-9;?]* [a-zA-Z]/g, '')
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
 }
+
+// Make UNTRUSTED text safe to paint: file contents from Read, command output from
+// Bash, diff bodies, tool arguments.
+//
+// The goal is to keep the content as ORIGINAL as possible while stopping the
+// terminal from OBEYING it. Only the ESC byte is rewritten — every following byte
+// (the `[31m`, the `[10;20H` parameters) is shown verbatim, so nothing is lost:
+//
+//     file contains:  ESC [ 3 1 m E R R O R ESC [ 0 m
+//     screen shows :  ^[ [ 3 1 m E R R O R ^[ [ 0 m
+//
+// A terminal cannot act on a sequence whose ESC has been split into `^[`, so:
+//   * `ESC[31m`   no longer recolours half the transcript
+//   * `ESC[0m`    no longer resets the row's styling mid-line
+//   * `ESC[10;20H` / `ESC[2J` no longer move the cursor or clear the screen
+//
+// `^[` is the same convention `cat -v`, `less` and `bat` use for ESC, so it reads
+// as "there is an escape here" rather than as content. Tab is kept (the renderer
+// expands it) and newlines are the caller's business; only the dangerous C0
+// controls are defanged, and they are shown as their caret form so they remain
+// visible instead of silently vanishing.
+export function sanitizeText(s) {
+  return String(s == null ? '' : s)
+    // ESC -> "^[" . The rest of the sequence is untouched.
+    .replace(/\x1b/g, '^[')
+    // A bare BEL/BS/VT/FF would still be interpreted by some terminals.
+    .replace(/\x07/g, '^G')
+    .replace(/\x08/g, '^H')
+    .replace(/[\x0b\x0c]/g, ' ')
+    // Drop NUL and the remaining C0 controls (they have no visible form).
+    .replace(/[\x00-\x06\x0e-\x1f\x7f]/g, '');
+}
+
 function visualCol(s) { return visualWidth(stripAnsi(String(s))); }
 function col(text, c) { return c + String(text) + C.reset; }
 
@@ -787,7 +1104,12 @@ function keyArgument(name, args, workspace) {
   for (const k of keys) {
     const v = args[k];
     if (typeof v !== 'string' || !v.length) continue;
-    let text = v.split('\n')[0];
+    // Neutralise escapes BEFORE measuring: sanitizeText turns ESC into the two
+    // visible characters `^[`, so truncating first and sanitizing after made a
+    // long command (a `node -e "…"` one-liner is the usual case) come out `+1`
+    // column wider than MAX_ARG — and a trailing ESC cut at the boundary left the
+    // row ending in a bare `^` instead of a proper `…`.
+    let text = sanitizeText(v.split('\n')[0]);
     // Make absolute paths under the workspace relative (shorter + familiar).
     if ((k === 'path' || k === 'file_path') && path.isAbsolute(text) && workspace) {
       const rel = path.relative(workspace, text);
@@ -807,7 +1129,7 @@ function keyArgument(name, args, workspace) {
 // "● Using Read (src/tui.js)" while running, "● Used Read (src/tui.js)" when done.
 // The verb is plain (white) / green once finished; the tool NAME is always the
 // theme (cyan) colour; the key argument is dim/gray.
-export function formatToolLine(msg, workspace, spin) {
+export function formatToolLine(msg, workspace, spin, pulseStart) {
   const name = msg.toolName || '';
   const arg = keyArgument(name, msg.toolArgs, workspace);
   const verb = msg.pending ? 'Using' : 'Used';
@@ -822,15 +1144,27 @@ export function formatToolLine(msg, workspace, spin) {
     const SWEEP = 6;                 // 0.5s
     const HALF  = SWEEP + SWEEP;     // 12 ticks per colour pair (sweep + sweep back)
     const CYCLE = HALF * 2;          // 24 ticks for the full loop (~2s)
-    const inCycle = spin % CYCLE;
+    // Phase is measured from the tick the pulse BEGAN (state.pulseStart), not
+    // from 0: the spinner has been running since turn start, so a raw
+    // `spin % CYCLE` dropped the pulse into a mid-cycle colour (often the red
+    // half) the instant the start animation handed over.
+    const inCycle = ((spin - (pulseStart || spin)) % CYCLE + CYCLE) % CYCLE;
     const inHalf  = inCycle % HALF;       // 0..23 within this colour pair's half
     const phase   = inCycle < HALF ? 0 : 1; // 0 = l↔c, 1 = c↔b
 
-    // Colours as plain RGB triples (mirroring Working's orange→yellow/red pattern):
-    // Base cyan (c), pale cyan (l = c + 25% toward white), cyan-blue (b = c with reduced green)
+    // Colours as plain RGB triples (mirroring Working's orange→yellow/red pattern).
+    // The orange pulse swings HARD — yellow is +100G/+120B off the base and red is
+    // -140G — but this sweep used to move only +64R / -35G, i.e. about a QUARTER of
+    // that amplitude, so "pale cyan" and "cyan-blue" were both nearly
+    // indistinguishable from plain cyan. Match the orange pulse's swing:
+    //   pale cyan = base + a strong red lift (toward white)
+    //   cyan-blue = base with the green pulled DOWN but not away: green 90 read as
+    //               plain blue and clashed with the cyan base, so it is kept at 150
+    //               — still clearly darker/cooler than the base, still cyan-family
+    // so each phase is a DIFFERENT colour, not a shade of the same one.
     const c = [0, 215, 255];      // pure cyan (like ORANGE base)
-    const l = [64, 239, 255];     // pale cyan (like YELLOW: c + white)
-    const b = [0, 180, 255];      // cyan-blue (like RED: c with less green)
+    const l = [150, 255, 255];    // pale cyan (like YELLOW: base + strong R/G lift)
+    const b = [0, 150, 255];      // cyan-blue (like RED: base with green pulled down)
     const base = c;                       // always cyan, like Working's constant ORANGE
     const target = phase === 0 ? l : b;   // pale cyan, then cyan-blue
 
@@ -883,11 +1217,13 @@ export function formatToolLine(msg, workspace, spin) {
       : bytes >= 1024 ? ` ${(bytes / 1024).toFixed(1)}KB`
       : ` ${bytes}B`;
   }
-  // Show +xx -xx diff counts for Edit tool when done
+  // Show +xx -xx diff counts for Edit tool when done. The diff itself is rendered
+  // under the `↳` receipt, so prefer the counts the tool_result handler copied over.
   let diffStr = '';
-  if (name === 'Edit' && !msg.pending && msg.diff && msg.diff.length) {
-    const adds = msg.diff.filter((d) => d.type === 'add').length;
-    const deletes = msg.diff.filter((d) => d.type === 'del').length;
+  const edDiff = (Array.isArray(msg.diff) && msg.diff.length) ? msg.diff : msg._diffCounts;
+  if (name === 'Edit' && !msg.pending && Array.isArray(edDiff) && edDiff.length) {
+    const adds = edDiff.filter((d) => d.type === 'add').length;
+    const deletes = edDiff.filter((d) => d.type === 'del').length;
     if (adds || deletes) {
       diffStr = ' ' + (adds ? col(`+${adds}`, C.green) : '') + ' ' + (deletes ? col(`-${deletes}`, C.red) : '');
     }
@@ -1066,11 +1402,11 @@ export function todoPanelHeight(state) {
 
 // Render one chat message into display lines.
 // Returns { lines: [{text, ind, color}] } (ind = indent string for continuation).
-function messageLines(msg, width, workspace, expanded, spin) {
+function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
   // Tool calls render as a single "● Using/Used Name (arg)" line (kimi style).
   // The body already carries its own ANSI colours, so mark it pre-colored.
   if (msg.role === 'tool') {
-    const body = formatToolLine(msg, workspace, spin);
+    const body = formatToolLine(msg, workspace, spin, pulseStart);
     // Red bullet for a failed call (a Bash non-zero exit / [error: …]).
     const failed = msg.failed === true || (msg.role === 'tool' && msg.failed === true);
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
@@ -1085,12 +1421,27 @@ function messageLines(msg, width, workspace, expanded, spin) {
     const indent = '  ';
     const avail = Math.max(1, width - visualCol(indent));
 
+    // AgentSwarm renders kimi's live progress BLOCK instead of a `↳` output dump:
+    // a header, one cell per subagent, and a status pip bar. The members live on
+    // the message (see the tool_use handler, which registers them as soon as the
+    // args arrive) and update in place while the swarm runs.
+    if (name === 'AgentSwarm' && Array.isArray(msg.swarmMembers) && msg.swarmMembers.length) {
+      const block = renderSwarmProgress({
+        description: msg.swarmDescription || '',
+        model: msg.swarmModel || '',
+        members: msg.swarmMembers,
+        failed: msg.swarmFailed === true,
+      }, width, { indent: ' ', availableGridHeight: 8 });
+      for (const line of block) out.push({ text: line, ind: '', raw: true });
+      return out;
+    }
+
     // Live output of a RUNNING command (Bash): rendered under the "Using …"
     // row exactly like the finished "Used …" output, just not done yet. Only
     // the tail is shown (capped) so a chatty command cannot flood the frame.
     if (msg.pending && typeof msg.liveOutput === 'string' && msg.liveOutput.length) {
       const bodyW = Math.max(1, width - visualCol('  '));
-      const rawLines = msg.liveOutput.replace(/\r\n/g, '\n').split('\n');
+      const rawLines = sanitizeText(msg.liveOutput).replace(/\r\n/g, '\n').split('\n');
       const MAX_RUN_LINES = expanded ? Infinity : 8;
       const shown = rawLines.slice(-MAX_RUN_LINES); // running: show the newest output
       if (rawLines.length > MAX_RUN_LINES) {
@@ -1103,35 +1454,75 @@ function messageLines(msg, width, workspace, expanded, spin) {
       }
     }
 
+    // Ctrl+B detach hint (mirrors kimi-code). A foreground Bash/Agent call that
+    // has been running a while advertises the shortcut that moves it to the
+    // background; the hint disappears the moment the result lands. Bash waits
+    // DETACH_HINT_DELAY_MS so short commands never flash it; Agent-like tools
+    // announce it immediately since they are long-running by nature.
+    if (msg.pending && (name === 'Bash' || name === 'Agent' || name === 'AgentSwarm') && msg.startAt) {
+      const waited = Date.now() - msg.startAt;
+      const delay = name === 'Bash' ? DETACH_HINT_DELAY_MS : 0;
+      if (waited >= delay) {
+        out.push({ text: col(DETACH_HINT_TEXT, C.gray), ind: indent, raw: true });
+      }
+    }
+
     // Write: stream the file content while the model is still emitting it.
     if (name === 'Write' && typeof msg.streamContent === 'string' && msg.streamContent.length) {
-      const lines = msg.streamContent.replace(/\r\n/g, '\n').split('\n');
+      const lines = sanitizeText(msg.streamContent).replace(/\r\n/g, '\n').split('\n');
       const MAX = 20;
       const wNum = String(lines.length).length;
       lines.slice(0, MAX).forEach((ln, i) => {
-        out.push({ text: col(`${String(i + 1).padStart(wNum)} ${ln}`, C.gray), ind: indent, raw: true });
+        out.push({ text: col(`${String(i + 1).padStart(wNum)} ${ln}`, C.gray), ind: i === 0 ? '↳ ' : indent, raw: true });
       });
       if (lines.length > MAX) out.push({ text: col(`… ${lines.length - MAX} more lines`, C.gray), ind: indent, raw: true });
     }
 
-    // Edit: show the diff once the tool has finished, as
-    //   <line-no> - old text
-    //   <line-no> + new text
-    if (name === 'Edit' && !msg.pending && msg.diff && msg.diff.length) {
-      const MAX = 40;
-      const changed = msg.diff.filter((d) => d.type !== 'ctx');
-      const width = Math.max(1, ...changed.map((d) => String(d.no || 0).length));
-      for (const d of changed.slice(0, MAX)) {
-        const no = String(d.no || 0).padStart(width);
-        const mark = d.type === 'add' ? '+' : '-';
-        const color = d.type === 'add' ? C.green : C.red;
-        out.push({ text: col(`${no} ${mark} ${d.text}`, color), ind: indent, raw: true });
-      }
-      if (changed.length > MAX) out.push({ text: col(`… ${changed.length - MAX} more changed lines`, C.gray), ind: indent, raw: true });
-      if (changed.length === 0) out.push({ text: col('(no changes)', C.gray), ind: indent, raw: true });
-    }
+    // The Edit diff is NOT drawn here: it rides on the tool_result message and is
+    // rendered BELOW the `↳` receipt (see the tool_result branch). Drawing it here
+    // put it between the `● Used Edit` status bullet and the receipt.
     return out;
   }
+  // A PLAN block (Plan mode): the model's <plan>…</plan> body, rendered as a
+  // single-column TABLE — the same ╭─┬─╮ / ├─┼─┤ / ╰─┴─╯ vocabulary the Markdown
+  // table renderer uses, so a plan reads as structured data rather than as prose
+  // or as a second composer box.
+  if (msg.role === 'plan') {
+    // `width` is the transcript's inner width (the caller already removed the
+    // one-column margin); the wrapped user boxes land at `width - 2`.
+    const tableW = Math.max(12, width - 2);
+    const inner = Math.max(1, tableW - 2);          // between the two │
+    // NOTE: rows must be {text, ind, raw} OBJECTS — messageLines' contract.
+    // Pushing plain strings here made rowToLine read `undefined` and the whole
+    // block rendered as blank lines.
+    const out = [];
+    const bar = (ch) => col(ch, C.border);
+    const full = (l, r) => bar(l + '─'.repeat(inner) + r);
+    // Header: the table's single column is captioned "Plan".
+    out.push({ text: full('╭', '╮'), ind: '', raw: true });
+    out.push({ text: bar('│') + fitAnsi(col(' Plan', C.cyan + C.bold), inner) + bar('│'), ind: '', raw: true });
+    out.push({ text: bar('├' + '─'.repeat(inner) + '┤'), ind: '', raw: true });
+    // Body rows.
+    const lines = String(msg.text || '').replace(/\r\n/g, '\n').split('\n');
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    const textW = Math.max(1, inner - 2);
+    for (const raw of lines) {
+      if (raw.trim() === '') {
+        out.push({ text: bar('│') + ' '.repeat(inner) + bar('│'), ind: '', raw: true });
+        continue;
+      }
+      // Headings are emphasised; everything else renders as Markdown body text so
+      // **bold**, `code` and bullets work.
+      const isHead = /^\s*#{1,6}\s/.test(raw);
+      const shown = isHead ? raw.replace(/^\s*#{1,6}\s*/, '') : raw;
+      for (const r of renderMdText(shown, textW, isHead ? (C.cyan + C.bold) : C.white, C.cyan)) {
+        out.push({ text: bar('│') + ' ' + fitAnsi(r, textW) + ' ' + bar('│'), ind: '', raw: true });
+      }
+    }
+    out.push({ text: full('╰', '╯'), ind: '', raw: true });
+    return out;
+  }
+
   // Tool output: a single "↳ " marker on the first line, then the output
   // indented by 2 columns. Long output is capped (kimi caps result previews
   // too) so one command cannot flood the whole transcript.
@@ -1143,7 +1534,11 @@ function messageLines(msg, width, workspace, expanded, spin) {
     const pre = '↳ ';
     const cont = '  ';
     const bodyW = Math.max(1, width - visualCol(cont));
-    const rawLines = String(msg.text || '').replace(/\r\n/g, '\n').split('\n');
+    // Strip escapes BEFORE splitting: a file or a command can emit raw SGR /
+    // cursor codes, and letting them through made the terminal OBEY them —
+    // recolouring the transcript, resetting styles mid-row, moving the cursor or
+    // clearing the screen over the composer.
+    const rawLines = sanitizeText(msg.text).replace(/\r\n/g, '\n').split('\n');
     // Trim blank lines at BOTH ends: commands typically emit a trailing
     // newline, and some tools emit a leading one. A stray blank line would
     // render as a lone "↳ " with no content.
@@ -1157,18 +1552,71 @@ function messageLines(msg, width, workspace, expanded, spin) {
     const visible = rawLines.filter((ln) => !/^\[exit code:/.test(ln.trim()));
     const failed = msg.failed === true;
     const shown = visible.slice(0, MAX_RESULT_LINES);
-    const out = [];
-    shown.forEach((ln, idx) => {
-      const isErr = /^\[error:/.test(ln.trim());
-      // A failed run is red throughout so it cannot be skimmed past.
-      const color = isErr ? C.red : (failed ? C.red : C.gray);
-      const wrapped = ln === '' ? [''] : wrapWords(ln, bodyW);
-      wrapped.forEach((t, i) => {
-        out.push({ text: t, ind: idx === 0 && i === 0 ? pre : cont, color });
+
+    // ---- DISPLAY ORDER -----------------------------------------------------
+    // The row reads as a block under the tool line, with ONE `↳` marker:
+    //   ● Used Edit (a.js) +1 -1        <- status bullet
+    //   ↳ 3 - old line                  <- `↳` rides the FIRST body row
+    //     3 + new line
+    //   Edited a.js: replaced 1 occurrence(s).   <- receipt LAST
+    // For an Edit the DIFF is the body (and carries the marker); the receipt text
+    // moves to the bottom. For every other tool the tool output IS the body, so
+    // the marker sits on its first line, exactly as before.
+    const diffRows = [];
+    const receiptRows = [];
+    const hasDiff = Array.isArray(msg.diff);   // empty array => receipt-only (Write)
+
+    if (hasDiff) {
+      // Same collapse rule as the tool output and thinking blocks above: a short
+      // preview by default, everything once Ctrl+O expands. 16 rows (not 12)
+      // because a change renders as a PAIR: `- old` then `+ new`.
+      const MAX = expanded ? Infinity : 16;
+      const changed = msg.diff.filter((d) => d.type !== 'ctx');
+      const wNo = Math.max(1, ...changed.map((d) => String(d.no || 0).length));
+      for (const d of changed.slice(0, MAX)) {
+        const no = String(d.no || 0).padStart(wNo);
+        const mark = d.type === 'add' ? '+' : '-';
+        const color = d.type === 'add' ? C.green : C.red;
+        // Diff lines are FILE content and can carry escapes; show them as `^[`.
+        diffRows.push({ text: col(`${no} ${mark} ${sanitizeText(d.text)}`, color), ind: cont, raw: true });
+      }
+      if (changed.length > MAX) {
+        diffRows.push({
+          text: col(`… (${changed.length - MAX} more changed lines, ctrl+o to expand)`, C.gray),
+          ind: cont, raw: true,
+        });
+      }
+      if (msg.diff.length > 0 && changed.length === 0) diffRows.push({ text: col('(no changes)', C.gray), ind: cont, raw: true });
+      // The receipt: one line per source line of the tool's own message.
+      for (const ln of shown) {
+        const color = failed ? C.red : C.gray;
+        for (const t of (ln === '' ? [''] : wrapWords(ln, bodyW))) {
+          receiptRows.push({ text: t, ind: cont, color });
+        }
+      }
+    } else {
+      // No diff: the tool's own output is the body.
+      shown.forEach((ln, idx) => {
+        const isErr = /^\[error:/.test(ln.trim());
+        // A failed run is red throughout so it cannot be skimmed past.
+        const color = isErr ? C.red : (failed ? C.red : C.gray);
+        const wrapped = ln === '' ? [''] : wrapWords(ln, bodyW);
+        wrapped.forEach((t, i) => {
+          diffRows.push({ text: t, ind: idx === 0 && i === 0 ? pre : cont, color });
+        });
       });
-    });
-    if (visible.length > MAX_RESULT_LINES) {
-      out.push({ text: `… ${visible.length - MAX_RESULT_LINES} more lines`, ind: cont, color: failed ? C.red : C.gray });
+      if (visible.length > MAX_RESULT_LINES) {
+        diffRows.push({ text: `… ${visible.length - MAX_RESULT_LINES} more lines`, ind: cont, color: failed ? C.red : C.gray });
+      }
+    }
+
+    const out = [];
+    for (const r of diffRows) out.push(r);
+    for (const r of receiptRows) out.push(r);
+    // Put the `↳` on the FIRST rendered row (diff or output) — never on the
+    // receipt, which now sits last.
+    if (out.length && out[0].ind === cont && Array.isArray(msg.diff) && msg.diff.length > 0) {
+      out[0] = { ...out[0], ind: pre };
     }
     // Nothing to show (empty output) -> render no row at all rather than a
     // dangling "↳ ".
@@ -1189,15 +1637,23 @@ function messageLines(msg, width, workspace, expanded, spin) {
       for (const w of wrapWords(ln, bodyW)) contentLines.push(w);
     }
     const PREVIEW = expanded ? Infinity : 2;
+    // The reasoning BODY is italic; the "thinking…" label and the "N more lines"
+    // hint are NOT. Closed with endItalic rather than reset, so the row keeps the
+    // dim gray it is drawn in.
+    const it = (s) => (s === '' ? s : C.italic + s + C.endItalic);
     const out = [];
     if (msg.pending) {
-      const spin = SPINNER[(msg.spin || 0) % SPINNER.length];
-      out.push({ text: spin + ' thinking…', ind: '', color: C.gray });
+      // The spinner frame is NOT baked in here: a glyph that changes every 80ms
+      // tick would invalidate this row's cache and re-wrap the whole reasoning
+      // block each time (measured ~44ms/frame vs ~6ms warm), which is what made
+      // long thinking look laggy while ordinary streamed text stayed smooth.
+      // renderChatLines substitutes the live frame outside the cache instead.
+      out.push({ text: SPIN_PLACEHOLDER + ' thinking…', ind: '', color: C.gray });
       const vis = contentLines.length > PREVIEW ? contentLines.slice(-PREVIEW) : contentLines;
-      for (const l of vis) out.push({ text: l, ind: INDENT, color: C.gray });
+      for (const l of vis) out.push({ text: it(l), ind: INDENT, color: C.gray });
     } else {
       const shown = contentLines.slice(0, PREVIEW);
-      shown.forEach((l, i) => out.push({ text: l, ind: i === 0 ? '● ' : INDENT, color: C.gray }));
+      shown.forEach((l, i) => out.push({ text: it(l), ind: i === 0 ? '● ' : INDENT, color: C.gray }));
       if (contentLines.length > PREVIEW) {
         out.push({ text: `… (${contentLines.length - PREVIEW} more lines, ctrl+o to expand)`, ind: INDENT, color: C.gray });
       }
@@ -1205,6 +1661,7 @@ function messageLines(msg, width, workspace, expanded, spin) {
     }
     return out;
   }
+
 
   let icon = '';
   switch (msg.role) {
@@ -1555,24 +2012,35 @@ function renderChatLines(state, w) {
     // The row WIDTH is keyed (not `w`) because the rows are laid out to it:
     // `boxText` for a bordered message (inside the box padding), `innerW` otherwise.
     const rowW = bordered ? boxText : innerW;
-    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${msg.pending ? (state.spin || 0) : 0}\u0000${msg.text || ''}\u0000${msg.streamContent || ''}`
-        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${JSON.stringify(msg.toolArgs || null)}`;
+    // The cache key MUST include everything messageLines() reads. `spin` is
+    // keyed ONLY for a pending TOOL row: formatToolLine sweeps the tool name's
+    // colour with it. The pending THINKING row deliberately does not key it —
+    // its spinner is substituted outside the cache (see SPIN_PLACEHOLDER), so
+    // the 80ms tick no longer re-wraps the reasoning preview every frame.
+    const spinKey = (msg.role === 'tool' && msg.pending) ? (state.spin || 0) : 0;
+    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${spinKey}\u0000${msg.text || ''}\u0000${msg.streamContent || ''}`
+        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${JSON.stringify(msg.toolArgs || null)}`
+        + `\u0000${msg.diff ? msg.diff.length : 0}\u0000${msg._diffCounts ? msg._diffCounts.length : 0}`;
     let cached = msg._cache;
     if (!cached || cached.key !== key) {
-      const rows = messageLines(msg, rowW, state.cwd, expanded, state.spin);
+      const rows = messageLines(msg, rowW, state.cwd, expanded, state.spin, state.pulseStart);
       cached = { key, rows: rows.map(rowToLine) };
       msg._cache = cached;
     }
+    // Swap the live spinner frame into any row that carries the placeholder.
+    // Done AFTER the cache, so the glyph animates without invalidating it.
+    const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
+    const live = (r) => (r.indexOf(SPIN_PLACEHOLDER) >= 0 ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r);
     // The margin is added here (outside the cache) so it is not baked into the
     // cached rows. A bordered message also gets its side walls, laid out to the
     // box's inner width so it lines up with the composer exactly.
     if (bordered) {
       const pad = ' '.repeat(boxPad);
       for (const r of cached.rows) {
-        out.push(PAD + col('│', C.border) + pad + fitAnsi(r, boxText) + pad + col('│', C.border));
+        out.push(PAD + col('│', C.border) + pad + fitAnsi(live(r), boxText) + pad + col('│', C.border));
       }
     } else {
-      for (const r of cached.rows) out.push(PAD + r);
+      for (const r of cached.rows) out.push(PAD + live(r));
     }
     if (bordered && out[out.length - 1] !== botRule) out.push(botRule);
   }
@@ -1593,8 +2061,10 @@ function lineToString(line) {
 }
 
 function modeLabel(mode) {
-  if (mode === 'auto') return 'Never Ask';
-  if (mode === 'yolo') return 'Ask When Needed';
+  // Short, uniform names — the long forms ("Always Ask", "Ask When Needed",
+  // "Never Ask") made the status group wrap awkwardly next to Plan/Focus.
+  if (mode === 'auto') return 'Auto';
+  if (mode === 'yolo') return 'Yolo';
   return 'Ask';
 }
 function trimDecimal(v) {
@@ -1626,7 +2096,10 @@ function usagePercent(used, max) {
 }
 
 // Human-readable elapsed duration, omitting zero leading units:
-// 1year 1mon 1day 1hour 1min 1s / 2years 2mons 2days 2hours 2mins 2s
+//   1y 1mon 1d 1h 1min 1s  /  2y 2mon 2d 2h 2min 2s
+// Units are NEVER pluralised with a trailing "s": the old code rendered 5
+// minutes as "5ms", which reads as 5 MILLISECONDS (and 2 hours as "2hs").
+// Minutes are "m", so months use "mon" to stay unambiguous.
 function fmtDuration(ms) {
   ms = Math.max(0, Math.floor(ms));
   const sec = Math.floor(ms / 1000) % 60;
@@ -1636,14 +2109,14 @@ function fmtDuration(ms) {
   const mon = Math.floor(ms / 2592000000) % 12;
   const year = Math.floor(ms / 31536000000);
   const parts = [];
-  if (year) parts.push(year + 'y' + (year > 1 ? 's' : ''));
-  if (mon) parts.push(mon + 'm' + (mon > 1 ? 's' : '') + ' ');
-  if (day) parts.push(day + 'd' + (day > 1 ? 's' : '') + ' ');
-  if (hour) parts.push(hour + 'h' + (hour > 1 ? 's' : '') + ' ');
-  if (min) parts.push(min + 'm' + (min > 1 ? 's' : '') + ' ');
+  if (year) parts.push(year + 'y');
+  if (mon) parts.push(mon + 'mon');
+  if (day) parts.push(day + 'd');
+  if (hour) parts.push(hour + 'h');
+  if (min) parts.push(min + 'm');
   // Seconds are always shown (at least "0s").
   parts.push(sec + 's');
-  return parts.join('');
+  return parts.join(' ');
 }
 
 // Left/right justify: left text, then padding, then right text flush to `w`.
@@ -1669,21 +2142,82 @@ export function composerHeight(state, cols) {
   return composerLayout(state, insideW - 3).rows.length + 2;
 }
 
+// UNCLAMPED height of the AskUserQuestion box. `composeFrame` caps the real
+// height to the space available (see `questionH`), and the renderer drops the
+// hint row / scrolls the option list to fit that cap. This is therefore the
+// height wanted when there IS room.
+// Rows: top border + header + wrapped question + one per row + hint/entry + bottom
+export function questionBoxHeight(state, insideW) {
+  const qs = state.question;
+  if (!qs) return 0;
+  const cur = qs.items[qs.index] || { question: '', options: [] };
+  const innerW = Math.max(1, insideW - 2);
+  const isLast = qs.index === qs.items.length - 1;
+  const optRows = (cur.options || []).length + 1 + (isLast ? 1 : 0);   // + Other (+ supplement)
+  const qRows = Math.max(1, wrapWords(cur.question, Math.max(1, innerW - 2)).length);
+  return 2 + 1 + qRows + optRows + 1;
+}
+
+// The height the box ACTUALLY emits, given the terminal height `h` and the rows
+// already taken by other chrome. Mirrors composeFrame's cap + the renderer's
+// fit logic, so geometry and painting cannot disagree.
+export function questionBoxClampedHeight(state, insideW, h, chromeH) {
+  const want = questionBoxHeight(state, insideW);
+  if (!want) return 0;
+  const cap = Math.max(1, h - chromeH - 1);
+  const q = Math.min(want, cap);
+  const qs = state.question;
+  const cur = qs.items[qs.index] || { question: '', options: [] };
+  const innerW = Math.max(1, insideW - 2);
+  const isLast = qs.index === qs.items.length - 1;
+  const optRows = (cur.options || []).length + 1 + (isLast ? 1 : 0);
+  const qRows = Math.max(1, wrapWords(cur.question, Math.max(1, innerW - 2)).length);
+  const boxBudget = q - 2 - qRows;                  // room for options (+hint)
+  const showHint = boxBudget >= optRows + 1;
+  const optShown = Math.min(optRows, Math.max(0, boxBudget - (showHint ? 1 : 0)));
+  return 2 + qRows + optShown + (showHint ? 1 : 0);
+}
+
 // ---- scrollbar (Codewhale's TranscriptScrollbar) ---------------------------
 // Geometry for a vertical scrollbar over the transcript body. `scroll` is the
 // number of lines scrolled UP from the bottom (0 = pinned to newest). Returns
 // the thumb's row range within the body (0-based) so the painter and the mouse
 // hit-test share one source of truth.
+//
+// NOTE on precision: the terminal's mouse protocol reports INTEGER rows, so a
+// drag can only address `bodyH` distinct positions. On a long transcript that is
+// inherently coarse (100k lines over 24 rows = ~4.3k lines per row) and no
+// formula fixes it — fine control comes from the wheel / keyboard instead (see
+// the `sbFine` handling in handleKey). What this function DOES guarantee is that
+// the thumb's travel is monotonic, uses every row, and lands exactly on both
+// ends; `thumbLenF` is kept unrounded purely so the grab offset inside the thumb
+// is not quantised to a whole row when the thumb is 10+ rows tall.
 export function scrollbarGeometry({ total, bodyH, scroll }) {
   const maxScroll = Math.max(0, total - bodyH);
   const pos = Math.min(maxScroll, Math.max(0, scroll || 0));
   // Thumb length proportional to the visible fraction, at least 1 row.
-  const thumb = Math.max(1, Math.round(bodyH * (bodyH / Math.max(1, total))));
+  const thumbLenF = Math.max(1, bodyH * (bodyH / Math.max(1, total)));
+  const thumb = Math.max(1, Math.round(thumbLenF));
   // 0 = bottom (pinned), maxScroll = top. Row 0 is the TOP of the body.
   const fromTop = maxScroll === 0 ? 0 : (maxScroll - pos) / maxScroll;
-  const maxThumbStart = Math.max(0, bodyH - thumb);
-  const thumbStart = Math.round(fromTop * maxThumbStart);
-  return { thumbStart, thumbLen: thumb, bodyH, total, maxScroll };
+  const maxThumbStartF = Math.max(0, bodyH - thumbLenF);
+  // Round once, at the end. Using `bodyH - thumb` (rounded) here made the last
+  // row unreachable when the thumb was 1 row and bodyH was even.
+  const thumbStart = Math.round(fromTop * maxThumbStartF);
+  return { thumbStart, thumbLen: thumb, thumbLenF, maxThumbStartF, bodyH, total, maxScroll };
+}
+
+// Map a position on the track to a transcript scroll offset. `rowF` is the mouse
+// row (fractional allowed) and `grabOffset` is where inside the thumb the drag
+// started, in rows, so the thumb does not jump under the pointer on press.
+// Exported so the drag handler and its tests share ONE definition of the mapping.
+export function scrollFromThumbPos(g, rowF, grabOffset = 0) {
+  if (!g) return 0;
+  const track = Math.max(1e-6, g.maxThumbStartF != null
+    ? g.maxThumbStartF
+    : Math.max(1, g.bodyH - (g.thumbLenF != null ? g.thumbLenF : g.thumbLen)));
+  const frac = Math.max(0, Math.min(1, (rowF - grabOffset) / track));
+  return Math.round((1 - frac) * g.maxScroll);
 }
 
 // Paint the scrollbar glyph into the LAST column of a body row. The row already
@@ -1834,9 +2368,28 @@ function sliceAnsi(s, width) {
 export function composeFrame(state, cols, rows) {
   const w = Math.max(20, cols | 0);
   const h = Math.max(12, rows | 0);
+  // Full-screen takeovers (kimi's screen-takeover): the /tasks browser and its
+  // output viewer own the ENTIRE screen, so they short-circuit the normal
+  // layout ? no chat, no composer, no status bar.
+  if (state.tasksViewer) {
+    const lines = renderTaskOutputViewer(state.tasksViewer, w, h);
+    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
+             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: [], composerMeta: [] };
+  }
+  if (state.tasksPanel) {
+    const lines = renderTasksBrowser(state.tasksPanel, w, h);
+    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
+             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: [], composerMeta: [] };
+  }
   const insideW = Math.max(0, w - 2);
 
-  const dialog = state.picker || state.form || state.panel || null;
+  // A full-screen overlay: it takes the whole body and the composer is hidden.
+  // `state.editor` MUST be in here — it renders into `lines` first, but without
+  // this the `if (!dialog)` composer block further down painted the input box
+  // straight over it, so /personal and /set-system-prompt showed only a caret.
+  // The question prompt is deliberately NOT a dialog: it is a box above the
+  // composer, so the transcript stays visible (see the `state.question` block).
+  const dialog = state.editor || state.picker || state.form || state.panel || null;
 
   // ---- geometry ----
   const composer = composerLayout(state, insideW - 3); // bodyW = (insideW-3)-2 = 53, matches fitAnsi(textW-2) = cInner-4 = 53
@@ -1844,12 +2397,29 @@ export function composeFrame(state, cols, rows) {
   const menuItems = (state.menuOpen && state.menuList.length && !dialog)
     ? Math.min(state.menuList.length, MAX_MENU) + 1
     : 0;
+  // The notice no longer reserves a row: it is drawn ON the context row (see the
+  // bottom of this function), so `noticeH` only selects the colour there.
   const noticeH = state.notice ? 1 : 0;
   const confirmH = state.confirmExit ? 1 : 0;
   const workingH = (!dialog && state.running) ? 1 : 0;
   const todoH = dialog ? 0 : todoPanelHeight(state);
   const queueH = dialog ? 0 : queuePanelHeight(state);
-  const bottomH = todoH + queueH + workingH + composerBoxH + menuItems + STATUS_H + noticeH + confirmH + CTX_H;
+  // The question box is chrome above the composer, so its rows must come OUT of
+  // the transcript area — otherwise the box would overlap the chat.
+  //
+  // On a short terminal the box can be taller than the whole space available. It
+  // must NOT simply overflow: the overflow is trimmed from the TOP (see the
+  // topTrim below), which eats the box's own top border and header and leaves a
+  // dangling `│`. Cap it so the box plus the composer always fit, and let the
+  // transcript shrink to zero instead.
+  const chromeH = todoH + queueH + workingH + composerBoxH + menuItems + STATUS_H + confirmH + CTX_H;
+  // NOTE the extra `- 1`: `bodyH` below is clamped to a MINIMUM of 1 row, so that
+  // row has to be reserved here too. Without it the total came out one over and
+  // the top trim ate the box's `╭` border.
+  const questionH = (!dialog && state.question)
+    ? Math.min(questionBoxHeight(state, insideW), Math.max(1, h - chromeH - 1))
+    : 0;
+  const bottomH = chromeH + questionH;
   const bodyH = Math.max(1, h - bottomH);
 
   const lines = [];
@@ -1868,8 +2438,15 @@ export function composeFrame(state, cols, rows) {
     const hint = ed.hint || 'Ctrl+S save · Esc cancel · Enter newline';
     lines.push(col(hint, C.gray));
     lines.push('');
-    // Viewport height for the editor body
-    const viewH = Math.max(1, bodyH - (ed.notice ? 6 : 5));
+    // Viewport height for the editor body. The editor's own rows are:
+    //   title + rule + hint + blank            (4, pushed above)
+    //   viewH body rows                        (the text)
+    //   line-info (+ optional notice) + rule   (2 or 3, pushed below)
+    // so `viewH` must leave room for 6 (or 7 with a notice), NOT 5 — one row too
+    // many made the frame one line over `h` and the top trim cut the editor's own
+    // title and text, leaving just a bare caret on /personal & /set-system-prompt.
+    const edFixed = ed.notice ? 7 : 6;
+    const viewH = Math.max(1, bodyH - edFixed);
     // Keep the caret row in view.
     let top = Math.max(0, ed.top || 0);
     if (ed.caretRow < top) top = ed.caretRow;
@@ -1885,9 +2462,13 @@ export function composeFrame(state, cols, rows) {
     lines.push(col(fitAnsi(`  line ${ed.caretRow + 1}/${textLines.length} · ${textLines.length} lines`, w), C.gray));
     if (ed.notice) lines.push(col(fitAnsi('  ' + ed.notice, w), ed.noticeKind === 'error' ? C.red : C.green));
     lines.push(rule);
-    // Caret position = caret column within the visible window.
+    // Caret position = caret column within the visible window. The `+ 4` is the
+    // four rows pushed above the body (title, rule, hint, blank) — it was `3`
+    // (i.e. the title / rule / hint / blank rows miscounted as three), so the
+    // block caret was drawn ONE ROW ABOVE the line it was editing on /personal
+    // and /set-system-prompt.
     dialogCaret = {
-      row: 3 + Math.max(0, Math.min(viewH - 1, ed.caretRow - top)),
+      row: 4 + Math.max(0, Math.min(viewH - 1, ed.caretRow - top)),
       col: Math.min(w - 1, visualCol(expandTabs(textLines[ed.caretRow] || '').slice(0, ed.caretCol))),
     };
     while (lines.length < bodyH) lines.push(' '.repeat(w));
@@ -1959,7 +2540,99 @@ export function composeFrame(state, cols, rows) {
     for (const b of body) lines.push(b);
     while (lines.length < bodyH) lines.push(' '.repeat(w));
     if (dialogCaret) dialogCaret.row += padTop;
-  } else if (state.picker) {
+  }
+  // AskUserQuestion prompt: rendered as a BOX sitting directly above the
+  // composer — the same treatment as the approval prompt — instead of a
+  // full-screen dialog. It is a prompt about the turn, not a separate screen, and
+  // taking over the whole viewport hid the conversation the question refers to.
+  if (state.question && !dialog) {
+    const qs = state.question;
+    const cur = qs.items[qs.index] || { question: '', options: [] };
+    const promptW = insideW;
+    const innerW = Math.max(1, promptW - 2);
+    const bar = (ch) => col(ch, C.border);
+    const boxRow = (content) => bar('│') + ' ' + fitAnsi(content, innerW) + ' ' + bar('│');
+    const counter = qs.items.length > 1 ? ` ${qs.index + 1}/${qs.items.length}` : '';
+    lines.push(bar('╭' + '─'.repeat(promptW) + '╮'));
+    // Body rows are built into `box` FIRST so the whole thing can be clamped to
+    // `questionH` before any of it reaches `lines`. Pushing the border/header
+    // straight into `lines` (as this used to) meant the budget below did not
+    // count them, so the box overflowed by one row and the top trim ate its `╭`.
+    const box = [];
+    box.push(boxRow(
+      col('Question', C.cyan + C.bold)
+      + (cur.header ? col(' ' + cur.header, C.yellow) : '')
+      + col(counter, C.gray),
+    ));
+    // The question text itself, wrapped by DISPLAY width so CJK cannot push the
+    // right border out.
+    for (const seg of wrapWords(cur.question, innerW - 2)) {
+      box.push(boxRow(col('  ' + seg, C.white)));
+    }
+    // Options, then the per-question free-text row, then (last question only) the
+    // global supplement row. All three are appended by US, never by the model.
+    const isLast = qs.index === qs.items.length - 1;
+    const opts = cur.options.map((o) => ({ label: o.label, description: o.description, kind: 'option' }));
+    opts.push({ label: OTHER_LABEL, description: 'Type your own answer', kind: 'other' });
+    if (isLast) opts.push({ label: SUPPLEMENT_LABEL, description: 'Optional notes for the whole request', kind: 'supplement' });
+    // The hint/entry row is the LAST body row; when space runs out it is the first
+    // thing to drop (the keys still work, the reminder is just not shown).
+    // `questionH` counts the WHOLE box, so the two border rows and the question
+    // rows already in `box` come OUT of the budget before anything is added.
+    const boxBudget = (questionH || Infinity) - 2 - box.length;
+    const showHint = boxBudget >= opts.length + 1;
+    const bodyBudget = Math.max(0, boxBudget - (showHint ? 1 : 0));
+    // Scroll the option window so the selected row stays visible when the list is
+    // taller than the budget (a 4-option question on a 12-row terminal).
+    let firstOpt = 0;
+    if (opts.length > bodyBudget && bodyBudget > 0) {
+      firstOpt = Math.min(Math.max(0, qs.sel - bodyBudget + 1), opts.length - bodyBudget);
+    }
+    const shownOpts = opts.slice(firstOpt, firstOpt + (bodyBudget || opts.length));
+    const itemRows = [];
+    shownOpts.forEach((o, k) => {
+      const j = firstOpt + k;
+      const isSel = j === qs.sel;
+      const ptr = isSel ? col('❯ ', C.cyan) : '  ';
+      const chosen = qs.picked.has(j);
+      // Only real options get checkboxes: Other/supplement are free text.
+      const box2 = (cur.multiSelect && o.kind === 'option')
+        ? (chosen ? col('[x] ', C.green) : col('[ ] ', C.gray)) : '';
+      // Echo what was already typed, so leaving the editor is not a dead end.
+      const typed = (o.kind === 'supplement' && qs.supplement) ? `: ${qs.supplement}`
+        : (o.kind === 'other' && qs.otherText) ? `: ${qs.otherText}` : '';
+      const label = col(String(o.label) + typed, isSel ? (C.cyan + C.bold) : C.white);
+      const desc = o.description ? col('  ' + o.description, C.gray) : '';
+      // The marker column is 2 wide, so the rest gets innerW - 2.
+      itemRows.push({ boxIdx: box.length, index: j });
+      box.push(boxRow(ptr + box2 + fitAnsi(label + desc, Math.max(1, innerW - 4))));
+    });
+    let caretInBox = -1;
+    if (qs.editing && showHint) {
+      // Free-text entry; the caret is drawn on this row.
+      const which = qs.editing === 'supplement' ? SUPPLEMENT_LABEL : OTHER_LABEL;
+      const label = which + ': ';
+      caretInBox = box.length;
+      box.push(boxRow(col(label, C.gray) + col(qs.editingText || '', C.white)));
+    } else if (showHint) {
+      const hint = cur.multiSelect
+        ? '↑↓ move · Space toggle · Enter confirm · Esc dismiss'
+        : '↑↓ move · Enter select · Esc dismiss';
+      box.push(boxRow(col(hint, C.gray)));
+    }
+    // Emit the box. `boxTop` is where row 0 of `box` lands in `lines`.
+    const boxTop = lines.length;
+    for (const b of box) lines.push(b);
+    lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
+    // Mouse hitboxes: the box rows are pushed into `lines`, and composeFrame's
+    // hitbox pass shifts them to final screen coordinates.
+    itemRows.forEach((r) => addHit(boxTop + r.boxIdx, 0, w - 1, { kind: 'questionItem', index: r.index }));
+    if (caretInBox >= 0) {
+      const which = qs.editing === 'supplement' ? SUPPLEMENT_LABEL : OTHER_LABEL;
+      dialogCaret = { row: boxTop + caretInBox, col: visualCol(which + ': ') + visualCol(qs.editingText || '') };
+    }
+  }
+  if (state.picker) {
     const pick = state.picker;
     const query = state.pickerQuery || '';
     const list = pickerFiltered(state);
@@ -2060,7 +2733,13 @@ export function composeFrame(state, cols, rows) {
     for (const b of body) lines.push(b);
     while (lines.length < bodyH) lines.push(' '.repeat(w));
     if (dialogCaret) dialogCaret.row += padTop;
-  } else {
+  }
+  // The chat body is the LAST fallback for an open overlay. It used to be the
+  // bare `else` of the PICKER branch, so opening the editor (picker == null) ran
+  // this too and appended a whole extra viewport of rows ON TOP of the editor.
+  // The frame then overflowed, the top trim ate the editor's own title and text,
+  // and /personal & /set-system-prompt showed nothing but a stray caret.
+  if (!state.editor && !state.panel && !state.form && !state.picker) {
     const chat = renderChatLines(state, w);
     if (state.selection && state.selection.anchor && state.selection.head) {
       // Apply selection highlight directly on ANSI strings
@@ -2120,7 +2799,17 @@ export function composeFrame(state, cols, rows) {
 
   if (workingH) {
     const frame = SPINNER[(state.spin || 0) % SPINNER.length];
-    const elapsed = state.turnStart ? ` ${col('[' + fmtDuration(Date.now() - state.turnStart) + ']', C.gray)}` : '';
+    // ---- shared palette for the whole Working row -------------------------
+    // Everything on this row (spinner glyph, typed chars, elapsed tail, sweep)
+    // must come from ONE set of RGB values, rendered through the SAME lerpColor
+    // path. Mixing C.gray (ANSI 90 ≈ #808080) with the sweep's #969696, or
+    // C.orange (256-colour 208) with the sweep's #ff8c00 (=214), made the row
+    // visibly change shade at each phase boundary.
+    const GREY_RGB = [150, 150, 150];
+    const ORANGE_RGB = [255, 140, 0];
+    const greyEsc = lerpColor(GREY_RGB[0], GREY_RGB[1], GREY_RGB[2], GREY_RGB[0], GREY_RGB[1], GREY_RGB[2], 0);
+    const orangeEsc = lerpColor(ORANGE_RGB[0], ORANGE_RGB[1], ORANGE_RGB[2], ORANGE_RGB[0], ORANGE_RGB[1], ORANGE_RGB[2], 0);
+    const elapsed = state.turnStart ? ` ${col('[' + fmtDuration(Date.now() - state.turnStart) + ']', greyEsc)}` : '';
     // The wording was chosen once at turn start; the gradient below loops
     // independently, so the phrase stays put while the colours sweep.
     const workMsg = state.workMsg || WORKING_MESSAGES[0];
@@ -2145,17 +2834,17 @@ export function composeFrame(state, cols, rows) {
       const out = [];
 
       if (phase === 'type') {
-        // Type the WHOLE row (phrase + tail) left → right, all grey.
+        // Type the WHOLE row (phrase + tail) left → right, all in the grey.
         const typedCount = Math.floor(phaseT * totalChars);
         for (let i = 0; i < phrase.length; i++) {
-          out.push(i < typedCount ? col(phrase[i], C.gray) : ' ');
+          out.push(i < typedCount ? col(phrase[i], greyEsc) : ' ');
         }
         const tailTyped = Math.max(0, typedCount - phrase.length);
         for (let i = 0; i < tailText.length; i++) {
-          out.push(i < tailTyped ? col(tailText[i], C.gray) : ' ');
+          out.push(i < tailTyped ? col(tailText[i], greyEsc) : ' ');
         }
         // The tail is already inside `out`, so do NOT append `elapsed` here.
-        lines.push(col(frame, C.orange) + ' ' + out.join(''));
+        lines.push(col(frame, orangeEsc) + ' ' + out.join(''));
       } else {
         // Colour sweep: only the PHRASE goes grey → orange. The tail stays grey
         // (it is appended as the colored `elapsed` chunk after `out`).
@@ -2164,21 +2853,23 @@ export function composeFrame(state, cols, rows) {
         // head sweeps from just left of the phrase (0) to just right of it (1),
         // extended by BAND on both ends so every char crosses the band smoothly.
         const head = -BAND + phaseT * (1 + 2 * BAND);
-        const GREY = [150, 150, 150];
-        const ORANGE = [255, 140, 0];
         for (let i = 0; i < phrase.length; i++) {
           const charAt = i / phrase.length;
           let tChar = (head - charAt) / BAND;
           tChar = Math.max(0, Math.min(1, tChar));
-          const r = Math.round(GREY[0] + (ORANGE[0] - GREY[0]) * tChar);
-          const g = Math.round(GREY[1] + (ORANGE[1] - GREY[1]) * tChar);
-          const b = Math.round(GREY[2] + (ORANGE[2] - GREY[2]) * tChar);
+          const r = Math.round(GREY_RGB[0] + (ORANGE_RGB[0] - GREY_RGB[0]) * tChar);
+          const g = Math.round(GREY_RGB[1] + (ORANGE_RGB[1] - GREY_RGB[1]) * tChar);
+          const b = Math.round(GREY_RGB[2] + (ORANGE_RGB[2] - GREY_RGB[2]) * tChar);
           out.push(col(phrase[i], lerpColor(r, g, b, r, g, b, 0)));
         }
-        lines.push(col(frame, C.orange) + ' ' + out.join('') + elapsed);
+        lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
       }
       if ((Date.now() - state.startAnim.start) >= 1000) {
         state.startAnim = null;
+        // The colour phase has just finished painting the phrase orange. Anchor
+        // the pulse to THIS tick so its first frame is the orange start of the
+        // orange -> yellow sweep, not a mid-cycle colour.
+        state.pulseStart = state.spin || 0;
       }
     }
         // ---- turn-finish animation ----
@@ -2206,14 +2897,13 @@ export function composeFrame(state, cols, rows) {
       for (let i = 0; i < width; i++) {
         word += (i < done) ? (toPadded[i] || '') : from[i];
       }
-      // Colour: orange → grey over the animation.
-      const ORANGE = [255, 140, 0];
-      const GREY   = [150, 150, 150];
-      const r = Math.round(ORANGE[0] + (GREY[0] - ORANGE[0]) * t);
-      const g = Math.round(ORANGE[1] + (GREY[1] - ORANGE[1]) * t);
-      const b = Math.round(ORANGE[2] + (GREY[2] - ORANGE[2]) * t);
+      // Colour: orange → grey over the animation. Uses the SAME shared constants
+      // so the row does not shift shade when the finish morph begins.
+      const r = Math.round(ORANGE_RGB[0] + (GREY_RGB[0] - ORANGE_RGB[0]) * t);
+      const g = Math.round(ORANGE_RGB[1] + (GREY_RGB[1] - ORANGE_RGB[1]) * t);
+      const b = Math.round(ORANGE_RGB[2] + (GREY_RGB[2] - ORANGE_RGB[2]) * t);
       const animColor = lerpColor(r, g, b, r, g, b, 0);
-      lines.push(col(frame, animColor) + ' ' + col('[', animColor) + col(word, animColor) + col(tail, C.gray));
+      lines.push(col(frame, animColor) + ' ' + col('[', animColor) + col(word, animColor) + col(tail, greyEsc));
     } else {
 
       // Timing (spinner ticks every 80ms, so 0.5s ≈ 6 ticks):
@@ -2225,12 +2915,16 @@ export function composeFrame(state, cols, rows) {
     const SWEEP = 6;                 // 0.5s
     const HALF  = SWEEP + SWEEP;     // 12 ticks per colour (sweep + sweep back)
     const CYCLE = HALF * 2;          // 24 ticks for the full loop (~2s)
-    const inCycle = spin % CYCLE;
+    // Phase is measured from the tick the pulse BEGAN (state.pulseStart), not
+    // from 0: the spinner has been running since turn start, so a raw
+    // `spin % CYCLE` dropped the pulse into a mid-cycle colour (often the red
+    // half) the instant the start animation handed over.
+    const inCycle = ((spin - (state.pulseStart || spin)) % CYCLE + CYCLE) % CYCLE;
     const inHalf  = inCycle % HALF;       // 0..23 within this colour's half
     const phase   = inCycle < HALF ? 0 : 1; // 0 = yellow, 1 = red
 
-    // Colours as plain RGB triples (never ANSI strings).
-    const ORANGE = [255, 140, 0];
+    // Colours as plain RGB triples (never ANSI strings). ORANGE is the shared
+    // constant so the pulse starts exactly where the start animation ended.
     const YELLOW = [255, 240, 120];
     const RED    = [255, 0, 0];    // pure red
     const target = phase === 0 ? YELLOW : RED;
@@ -2249,12 +2943,12 @@ export function composeFrame(state, cols, rows) {
     const mix = (t) => {
       const k = Math.max(0, Math.min(1, t));
       return lerpColor(
-          ORANGE[0] + (target[0] - ORANGE[0]) * k,
-          ORANGE[1] + (target[1] - ORANGE[1]) * k,
-          ORANGE[2] + (target[2] - ORANGE[2]) * k,
-          ORANGE[0] + (target[0] - ORANGE[0]) * k,
-          ORANGE[1] + (target[1] - ORANGE[1]) * k,
-          ORANGE[2] + (target[2] - ORANGE[2]) * k,
+          ORANGE_RGB[0] + (target[0] - ORANGE_RGB[0]) * k,
+          ORANGE_RGB[1] + (target[1] - ORANGE_RGB[1]) * k,
+          ORANGE_RGB[2] + (target[2] - ORANGE_RGB[2]) * k,
+          ORANGE_RGB[0] + (target[0] - ORANGE_RGB[0]) * k,
+          ORANGE_RGB[1] + (target[1] - ORANGE_RGB[1]) * k,
+          ORANGE_RGB[2] + (target[2] - ORANGE_RGB[2]) * k,
           0,
       );
     };
@@ -2276,7 +2970,7 @@ export function composeFrame(state, cols, rows) {
       }
       out.push(col(chars[i], mix(t)));
     }
-      lines.push(col(frame, C.orange) + ' ' + out.join('') + elapsed);
+      lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
     }
   }
 
@@ -2329,6 +3023,22 @@ export function composeFrame(state, cols, rows) {
       for (const seg of wrapWords(ap.desc, innerW)) lines.push(boxRow(col(seg, C.gray)));
     }
     lines.push(boxRow(col('Enter to approve | Esc to reject', C.gray)));
+    lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
+  }
+
+  // Plan approval: shown once the model hands over a <plan> in Plan mode. Same
+  // box shape as the tool approval above so the two read as the same kind of
+  // prompt. Enter approves (turn Plan off and execute); Esc keeps planning.
+  if (state.planPending && !dialog) {
+    const pp = state.planPending;
+    const promptW = insideW;
+    const innerW = Math.max(1, promptW - 2);
+    const bar = (ch) => col(ch, C.border);
+    const boxRow = (content) => bar('│') + ' ' + fitAnsi(content, innerW) + ' ' + bar('│');
+    lines.push(bar('╭' + '─'.repeat(promptW) + '╮'));
+    lines.push(boxRow(col('Approve', C.white + C.bold) + ' ' + col('this plan?', C.cyan + C.bold)));
+    // The plan is ALREADY shown in its table above - do not repeat it here.
+    lines.push(boxRow(col('Enter to approve & execute | Esc to keep planning', C.gray)));
     lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
   }
   
@@ -2404,40 +3114,73 @@ export function composeFrame(state, cols, rows) {
     ? (state.effort && state.effort !== 'on' ? ` thinking: ${state.effort}` : ' thinking')
     : state.seenThinking ? ' thinking' : '';
   const label = state.modelLabel || state.model || '';
+  // Plan / Focus / Swarm are mutually exclusive modes, so at most one badge is
+  // shown. Swarm uses a spring-green (cyan shifted toward green) to stay in the
+  // theme family while reading as its own thing next to Plan's cyan.
   const modeBadge = state.plan ? col('Plan', C.cyan + C.bold)
-    : state.focus ? col('Focus', C.magenta + C.bold)
+    : state.focus ? col('Focus', C.blue + C.bold)
+    : state.swarm ? col('Swarm', C.spring + C.bold)
     : '';
   const parts = [];
-  if (state.slMode !== false) parts.push(col(modeLabel(state.mode), C.yellow));
-  if (modeBadge) parts.push(modeBadge);
+  // The permission mode and the Plan/Focus badge are both "what mode am I in",
+  // so they read as ONE group: separated by a single space. Everything after the
+  // group gets the normal two-space divider, so a name that already contains a
+  // space is not mistaken for the group boundary:
+  //   Auto Plan  workbuddy/deepseek-v4.1-flash  D:\hncode
+  let modeGroup = state.slMode !== false ? col(modeLabel(state.mode), C.orange + C.bold) : '';
+  if (modeBadge) modeGroup = modeGroup ? modeGroup + ' ' + modeBadge : modeBadge;
+  if (modeGroup) parts.push(modeGroup);
   if (state.slModel !== false && label) {
     const think = state.slEffort !== false ? thinking : '';
     parts.push(col(`${label}${think}`, C.white));
   }
   if (state.slTasks !== false) {
+    // Two SEPARATE badges, mirroring kimi-code's footer: `bashTasks` counts
+    // background processes and `agentTasks` counts background subagents. They are
+    // semantically different (you wait on a command, you read an agent's report),
+    // so kimi keeps them apart and so do we. Only RUNNING tasks are counted — a
+    // finished task leaves the badge, which is what makes it a live indicator
+    // rather than a running total. `bg N→M` used to conflate both kinds and also
+    // showed a stale count after everything finished.
     const ts = Object.values(state.tasks || {});
-    const running = ts.filter((t) => t.status === 'running').length;
-    const done = ts.length - running;
-    if (ts.length) {
-      parts.push(col(running ? `bg ${running}→${done}` : `bg ${done}`, running ? C.cyan : C.gray));
-    }
+    const running = ts.filter((t) => t.status === 'running');
+    const bashTasks = running.filter((t) => t.kind !== 'agent').length;
+    const agentTasks = running.filter((t) => t.kind === 'agent').length;
+    if (bashTasks > 0) parts.push(col(`[${bashTasks} task${bashTasks === 1 ? '' : 's'} running]`, C.cyan));
+    if (agentTasks > 0) parts.push(col(`[${agentTasks} agent${agentTasks === 1 ? '' : 's'} running]`, C.spring));
   }
   if (state.slCwd !== false && cwd) parts.push(col(cwd, C.gray));
   const statusLeft = parts.join('  ');
   const statusRight = (state.slTips !== false && state.tip) ? col(state.tip, C.gray) : '';
   lines.push(justify(statusLeft, statusRight, w));
 
-  if (noticeH) {
-    const nc = state.noticeKind === 'error' ? C.red : C.gray;
-    lines.push(col(fitAnsi('  ' + state.notice, w), nc));
-  }
-
   if (confirmH) lines.push(col(fitAnsi('Press Ctrl+C again to exit the hncode', w), C.yellow));
 
   const ctxRight = `${state.rounds} turn${state.rounds === 1 ? '' : 's'} | ${state.steps} step${state.steps === 1 ? '' : 's'} | ${Math.round(state.tokRate)} tok/s | context: ${state.ctxPercent}% (${fmtTokens(state.ctxTokens || 0)}/${fmtTokens(state.ctxMax || 1)})`;
+  // The short-lived notice ("Expanded tool output", "Copied 1.2k chars", …)
+  // shares the context row, LEFT-aligned, instead of reserving a row of its own
+  // — a whole blank line appeared and disappeared above the context bar on every
+  // Ctrl+O. The gauge keeps its full width (it must never be the part that gets
+  // cut), so the notice is truncated into whatever space is left over. NOTE:
+  // measure the RAW string — fitAnsi() pads to the full width, so using its
+  // result here made the available room always 0 and the notice invisible.
   const ctxW = visualCol(ctxRight);
-  const ctxPad = Math.max(0, w - ctxW);
-  lines.push(' '.repeat(ctxPad) + col(fitAnsi(ctxRight, Math.min(ctxW, w)), C.white));
+  if (noticeH) {
+    const nc = state.noticeKind === 'error' ? C.red : C.gray;
+    // The notice yields first: it gets whatever is left after the gauge keeps
+    // its natural width plus a 1-column gap, and is truncated into it.
+    const room = Math.max(0, w - Math.min(ctxW, w) - 1);
+    const left = room > 0 ? col(fitAnsi(state.notice, room), nc) : '';
+    const lw = visualCol(left);
+    const gap = lw > 0 ? 1 : 0;
+    // The gauge takes the remaining columns exactly, so the row is always
+    // EXACTLY `w` wide (never 1 over, which wrapped the last column onto the
+    // next screen row) and stays visible even on a narrow terminal.
+    const gauge = col(fitAnsi(ctxRight, Math.max(0, w - lw - gap)), C.white);
+    lines.push(left + ' '.repeat(gap) + gauge);
+  } else {
+    lines.push(' '.repeat(Math.max(0, w - ctxW)) + col(fitAnsi(ctxRight, Math.min(ctxW, w)), C.white));
+  }
 
   let topPad = 0;
   if (lines.length < h) { topPad = h - lines.length; }
@@ -2458,7 +3201,14 @@ export function composeFrame(state, cols, rows) {
   let cursor;
   let cursorVisible;
   if (dialogCaret) {
-    cursor = { row: Math.min(dialogCaret.row, h - 1), col: Math.min(dialogCaret.col, w - 1) };
+    // A dialog is drawn at the TOP of the frame: the filler rows go BELOW it
+    // (topPad) and nothing is trimmed off the top. The caret row is relative to
+    // the dialog body, so it MUST be shifted by that same pad — without it the
+    // block caret landed `topPad` rows too high (the editor's title / rule / hint
+    // sit above the body, which is exactly the one row it was off by on
+    // /personal and /set-system-prompt). The hitboxes below already apply the pad;
+    // the caret did not.
+    cursor = { row: Math.min(dialogCaret.row + topPad, h - 1), col: Math.min(dialogCaret.col, w - 1) };
     cursorVisible = true;
   } else if (dialog) {
     cursor = { row: 0, col: 0 };
@@ -2466,7 +3216,7 @@ export function composeFrame(state, cols, rows) {
   } else {
     const menuH = (state.menuOpen && state.menuList.length && !dialog)
       ? Math.min(state.menuList.length, MAX_MENU) + 1 : 0;
-    const bottomChrome = STATUS_H + (state.notice ? 1 : 0) + (state.confirmExit ? 1 : 0) + CTX_H + menuH;
+    const bottomChrome = STATUS_H + (state.confirmExit ? 1 : 0) + CTX_H + menuH;
     const caretScreenRow = h - bottomChrome - 2 - (composer.rows.length - 1 - composer.caretRow);
     cursor = {
       row: Math.max(0, Math.min(caretScreenRow, h - 1)),
@@ -2523,26 +3273,23 @@ export function diffFrame(prev, next) {
   let out = '\x1b[?2026h';
   // Only [first, last] changed; rewriting to the bottom of the screen made a
   // single appended line repaint the whole viewport every frame.
+  //
+  // Every row is addressed ABSOLUTELY (`ESC[<n>;1H`). This used to write the
+  // first row absolutely and then advance with `\r\n`, which is a RELATIVE move
+  // that SCROLLS the screen once the line feed happens on the last terminal row
+  // (or with the cursor past the bottom margin). The Working/pulse row sits
+  // directly above the composer's `╭` border, so a repaint span reaching it
+  // scrolled everything up by a row and the next `ESC[2K` erased the composer's
+  // top border — "Working… gets written on the next line and overwrites the
+  // input box". Absolute addressing cannot scroll, so the span is now safe.
   const reach = Math.min(next.lines.length, last + 1);
-  let pos2 = first;
   for (let i = first; i < reach; i++) {
-    if (i === first) out += `\x1b[${first + 1};1H`;
-    else out += '\r\n';
-    out += '\x1b[2K' + next.lines[i];
-    pos2 = i;
+    out += `\x1b[${i + 1};1H\x1b[2K` + next.lines[i];
   }
-  if (next.lines.length < prev.lines.length) {
-    const extraStart = next.lines.length;
-    const extraEnd = Math.max(extraStart, prev.lines.length);
-    if (pos2 < extraStart - 1) out += '\r\n'.repeat(extraStart - 1 - pos2);
-    else if (pos2 > extraStart - 1) out += `\x1b[${pos2 - (extraStart - 1)}A`;
-    out += '\r\n';
-    for (let i = extraStart; i < extraEnd; i++) {
-      out += '\x1b[2K';
-      if (i < extraEnd - 1) out += '\r\n';
-    }
-    out += `\x1b[${extraEnd - extraStart}A`;
-  }
+  // No "clear the trailing rows" pass is needed: composeFrame always returns
+  // EXACTLY `rows` lines (both frames here share the same height, otherwise the
+  // sizeChanged path above would have run), so a shrinking viewport is already
+  // handled by `last` moving up and the freed rows being rewritten as blanks.
   out += '\x1b[?2026l';
   out += pos + shape;
   return out;
@@ -2625,6 +3372,10 @@ export function makeState({ cfg, session, opts }) {
     running: false,
     spin: 0,
     workMsg: WORKING_MESSAGES[0],   // chosen once per turn
+    // (swarm state is set below from the session — see the `swarm:` line after
+    // plan/focus, so it is read from ONE place.)
+    // Turn-finish animation: while non-null, the Working row renders the morph
+    // from `from` to `to` (see composeFrame). Cleared ~0.5s after turn end.
     // Turn-finish animation: while non-null, the Working row renders the morph
     // from `from` to `to` (see composeFrame). Cleared ~0.5s after turn end.
     finishAnim: null,   // { start, from, to }
@@ -2638,6 +3389,10 @@ export function makeState({ cfg, session, opts }) {
     plan: !!(session && session.plan),
     planPath: (session && session.planPath) || null,
     focus: !!(session && session.focus),
+    // Swarm mode is per-SESSION (like plan/focus), not just per-config: it is
+    // restored here and written by persistState(). Reading only config.toml left
+    // it off after /sessions resume, /fork and a plain restart.
+    swarm: !!(session && session.swarm),
     effort: (session && session.effort) || cfg.effort || (cfg.reasoning ? 'on' : 'off'),
     // Theme removed - forced dark only
     addDirs: [],
@@ -2648,6 +3403,20 @@ export function makeState({ cfg, session, opts }) {
     pickerCategory: null,  // active filter category (null = "All")
     pickerCategories: null,
     form: null,
+    // AskUserQuestion dialog: { items, index, sel, picked:Set, multiSelect-going
+    // state, editing, text, resolve }. Non-null while the user is answering.
+    question: null,
+    // Plan approval: { plan, resolve } while the user reviews a <plan> in Plan
+    // mode. Mirrors approvalPending, but for the whole plan rather than one tool.
+    planPending: null,
+    // /tasks full-screen browser: { tasks, filter, selectedIndex, listScroll,
+    // pendingStop, flash, flashTimer } or null when closed.
+    tasksPanel: null,
+    // Output viewer state (makeViewerState result) or null.
+    tasksViewer: null,
+    // Swarm mode (/swarm): when on, the prompt tells the model to decompose work
+    // across parallel subagents via AgentSwarm.
+    swarm: false,
     panel: null,
     notice: '',
     noticeKind: 'info',
@@ -2775,7 +3544,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       if (a === 'on') state.plan = true;
       else if (a === 'off') state.plan = false;
       else state.plan = !state.plan;
-      if (state.plan) state.focus = false;
+      if (state.plan) { state.focus = false; state.swarm = false; }
       persist();
       app(`Plan mode: ${state.plan ? 'ON (read-only planning)' : 'OFF'}`);
       return;
@@ -2786,7 +3555,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       if (a === 'on') want = true;
       else if (a === 'off') want = false;
       state.focus = want;
-      if (state.focus) state.plan = false;
+      if (state.focus) { state.plan = false; state.swarm = false; }
       persist();
       app(`Focus mode: ${state.focus ? 'ON (Read/Write/Edit/Bash only)' : 'OFF (all tools)'}`);
       return;
@@ -2802,6 +3571,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
           { label: 'provider', sub: 'manage AI providers' },
           { label: 'statusline', sub: 'configure status line items' },
           { label: 'add-dir', sub: 'add an additional workspace directory' },
+          { label: 'auto-update', sub: 'check npm for updates at startup + every 30 min' },
         ],
         onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
       });
@@ -3187,16 +3957,92 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       return;
     }
     case 'tasks': {
-      const tasks = Object.values(state.tasks || {});
-      if (!tasks.length) { app('No background tasks.'); return; }
-      const rows = tasks
-        .sort((a, b) => (b.start || 0) - (a.start || 0))
-        .map((t) => {
-          const secs = t.end ? Math.round((t.end - (t.start || t.end)) / 1000) : Math.round((Date.now() - (t.start || Date.now())) / 1000);
-          const extra = t.stopReason ? ` (${t.stopReason})` : '';
-          return `  #${t.id} [${t.status}${extra}] pid=${t.pid} ${secs}s ${t.description || t.command || ''}`;
-        });
-      say('Background tasks:\n' + rows.join('\n'));
+      // Open the full-screen task browser (kimi's TASK BROWSER). Through the host:
+      // dispatch is module-level and the panel lives inside startTUI.
+      h.openTasksPanel();
+      return;
+    }
+    case 'swarm': {
+      // Swarm mode: tell the model to decompose work across parallel subagents.
+      const a = raw.toLowerCase();
+      let want;
+      if (a === 'on') want = true;
+      else if (a === 'off') want = false;
+      else want = !state.swarm;
+      state.swarm = want;
+      // Plan / Focus / Swarm are one mutually exclusive group: turning one on
+      // turns the other two off.
+      if (want) { state.plan = false; state.focus = false; }
+      try { setConfigString('swarm_mode', want ? 'true' : 'false'); } catch {}
+      cfg.raw.swarm_mode = want;
+      app(want
+        ? 'Swarm mode ON - the model will decompose work across parallel subagents (AgentSwarm)'
+        : 'Swarm mode OFF');
+      return;
+      return;
+    }
+    case 'swarm-sub-agent': {
+      // Which model subagents run on. Empty/unset = follow this session's model
+      // (the "default"), so a user who never touches this gets the behaviour they
+      // already had. Stored in config.toml as `subagent_model`, and mirrored onto
+      // `cfg.subagentModel` where the Agent/AgentSwarm tools read it.
+      const models = (cfg.raw && cfg.raw.models) || {};
+      const names = Object.keys(models);
+      const desired = raw.trim();
+
+      const showCurrent = () => (cfg.subagentModel
+        ? `Subagent model: ${cfg.subagentModel}`
+        : `Subagent model: default (this session's — ${cfg.model || 'unset'})`);
+
+      const setSubagentModel = (value) => {
+        const v = value || '';
+        try { setConfigString('subagent_model', v); }
+        catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+        cfg.subagentModel = v;
+        cfg.raw.subagent_model = v;
+        app(v ? `Subagent model → ${v}` : `Subagent model → default (this session's model)`);
+      };
+
+      // `/swarm-sub-agent default` (or `none`/`reset`) clears the override.
+      if (desired) {
+        const d = desired.toLowerCase();
+        if (d === 'default' || d === 'none' || d === 'reset' || d === 'clear') { setSubagentModel(''); return; }
+        if (!models[desired]) { appErr(`Unknown model alias: ${desired}. Run /swarm-sub-agent to pick one.`); return; }
+        setSubagentModel(desired);
+        return;
+      }
+      if (!names.length) {
+        appErr('No models configured. Add one first: /provider');
+        return;
+      }
+      // The same model menu as /model, with a subagent-scoped title and a
+      // "default" row that clears the override.
+      const providers = Object.keys(cfg.raw.providers || {});
+      openPicker({
+        title: 'Select a subagent model',
+        items: [
+          {
+            label: 'default',
+            sub: `follow this session's model (${cfg.model || 'unset'})`,
+            action: 'default',
+            current: !cfg.subagentModel,
+          },
+          ...names.map((n) => ({
+            label: n,
+            sub: models[n].provider || cfg.provider || '',
+            current: n === cfg.subagentModel,
+            category: models[n].provider || '',
+          })),
+        ],
+        categories: ['All', ...providers],
+        category: null,
+        hint: '↑↓ navigate · Tab switch category · Enter select · Esc cancel',
+        onPick: (it) => {
+          if (it.action === 'default') { setSubagentModel(''); return true; }
+          setSubagentModel(it.label);
+          return true;
+        },
+      });
       return;
     }
     case 'fork': {
@@ -3294,30 +4140,159 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       return;
     }
     case 'set-system-prompt': {
-      // Show the prompt currently in effect: the custom one if set, else the
-      // built-in. Saving writes it to config.toml; an EMPTY value clears the
-      // override and restores the built-in.
+      // Two steps: pick a source, then edit it. Showing the editor straight away
+      // (the old behaviour) left no way to start from a preset.
       const builtin = SYSTEM_PROMPT;
       const custom = cfg.raw && cfg.raw.system_prompt ? String(cfg.raw.system_prompt) : '';
-      const current = custom || builtin;
-      openEditor({
-        title: custom
-          ? 'System prompt (custom — saving replaces it; clear it to restore the built-in)'
-          : 'System prompt (built-in — saving overrides it)',
-        text: current,
-        caretRow: 0,
-        caretCol: 0,
-        onSave: (text) => {
-          const value = String(text).trim();
-          try {
-            setConfigString('system_prompt', value);
-          } catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
-          cfg.systemPrompt = value;
-          cfg.raw.system_prompt = value;
-          if (value) app(`System prompt saved (${value.length} chars) → ${hncodeConfigFile()}`);
-          else app('System prompt override cleared; the built-in prompt is in use again.');
+
+      // Open the editor on `text`. Saving writes it to config.toml; an EMPTY value
+      // clears the override and restores the built-in. `presetName` is only used
+      // for the title, so the user can see which preset they started from.
+      const edit = (text, presetName) => {
+        openEditor({
+          title: presetName
+            ? `System prompt — preset "${presetName}" (edit, then Ctrl+S to save)`
+            : (custom
+              ? 'System prompt (custom — saving replaces it; clear it to restore the built-in)'
+              : 'System prompt (built-in — saving overrides it)'),
+          text,
+          caretRow: 0,
+          caretCol: 0,
+          onSave: (value) => {
+            const trimmed = String(value).trim();
+            try {
+              setConfigString('system_prompt', trimmed);
+            } catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+            cfg.systemPrompt = trimmed;
+            cfg.raw.system_prompt = trimmed;
+            if (trimmed) app(`System prompt saved (${trimmed.length} chars) → ${hncodeConfigFile()}`);
+            else app('System prompt override cleared; the built-in prompt is in use again.');
+          },
+        });
+      };
+
+      // A preset only lands in the editor — never written straight to config.toml.
+      // No preset fits every workflow, and the user should be free to adjust it
+      // before it takes effect.
+      const items = [
+        {
+          label: 'Edit current prompt',
+          sub: custom ? 'edit the custom prompt in use' : 'edit the built-in prompt',
+          action: 'edit-current',
+        },
+        {
+          label: 'Start from a preset…',
+          sub: `${FAMILIES.length} model families × ${TASKS.length} tasks`,
+          action: 'presets',
+        },
+      ];
+      if (custom) {
+        items.push({
+          label: 'Restore built-in',
+          sub: 'clear the override and go back to the shipped prompt',
+          action: 'restore',
+        });
+      }
+      openPicker({
+        title: 'System prompt',
+        items,
+        searchable: false,
+        hint: '↑↓ navigate · Enter select · Esc cancel',
+        onPick: (it) => {
+          if (it.action === 'edit-current') {
+            edit(custom || builtin);
+            return true;
+          }
+          if (it.action === 'restore') {
+            try { setConfigString('system_prompt', ''); }
+            catch (e) { appErr('Could not write config.toml: ' + e.message); return true; }
+            cfg.systemPrompt = '';
+            cfg.raw.system_prompt = '';
+            app('System prompt override cleared; the built-in prompt is in use again.');
+            return true;
+          }
+          // Preset picker: the FAMILY is the list (↑↓), the TASK is a footer row
+          // (Tab to focus, ←→ to change) — the same shape /model uses for its
+          // Thinking row. `presetState` remembers the chosen task across the
+          // list selection.
+          const presetState = { task: 'general' };
+          const taskLabel = () => {
+            const t = TASKS.find((x) => x.id === presetState.task) || TASKS[0];
+            return t.label;
+          };
+          openPicker({
+            title: 'System prompt presets',
+            items: FAMILIES.map((f) => ({
+              label: f.label,
+              sub: f.sub,
+              presetId: f.id,
+            })),
+            hint: '↑↓ family · Tab focus task · Enter load into editor · Esc cancel',
+            footer: {
+              label: 'Task',
+              options: TASKS.map((t) => t.label),
+              value: taskLabel(),
+              focused: false,
+            },
+            onPick: (it) => {
+              // Tab/←→ moved the footer; Enter on a list row applies (family, task).
+              const task = TASKS.find((t) => t.label === state.picker.footer.value) || TASKS[0];
+              const text = buildPreset(it.presetId, task.id);
+              // An empty result means the preset could not be built (unknown family,
+              // or a build() that failed). Say so instead of closing the menu with
+              // nothing happening, which reads as a broken Enter key.
+              if (!text) { appErr(`Could not build the "${it.presetId}" preset.`); return false; }
+              edit(text, presetLabel(it.presetId, task.id));
+              return true;
+            },
+          });
+          return true;
         },
       });
+      return;
+    }
+
+    case 'personal': {
+      // Personal preferences: free-form notes injected into the system prompt on
+      // EVERY turn (see /personal's handler comment in config.js). Two scopes —
+      // global (~/.hncode/PERSONAL.md, all workspaces) and project
+      // (<workspace>/.hncode/PERSONAL.md, this workspace only). Bare /personal
+      // asks which scope; saving an EMPTY body deletes that scope's file.
+      const workspace = state.workspace || cfg.workspace || process.cwd();
+      const openScope = (scope) => {
+        const file = personalPromptFile(scope, workspace);
+        openEditor({
+          title: `Personal preferences (${scope}) — ${file}`,
+          text: readPersonalPromptRaw(scope, workspace),
+          caretRow: 0,
+          caretCol: 0,
+          onSave: (value) => {
+            try { writePersonalPrompt(scope, workspace, value); }
+            catch (e) { appErr('Could not write ' + file + ': ' + e.message); return; }
+            if (String(value).trim()) app(`Personal preferences saved (${scope}) → ${file}`);
+            else app(`Personal preferences cleared (${scope}); nothing will be injected.`);
+          },
+        });
+      };
+      const firstLine = (scope) => {
+        const t = readPersonalPromptRaw(scope, workspace).trim();
+        return t ? t.split('\n')[0].slice(0, 48) : '(empty)';
+      };
+      const a = raw.toLowerCase();
+      if (a === 'global' || a === 'g' || a === 'user') { openScope('global'); return; }
+      if (a === 'project' || a === 'p' || a === 'local') { openScope('project'); return; }
+      if (a === '') {
+        openPicker({
+          title: 'Personal preferences — choose a scope',
+          items: [
+            { label: 'project', sub: `this workspace only — ${firstLine('project')}` },
+            { label: 'global', sub: `all workspaces — ${firstLine('global')}` },
+          ],
+          onPick: (it) => { openScope(it.label); return true; },
+        });
+        return;
+      }
+      appErr('Usage: /personal [global|project]');
       return;
     }
 
@@ -3341,8 +4316,29 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
 
     case 'init': {
       if (!cfg.model) { appErr('LLM not set. Configure a provider with /provider first.'); return; }
-      say('/init — analyzing the workspace to generate AGENTS.md…');
-      sendPrompt('Analyze this codebase and write an AGENTS.md file at the workspace root with concise instructions for future agents: project layout, build/test commands, and conventions.');
+      // Optional free-text instructions, like /compact's optional ratio: whatever
+      // the user types after `/init` steers what goes into the file (e.g.
+      // `/init focus on the tRPC routers and our migration rules`). With no
+      // argument the built-in checklist is used on its own.
+      const instructions = raw.trim();
+      // Already have one? Then this is likely an UPDATE, and overwriting silently
+      // would throw away whatever the user hand-edited in there.
+      const existing = agentsFilesFor(state.cwd || cfg.workspace, cfg.workspace || state.cwd || process.cwd())
+        .filter((f) => /(^|[\\/])agents?\.md$/i.test(f.path) && !/override/i.test(f.path));
+      const base = 'Analyze this codebase and write an AGENTS.md file at the workspace root. '
+        + 'Keep it concise instructions for future agents: project layout, build/test commands, '
+        + 'and conventions. Prefer concrete commands and paths over prose.';
+      const update = existing.length
+        ? `\n\nThere is already an AGENTS.md at ${existing[0].path}. Read it first, then revise it `
+          + 'in place: keep what is still accurate, correct what is stale, and add what is missing. '
+          + 'Do not discard existing instructions unless they are wrong.'
+        : '';
+      const extra = instructions ? `\n\nThe user asked you to focus on this:\n${instructions}` : '';
+      say(instructions
+        ? '/init — generating AGENTS.md, guided by your instructions…'
+        : '/init — analyzing the workspace to generate AGENTS.md…');
+      sendPrompt(base + update + extra);
+      return;
       return;
     }
 
@@ -3417,6 +4413,39 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
         'Context window',
         `  ${state.ctxPercent}% used (${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})`,
       ].join('\n'));
+      return;
+    }
+    case 'auto-update': {
+      // Toggle /auto-update. Persists to config.toml so it survives restarts.
+      const a = raw.toLowerCase();
+      let want;
+      if (a === 'on') want = true;
+      else if (a === 'off') want = false;
+      else want = !cfg.autoUpdate;
+      try { setConfigString('auto_update', want ? 'true' : 'false'); }
+      catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+      cfg.autoUpdate = want;
+      cfg.raw.auto_update = want;
+      app(want
+        ? 'Auto-update ON — checks npm at startup and every 30 min, installs in the background'
+        : 'Auto-update OFF');
+      return;
+    }
+    case 'update': {
+      // Manual update check. This is the ONLY place an update is ever reported;
+      // the automatic background check stays completely silent.
+      app('Checking for updates...');
+      cfg.updateRunning = true;
+      try {
+        const r = await upd.checkAndUpdate();
+        if (r.status === 'updated') app(r.message);
+        else if (r.status === 'uptodate') app(r.message);
+        else app('Update check: ' + (r.message || 'failed'));
+      } catch (e) {
+        appErr('Update check failed: ' + (e && e.message || e));
+      } finally {
+        cfg.updateRunning = false;
+      }
       return;
     }
     case 'version': app(`hncode v${VERSION}`); return;
@@ -3619,6 +4648,7 @@ case 'statusline':
         plan: session.plan,
         planPath: session.planPath,
         focus: session.focus,
+        swarm: session.swarm,
         effort: session.effort,
         theme: session.theme,
         todos: (session.todos || []).slice(),
@@ -3874,6 +4904,20 @@ function tokenize(str) {
           out.push({ ch: String.fromCodePoint(cp) });
           i += ku[0].length; continue;
         }
+        // Shift+Arrow / Shift+Home / Shift+End: the caret MOVES while extending a
+        // selection. Emitted as their own tokens so the composer can tell them
+        // apart from the plain arrows (which scroll the transcript).
+        if (shift && !ctrl && !alt && cp >= 0xE000 && cp < 0xE100) {
+          const arrows = { 0xE000: 'up', 0xE001: 'down', 0xE003: 'left', 0xE002: 'right' };
+          const a = arrows[cp];
+          if (a) { out.push({ key: 'shift-' + a }); i += ku[0].length; continue; }
+        }
+        if (shift && !ctrl && !alt && (cp === 0xE014 || cp === 0xE015)) {
+          out.push({ key: cp === 0xE014 ? 'shift-home' : 'shift-end' });
+          i += ku[0].length; continue;
+        }
+        // Fall back for terminals that send the legacy CSI form with a `2` modifier
+        // (handled in csiName) — nothing to do here.
         if (ctrl && shift && !alt) {
           // Ctrl+Shift+<letter> needs its own token. Collapsing it into 'c-<x>'
           // made Ctrl+Shift+C indistinguishable from Ctrl+C, so "copy" ran the
@@ -3916,8 +4960,21 @@ function tokenize(str) {
         if (str[j] === '?') { j++; while (j < str.length && str[j] >= '0' && str[j] <= '9') j++; }
         const fin = str[j];
         if (fin === undefined || !/[A-Za-z~]/.test(fin)) break;
-        const params = (str.slice(i + 2, j).match(/^\d+/) || [''])[0];
-        out.push({ key: csiName(params, fin) });
+        const rawParams = str.slice(i + 2, j);
+        const params = (rawParams.match(/^\d+/) || [''])[0];
+        // Modifier: the 2nd `;`-separated parameter, 1-based (`;2` = Shift, `;5`
+        // = Ctrl, `;6` = Ctrl+Shift). Legacy terminals send Shift+Arrow this way
+        // rather than as a CSI-u sequence.
+        const modStr = (rawParams.match(/;(\d+)/) || [])[1];
+        const mod = modStr ? parseInt(modStr, 10) - 1 : 0;
+        const shift = (mod & 1) !== 0, ctrl = (mod & 4) !== 0;
+        const base = csiName(params, fin);
+        if (shift && !ctrl && ['up', 'down', 'left', 'right', 'home', 'end'].includes(base)) {
+          out.push({ key: 'shift-' + base });
+          i = j + 1;
+          continue;
+        }
+        out.push({ key: base });
         i = j + 1;
       } else if (str[i + 1] === 'O') {
         const f = str[i + 2];
@@ -3945,6 +5002,9 @@ function tokenize(str) {
     // CSI-u sequence unless the Kitty protocol maps it), so it needs an explicit
     // entry here — otherwise it fell through to { ch: '\x16' } and was dropped.
     else if (c === '\x16') { out.push({ key: 'c-v' }); i++; }
+    // Ctrl+X is the same story: raw 0x18. Ctrl+Shift+X comes through the CSI-u
+    // path above as `c-s-x` on terminals that report modified keys.
+    else if (c === '\x18') { out.push({ key: 'c-x' }); i++; }
     else if (c === '\x7f' || c === '\x08') { out.push({ key: 'backspace' }); i++; }
     else { out.push({ ch: c }); i++; }
   }
@@ -4014,7 +5074,27 @@ export async function startTUI(opts) {
     // Only auto-follow when the view is ALREADY pinned to the bottom. Forcing
     // scroll = 0 unconditionally yanked the user back down whenever new output
     // arrived — so reading history mid-turn was impossible.
-    if ((state.scroll || 0) === 0) state.scroll = 0;
+    //
+    // This used to be `if ((state.scroll||0) === 0) state.scroll = 0;`, i.e. a
+    // NO-OP. The comment promised "auto-follow" but nothing re-anchored the view,
+    // so appending a tall message (a long Read/Bash result) pushed the whole
+    // transcript up by its height in a single frame instead of scrolling by one
+    // row — the "everything jumps" report. When the user IS scrolled up we leave
+    // the offset alone, which is the other half of the original intent.
+    if ((state.scroll || 0) === 0) {
+      state.scroll = 0;              // pinned: keep following the newest message
+    } else {
+      // Scrolled up: grow the offset by exactly the number of rows this message
+      // added, so the content the user is reading does not move.
+      try {
+        const rows = renderChatLines(state, dims().cols).length;
+        if (state._addChatRows != null) {
+          const grew = Math.max(0, rows - state._addChatRows);
+          if (grew) state.scroll = (state.scroll || 0) + grew;
+        }
+        state._addChatRows = rows;
+      } catch { /* rendering is best-effort here; never break a message append */ }
+    }
     renderFrame();
   };
   let noticeTimer = null;
@@ -4140,6 +5220,145 @@ export async function startTUI(opts) {
     renderFrame();
   }
 
+  // ---- /tasks panel (kimi's TASK BROWSER) ----------------------------------
+  function refreshTasksPanel() {
+    const p = state.tasksPanel;
+    if (!p) return;
+    p.tasks = sortedTasks(state.agent ? state.agent.ctx : { tasks: state.tasks });
+    const vis = visibleTasks(p.tasks, p.filter);
+    if (p.selectedIndex >= vis.length) p.selectedIndex = Math.max(0, vis.length - 1);
+  }
+
+  function openTasksPanel() {
+    const tasks = sortedTasks(state.tasks ? { tasks: state.tasks } : {});
+    state.tasksPanel = {
+      tasks,
+      filter: 'all',
+      selectedIndex: 0,
+      listScroll: 0,
+      pendingStop: null,
+      flash: '',
+      flashTimer: null,
+    };
+    const vis = visibleTasks(tasks, 'all');
+    const runningIdx = vis.findIndex((x) => x.status === 'running');
+    state.tasksPanel.selectedIndex = runningIdx >= 0 ? runningIdx : 0;
+    state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    state.picker = null; state.form = null; state.panel = null;
+    renderFrame();
+  }
+
+  function closeTasksPanel() {
+    const p = state.tasksPanel;
+    if (!p) return;
+    if (p.flashTimer) clearTimeout(p.flashTimer);
+    if (p.pollTimer) clearInterval(p.pollTimer);
+    state.tasksPanel = null;
+    renderFrame();
+  }
+
+  function tasksFlash(msg) {
+    const p = state.tasksPanel;
+    if (!p) return;
+    p.flash = msg;
+    if (p.flashTimer) clearTimeout(p.flashTimer);
+    p.flashTimer = setTimeout(() => { p.flash = ''; renderFrame(); }, 2500);
+  }
+
+  function openTaskOutputViewer(taskId) {
+    const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+    const task = getTask(ctxLike, taskId) || (state.tasks || {})[taskId];
+    if (!task) { tasksFlash('No such task: ' + taskId); return; }
+    state.tasksViewer = makeViewerState(task);
+    renderFrame();
+  }
+
+  function closeTaskOutputViewer() {
+    state.tasksViewer = null;
+    renderFrame();
+  }
+
+  // Returns true when the key was consumed by the panel / viewer.
+  function handleTasksPanelKey(t) {
+    const p = state.tasksPanel;
+    if (!p) return false;
+    const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+    // Snapshot the STOP target BEFORE the key handler clears pendingStop on 'y'.
+    const stopTarget = p.pendingStop;
+    const action = handleTasksBrowserKey(p, t);
+    p.tasks = sortedTasks(ctxLike);
+    const vis = visibleTasks(p.tasks, p.filter);
+    const sel = vis[p.selectedIndex];
+
+    switch (action) {
+      case 'close': closeTasksPanel(); return true;
+      case 'toggleFilter':
+        p.filter = p.filter === 'all' ? 'active' : 'all';
+        p.selectedIndex = 0;
+        break;
+      case 'refresh':
+        p.tasks = sortedTasks(ctxLike);
+        tasksFlash('Refreshed');
+        break;
+      case 'stopIgnored':
+        tasksFlash((sel ? sel.taskId : '') + ' is already terminal - nothing to stop.');
+        break;
+      case 'requestStop':
+        // Nothing to do yet: the footer now asks for Y to confirm.
+        break;
+      case 'cancelStop':
+        tasksFlash('Stop cancelled');
+        break;
+      case 'confirmStop': {
+        // 'y' was pressed: stop the task that was pending.
+        stopTask(ctxLike, stopTarget);
+        p.tasks = sortedTasks(ctxLike);
+        break;
+      }
+      case 'openOutput':
+        if (sel) openTaskOutputViewer(sel.taskId);
+        return true;
+      default:
+        break;
+    }
+    renderFrame();
+    return true;
+  }
+
+  // Kill / abort one task by id. An agent task aborts through its controller; a
+  // process is killed as a tree (Windows) or by signal.
+  function stopTask(ctxLike, id) {
+    if (!id) return;
+    const tk = getTask(ctxLike, id) || (state.tasks || {})[id];
+    if (!tk || tk.status !== 'running') return;
+    try {
+      if (tk.kind === 'agent' && typeof tk._abort === 'function') {
+        tk._abort();
+      } else if (tk.pid) {
+        if (process.platform === 'win32') {
+          try { cp.spawnSync('taskkill', ['/pid', String(tk.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
+        } else {
+          try { process.kill(tk.pid, 'SIGTERM'); } catch {}
+        }
+      }
+    } catch {}
+    settleTask(tk, 'killed', { stopReason: 'User initiated stop' });
+    tasksFlash('Stopped ' + id);
+  }
+
+  function handleTasksViewerKey(t) {
+    const v = state.tasksViewer;
+    if (!v) return false;
+    // Refresh from the live store so a running task's tail keeps moving.
+    const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+    const fresh = getTask(ctxLike, v.task.taskId);
+    if (fresh) v.task = fresh;
+    const action = handleViewerKey(v, t, dims().rows);
+    if (action === 'close') closeTaskOutputViewer();
+    else renderFrame();
+    return true;
+  }
+
   if (!stdin.isTTY) {
     return 1;
   }
@@ -4183,6 +5402,26 @@ export async function startTUI(opts) {
     const rate = times.length;
     if (rate !== state.tokRate) { state.tokRate = rate; renderFrame(); }
   }, 50);
+
+  // ---- auto-update (background + SILENT, never blocks the TUI) --------------
+  // If autoUpdate is on, check npm at startup and then every 30 minutes. The
+  // check and the install both run detached, and NOTHING is ever printed: the
+  // whole point is that the user never notices. Version notices appear only for
+  // the explicit /update command (see its dispatch case).
+  let autoCheckTimer = null;
+  let autoCheckInflight = false;
+  const runAutoCheck = async () => {
+    if (!cfg.autoUpdate || autoCheckInflight) return;
+    autoCheckInflight = true;
+    try { await upd.checkAndUpdate(); } catch { /* silent */ }
+    finally { autoCheckInflight = false; }
+  };
+  if (cfg.autoUpdate) {
+    setTimeout(() => { void runAutoCheck(); }, 800);
+    autoCheckTimer = setInterval(() => { void runAutoCheck(); }, upd.AUTO_UPDATE_INTERVAL_MS);
+    if (autoCheckTimer.unref) autoCheckTimer.unref();
+  }
+
 
   let keyBuf = '';
   let escTimer = null;
@@ -4248,12 +5487,13 @@ export async function startTUI(opts) {
     const { cols } = dims();
     return (t.col || 1) === cols;
   }
-  function scrollFromThumb(rowInBody) {
+  // Drag the thumb. `rowF` may be fractional (the pointer reports sub-cell
+  // resolution), and `grabOffset` remembers where inside the thumb the press
+  // landed so the thumb does not jump under the cursor on the first move.
+  function scrollFromThumb(rowF) {
     const sb = state._sb;
     if (!sb) return;
-    const maxThumbStart = Math.max(1, sb.bodyH - sb.thumbLen);
-    const frac = Math.max(0, Math.min(1, (rowInBody - (state.sbDragOffset || 0)) / maxThumbStart));
-    state.scroll = Math.round((1 - frac) * sb.maxScroll);
+    state.scroll = scrollFromThumbPos(sb, rowF, state.sbDragOffset || 0);
     renderFrame();
   }
   function hitAt(t) {
@@ -4361,8 +5601,12 @@ export async function startTUI(opts) {
         const sb = state._sb;
         const { rowInBody } = mouseToCell(t);
         state.sbDrag = true;
+        // Grab INSIDE the thumb (so it does not jump under the pointer); off the
+        // thumb, centre it on the pointer. Uses the FRACTIONAL length so the grab
+        // point is not quantised to a whole row.
+        const len = sb.thumbLenF != null ? sb.thumbLenF : sb.thumbLen;
         state.sbDragOffset = (rowInBody >= sb.thumbStart && rowInBody < sb.thumbStart + sb.thumbLen)
-          ? rowInBody - sb.thumbStart : Math.floor(sb.thumbLen / 2);
+          ? rowInBody - sb.thumbStart : len / 2;
         scrollFromThumb(rowInBody);
         return;
       }
@@ -4668,6 +5912,7 @@ export async function startTUI(opts) {
     const items = [];
     if (hasSel) items.push({ label: 'Copy', sub: 'copy the selected text', action: 'copy', primary: true });
     if (hasComposerSel) items.push({ label: 'Copy', sub: 'copy the selected composer text', action: 'copy-composer', primary: true });
+    if (hasComposerSel) items.push({ label: 'Cut', sub: 'cut the selected composer text to the clipboard', action: 'cut-composer' });
     items.push({ label: 'Copy last answer', sub: 'copy the last assistant message', action: 'copy-last' });
     items.push({ label: 'Clear selection', sub: 'drop the current selection', action: 'clear' });
     if (hasComposerSel) items.push({ label: 'Clear composer selection', sub: 'drop the composer selection', action: 'clear-composer' });
@@ -4685,6 +5930,17 @@ export async function startTUI(opts) {
           const a = Math.min(sel.anchor, sel.head);
           const h = Math.max(sel.anchor, sel.head);
           copyToClipboard((state.input || '').slice(a, h));
+        }
+        else if (it.action === 'cut-composer') {
+          // Same operation as Ctrl+X: to the clipboard, then out of the composer.
+          const sel = state.composerSel;
+          const a = Math.min(sel.anchor, sel.head);
+          const h = Math.max(sel.anchor, sel.head);
+          copyToClipboard((state.input || '').slice(a, h));
+          state.input = (state.input || '').slice(0, a) + (state.input || '').slice(h);
+          state.caret = a;
+          state.composerSel = null;
+          refreshMenu(state);
         }
         else if (it.action === 'copy-last') {
           const last = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
@@ -4705,6 +5961,9 @@ export async function startTUI(opts) {
   }
 
   function handleKey(t) {
+    // Full-screen takeovers own EVERY key while open.
+    if (state.tasksViewer) { handleTasksViewerKey(t); return; }
+    if (state.tasksPanel) { handleTasksPanelKey(t); return; }
     if (t.key === 'mousedown' || t.key === 'mousemove' || t.key === 'mouseup' || t.key === 'rightclick' || t.key === 'mousehover') {
       handleMouse(t);
       return;
@@ -4730,13 +5989,40 @@ export async function startTUI(opts) {
       // keep drafting while deciding.
       if (t.key === 'c-c') return;
     }
+    // Plan approval: the model produced a <plan> and Plan mode is waiting.
+    // Enter = approve (Plan turns off, the plan is sent back to be executed).
+    // Esc  = keep planning, do NOT execute.
+    if (state.planPending) {
+      if (t.key === 'enter' || t.key === ' ') {
+        const resolve = state.planPending.resolve;
+        state.planPending = null;
+        resolve(true);
+        renderFrame();
+        return;
+      }
+      if (t.key === 'escape') {
+        const resolve = state.planPending.resolve;
+        state.planPending = null;
+        resolve(false);
+        renderFrame();
+        return;
+      }
+      if (t.key === 'c-c') return;   // do not exit while a plan is under review
+    }
     if (t.key === 'c-c') {
       // An open overlay consumes Ctrl+C: close it instead of interrupting the
-      // turn that is still running behind it.
-      if (state.menuOpen || state.picker || state.form || state.panel) {
+      // turn that is still running behind it. The modal editor belongs here too:
+      // without it Ctrl+C fell through to the exit path below, armed the
+      // "Press Ctrl+C again to exit" prompt behind the editor (which stays on
+      // screen), and a second Ctrl+C — often the very key the user pressed again
+      // to dismiss the prompt — quit the app and discarded the draft.
+      if (state.menuOpen || state.picker || state.form || state.panel || state.question || state.editor) {
         if (state.picker) { const cb = state.picker.onCancel; state.picker = null; if (cb) cb(); }
         if (state.form) { const cb = state.form.onCancel; state.form = null; if (cb) cb(); }
+        // Ctrl+C on the question dialog = dismiss, the same as Esc.
+        if (state.question) { const r = state.question.resolve; state.question = null; r({}); }
         state.panel = null;
+        state.editor = null;   // Ctrl+C cancels the editor, like Esc
         state.menuOpen = false; state.menuList = []; state.menuSel = 0; state.menuOffset = 0;
         renderFrame();
         return;
@@ -4751,7 +6037,130 @@ export async function startTUI(opts) {
       confirmTimer = setTimeout(() => { state.confirmExit = false; renderFrame(); }, 3000);
       return;
     }
+    if (state.question) {
+      // AskUserQuestion dialog. Owns ALL input while open — unlike the approval
+      // prompt, the user is here to answer, and the free-text "Other" row needs
+      // the character keys for itself.
+      const qs = state.question;
+      const cur = qs.items[qs.index] || { options: [] };
+      const isLast = qs.index === qs.items.length - 1;
+      // The list is: options, then "Other", then (last question only) the global
+      // supplement row.
+      const otherIdx = (cur.options || []).length;
+      const suppIdx = isLast ? otherIdx + 1 : -1;
+      const optCount = otherIdx + 1 + (isLast ? 1 : 0);
+      // Resolve the call. `dismissed` distinguishes "Esc out of everything" from
+      // "answered, and maybe left a note" so the tool can emit kimi's dismissal
+      // contract instead of a half-filled result.
+      const finish = (dismissed) => {
+        const r = qs.resolve; state.question = null;
+        r(dismissed ? {} : { answers: qs.answers, additional: (qs.supplement || '').trim() });
+        renderFrame();
+      };
+
+      // Move on after an answer was recorded.
+      //   * a further question -> ask it, cursor at the top
+      //   * the LAST question   -> drop the cursor on the supplement row so the
+      //     very next Enter opens the note editor (or Esc/Enter twice skips it).
+      //     Jumping straight to `finish` made the row unreachable: `sel` stayed on
+      //     the option just picked, so a second Enter re-picked that option.
+      const advance = () => {
+        if (qs.index < qs.items.length - 1) {
+          qs.index++;
+          qs.sel = 0;
+          qs.picked = new Set();
+          renderFrame();
+          return;
+        }
+        qs.sel = (cur.options || []).length + 1;   // the supplement row
+        renderFrame();
+      };
+
+      if (qs.editing) {
+        // Free-text entry, shared by the per-question "Other" and the global
+        // supplement (qs.editing says which). Esc backs out WITHOUT losing what
+        // was typed, so a half-written note survives a look at the options.
+        if (t.key === 'escape') { qs.editing = null; renderFrame(); return; }
+        if (t.key === 'backspace') { qs.editingText = (qs.editingText || '').slice(0, -1); renderFrame(); return; }
+        if (t.paste !== undefined) { qs.editingText += String(t.paste).replace(/[\r\n]+/g, ' '); renderFrame(); return; }
+        if (t.key === 'enter') {
+          const answer = (qs.editingText || '').trim();
+          if (qs.editing === 'supplement') {
+            // The supplement is optional: Enter commits it (empty is fine) and
+            // ends the call — it is the last row, so nothing follows it.
+            qs.supplement = answer;
+            qs.editing = null;
+            finish(false);
+            return;
+          }
+          if (!answer) { renderFrame(); return; }          // nothing typed: stay
+          qs.answers[cur.question] = answer;
+          qs.otherText = '';
+          qs.editing = null;
+          advance();
+          return;
+        }
+        if (t.ch) { qs.editingText = (qs.editingText || '') + t.ch; renderFrame(); return; }
+        return;
+      }
+
+      if (t.key === 'escape') { finish(true); return; }    // dismiss: empty answers
+      if (t.key === 'up') { qs.sel = (qs.sel - 1 + optCount) % optCount; renderFrame(); return; }
+      if (t.key === 'down') { qs.sel = (qs.sel + 1) % optCount; renderFrame(); return; }
+
+      // Open a free-text editor, seeding it with whatever was typed before.
+      const openEditor = (which) => {
+        qs.editing = which;
+        qs.editingText = which === 'supplement' ? (qs.supplement || '') : (qs.otherText || '');
+        renderFrame();
+      };
+
+      if (cur.multiSelect && t.key === ' ') {
+        if (qs.sel >= otherIdx) { openEditor(qs.sel === suppIdx ? 'supplement' : 'other'); return; }
+        if (qs.picked.has(qs.sel)) qs.picked.delete(qs.sel); else qs.picked.add(qs.sel);
+        renderFrame(); return;
+      }
+      if (t.key === 'enter') {
+        if (qs.sel >= otherIdx) { openEditor(qs.sel === suppIdx ? 'supplement' : 'other'); return; }
+        if (cur.multiSelect) {
+          // Enter CONFIRMS the multi-select; an empty selection is allowed (the
+          // user may genuinely want none of them).
+          const labels = [...qs.picked].sort((a, b) => a - b).map((i) => cur.options[i].label);
+          if (labels.length) qs.answers[cur.question] = labels.join(', ');
+          advance();
+          return;
+        }
+        qs.answers[cur.question] = cur.options[qs.sel].label;
+        advance();
+        return;
+      }
+      return;
+    }
+
     if (state.confirmExit) { state.confirmExit = false; if (confirmTimer) clearTimeout(confirmTimer); }
+
+    // Ctrl+X / Ctrl+Shift+X — CUT. Removes the composer's selected text (or the
+    // whole line when nothing is selected) and puts it on the clipboard, like a
+    // normal editor. Ctrl+Shift+X is accepted as an alias because some terminals
+    // only deliver the modified form.
+    if (t.key === 'c-x' || t.key === 'c-s-x') {
+      const cur = state.input || '';
+      const sel = state.composerSel;
+      if (sel && sel.anchor !== sel.head) {
+        const a = Math.min(sel.anchor, sel.head);
+        const h = Math.max(sel.anchor, sel.head);
+        const removed = cur.slice(a, h);
+        state.input = cur.slice(0, a) + cur.slice(h);
+        state.caret = a;
+        state.composerSel = null;
+        copyToClipboard(removed);
+        refreshMenu(state);
+      } else {
+        notice('Nothing selected to cut', 'error');
+      }
+      renderFrame();
+      return;
+    }
 
     if (t.key === 'c-s-c') {
       // Ctrl+Shift+C: copy the mouse selection, else the last answer — the same
@@ -4966,6 +6375,7 @@ export async function startTUI(opts) {
       if (t.key === 'home') { p.top = 0; renderFrame(); return; }
       return;
     }
+
 
     if (state.form) {
       const f = state.form;
@@ -5218,7 +6628,12 @@ export async function startTUI(opts) {
       renderFrame(); return;
     }
     if (t.key === 'wheelup' || t.key === 'wheeldown') {
-      const d = t.key === 'wheelup' ? 3 : -3;
+      // With the pointer ON the scrollbar, scroll one line per notch: the bar is
+      // the precision control, and 3-line steps there feel jumpy on a long
+      // transcript. Everywhere else keeps the usual 3-line step.
+      const onBar = !!(state._lastMouse && isOnScrollbar(state._lastMouse));
+      const step = onBar ? 1 : 3;
+      const d = t.key === 'wheelup' ? step : -step;
       if (state.panel) {
         const p = state.panel;
         p.top = Math.max(0, (p.top || 0) + (t.key === 'wheelup' ? -3 : 3));
@@ -5262,6 +6677,41 @@ export async function startTUI(opts) {
       scrollChat(state, t.key === 'pageup' ? 10 : -10);
       renderFrame(); return;
     }
+    // Shift+arrows EXTEND a composer selection instead of moving the caret. The
+    // anchor is remembered on the first shift-move so moving back shrinks it.
+    if (t.key && t.key.startsWith('shift-') && !state.editor && !state.picker && !state.form && !state.panel) {
+      const dirName = t.key.slice(6);   // left | right | up | down | home | end
+      const cur = state.input || '';
+      const caret = state.caret || 0;
+      const anchor = state.composerSel ? state.composerSel.anchor : caret;
+      let next = caret;
+      if (dirName === 'left') {
+        const mk = adjacentPasteMarker(cur, caret, -1);
+        next = mk ? mk.start : Math.max(0, caret - 1);
+      } else if (dirName === 'right') {
+        const mk = adjacentPasteMarker(cur, caret, 1);
+        next = mk ? mk.end : Math.min(cur.length, caret + 1);
+      } else if (dirName === 'home') {
+        next = 0;
+      } else if (dirName === 'end') {
+        next = cur.length;
+      } else {
+        // up/down: move a visual row keeping the column, like the plain arrows,
+        // so a multi-line prompt can be selected across lines.
+        const insideW = Math.max(0, dims().cols - 2);
+        const layout = composerLayout(state, insideW - 3);
+        const targetRow = layout.caretRow + (dirName === 'down' ? 1 : -1);
+        if (targetRow < 0 || targetRow >= layout.rows.length) { renderFrame(); return; }
+        const starts = rowStartOffsets(cur, layout.rows.length, insideW);
+        const colInRow = Math.max(0, layout.caretCol - 1);
+        const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
+        next = Math.min(cur.length, targetStart + colInRow);
+      }
+      state.caret = next;
+      state.composerSel = (anchor === next) ? null : { anchor, head: next };
+      renderFrame(); return;
+    }
+
     if (t.key === 'left' || t.key === 'right') {
       const dir = t.key === 'left' ? -1 : 1;
       const mk = adjacentPasteMarker(state.input, state.caret || 0, dir);
@@ -5391,8 +6841,9 @@ export async function startTUI(opts) {
   }
 
   function statusExtra(state) {
+    // No `notice` term: the notice shares the context row instead of taking a
+    // row of its own, so it must not shrink the calculated chat viewport either.
     return (state.confirmExit ? 1 : 0)
-      + (state.notice ? 1 : 0)
       + (state.running ? 1 : 0)
       + ((state.menuOpen && state.menuList.length) ? Math.min(state.menuList.length, MAX_MENU) + 1 : 0);
   }
@@ -5425,6 +6876,10 @@ export async function startTUI(opts) {
       state.turnStart = Date.now();
       // Start animation: 0.5s type out + 0.5s fill with orange = 1s total
       state.startAnim = { start: Date.now() };
+      // Marks the tick the steady pulse begins on, so the pulse can start its
+      // own orange -> yellow sweep instead of inheriting whatever phase the
+      // spinner happens to be in when the start animation ends.
+      state.pulseStart = null;
     }
     
     if (state.history[state.history.length - 1] !== text) state.history.push(text);
@@ -5452,8 +6907,14 @@ export async function startTUI(opts) {
     await runAgent(text);
   }
 
-  async function runAgent(text) {
-    addChat({ role: 'user', text });
+  // `asSystem` injects the text as a SYSTEM message instead of a user message and
+  // skips the user bubble. Used by the approved-plan handoff: the plan is not
+  // something the user typed, so it must not appear (or persist) as their message.
+  async function runAgent(text, opts = {}) {
+    const asSystem = !!opts.asSystem;
+    if (!asSystem) addChat({ role: 'user', text });
+    // Fresh buffer for this turn's <plan> split (see appendAssistant).
+    state._planBuf = '';
     // A message the user JUST SENT should always bring the newest content into
     // view, even if they were scrolled up reading history. (Queue/steer do NOT
     // come through here, so they keep the view exactly where the user left it.)
@@ -5483,6 +6944,28 @@ export async function startTUI(opts) {
     if (cfg.calmMode) {
       sysText += '\n\n' + CALM_MODE_INSTRUCTION;
     }
+    // PLAN MODE (/plan): tell the model what to PRODUCE. The tool filter alone
+    // only removed its write tools — this is what makes it emit a <plan> block.
+    if (state.plan) {
+      sysText += '\n\n' + PLAN_MODE_INSTRUCTION;
+    }
+    // SWARM MODE (/swarm): push the model toward parallel decomposition.
+    if (state.swarm) {
+      sysText += '\n\n' + SWARM_MODE_INSTRUCTION;
+    }
+    const personal = readPersonalPrompt(state.workspace || cfg.workspace);
+    if (personal) {
+      sysText += '\n\n' + personal;
+    }
+    // AGENTS.md: the PROJECT's own instructions, read fresh each turn like the
+    // personal notes above, so an edit (or a fresh /init) takes effect on the next
+    // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
+    // which is the precedence order codex documents. Previously /init wrote this
+    // file and nothing ever loaded it.
+    const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
+    if (agents) {
+      sysText += '\n\n' + agents;
+    }
     let messages = [{ role: 'system', content: sysText }];
     if (session.messages && session.messages.length) {
       for (const m of session.messages) {
@@ -5496,7 +6979,10 @@ export async function startTUI(opts) {
         messages.push(m);
       }
     }
-    messages.push({ role: 'user', content: text });
+    // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
+    // from the harness, not something the user typed, and it must not show up as a
+    // user bubble or be persisted as one.
+    messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
     // 只持久化对话本身，system 不进 session。
     Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
     sess.saveSession(session);
@@ -5509,24 +6995,61 @@ export async function startTUI(opts) {
       cfg.toolFilter = undefined;
     }
 
-        const mode = state.mode || 'ask';
-    
+    // AUTO ("Never Ask") implies unrestricted paths: the mode already auto-approves
+    // every tool, so ALSO lifting the tool-layer workspace check keeps behaviour
+    // consistent. Without this the approval callback said "yes" while
+    // resolvePath() still threw `Path outside workspace` — the mode looked broken.
+    //
+    // YOLO gets the same treatment for BASH only: its approval no longer runs the
+    // workspace test (see onApproval), so the tool layer must not re-impose it.
+    // Other tools keep the check, because for them "inside the workspace" is still
+    // what decides approve-vs-ask.
+    const mode = state.mode || 'ask';
+    cfg.allowExternal = (mode === 'auto' || mode === 'yolo') ? true : cfg.allowExternal;
+    // AskUserQuestion reads this to refuse in auto mode. Set here so the FIRST
+    // tool call of the turn already sees it (onApproval re-syncs it live after).
+    cfg.permissionMode = mode;
+
     // Approval callback: called before every tool execution
     const onApproval = async (toolName, args) => {
       // Read the mode LIVE: /permission, /yolo and /auto can change while the
       // turn runs, and the decision must follow the CURRENT setting.
       const cur = state.mode || 'ask';
+      // Keep the TOOL LAYER in step with the LIVE mode. Agent snapshots cfg into
+      // its own ctx at construction, so mutating cfg alone would not reach a turn
+      // that is already running. Two things depend on this:
+      //   * allowExternal — resolvePath()'s workspace guard
+      //   * permissionMode — AskUserQuestion refuses to ask while auto is on
+      if (state.agent && state.agent.ctx) {
+        state.agent.ctx.allowExternal = (cur === 'auto') || !!cfg.allowExternal;
+        state.agent.ctx.permissionMode = cur;
+      }
       if (cur === 'auto') return true;
-
-      // Read-only tools never need permission in any mode.
-      const safeTools = ['Read', 'Grep', 'Glob', 'FetchURL', 'WebSearch', 'TaskOutput', 'TaskList', 'TaskStop', 'TaskWait', 'TodoList', 'FileLines'];
+      // Read-only tools never need permission in any mode. AskUserQuestion is on
+      // this list because ASKING the user is not a side effect — gating it behind
+      // an approval prompt would mean answering two prompts to ask one question.
+      // (In auto mode the TOOL refuses itself before any UI; see ctx.permissionMode.)
+      const safeTools = ['Read', 'Grep', 'Glob', 'FetchURL', 'WebSearch', 'TaskOutput', 'TaskList', 'TaskStop', 'TaskWait', 'TodoList', 'FileLines', 'AskUserQuestion'];
       if (safeTools.includes(toolName)) return true;
 
       // YOLO ("Ask When Needed"): anything that stays INSIDE the workspace runs
       // without asking — edits, writes and commands alike. Only work that touches
       // a path OUTSIDE the workspace (or a command whose target we cannot prove is
       // inside) needs the user.
-      if (cur === 'yolo' && isInsideWorkspace(state, toolName, args)) return true;
+      //
+      // BASH is the exception: a shell command's paths cannot be proven either way
+      // (variables, pipes, subshells), so the old path heuristic flagged ordinary
+      // commands like `ls /tmp` and asked about them. In yolo the user has already
+      // said "run routine work", so Bash runs without the workspace test — only an
+      // obviously destructive command still asks.
+      if (cur === 'yolo') {
+        if (toolName === 'Bash') {
+          const cmd = String((args && (args.command || args.cmd)) || '');
+          if (!isDestructiveCommand(cmd)) return true;
+        } else if (isInsideWorkspace(state, toolName, args)) {
+          return true;
+        }
+      }
 
       return new Promise((resolve) => {
         let desc = '';
@@ -5554,6 +7077,40 @@ export async function startTUI(opts) {
     // Seed the agent with the persisted list: Agent() otherwise starts from an
     // empty todoState, which wiped the panel on every new turn.
     cfg.todoState = state.todos || [];
+    // AskUserQuestion bridge: the tool calls ctx.askQuestion(questions, ctx) and
+    // awaits the answers. Same promise-handshake the approval prompt uses, so the
+    // agent simply blocks while the user reads and chooses.
+    cfg.askQuestion = (questions, ctx) => new Promise((resolve) => {
+      state.question = {
+        items: questions,
+        index: 0,
+        sel: 0,
+        picked: new Set(),
+        answers: {},
+        // Free-text state. `editing` is null | 'other' | 'supplement' and says
+        // WHICH row is open; `editingText` is its live buffer. The committed
+        // values live in `otherText` / `supplement` so an Esc back-out keeps them.
+        editing: null,
+        editingText: '',
+        otherText: '',
+        supplement: '',
+        resolve: (answers) => resolve(answers),
+      };
+      // An aborted turn must not leave the dialog stranded on screen.
+      const sig = ctx && ctx.signal;
+      const onAbort = () => {
+        if (state.question && state.question.resolve === resolve) {
+          state.question = null;
+          resolve({});
+          renderFrame();
+        }
+      };
+      if (sig) {
+        if (sig.aborted) { onAbort(); return; }
+        sig.addEventListener('abort', onAbort, { once: true });
+      }
+      renderFrame();
+    });
     const agent = new Agent({
       // maxSteps omitted: the agent loop is uncapped (see agent.js).
       cfg, messages, onApproval,
@@ -5629,7 +7186,7 @@ export async function startTUI(opts) {
         if (e.type === 'tool_start') {
           const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (!dup) {
-            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '' });
+            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now() });
           }
         } else if (e.type === 'tool_args') {
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
@@ -5648,6 +7205,15 @@ export async function startTUI(opts) {
             || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending);
           if (entry) {
             entry.liveOutput = (entry.liveOutput || '') + e.chunk;
+            // A swarm streams `[n/m] finished` lines as subagents land: advance the
+            // matching cells from queued -> completed so the grid fills in live.
+            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
+              const done = (String(entry.liveOutput).match(/^\[\d+\/\d+\] finished$/gm) || []).length;
+              entry.swarmMembers.forEach((mem, i) => {
+                if (i < done) { mem.phase = 'completed'; mem.ratio = 1; }
+                else if (i === done) { mem.phase = 'working'; mem.ratio = 0.5; }
+              });
+            }
             renderSoon();
           }
           return;
@@ -5656,6 +7222,22 @@ export async function startTUI(opts) {
             || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
           if (entry) {
             entry.toolArgs = { ...(entry.toolArgs || {}), ...(e.args || {}) };
+            // AgentSwarm: turn the args into a live member list so the progress
+            // block renders from the moment the swarm is announced. Every item
+            // starts "queued" and flips as the tool reports progress.
+            if (e.name === 'AgentSwarm') {
+              const a = entry.toolArgs || {};
+              entry.swarmDescription = a.description || '';
+              entry.swarmModel = a.subagent_type || '';
+              if (!entry.swarmMembers && Array.isArray(a.items)) {
+                entry.swarmMembers = a.items.map(() => ({ phase: 'queued', ratio: 0, latestText: '' }));
+              }
+            }
+            // Edit: build the +/- diff. The tool now reports the text it actually
+            // replaced on the tool_result (`editDiff`), which is the only way a
+            // LINE-RANGE edit (start_line/end_line/new_content) can produce a
+            // diff — it has no `old_string` in its args. Args still seed a
+            // provisional diff so the rows appear while the edit is still running.
             if (e.name === 'Edit' && e.args && typeof e.args.old_string === 'string') {
               let startLine = 1;
               try {
@@ -5676,16 +7258,52 @@ export async function startTUI(opts) {
           // A failed run must be visible on the TOOL line too: the status bullet
           // turns red (see messageLines).
           const failedRun = isFailureResult(e.content, e.name);
-          if (entry) { entry.pending = false; entry.id = undefined; entry.failed = failedRun; }
-          const reason = failureReason(e.content, e.name);
-          const isEditLike = e.name === 'Edit' || e.name === 'Write';
-          if (!isEditLike) {
-            // Non-Edit tools show their raw result underneath.
-            addChat({ role: 'tool_result', text: e.content, failed: failedRun });
-          } else if (reason) {
-            // Edit/Write hide their body (the diff already shows the change), so
-            // surface a failure reason as its own red line under the tool call.
-            addChat({ role: 'tool_result', text: reason, failed: true });
+          if (entry) {
+            entry.pending = false; entry.id = undefined; entry.failed = failedRun;
+            // The AUTHORITATIVE diff comes from the tool itself (`editDiff`): it
+            // knows the text it really replaced, so this is the only source that
+            // covers line-range edits. Fall back to the provisional diff built
+            // from the args for older/other callers.
+            if (e.editDiff && typeof e.editDiff.old === 'string') {
+              entry.diff = lineDiff(e.editDiff.old, e.editDiff.new, e.editDiff.startLine || 1);
+            }
+            // Hand the counts to the TOOL row (which keeps `+N -N` next to its
+            // name) and the diff to the RESULT row (rendered beneath the `↳`).
+            if (entry.diff) entry._diffCounts = entry.diff;
+            // A finished swarm has no `↳` dump: the progress block IS the result.
+            // Settle every member so the grid and the pip bar read as final.
+            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
+              entry.swarmFailed = failedRun;
+              entry.swarmMembers.forEach((mem) => {
+                if (mem.phase === 'queued' || mem.phase === 'working' || mem.phase === 'prompting') {
+                  mem.phase = failedRun ? 'failed' : 'completed';
+                }
+                mem.ratio = mem.phase === 'completed' ? 1 : mem.ratio;
+              });
+            }
+          }
+          // An AgentSwarm is the ONE exception: it has already rendered its own
+          // result as the live progress block above (cells + status pip bar), so a
+          // `↳ Swarm finished: …` dump underneath would print the same thing twice.
+          const isSwarm = e.name === 'AgentSwarm' && entry && Array.isArray(entry.swarmMembers);
+          const resultMsg = normalizeMsg({
+            role: 'tool_result', text: e.content, failed: failedRun,
+            diff: e.name === 'Write' ? (entry && entry.diff || []) : (entry && entry.diff),
+          });
+          if (entry && !isSwarm) {
+            const at = state.chat.indexOf(entry);
+            // Skip any rows already sitting between the call and the transcript
+            // tail (the result rows of EARLIER calls in this same step), so each
+            // block reads call -> its result -> call -> its result.
+            let ins = at + 1;
+            while (ins < state.chat.length && state.chat[ins].role === 'tool_result') ins++;
+            state.chat.splice(ins, 0, resultMsg);
+            renderFrame();
+            if ((state.scroll || 0) === 0) state.scroll = 0;
+          } else if (!isSwarm) {
+            addChat(resultMsg);
+          } else {
+            renderFrame();
           }
           // NOTE: queued input is deliberately NOT drained into the running turn
           // here. A message typed while the agent works is a NEW turn, so it waits
@@ -5698,12 +7316,66 @@ export async function startTUI(opts) {
     });
     state.agent = agent;
     if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
+    // A background subagent (Agent {run_in_background:true}, or an AgentSwarm)
+    // finishes AFTER the turn that launched it returned. The tools call
+    // `ctx._onBackgroundTaskDone`, which nothing installed, so the parent was
+    // never told: its result sat in the task store until the user opened /tasks.
+    // Post it into the transcript when it lands (mirroring how a queued message
+    // arrives after the turn), so the parent model sees it on its next turn.
+    if (agent.ctx) {
+      agent.ctx._onBackgroundTaskDone = (task) => {
+        if (!task) return;
+        const status = task.status || 'completed';
+        const head = status === 'completed'
+          ? `[background agent finished: ${task.taskId}]`
+          : `[background agent ${status}: ${task.taskId}${task.stopReason ? ' - ' + task.stopReason : ''}]`;
+        const body = String(task.output || '').trim();
+        addChat({ role: 'system', text: body ? `${head}\n${body}` : head });
+      };
+    }
     await agent.run();
     messages = agent.messages;
     if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
     state.agent = null;
     const liveThink = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
     if (liveThink) liveThink.pending = false;
+
+    // ---- PLAN MODE: finalize the plan and ask to proceed --------------------
+    // The plan bubble is ALREADY on screen (appendAssistant streams the text after
+    // `<plan>` straight into it), so this only: closes the tags out of the prose,
+    // asks for approval, and clears the streaming buffer.
+    let approvedPlan = null;
+    if (state.plan) {
+      const lastAssistant = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
+      // Prefer what arrived on the wire; fall back to scanning the prose for the
+      // case where the tags were split across bubbles.
+      const streamedPlan = [...state.chat].reverse().find((m) => m.role === 'plan');
+      const planText = (streamedPlan && String(streamedPlan.text).trim())
+        || extractPlan(lastAssistant ? lastAssistant.text : '');
+      if (planText) {
+        // Make sure the bubble holds the final, complete text, and drop any
+        // leftover tag remnants from the prose.
+        if (streamedPlan) streamedPlan.text = planText;
+        else addChat({ role: 'plan', text: planText });
+        if (lastAssistant) {
+          lastAssistant.text = String(lastAssistant.text).replace(/<\/?plan>/gi, '').trim();
+          if (!lastAssistant.text.trim()) {
+            const i = state.chat.indexOf(lastAssistant);
+            if (i >= 0) state.chat.splice(i, 1);
+          }
+        }
+        // ask / yolo -> the user decides; auto -> approved without asking, which
+        // is the whole point of "Never Ask".
+        const cur = state.mode || 'ask';
+        const ok = cur === 'auto' ? true : await new Promise((resolve) => {
+          state.planPending = { plan: planText, resolve };
+          renderFrame();
+        });
+        state.planPending = null;
+        if (ok) approvedPlan = planText;
+      }
+    }
+
     const approx = estimateMessagesTokens(messages, cfg);
     state.ctxTokens = approx;
     state.ctxMax = cfg.maxContextTokens || state.ctxMax;
@@ -5719,6 +7391,7 @@ export async function startTUI(opts) {
     session.plan = !!state.plan;
     session.planPath = state.planPath || null;
     session.focus = !!state.focus;
+    session.swarm = !!state.swarm;
     sess.saveSession(session);
     const turnMs = state.turnStart ? Date.now() - state.turnStart : 0;
     const dur = fmtDuration(turnMs);
@@ -5758,6 +7431,19 @@ export async function startTUI(opts) {
       const next = state.queued.shift();
       if (next) { void submit(next); }
     }
+    // Approved plan: Plan mode OFF (write tools come back), then re-enter the agent
+    // with the plan as a SYSTEM message. Deliberately NOT via submit(): that path
+    // posts a user bubble and re-runs the whole submit flow, which is what produced
+    // a stray user message and an extra turn teardown before the work started.
+    // Done LAST so it cannot race the queue drain above.
+    if (approvedPlan) {
+      state.plan = false;
+      session.plan = false;
+      persistState();
+      addChat({ role: 'system', text: 'Plan approved — Plan mode is off, executing.' });
+      renderFrame();
+      void runAgent(PLAN_EXECUTE_PREFIX, { asSystem: true });
+    }
   }
 
   // Remember the session's working mode (permission / plan / focus / effort)
@@ -5769,6 +7455,7 @@ export async function startTUI(opts) {
     session.plan = !!state.plan;
     session.planPath = state.planPath || null;
     session.focus = !!state.focus;
+    session.swarm = !!state.swarm;
     session.effort = state.effort || '';
     // Theme removed - forced dark only
     session.steps = state.steps || 0;
@@ -5778,7 +7465,7 @@ export async function startTUI(opts) {
   }
 
   const host = {
-    addChat, openPicker, openForm, notice, openPanel, openEditor,
+    addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel,
     sendPrompt: (text) => { void runAgent(text); },
     quit: () => { state._quit = true; },
     saveSession: (s) => sess.saveSession(s),
@@ -5802,7 +7489,78 @@ export async function startTUI(opts) {
     state._anchorRows = rows;
   }
 
+  // Live split of the streamed reply into prose vs. <plan> block.
+  // While Plan mode is on and the model is inside <plan>…</plan>, the text is
+  // routed into a `plan` bubble so it renders in its frame AS IT ARRIVES — the old
+  // behaviour buffered the whole reply and only showed the plan at turn end, so
+  // the user watched prose and then the plan popped in.
   function appendAssistant(text) {
+    if (state.plan && typeof text === 'string' && text) {
+      state._planBuf = (state._planBuf || '') + text;
+      const buf = state._planBuf;
+      const open = buf.toLowerCase().indexOf('<plan>');
+      if (open === -1) {
+        // Still in the prose part (or the tag has not finished arriving).
+        const last = state.chat[state.chat.length - 1];
+        if (last && last.role === 'assistant') last.text += text;
+        else state.chat.push({ role: 'assistant', text });
+        anchorScroll();
+        return;
+      }
+      // Everything before the tag is prose; everything after it is the plan body.
+      const prose = buf.slice(0, open);
+      const body = buf.slice(open + 6);
+      const close = body.toLowerCase().indexOf('</plan>');
+      const planSoFar = close === -1 ? body : body.slice(0, close);
+      setStreamedProse(prose);
+      setStreamedPlan(planSoFar);
+      anchorScroll();
+      return;
+    }
+    appendAssistantRaw(text);
+  }
+
+  // Replace the trailing assistant bubble with exactly `prose`.
+  // Order is FIXED: prose bubbles are BEFORE the plan bubble (the plan is last).
+  // Pushing an assistant AFTER the plan put `plan` mid-list on the next update, so
+  // setStreamedPlan saw a non-plan tail, pushed ANOTHER plan, and repeated — every
+  // stream chunk created a new plan bubble (the "1, 12, 123, 1234" spam the user
+  // reported). Find the prose bubble that PRECEDES the plan and update it.
+  function setStreamedProse(prose) {
+    const trimmed = String(prose).replace(/^\s*\n/, '');
+    // Find the FIRST plan bubble; prose must be updated BEFORE it, never after.
+    let planIdx = -1;
+    for (let i = 0; i < state.chat.length; i++) {
+      if (state.chat[i].role === 'plan') { planIdx = i; break; }
+    }
+    // Look for the assistant bubble right BEFORE the plan; with no plan, take the
+    // LAST assistant. This loop indexes UP TO planIdx so it can never miss one —
+    // the old code broke at the first plan it hit from the tail, so it never saw
+    // the assistant in front of it and duplicated the prose on every chunk.
+    const bound = planIdx >= 0 ? planIdx : state.chat.length;
+    let proseIdx = -1;
+    for (let i = bound - 1; i >= 0; i--) {
+      if (state.chat[i].role === 'assistant') { proseIdx = i; break; }
+    }
+    if (proseIdx >= 0) {
+      state.chat[proseIdx].text = trimmed;
+      if (!trimmed.trim()) state.chat.splice(proseIdx, 1);   // nothing left: drop it
+    } else if (trimmed.trim()) {
+      state.chat.unshift({ role: 'assistant', text: trimmed });
+    }
+  }
+
+  // Create/update the live plan bubble, always at the END of the transcript.
+  function setStreamedPlan(planSoFar) {
+    let last = state.chat[state.chat.length - 1];
+    if (last && last.role === 'plan') {
+      last.text = planSoFar;
+    } else {
+      state.chat.push({ role: 'plan', text: planSoFar });
+    }
+  }
+
+  function appendAssistantRaw(text) {
     const last = state.chat[state.chat.length - 1];
     if (last && last.role === 'assistant') {
       last.text += text;
@@ -5844,11 +7602,15 @@ export async function startTUI(opts) {
   function normalizeMsg(m) {
     // Keep `failed`: a failed tool result must render in RED. Dropping it here
     // made every failure look like ordinary gray output.
-    return {
+    // Keep `diff`: an Edit's diff travels ON the tool_result message so it renders
+    // below the `↳` receipt (see messageLines). Dropping it removed the diff.
+    const out = {
       role: m && m.role ? m.role : 'system',
       text: m && m.text != null ? String(m.text) : '',
       failed: !!(m && m.failed),
     };
+    if (m && Array.isArray(m.diff)) out.diff = m.diff;
+    return out;
   }
 
   let stopped = false;
@@ -5861,6 +7623,9 @@ export async function startTUI(opts) {
     if (spinTimer) clearInterval(spinTimer);
     if (tokTimer) clearInterval(tokTimer);
     if (confirmTimer) clearTimeout(confirmTimer);
+    // The /tasks panel owns a flash timer; leaving it armed keeps the process
+    // alive until it fires after exit.
+    if (state.tasksPanel && state.tasksPanel.flashTimer) clearTimeout(state.tasksPanel.flashTimer);
     try { sess.saveSession(session); } catch {}
     stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
     stdout.write(alternateScreen(false));

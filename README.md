@@ -67,6 +67,7 @@ hncode draws inspiration from several excellent projects:
 
 - **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - The original cyan-blue TUI coding agent that inspired this project's design and approach
 - **[Claude Code](https://github.com/anthropics/claude-code)** - The conversation flow and tool interaction patterns
+- **[Codex](https://github.com/openai/codex)** - Several behaviours were shaped by reading its open-source implementation: the AGENTS.md loading spec, the rule against spawning subagents unprompted, the plan-tool state machine, the review rubric, and parts of the system prompt
 
 Special thanks to the communities behind these projects for pushing the boundaries of AI-assisted coding.
 

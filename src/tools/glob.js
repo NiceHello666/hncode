@@ -22,7 +22,13 @@ export const spec = {
     required: ['pattern'],
   },
   async execute(args, ctx) {
-    const fromDir = args.path ? args.path : '.';
+    // `pattern` is required, but the model can still omit it. Return an error
+    // string like every other tool instead of throwing — an uncaught throw here
+    // aborts the whole turn.
+    if (typeof args.pattern !== 'string' || !args.pattern.trim()) {
+      return 'Error: `pattern` is required (e.g. "src/**/*.ts").';
+    }
+    const fromDir = typeof args.path === 'string' && args.path ? args.path : '.';
     const p = normalizeInput(fromDir);
     let base;
     try { base = path.resolve(ctx.cwd || ctx.workspace, p); } catch (e) { return `Error: ${e.message}`; }
@@ -31,6 +37,7 @@ export const spec = {
 
     const alts = expandBraces(args.pattern);
     const re = new RegExp('^(?:' + alts.map((a) => globRegex(a).source.slice(1, -1)).join('|') + ')$');
+
 
     const files = walkFiles(base, { includeIgnored: !!args.include_ignored, includeDirs: false });
     const matches = [];

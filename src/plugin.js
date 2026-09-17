@@ -143,8 +143,18 @@ export async function loadPlugins(dir) {
         continue;
       }
 
-      const meta = (mod.default && (mod.default.name || mod.default.meta)) || { name: f };
-      const plugin = { id: f, name: meta.name || f, version: meta.version || '0.0.0' };
+      // Metadata comes from the default export. `name` there is a plain STRING
+      // (`export default { name: 'recorder' }`), so reading `meta.name` off it
+      // returned undefined and the plugin showed up as its FILENAME with version
+      // 0.0.0 — /plugins listed every plugin under the wrong name. Accept both
+      // shapes: a string name, or an object carrying { name, version }.
+      const def = (mod && mod.default) || {};
+      const meta = typeof def === 'string' ? { name: def } : def;
+      const plugin = {
+        id: f,
+        name: meta.name || meta.meta?.name || f,
+        version: meta.version || meta.meta?.version || '0.0.0',
+      };
       loadedPlugins.push(plugin);
       installFn(API);
       // eslint-disable-next-line no-console

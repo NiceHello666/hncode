@@ -24,9 +24,16 @@ hncode 的完整文档 —— 一个运行在终端用户界面（TUI）里的 A
 11. [上下文管理与自动压缩](#11-上下文管理与自动压缩)
 12. [会话](#12-会话)
 13. [插件系统](#13-插件系统)
+   - [最小的可用插件](#最小的可用插件)
+   - [确认它加载了](#确认它加载了)
+   - [注册斜杠命令](#注册斜杠命令)
+   - [注册钩子](#注册钩子)
+   - [API 完整一览](#api-完整一览)
+   - [容易踩的坑](#容易踩的坑)
 14. [开发者指南](#14-开发者指南)
 15. [故障排查](#15-故障排查)
-16. [许可证](#16-许可证)
+16. [致谢](#16-致谢)
+17. [许可证](#17-许可证)
 
 ---
 
@@ -283,6 +290,7 @@ hncode -p "列出 TODO" --output-format stream-json
 | `/focus [on\|off]` | — | Focus 模式：以最小工具子集起步。 |
 | `/calm-mode [on\|off]` | — | 简洁回复；模型不再叙述过程。 |
 | `/set-system-prompt` | `/system-prompt` | 编辑并保存系统提示词（持久化到 `config.toml`）。 |
+| `/personal [global\|project]` | `/preferences` | 编辑每轮都会注入的个人偏好。`project` → `<工作区>/.hncode/PERSONAL.md`（仅当前工作区），`global` → `~/.hncode/PERSONAL.md`（所有工作区）。不带参数时先选择作用域。 |
 | `/goal [status\|pause\|resume\|cancel] \| <objective>` | `/objective` | 启动或管理自主目标。 |
 
 ### 上下文与诊断
@@ -360,6 +368,7 @@ hncode -p "列出 TODO" --output-format stream-json
 | `WebSearch` | 网络搜索。 |
 | `ReadMediaFile` | 读取图片/媒体文件。 |
 | `FileLines` | 统计（或查看）文件行数。 |
+| `AskUserQuestion` | 在回合中向用户提 1-4 个结构化选择题并等待作答。每题末尾的「Other」自由输入项由系统自动加上，不要自己创建；最后一题之后还有一个「Add a note」全局补充项。返回 JSON：`{"answers":{"<问题>":"<选项>"},"additional":"<补充>"}`，`additional` 仅在用户写了补充时出现；用户按 Esc 放弃时返回 `{"answers":{},"note":"User dismissed…"}`。 |
 
 ### Edit 的安全模型
 
@@ -384,7 +393,7 @@ hncode -p "列出 TODO" --output-format stream-json
 |------|------|------|
 | **Always Ask** | `/ask` | 只读工具自动执行；其他操作一律先询问。 |
 | **Ask When Needed** | `/yolo` | 工作区内的编辑/命令自动执行。工作区外路径、破坏性命令、提问与计划仍会询问。 |
-| **Never Ask** | `/auto` | 不打断你；一切自动决定并执行。 |
+| **Never Ask** | `/auto` | 不打断你；一切自动决定并执行。同时解除工作区路径限制，Agent 可以在任意位置读写 —— 相当于本次会话开启 `HNCODE_ALLOW_EXTERNAL=1`。 |
 
 模式显示在状态行，并且**持久化在会话中**，恢复会话时一并恢复。命令行标志（`--auto`、`-y`）会在本次调用中覆盖它。
 
@@ -426,56 +435,135 @@ token 估算采用与 Kimi Code 相同的启发式：`ceil(ASCII 字符数 / 4) 
 
 ## 13. 插件系统
 
-插件是从 `~/.hncode/plugins/`（或 `HNCODE_PLUGINS`）加载的纯 ESM 模块。
+一个插件就是一个 `.js`/`.mjs` 文件，放进 `~/.hncode/plugins/`（或用 `HNCODE_PLUGINS`
+指定目录）即可。它就是普通的 ES 模块 —— 不需要构建、不需要清单文件、不需要任何依赖。
+文件名就是插件 id。
 
-### 一个插件
+### 最小的可用插件
+
+保存为 `~/.hncode/plugins/echo.mjs`，重启 hncode，模型就多了一个可以调用的工具：
 
 ```javascript
-// ~/.hncode/plugins/my-plugin.mjs
 export function install(api) {
-  // 1. 注册模型可调用的工具。
   api.registerTool({
-    name: 'MyTool',
-    description: '做一件事。',
+    name: 'Echo',
+    description: '把传入的文本原样返回。用户要求回显时使用。',
     parameters: {
       type: 'object',
-      properties: { text: { type: 'string' } },
+      properties: { text: { type: 'string', description: '要回显的文本。' } },
       required: ['text'],
     },
     async execute(args, ctx) {
-      return `got: ${args.text}`;
+      return args.text;
     },
   });
-
-  // 2. 注册斜杠命令。
-  api.registerCommand({
-    name: 'mycmd',
-    description: '运行我的命令。',
-    argumentHint: '[text]',
-    run: (arg, ctx) => { /* ... */ },
-  });
-
-  // 3. 注册生命周期钩子。
-  api.registerHook('onTurnEnd', (turnInfo) => { /* ... */ });
 }
 
-export default { name: 'my-plugin', version: '1.0.0' };
+export default { name: 'echo', version: '1.0.0' };
 ```
 
-### API 一览
+能跑起来靠两点：
 
-| 方法 | 用途 |
-|------|------|
-| `api.registerTool(spec)` | 添加工具。返回反注册函数。 |
-| `api.registerCommand(cmd)` | 添加 `/命令`。返回反注册函数。 |
-| `api.registerHook(name, fn)` | 添加生命周期钩子。返回反注册函数。 |
-| `api.registerConfig(defaults)` | 合并默认配置值。 |
-| `api.ctx` | 运行时 agent 上下文（钩子期间可用）。 |
-| `api.tools` / `api.commands` / `api.hooks` / `api.config` / `api.plugins` | 内省。 |
+- **`install(api)` 是入口。** 具名导出，或者 `default.install` 都行。没有它的文件会被
+  跳过，并在 stderr 上给出提示。
+- **`export default` 只是元信息** —— `{ name, version }`，供 `/plugins` 显示。不写也能
+  正常工作，只是会用文件名代替名字。
 
-支持的钩子名：`onTurnStart`、`onTurnEnd`、`onBeforeRequest`、`onAfterRequest`、`onToolExecute`、`onToolResult`、`onNewMessage`。
+### 确认它加载了
 
-用 `/plugins` 查看已加载内容。
+`/plugins` 会列出已加载的插件、版本，以及它添加的命令：
+
+```
+Loaded plugins:
+  • echo v1.0.0 (echo.mjs)
+```
+
+如果插件没出现，原因打在了 **stderr** 上 —— TUI 占着整个屏幕，所以加载失败会输出到
+终端而不是对话里。工具名或命令名重复时抛的错也在那里。
+
+### 注册斜杠命令
+
+```javascript
+api.registerCommand({
+  name: 'greet',              // 就是 /greet
+  aliases: ['hi'],
+  description: '打个招呼。',
+  argumentHint: '[name]',
+  run: async (arg, ctx) => {
+    // `arg` 是命令名后面输入的全部内容。
+    // 返回字符串就会显示出来；不返回则表示什么都不做。
+    return `你好，${arg || 'world'}！`;
+  },
+});
+```
+
+### 注册钩子
+
+钩子是插件介入 agent 循环的方式。每个钩子都是可选的，参数都是普通数据 ——
+插件不需要去碰任何内部结构。
+
+| 钩子 | 触发时机 | 参数 |
+|------|----------|------|
+| `onTurnStart` | 一个回合开始 | `({ messages })` |
+| `onBeforeRequest` | 调用模型前 | `(messages, cfg)` |
+| `onAfterRequest` | 流式响应读完 | `(messages, cfg)` |
+| `onNewMessage` | 助手消息写入历史时 | `(message, allMessages)` |
+| `onToolExecute` | 工具执行前 | `(toolName, args, ctx)` |
+| `onToolResult` | 工具返回后 | `(toolName, result, ctx)` |
+| `onTurnEnd` | 回合结束（被打断也算） | `({ messages, stopped })` |
+
+一个实用的例子 —— 审计 agent 执行的每一条 shell 命令：
+
+```javascript
+export function install(api) {
+  api.registerHook('onToolExecute', (name, args) => {
+    if (name === 'Bash') console.error('[audit] bash:', args.command);
+  });
+}
+```
+
+两条可以放心依赖的保证：
+
+- **钩子抛异常不会破坏回合。** 每个钩子都在 `try/catch` 里执行，错误输出到 stderr，
+  agent 继续正常工作。
+- **钩子按注册顺序执行**，可以是 async。
+
+### 注册配置默认值
+
+`api.registerConfig({ ... })` 合并的值会进入 `resolveConfig`。它们在内置默认值之后、
+用户的 `config.toml` **之前**生效，所以用户始终优先。
+
+### API 完整一览
+
+| 成员 | 类型 | 用途 |
+|------|------|------|
+| `api.registerTool(spec)` | 函数 | 添加工具。返回反注册函数。 |
+| `api.registerCommand(cmd)` | 函数 | 添加 `/命令`。返回反注册函数。 |
+| `api.registerHook(name, fn)` | 函数 | 添加生命周期钩子。返回反注册函数。 |
+| `api.registerConfig(defaults)` | 函数 | 合并默认配置值。 |
+| `api.ctx` | getter | 运行时 agent 上下文。只在钩子内有意义。 |
+| `api.tools` / `api.commands` / `api.hooks` / `api.config` / `api.plugins` | getter | 副本，用于内省。 |
+
+三个 `register*` 都返回一个可以撤销注册的函数，因此插件能自己卸载：
+
+```javascript
+const off = api.registerTool({ /* … */ });
+// 之后：
+off();
+```
+
+### 容易踩的坑
+
+- **名字在所有插件之间必须唯一。** 注册两次 `Echo` 会抛错；两个插件不能抢同一个
+  工具名或命令名。
+- **插件只在启动时加载一次。** 改了插件文件需要重启。`/reload` 重载的是
+  `config.toml`，不是插件代码。
+- **钩子外面 `api.ctx` 是 null。** 它是 agent 运行时注入的，所以要写在钩子回调里，
+  而不是 install 阶段。
+- **工具的 `execute` 必须返回字符串。** 这个字符串就是模型看到的内容。如果选择抛错，
+  对话里会出现 `Error running <工具名>: …`。
+
+---
 
 ---
 
@@ -523,14 +611,25 @@ src/
 |------|----------------|
 | `hncode: interactive mode requires a TTY` | 你在管道中运行。非交互请用 `hncode -p \"…\"`。 |
 | `no api_key configured` | 设置 `HNCODE_API_KEY`，或配置服务商（`/provider`）。运行 `hncode doctor config`。 |
-| Windows 上界面乱码 | 使用 **Windows Terminal**；老式 `cmd.exe` 控制台渲染很差。 |
+| Windows 上界面乱码 | 使用 **[Windows Terminal](https://github.com/microsoft/terminal)**；老式 `cmd.exe` 控制台渲染很差。微软商店可免费安装，hncode 的渲染就是为它设计的。 |
 | 粘贴很慢 | 首次粘贴后应约为 10ms（剪贴板助手已预热）。首次极慢是 PowerShell 冷启动所致。 |
 | `Edit rejected: you have not read the lines…` | 先 `Read` 文件（相关行），再 `Edit`。 |
 | 上下文计量接近 100% | 运行 `/compact`，或等 85% 时自动压缩触发。 |
+| 自己写的插件没加载 | 原因打在 **stderr** 上，不在对话里 —— TUI 占着整个屏幕。启动 hncode 再退出，读终端输出。一个文件一个插件，且名字必须唯一。 |
 
 ---
 
-## 16. 许可证
+## 16. 致谢
+
+hncode 建立在这几个开源项目的理念之上：
+
+- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** —— 青色蓝调的裸终端 TUI，以及本项目遵循的整体 agent 形态。
+- **[Claude Code](https://github.com/anthropics/claude-code)** —— 对话流程与工具交互模式。
+- **[Codex](https://github.com/openai/codex)** —— 通过阅读其开源实现，本项目确定了几处行为：`AGENTS.md` 的加载规则（作用域、优先级、注入方式）、未获明确许可不得开启子代理、计划工具的状态流转约束、代码审查的判定标准，以及系统提示词的部分内容。
+
+---
+
+## 17. 许可证
 
 [GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE)。
 

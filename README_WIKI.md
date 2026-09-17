@@ -24,9 +24,16 @@ Complete documentation for hncode — an AI coding agent that runs as a terminal
 11. [Context management & auto-compaction](#11-context-management--auto-compaction)
 12. [Sessions](#12-sessions)
 13. [Plugin system](#13-plugin-system)
+   - [The smallest useful plugin](#the-smallest-useful-plugin)
+   - [Verify it loaded](#verify-it-loaded)
+   - [Registering a slash command](#registering-a-slash-command)
+   - [Registering a hook](#registering-a-hook)
+   - [The full API surface](#the-full-api-surface)
+   - [Things that trip people up](#things-that-trip-people-up)
 14. [For developers](#14-for-developers)
 15. [Troubleshooting](#15-troubleshooting)
-16. [License](#16-license)
+16. [Acknowledgments](#16-acknowledgments)
+17. [License](#17-license)
 
 ---
 
@@ -282,6 +289,7 @@ Type `/` in the composer to open the command menu; **Tab** completes, **Enter** 
 | `/focus [on\|off]` | — | Focus mode: start with a minimal tool subset. |
 | `/calm-mode [on\|off]` | — | Terse replies; the model stops narrating. |
 | `/set-system-prompt` | `/system-prompt` | Edit and save the system prompt (persisted to `config.toml`). |
+| `/personal [global\|project]` | `/preferences` | Edit personal preferences injected into every prompt. `project` → `<workspace>/.hncode/PERSONAL.md` (this workspace), `global` → `~/.hncode/PERSONAL.md` (all workspaces). Bare `/personal` picks the scope. |
 | `/goal [status\|pause\|resume\|cancel] \| <objective>` | `/objective` | Start or manage an autonomous goal. |
 
 ### Context & diagnostics
@@ -359,6 +367,7 @@ The model can call these built-in tools. Each returns a string; failures are sho
 | `WebSearch` | Search the web. |
 | `ReadMediaFile` | Read an image/media file. |
 | `FileLines` | Count (or inspect) the lines of a file. |
+| `AskUserQuestion` | Ask the user 1-4 structured multiple-choice questions mid-turn and wait for the answer. An "Other" free-text option is always added per question, plus an "Add a note" row after the last one for a free-form supplement. The result is JSON: `{"answers":{"<question>":"<label>"},"additional":"<note>"}` — `additional` appears only when a note was written — or `{"answers":{},"note":"User dismissed…"}` when they press Esc. |
 
 ### The Edit safety model
 
@@ -383,7 +392,7 @@ These guards prevent clobbering concurrent changes.
 |------|---------|-----------|
 | **Always Ask** | `/ask` | Read-only tools run automatically; everything else asks first. |
 | **Ask When Needed** | `/yolo` | Workspace edits/commands run automatically. Paths outside the workspace, destructive commands, questions, and plans still ask. |
-| **Never Ask** | `/auto` | Nothing interrupts you; everything is decided automatically. |
+| **Never Ask** | `/auto` | Nothing interrupts you; everything is decided automatically. The workspace path guard is lifted too, so the agent may read and write anywhere — this is the equivalent of `HNCODE_ALLOW_EXTERNAL=1` for the session. |
 
 The mode is shown in the status line and is **persisted in the session**, so resuming restores it. CLI flags (`--auto`, `-y`) override it for that invocation.
 
@@ -425,56 +434,139 @@ A session records `id`, `title`, `workspace`, `model`, `messages`, `rounds`, `st
 
 ## 13. Plugin system
 
-Plugins are plain ESM modules loaded from `~/.hncode/plugins/` (or `HNCODE_PLUGINS`).
+A plugin is a single `.js`/`.mjs` file you drop into `~/.hncode/plugins/` (or the
+directory named by `HNCODE_PLUGINS`). It is a normal ES module — no build step, no
+manifest, no dependencies required. The file name is the plugin id.
 
-### A plugin
+### The smallest useful plugin
+
+Save this as `~/.hncode/plugins/echo.mjs`, restart hncode, and the model gains a new
+tool it can call:
 
 ```javascript
-// ~/.hncode/plugins/my-plugin.mjs
 export function install(api) {
-  // 1. Register a tool the model can call.
   api.registerTool({
-    name: 'MyTool',
-    description: 'Does a thing.',
+    name: 'Echo',
+    description: 'Echo the given text back. Use when the user asks to echo.',
     parameters: {
       type: 'object',
-      properties: { text: { type: 'string' } },
+      properties: { text: { type: 'string', description: 'Text to echo.' } },
       required: ['text'],
     },
     async execute(args, ctx) {
-      return `got: ${args.text}`;
+      return args.text;
     },
   });
-
-  // 2. Register a slash command.
-  api.registerCommand({
-    name: 'mycmd',
-    description: 'Runs my command.',
-    argumentHint: '[text]',
-    run: (arg, ctx) => { /* ... */ },
-  });
-
-  // 3. Register a lifecycle hook.
-  api.registerHook('onTurnEnd', (turnInfo) => { /* ... */ });
 }
 
-export default { name: 'my-plugin', version: '1.0.0' };
+export default { name: 'echo', version: '1.0.0' };
 ```
 
-### API surface
+Two things make it work:
 
-| Method | Purpose |
-|--------|---------|
-| `api.registerTool(spec)` | Add a tool. Returns an unregister function. |
-| `api.registerCommand(cmd)` | Add a `/command`. Returns an unregister function. |
-| `api.registerHook(name, fn)` | Add a lifecycle hook. Returns an unregister function. |
-| `api.registerConfig(defaults)` | Merge default config values. |
-| `api.ctx` | The live agent context (during hooks). |
-| `api.tools` / `api.commands` / `api.hooks` / `api.config` / `api.plugins` | Introspection. |
+- **`install(api)` is the entry point.** Export it by name, or as `default.install`.
+  A file without it is skipped, with a message on stderr.
+- **`export default` is metadata only** — `{ name, version }`, used by `/plugins`.
+  Omit it and the plugin still works; it just shows up under its file name.
 
-Supported hook names: `onTurnStart`, `onTurnEnd`, `onBeforeRequest`, `onAfterRequest`, `onToolExecute`, `onToolResult`, `onNewMessage`.
+### Verify it loaded
 
-Inspect what loaded with `/plugins`.
+`/plugins` lists everything that loaded, its version, and any commands it added:
+
+```
+Loaded plugins:
+  • echo v1.0.0 (echo.mjs)
+```
+
+If your plugin is missing, the reason went to **stderr** — the TUI owns the screen,
+so a load failure prints to the terminal rather than into the chat. A duplicate tool
+or command name throws there too.
+
+### Registering a slash command
+
+```javascript
+api.registerCommand({
+  name: 'greet',              // becomes /greet
+  aliases: ['hi'],
+  description: 'Say hello.',
+  argumentHint: '[name]',
+  run: async (arg, ctx) => {
+    // `arg` is everything typed after the command name.
+    // Return a string to display it; return nothing for a no-op.
+    return `Hello, ${arg || 'world'}!`;
+  },
+});
+```
+
+### Registering a hook
+
+Hooks are how a plugin reacts to the agent loop. Every hook is optional, and each
+receives plain data — a plugin never has to reach into internals.
+
+| Hook | When it fires | Arguments |
+|------|---------------|-----------|
+| `onTurnStart` | A turn begins | `({ messages })` |
+| `onBeforeRequest` | Just before the model call | `(messages, cfg)` |
+| `onAfterRequest` | Just after the stream is consumed | `(messages, cfg)` |
+| `onNewMessage` | An assistant message is committed to history | `(message, allMessages)` |
+| `onToolExecute` | Before a tool runs | `(toolName, args, ctx)` |
+| `onToolResult` | After a tool returns | `(toolName, result, ctx)` |
+| `onTurnEnd` | The turn is over (also on interrupt) | `({ messages, stopped })` |
+
+A practical example — audit every shell command the agent runs:
+
+```javascript
+export function install(api) {
+  api.registerHook('onToolExecute', (name, args) => {
+    if (name === 'Bash') console.error('[audit] bash:', args.command);
+  });
+}
+```
+
+Two guarantees worth relying on:
+
+- **A throwing hook cannot break a turn.** Each hook runs inside a `try/catch`, the
+  error is reported to stderr, and the agent continues.
+- **Hooks run in registration order**, and may be async.
+
+### Registering config defaults
+
+`api.registerConfig({ ... })` merges values used by `resolveConfig`. They are applied
+after the built-in defaults and **before** the user's `config.toml`, so the user
+always wins.
+
+### The full API surface
+
+| Member | Type | Purpose |
+|--------|------|---------|
+| `api.registerTool(spec)` | fn | Add a tool. Returns an unregister function. |
+| `api.registerCommand(cmd)` | fn | Add a `/command`. Returns an unregister function. |
+| `api.registerHook(name, fn)` | fn | Add a lifecycle hook. Returns an unregister function. |
+| `api.registerConfig(defaults)` | fn | Merge default config values. |
+| `api.ctx` | getter | The live agent context. Only meaningful inside a hook. |
+| `api.tools` / `api.commands` / `api.hooks` / `api.config` / `api.plugins` | getter | Copies, for introspection. |
+
+All three `register*` functions return a function that undoes the registration, so a
+plugin can unload itself:
+
+```javascript
+const off = api.registerTool({ /* … */ });
+// later:
+off();
+```
+
+### Things that trip people up
+
+- **Names must be unique across all plugins.** Registering `Echo` twice throws; two
+  plugins cannot both claim the same tool or command name.
+- **Plugins load once, at startup.** Editing a plugin file needs a restart.
+  `/reload` reloads `config.toml`, not plugin code.
+- **`api.ctx` is null outside a hook.** It is injected when the agent runs, so read it
+  inside a hook callback rather than at install time.
+- **A tool's `execute` must return a string.** That string is what the model sees.
+  Throw instead, and the transcript shows `Error running <tool>: …`.
+
+---
 
 ---
 
@@ -522,14 +614,26 @@ There is no test runner wired up; keep `node --check <file>` clean and exercise 
 |---------|--------------------|
 | `hncode: interactive mode requires a TTY` | You are piping output. Use `hncode -p \"…\"` for non-interactive use. |
 | `no api_key configured` | Set `HNCODE_API_KEY`, or configure a provider (`/provider`). Run `hncode doctor config`. |
-| Commands look garbled on Windows | Use **Windows Terminal**; legacy `cmd.exe` consoles render poorly. |
+| Commands look garbled on Windows | Use **[Windows Terminal](https://github.com/microsoft/terminal)**; legacy `cmd.exe` consoles render poorly. It is free on the Microsoft Store, and hncode's renderer is built for it. |
 | Paste feels slow | It should be ~10 ms after the first paste (the clipboard helper is pre-warmed). A very slow first paste is the PowerShell cold start. |
 | `Edit rejected: you have not read the lines…` | `Read` the file (the relevant lines) first, then `Edit`. |
 | Context gauge near 100% | Run `/compact`, or let auto-compaction trigger at 85%. |
+| Context gauge near 100% | Run `/compact`, or let auto-compaction trigger at 85%. |
+| A plugin I wrote does not load | The reason is on **stderr**, not in the chat — the TUI owns the screen. Run hncode, quit, and read the terminal output. One file per plugin, and the name must be unique. |
 
 ---
 
-## 16. License
+## 16. Acknowledgments
+
+hncode is built on the ideas of several open-source projects:
+
+- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** — the cyan-blue raw-terminal TUI and the overall agent shape that this project follows.
+- **[Claude Code](https://github.com/anthropics/claude-code)** — conversation flow and tool-interaction patterns.
+- **[Codex](https://github.com/openai/codex)** — reading its open-source implementation shaped several behaviours here: the `AGENTS.md` loading spec (scope, precedence, injection), the rule against spawning subagents without explicit permission, the plan-tool state machine, the code-review finding filter, and parts of the system prompt.
+
+---
+
+## 17. License
 
 [GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
 
