@@ -74,7 +74,7 @@ try {
     // Windows: Use PowerShell to refresh environment
     const { execSync } = require('child_process');
     try {
-      execSync('Refresh-Environment', { stdio: 'pipe' });
+      execSync('$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User");', { stdio: 'pipe' });
       console.log('✓ Environment refreshed automatically (PowerShell)');
     } catch (e) {
       console.log('ℹ️  To refresh environment in PowerShell:');

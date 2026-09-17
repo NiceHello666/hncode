@@ -57,6 +57,13 @@ export const C = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
   dim: '\x1b[2m',
+  // Italic (SGR 3). Used for the BODY of a reasoning block — the prose reads as
+  // an aside rather than as the answer. Must be closed with SGR 23 (`endItalic`),
+  // NOT with `reset`, because resetting also drops the surrounding dim/gray that
+  // the same row depends on. Terminals without italic fall back to normal text,
+  // so this is a decoration, never load-bearing.
+  italic: '\x1b[3m',
+  endItalic: '\x1b[23m',
   muted: '\x1b[90m',
   teal: TEAL,
   cyan: CYAN,
@@ -74,6 +81,13 @@ export const C = {
   gray: '\x1b[90m',
   white: '\x1b[97m',
   orange: TRUECOLOR ? rgb(255, 140, 0) : '\x1b[38;5;208m',
+  // Cyan pushed slightly toward green — used for the Swarm mode badge so it reads
+  // as its own mode next to Plan (pure cyan) and Focus (blue) while staying in the
+  // theme's blue-green family. 38;5;43 is rgb(0,215,175): red at zero and green
+  // only 40 above blue, i.e. still clearly cyan with a green cast. 38;5;85 was the
+  // first attempt and read as plain GREEN — its red channel is lifted to 95 and
+  // green pins at 255, which is a spring green, not a green-tinted cyan.
+  spring: TRUECOLOR ? rgb(0, 215, 175) : '\x1b[38;5;43m',
   bgRed: '\x1b[41m',
   bgGreen: '\x1b[42m',
   // Selection highlight (mouse text selection) and the scrollbar gutter.

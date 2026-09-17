@@ -3,7 +3,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { resolveConfig, effectiveSnapshot, saveConfig, resolveModelArg } from './config.js';
+import { resolveConfig, effectiveSnapshot, saveConfig, resolveModelArg, readPersonalPrompt } from './config.js';
 import * as sess from './session.js';
 import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { llmTools } from './tools/index.js';
@@ -171,7 +171,12 @@ async function runPrompt({ cfg, prompt, format, session, modelArg }) {
   }
   const messages = [];
   if (session && session.messages) for (const m of session.messages.slice(-30)) messages.push(m);
-  messages.push({ role: 'system', content: SYSTEM_PROMPT });
+  // Same layering as the TUI: built-in prompt first, then the user's own
+  // system_prompt override if any, then the /personal notes, then calm mode.
+  let sysText = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
+  const personal = readPersonalPrompt(cfg.workspace);
+  if (personal) sysText += '\n\n' + personal;
+  messages.push({ role: 'system', content: sysText });
   const saved = session || { id: sess.newId(), title: prompt.slice(0, 60), workspace: path.resolve(process.cwd()), model: cfg.model, createdAt: Date.now(), messages: [] };
   const agent = new Agent({
     cfg,

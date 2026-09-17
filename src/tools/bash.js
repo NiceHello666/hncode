@@ -6,12 +6,15 @@
 import fs from 'node:fs';
 import cp from 'node:child_process';
 import { resolvePath, truncateBuf } from './utils.js';
+import { createTask, appendTaskOutput, settleTask } from '../agent-task.js';
 
 // kimi-code's timeout policy (agent-core-v2/agent/tools/os/bash/bash.ts).
 export const DEFAULT_TIMEOUT_S = 60;
 export const MAX_TIMEOUT_S = 5 * 60;
 export const DEFAULT_BACKGROUND_TIMEOUT_S = 10 * 60;
 export const MAX_BACKGROUND_TIMEOUT_S = 24 * 60 * 60;
+
+
 
 // ---- output sanitizing -------------------------------------------------------
 // Captured output can contain terminal control sequences (colours, cursor
@@ -190,51 +193,66 @@ export const spec = {
 // `existingChunks` array the task reads, so we must NOT add new listeners here
 // (doing so doubled every line of output).
 function registerBackgroundTask(args, child, ctx, existingChunks) {
-  const id = `task_${Date.now()}`;
-  const task = {
-    id, pid: child.pid, command: args.command,
+  const task = createTask(ctx, 'process', {
     description: args.description || args.command,
-    status: 'running', start: Date.now(),
+    command: args.command,
+    pid: child.pid,
+    detached: true,
     _chunks: existingChunks || [],
-  };
-  Object.defineProperty(task, 'output', {
-    enumerable: true,
-    get() { return sanitizeShellOutput(decodeChunks(this._chunks)); },
   });
-  ctx.tasks[id] = task;
-  child.on('close', (code) => { task.status = code === 0 ? 'done' : 'failed'; task.code = code; task.end = Date.now(); });
-  return id;
+  defineOutput(task);
+  child.on('close', (code) => {
+    // A task already settled (TaskStop -> 'killed') keeps its status; the
+    // process's non-zero kill exit must not relabel a deliberate stop.
+    if (task.status === 'running') {
+      settleTask(task, code === 0 ? 'completed' : 'failed', { exitCode: code });
+    } else {
+      task.exitCode = code;
+    }
+  });
+  return task.taskId;
 }
 
 function spawnBackground(args, cwd, ctx) {
   const command = args.command;
   const child = cp.spawn('pwsh', ['-Command', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  const id = `task_${Date.now()}`;
-  const task = {
-    id, pid: child.pid, command: args.command,
+  const task = createTask(ctx, 'process', {
     description: args.description || args.command,
-    status: 'running', start: Date.now(),
-    _chunks: [],
-  };
-  // Decode lazily: the accumulated bytes are decoded only when the output is
-  // actually read, so a chatty background task costs nothing until queried.
-  Object.defineProperty(task, 'output', {
-    enumerable: true,
-    get() { return sanitizeShellOutput(decodeChunks(this._chunks)); },
+    command: args.command,
+    pid: child.pid,
+    detached: true,
   });
-  ctx.tasks[id] = task;
-  const push = (d) => { task._chunks.push(d); };
+  defineOutput(task);
+  const push = (d) => appendTaskOutput(task, d);
   if (child.stdout) child.stdout.on('data', push);
   if (child.stderr) child.stderr.on('data', push);
-  child.on('close', (code) => { task.status = code === 0 ? 'done' : 'failed'; task.code = code; task.end = Date.now(); });
+  child.on('close', (code) => {
+    if (task.status === 'running') {
+      settleTask(task, code === 0 ? 'completed' : 'failed', { exitCode: code });
+    } else {
+      task.exitCode = code;
+    }
+  });
   // Background timeout: default 600s, capped at 86400s; `disable_timeout` removes
   // it. The timer is unref'd so it never keeps the process alive on its own.
   if (!args.disable_timeout) {
     const bgTimeoutMs = Math.min(args.timeout ?? DEFAULT_BACKGROUND_TIMEOUT_S, MAX_BACKGROUND_TIMEOUT_S) * 1000;
-    const t = setTimeout(() => { killTree(child); task.status = 'failed'; task.stopReason = 'timed out'; }, bgTimeoutMs);
+    const t = setTimeout(() => {
+      killTree(child);
+      settleTask(task, 'timed_out', { stopReason: 'timed out' });
+    }, bgTimeoutMs);
     if (t.unref) t.unref();
   }
   child.unref();
-  return `Background task #${id} started (pid ${child.pid}): ${args.description || args.command}
-Inspect with TaskList (running tasks) and TaskOutput {task_id: "${id}"} (output).`;
+  return `Background task ${task.taskId} started (pid ${child.pid}): ${args.description || args.command}
+Inspect with TaskList (running tasks) and TaskOutput {task_id: "${task.taskId}"} (output).`;
+}
+
+// Lazy output: the accumulated bytes are decoded only when actually read, so a
+// chatty background task costs nothing until queried.
+function defineOutput(task) {
+  Object.defineProperty(task, 'output', {
+    enumerable: true,
+    get() { return sanitizeShellOutput(decodeChunks(this._chunks)); },
+  });
 }

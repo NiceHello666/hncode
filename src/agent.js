@@ -4,7 +4,9 @@
 
 import { LLM, setToolsList } from './llm.js';
 import { tools, getTool, llmTools } from './tools/index.js';
+import { DELEGATION_TOOLS } from './subagent-types.js';
 import { estimateMessagesTokens } from './term.js';
+import { runHooks } from './plugin.js';
 
 // ---- completion guard --------------------------------------------------------
 // A turn is only complete when the model ends it with an actual answer. Models
@@ -33,10 +35,40 @@ Tools:
 - If a tool fails, read the error and fix your approach. After 2 failed attempts on the same goal, stop and report the blocker.
 - Independent tool calls may run in parallel; never parallelize dependent ones.
 
+Reasoning:
+- Put ALL of your internal reasoning inside <think>...</think> tags, and always emit BOTH the opening
+  and the closing tag. Do not omit the tags, do not abbreviate them, and do not leave the block unclosed.
+- Everything outside <think>...</think> is what the user reads: keep it to the answer itself — what you
+  did and what you found. Never repeat or summarise your reasoning there.
+- Keep the tags exactly as written: <think> and </think>. Do not emit any other variant.
+Acting:
+- Unless the user is explicitly asking for a plan, asking a question about the code, or brainstorming,
+  assume they want the work DONE. Say less and do more: implement the change rather than describing it.
+- Carry the task through implementation and verification in this turn. Do not stop at analysis, at a
+  partial fix, or at a list of things you would do next.
+- New project, no prior context: be ambitious, use your judgement on structure.
+  Existing codebase: be surgical. Touch only what the task needs — no renames, no reorganising,
+  no drive-by fixes.
+- Read the neighbours before you write: match the naming, error handling and comment density you see.
+- Do not re-read a file after editing it, and do not re-run a search you already have results for.
+  A successful edit tool call already proves it worked.
+
 Scope:
 - Do only what was asked. Do not refactor or "improve" unrelated code.
+- Do not fix unrelated bugs or broken tests — mention them instead; they are not yours to change.
 - If the request is ambiguous, ask one short clarifying question.
 - State any assumption you make.
+- Might be a dirty git worktree. Never revert changes you did not make. Never run a destructive command
+  (git reset --hard, git checkout --) unless the user asked for it. If you notice an unexpected change
+  you did not make, stop and ask.
+
+Verifying:
+- Run the narrowest check that exercises your change first, then widen.
+- In auto/yolo mode, run tests and lint yourself without asking.
+- In ask mode, do not burn the user's time on slow test suites mid-task: say what you would run and
+  let them confirm.
+- Do not add tests to a codebase that has none. Do not add a formatter that the project did not configure.
+- If you could not verify something, say so plainly. Do not imply a test passed when you did not run it.
 
 Finishing:
 - Never stop silently after a tool call; end every turn with a written answer in the user's language.
@@ -56,10 +88,18 @@ export class Agent {
     // Ensure the LLM client knows the bare tool specs (the client wraps them per-protocol).
     // A toolFilter (array of tool names) limits which tools are exposed — used
     // by Plan mode (read-only subset) and Focus mode (minimal subset first).
-    const filtered = Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
+    // `cfg.noDelegation` marks this as a SUBAGENT: delegation tools are removed
+    // even if the filter would have allowed them. The catalog already excludes
+    // them from every profile; this is the hard backstop that also covers the
+    // `null` (= everything) case, so a subagent can never spawn another agent.
+    const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       ? tools.filter((t) => cfg.toolFilter.includes(t.name))
-      : tools;
+      : tools
+    ).filter((t) => !(cfg.noDelegation && DELEGATION_TOOLS.includes(t.name)));
     setToolsList(filtered);
+    // A block for the direct-call path too: the model can still emit a tool call
+    // for a tool that is not exposed, so refuse it here rather than at execution.
+    this.noDelegation = !!cfg.noDelegation;
     // AbortSignal handed to every tool so a long-running one (Bash) is killed
     // when the user presses Esc / Ctrl-C — otherwise the command keeps running
     // after the turn was interrupted.
@@ -72,6 +112,12 @@ export class Agent {
     this.ctx.onOutput = (chunk) => {
       if (chunk && this._currentToolId) this.onEvent({ type: 'tool_output', id: this._currentToolId, chunk });
     };
+    // `fork` (the Agent tool) snapshots THIS conversation into the subagent. The
+    // tool reads `ctx._parentMessages`, which nothing ever set — so `fork: true`
+    // was accepted and then seeded the subagent with an empty history. Hand the
+    // tool a live getter over this agent's own messages instead of a copy, so the
+    // snapshot is taken at spawn time and reflects everything up to that point.
+    this.ctx._parentMessages = this.messages;
     this.llm = new LLM(cfg);
     this.stopRequested = false;
     this.onApproval = onApproval; // async (toolName, args) => boolean
@@ -97,14 +143,15 @@ export class Agent {
   }
 
   async run() {
+    // Plugin lifecycle: `onTurnStart` fires here and `onTurnEnd` in the finally
+    // block at the end of this method. Both are awaited and both swallow plugin
+    // errors (see runHooks), so a broken plugin cannot abort a turn.
+    await runHooks('onTurnStart', { messages: this.messages });
     let text = '';
     let toolCalls = [];
     let emittedEnd = false;
-    // Reasoning text seen in the current step. A turn that ends with reasoning
-    // but no answer is a truncated turn (see the completion guard below).
     let thought = '';
     let nudges = 0;
-    // True when the most recent iteration still had tool calls pending; used to
     // decide whether running out of steps actually left the turn unfinished.
     let hadToolCallsOnFinalStep = false;
 
@@ -225,7 +272,12 @@ export class Agent {
         }
       }
 
+      // Plugin hooks around the model round-trip. `onBeforeRequest` sees the exact
+      // message array being sent (and may mutate it); `onAfterRequest` fires once
+      // the stream has been consumed.
+      await runHooks('onBeforeRequest', this.messages, this.cfg);
       await this.llm.request(this.messages, handle);
+      await runHooks('onAfterRequest', this.messages, this.cfg);
 
       // An abort ends the turn: keep whatever text arrived, then stop.
       if (this.stopRequested) {
@@ -238,11 +290,17 @@ export class Agent {
       const hasText = !!(text && text.trim());
       const hasCalls = toolCalls.length > 0;
       if (hasText || hasCalls) {
-        this.messages.push({
+        const assistantMsg = {
           role: 'assistant',
           content: hasText ? text : null,
           toolCalls: hasCalls ? toolCalls : undefined,
-        });
+        };
+        this.messages.push(assistantMsg);
+        // Plugin hook: one per assistant message committed to the history. Fired
+        // here (the single point where the model's reply lands) rather than at each
+        // of the eleven `messages.push` sites, so a plugin sees a coherent message
+        // instead of the intermediate bookkeeping pushes.
+        await runHooks('onNewMessage', assistantMsg, this.messages);
       }
 
       // ---- if tool calls exist, execute them ----
@@ -308,6 +366,17 @@ export class Agent {
         }
         
         const tool = getTool(tc.name);
+        // A subagent may not delegate. The tool is not exposed to it, but the model
+        // can still emit a call for a tool it was told about earlier, so refuse it
+        // here with an actionable message instead of running a nested agent.
+        if (this.noDelegation && DELEGATION_TOOLS.includes(tc.name)) {
+          result = `You CAN'T use ${tc.name}: subagents cannot delegate. Do the work yourself and report the result to the agent that started you.`;
+          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+          this.messages.push({ role: 'tool', toolCallId: tc.id, content: result });
+          this.onEvent({ type: 'tool_result', id: tc.id, name: tc.name, content: result });
+          allOk = false;
+          continue;
+        }
         if (modeName && !this.cfg.toolFilter.includes(tc.name)) {
           result = `You CAN'T use this tool on ${modeName} Mode. Allowed: ${this.cfg.toolFilter.join(', ')}.`;
           this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
@@ -322,6 +391,10 @@ export class Agent {
         } else {
           if (this.onToolStart) this.onToolStart(tc.name, tc.args);
           this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+          // Plugin hook: onToolExecute fires BEFORE the tool runs and receives the
+          // mutable args object, so a plugin can inspect or adjust a call. Errors
+          // are swallowed by runHooks — a broken plugin must not break a turn.
+          await runHooks('onToolExecute', tc.name, tc.args, this.ctx);
           try {
             result = await tool.execute(tc.args, this.ctx);
           } catch (err) {
@@ -329,14 +402,26 @@ export class Agent {
             allOk = false;
           }
           this.ctx.lastResult = result;
+          // Plugin hook: onToolResult fires with the tool's output.
+          await runHooks('onToolResult', tc.name, result, this.ctx);
           // Surface the live TODO list so the TUI can render its panel.
           if (tc.name === 'TodoList') {
             this.onEvent({ type: 'todos', todos: this.ctx.todoState || [] });
           }
         }
         this.messages.push({ role: 'tool', toolCallId: tc.id, content: result });
-        this.onEvent({ type: 'tool_result', id: tc.id, name: tc.name, content: result });
+        // An Edit reports the text it replaced on ctx (both the substring and the
+        // line-range path do). Forward it so the TUI can draw the +/- diff: the
+        // line-range mode has no `old_string` in its args, so without this the
+        // edit rendered with no diff at all. Cleared every time so a later tool
+        // cannot inherit a stale diff.
+        this.onEvent({
+          type: 'tool_result', id: tc.id, name: tc.name, content: result,
+          editDiff: this.ctx.lastEditDiff || null,
+        });
+        this.ctx.lastEditDiff = null;
       }
+
 
       // Did THIS iteration still have tool calls? If the loop runs out of budget
       // right after running them, the turn really is unfinished.
@@ -360,5 +445,8 @@ export class Agent {
       });
     }
     if (!emittedEnd && this.onEvent) this.onEvent({ type: 'done' });
+    // Plugin lifecycle: the turn is over (normally, interrupted, or out of steps).
+    // In a finally-equivalent position — every exit path above reaches here.
+    await runHooks('onTurnEnd', { messages: this.messages, stopped: this.stopRequested });
   }
 }

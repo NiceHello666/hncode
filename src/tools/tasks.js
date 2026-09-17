@@ -1,22 +1,32 @@
-// TaskList / TaskOutput / TaskStop — manage background Bash tasks spawned with
-// run_in_background.
+// TaskList / TaskOutput / TaskStop / TaskWait — manage background tasks spawned
+// by Bash (run_in_background) and Agent (run_in_background). The task records
+// live in the shared registry (src/agent-task.js), so the CLI tools and the
+// /tasks panel read exactly the same data.
 
 import cp from 'node:child_process';
+import { isTerminal, settleTask, STATUS_LABEL } from '../agent-task.js';
+
+function taskLine(t) {
+  const extra = t.stopReason ? ` (${t.stopReason})` : '';
+  const label = STATUS_LABEL[t.status] || t.status;
+  const what = t.kind === 'process' ? (t.description || t.command) : t.description;
+  return `#${t.taskId} [${label}${extra}] pid=${t.pid || '-'} ${what}`;
+}
 
 export const TaskListSpec = {
   name: 'TaskList',
-  description: 'List background tasks (from Bash run_in_background). Reports id, status, description.',
+  description: 'List background tasks (from Bash or Agent run_in_background). Reports task id, status, description.',
   parameters: { type: 'object', properties: {}, required: [] },
   async execute(_args, ctx) {
-    const tasks = Object.values(ctx.tasks || {}).sort((a, b) => b.start - a.start);
+    const tasks = Object.values(ctx.tasks || {}).sort((a, b) => b.startedAt - a.startedAt);
     if (tasks.length === 0) return 'No background tasks.';
-    return tasks.map((t) => `#${t.id} [${t.status}] pid=${t.pid} ${t.description || t.command}`).join('\n');
+    return tasks.map(taskLine).join('\n');
   },
 };
 
 export const TaskOutputSpec = {
   name: 'TaskOutput',
-  description: 'Get the output of a background task (Bash run_in_background) by task_id. head_limit caps the lines returned.',
+  description: 'Get the output of a background task by task_id. head_limit caps the lines returned.',
   parameters: {
     type: 'object',
     properties: {
@@ -28,10 +38,12 @@ export const TaskOutputSpec = {
   async execute(args, ctx) {
     const t = (ctx.tasks || {})[args.task_id];
     if (!t) return `No such task: ${args.task_id}`;
-    const lines = t.output ? t.output.split('\n').filter((l) => l.length > 0) : [];
+    const text = t.output || '';
+    const lines = text ? text.split('\n').filter((l) => l.length > 0) : [];
     const capped = args.head_limit ? lines.slice(0, args.head_limit) : lines;
-    const tail = lines.length > (capped.length);
-    let out = `#${t.id} [${t.status}] (pid ${t.pid})\n${capped.join('\n')}`;
+    const tail = lines.length > capped.length;
+    const label = STATUS_LABEL[t.status] || t.status;
+    let out = `#${t.taskId} [${label}] (pid ${t.pid || '-'})\n${capped.join('\n')}`;
     if (tail) out += `\n... [${lines.length - capped.length} more lines; use head_limit]`;
     return out;
   },
@@ -39,7 +51,7 @@ export const TaskOutputSpec = {
 
 export const TaskStopSpec = {
   name: 'TaskStop',
-  description: 'Stop a running background task (Bash run_in_background) by task_id. Use only when the task must be cancelled.',
+  description: 'Stop a running background task by task_id. Use only when the task must be cancelled.',
   parameters: {
     type: 'object',
     properties: {
@@ -51,30 +63,33 @@ export const TaskStopSpec = {
   async execute(args, ctx) {
     const t = (ctx.tasks || {})[args.task_id];
     if (!t) return `No such task: ${args.task_id}`;
-    if (t.status !== 'running') return `Task ${t.id} is not running (status: ${t.status}).`;
+    if (isTerminal(t.status)) return `Task ${t.taskId} already ${STATUS_LABEL[t.status] || t.status}.`;
     const reason = args.reason || 'Stopped by TaskStop';
     try {
-      if (process.platform === 'win32' && t.pid) {
-        try { cp.spawnSync('taskkill', ['/pid', String(t.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
+      // An agent task aborts through its controller; a process is killed.
+      if (t.kind === 'agent' && typeof t._abort === 'function') {
+        t._abort();
       } else if (t.pid) {
-        try { process.kill(t.pid, 'SIGTERM'); } catch {}
+        if (process.platform === 'win32') {
+          try { cp.spawnSync('taskkill', ['/pid', String(t.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
+        } else {
+          try { process.kill(t.pid, 'SIGTERM'); } catch {}
+        }
       }
     } catch (e) {
-      return `Failed to stop ${t.id}: ${e.message}`;
+      return `Failed to stop ${t.taskId}: ${e.message}`;
     }
-    t.status = 'stopped';
-    t.stopReason = reason;
-    t.end = Date.now();
-    return `Stopped task ${t.id}. reason: ${reason}`;
+    // 'killed' — a deliberate stop, distinct from a failure (kimi's vocabulary).
+    settleTask(t, 'killed', { stopReason: reason });
+    return `Stopped task ${t.taskId}. reason: ${reason}`;
   },
 };
 
-// WaitFor — block until a background task finishes (or the timeout elapses).
-// Mirrors kimi-code's task-wait: a timeout is not an error; the result lists
-// the tasks still running so the caller can wait again.
+// Wait for background tasks to finish. A timeout is not an error; the result
+// lists the tasks still running so the caller can wait again.
 export const TaskWaitSpec = {
   name: 'TaskWait',
-  description: 'Wait for background tasks (Bash run_in_background) to finish, timeout in seconds (1-600). With task_id, waits for that task; without it, returns when any running task finishes. A timeout is not an error; still-running tasks are listed, so you may call it again.',
+  description: 'Wait for background tasks to finish, timeout in seconds (1-600). With task_id, waits for that task; without it, returns when any running task finishes. A timeout is not an error; still-running tasks are listed, so you may call it again.',
   parameters: {
     type: 'object',
     properties: {
@@ -91,12 +106,11 @@ export const TaskWaitSpec = {
     const deadline = Date.now() + secs * 1000;
     const signal = ctx && ctx.signal;
 
-    const isDone = (t) => t && t.status !== 'running';
+    const isDone = (t) => t && isTerminal(t.status);
     const anyRunning = () => Object.values(tasks).some((t) => t.status === 'running');
 
-    // Nothing to wait for at call time.
     if (args.task_id) {
-      if (isDone(target)) return `Task ${target.id} already ${target.status}${target.code !== undefined ? ` (exit ${target.code})` : ''}.`;
+      if (isDone(target)) return `Task ${target.taskId} already ${STATUS_LABEL[target.status] || target.status}${target.exitCode != null ? ` (exit ${target.exitCode})` : ''}.`;
     } else if (!anyRunning()) {
       return 'No background tasks are running.';
     }
@@ -115,12 +129,12 @@ export const TaskWaitSpec = {
     const still = Object.values(tasks).filter((t) => t.status === 'running');
     if (args.task_id) {
       if (isDone(target)) {
-        return `Task ${target.id} finished: ${target.status}${target.code !== undefined ? ` (exit ${target.code})` : ''}${target.stopReason ? ` — ${target.stopReason}` : ''}.`;
+        return `Task ${target.taskId} finished: ${STATUS_LABEL[target.status] || target.status}${target.exitCode != null ? ` (exit ${target.exitCode})` : ''}${target.stopReason ? ` — ${target.stopReason}` : ''}.`;
       }
-      return `Task ${target.id} still running after ${secs}s.`;
+      return `Task ${target.taskId} still running after ${secs}s.`;
     }
     if (!still.length) return 'All background tasks have finished.';
-    const list = still.map((t) => `#${t.id} ${t.description || t.command}`).join('; ');
+    const list = still.map((t) => `#${t.taskId} ${t.description || t.command || ''}`).join('; ');
     return `Timeout after ${secs}s; still running: ${list}`;
   },
 };
