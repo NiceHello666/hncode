@@ -42,8 +42,14 @@ export const spec = {
 };
 
 function hasRg() {
-  try { cp.spawnSync('rg', ['--version'], { stdio: 'ignore' }); return true; }
-  catch { return false; }
+  try {
+    // spawnSync does NOT throw when the binary is missing — it returns
+    // { error: ENOENT, status: null }. The old try/catch therefore always
+    // reported "rg available", and grepRg() then returned an empty stdout as
+    // "No matches found" instead of falling back to the JS walker.
+    const r = cp.spawnSync('rg', ['--version'], { stdio: 'ignore' });
+    return !r.error && r.status === 0;
+  } catch { return false; }
 }
 
 function buildRgArgs(args, base) {
@@ -70,10 +76,13 @@ function grepRg(args, base, ctx) {
       maxBuffer: 64 * 1024 * 1024,
       encoding: 'utf8',
     });
+    // spawn failure: `r.error` set, status null. Must fall back to JS, not
+    // return an empty result as "No matches found".
+    if (r.error) return grepJs(args, base, ctx);
     out = r.stdout || '';
     if (r.status > 1 && r.stderr) return `rg error: ${r.stderr.trim()}`;
   } catch (e) {
-    return `rg unavailable: ${e.message}; falling back`;
+    return grepJs(args, base, ctx);
   }
   return paginate(out, args);
 }
@@ -118,6 +127,10 @@ function grepJs(args, base, ctx) {
       const lines = txt.split('\n');
       let count = 0;
       for (let i = 0; i < lines.length; i++) {
+        // `re` carries the `g` flag, so RegExp.test() advances lastIndex and
+        // the NEXT call starts mid-string — every other matching line was
+        // skipped. Reset lastIndex before each test.
+        re.lastIndex = 0;
         if (re.test(lines[i])) {
           count++;
           if (mode === 'files_with_matches') { out.push(abs); break; }

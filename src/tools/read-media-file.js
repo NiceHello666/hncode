@@ -36,15 +36,29 @@ export const spec = {
       if (stat.size > MAX_IMAGE_SIZE) {
         return `Error: image too large (${(stat.size / 1024 / 1024).toFixed(1)}MB, max 20MB): ${args.path}`;
       }
-      const data = fs.readFileSync(p);
-      const base64 = data.toString('base64');
+      // A tool result is plain TEXT that goes back into the model's context on
+      // the next request. A 20MB image becomes ~27MB of base64, which blows the
+      // context window and (for OpenAI/Anthropic chat completions) is not a
+      // recognised image payload anyway — the model only sees a wall of text.
+      // Return a REFERENCE the caller can act on instead of the bytes.
       const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
         : ext === '.png' ? 'image/png'
         : ext === '.gif' ? 'image/gif'
         : ext === '.webp' ? 'image/webp'
         : ext === '.bmp' ? 'image/bmp'
         : 'image/unknown';
-      return `data:${mimeType};base64,${base64}`;
+      const sizeKB = Math.max(1, Math.round(stat.size / 1024));
+      const abs = p.replace(/\\/g, '/');
+      // Keep a small inline preview ONLY for tiny files (< 64KB), where the
+      // base64 is at most ~87KB and genuinely usable by a multimodal client.
+      if (stat.size <= 64 * 1024) {
+        const base64 = fs.readFileSync(p).toString('base64');
+        return `data:${mimeType};base64,${base64}`;
+      }
+      return `[Image: ${mimeType}] ${args.path} (${sizeKB}KB, ${stat.width || '?'}x${stat.height || '?'} unknown)\n`
+        + `Path: ${abs}\n`
+        + `This image is too large to inline as base64 (would be ~${Math.round(stat.size * 4 / 3 / 1024)}KB of text). `
+        + `To view it, use a client that renders image paths, or resize it first.`;
     }
     
     const fileType = VIDEO_EXT.includes(ext) ? 'video' : AUDIO_EXT.includes(ext) ? 'audio' : 'unknown';

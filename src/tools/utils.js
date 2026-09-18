@@ -13,7 +13,17 @@ export function truncateBuf(buf) {
   }
   const s = String(buf);
   if (s.length <= MAX_OUTPUT_BYTES) return s;
-  return s.slice(0, MAX_OUTPUT_BYTES) + `\n...[truncated ${s.length - MAX_OUTPUT_BYTES} chars]`;
+  // The cap is a BYTE budget, but `s.length` is UTF-16 code units. Slicing by
+  // code units both under-counts non-ASCII (a 3-byte CJK char costs 1 unit)
+  // and can split a surrogate pair, emitting a lone half. Truncate by BYTES
+  // and back off to the nearest code-point boundary.
+  const bytes = Buffer.byteLength(s, 'utf8');
+  if (bytes <= MAX_OUTPUT_BYTES) return s;
+  const cut = Buffer.from(s, 'utf8').subarray(0, MAX_OUTPUT_BYTES).toString('utf8');
+  // A trailing lone surrogate (from a split pair) is dropped by decoding; the
+  // replacement char U+FFFD at the tail is also stripped so the marker is clean.
+  const safe = cut.endsWith('\uFFFD') ? cut.slice(0, -1) : cut;
+  return safe + `\n...[truncated ${bytes - MAX_OUTPUT_BYTES} bytes]`;
 }
 
 // Expand ~ and map Git-Bash /c/x -> C:\x style paths, then resolve against cwd.

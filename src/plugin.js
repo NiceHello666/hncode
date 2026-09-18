@@ -125,6 +125,15 @@ export async function loadPlugins(dir) {
   const pluginDir = dir || PLUGIN_DIR;
   if (!fs.existsSync(pluginDir)) return [];
 
+  // loadPlugins() may be called more than once (tests, hot reload). Reset the
+  // registries first so a second load cannot throw "tool already registered"
+  // and accumulate stale hooks/config over reloads.
+  registeredTools.length = 0;
+  registeredCommands.length = 0;
+  for (const k of Object.keys(registeredHooks)) delete registeredHooks[k];
+  for (const k of Object.keys(registeredConfig)) delete registeredConfig[k];
+  loadedPlugins.length = 0;
+
   const files = fs.readdirSync(pluginDir)
     .filter((f) => f.endsWith('.js') || f.endsWith('.mjs'))
     .sort();
@@ -189,6 +198,10 @@ export async function runHooks(name, ...args) {
 // ---------------------------------------------------------------------------
 
 export { API, registeredTools as pluginTools, registeredCommands as pluginCommands };
+// Plugin-provided config DEFAULTS. resolveConfig() must merge these BEFORE
+// user config so a plugin can supply a value the user has not set. Previously
+// registerConfig() stored into this object and nothing ever read it.
+export { registeredConfig as pluginConfigDefaults };
 
 // Reset state — useful for tests.
 export function _resetPlugins() {

@@ -66,7 +66,6 @@ npx @hncode/hncode
 hncode 从以下几个优秀项目中汲取了灵感：
 
 - **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - 原始的青色蓝调终端界面 AI 编程助手，启发了本项目的设计和理念
-- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - 原始的青色蓝调终端界面 AI 编程助手，启发了本项目的设计和理念
 - **[Claude Code](https://github.com/anthropics/claude-code)** - 对话流程和工具交互模式
 - **[Codex](https://github.com/openai/codex)** - 通过阅读其开源实现，本项目确定了几处行为：AGENTS.md 的加载规则、未获明确许可不得开启子代理、计划工具的状态流转约束、代码审查的判定标准，以及系统提示词的部分内容
 

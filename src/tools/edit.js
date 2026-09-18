@@ -6,14 +6,14 @@ import fs from 'node:fs';
 import { resolvePath, ensureDir } from './utils.js';
 import { hashStr, normalizeText } from './read.js';
 
-// Hash the <start..end> 1-based line slice of an already-normalized line array.
-function hashLines(lines, start, end) {
-  return hashStr((lines.slice(start - 1, end) || []).join('\n'));
-}
+// Re-exported from read.js so the staleness guard has ONE definition of the
+// region hash. Previously read.js and edit.js each had their own copy; any
+// drift between them would silently disable staleness detection.
+import { hashRegion as hashLines } from './read.js';
 
 export const spec = {
   name: 'Edit',
-  description: 'Replace an exact substring (old_string) with new_string. Fails if old_string is missing or ambiguous (unless replace_all).',
+description: 'Edit a file. PREFERRED: line-range mode (path + start_line/end_line/new_content) — replace by line numbers when you have Read the file and know the positions. Use line-range mode whenever possible; fall back to exact-substring mode (path + old_string/new_string) only when the exact text is known and a line range is not convenient.',
   parameters: {
     type: 'object',
     properties: {
@@ -21,14 +21,16 @@ export const spec = {
       old_string: { type: 'string', description: 'Exact text to replace, including whitespace and newlines. Omit when using start_line/end_line.' },
       new_string: { type: 'string', description: 'Replacement text for old_string.' },
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
-      start_line: { type: 'integer', minimum: 1, description: '1-based first line to replace (requires end_line and new_content).' },
-      end_line: { type: 'integer', minimum: 1, description: '1-based last line to replace (inclusive; requires start_line).' },
-      new_content: { type: 'string', description: 'Replacement text for the line range [start_line, end_line]. Requires start_line and end_line.' },
+start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_content). Use this line-range mode first.' },
+      end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line).' },
+      new_content: { type: 'string', description: 'PREFERRED MODE. Replacement text for the line range [start_line, end_line]. Requires start_line and end_line.' },
     },
-    // Either exact-substring mode (old_string+new_string) OR line-range mode.
+// Either line-range mode (start_line+end_line+new_content) OR exact-substring
+    // mode (old_string+new_string). Line-range is the preferred route — see the
+    // tool description and the PREFERRED MODE notes on the params.
     anyOf: [
-      { required: ['path', 'old_string', 'new_string'] },
       { required: ['path', 'start_line', 'end_line', 'new_content'] },
+      { required: ['path', 'old_string', 'new_string'] },
     ],
   },
   async execute(args, ctx) {
@@ -164,8 +166,6 @@ export const spec = {
     return `Edited ${args.path}: replaced ${occurrences} occurrence(s).`;
   },
 };
-
-// Returns an error message when the edit is stale, else null (safe to edit).
 
 // Returns an error message when the edit is stale, else null (safe to edit).
 function checkStale(p, normContent, normOld, ctx) {

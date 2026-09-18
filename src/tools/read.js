@@ -22,6 +22,8 @@ function hashLines(lines, start, end) {
   const slice = (lines.slice(start - 1, end) || []).join('\n');
   return hashStr(slice);
 }
+// Public alias so edit.js (and the line-range path) share ONE implementation.
+export const hashRegion = hashLines;
 
 export const spec = {
   name: 'Read',

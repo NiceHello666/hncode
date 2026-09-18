@@ -50,8 +50,19 @@ export function combinedTools() {
 export const tools = builtinTools;
 export { builtinTools };
 
-const byName = new Map(builtinTools.map((t) => [t.name, t]));
-export function getTool(name) { return byName.get(name); }
+// NOTE: the map is built lazily over combinedTools() so plugin-registered
+// tools are resolvable. The previous Map was built from builtinTools only,
+// so `llmTools()` advertised a plugin tool to the model but `getTool(name)`
+// returned undefined and the call failed with `unknown tool`.
+let _byName = null;
+function byNameMap() {
+  if (!_byName) {
+    _byName = new Map();
+    for (const t of combinedTools()) if (!_byName.has(t.name)) _byName.set(t.name, t);
+  }
+  return _byName;
+}
+export function getTool(name) { return byNameMap().get(name); }
 export function toolNames() { return combinedTools().map((t) => t.name); }
 
 // Schemas for sending to an LLM (OpenAI `tools` array).

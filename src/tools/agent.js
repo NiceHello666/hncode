@@ -112,7 +112,14 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
   //     content stream instead of the separate reasoning channel.
   // So: take the LAST assistant message (the handoff), and strip any think block
   // from it. Fall back to the filtered stream text when there is no message.
-  const stripThink = (s) => String(s).replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '').trim();
+  // Strip whichever spelling the model used. `\b` alone is wrong here: `k` and `i`
+  // are both word characters, so `<think\b` does NOT match `<thinking>` — a model
+  // using the long form had its whole reasoning block leak into the handoff. Enumerate
+  // the variants instead, matching llm.js's tag table.
+  const stripThink = (s) => String(s)
+    .replace(/<(?:think|thinking)\b[^>]*>[\s\S]*?<\/(?:think|thinking)>/gi, '')
+    .replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/i, '')   // an unclosed block: drop to the end
+    .trim();
   const lastAssistant = [...agent.messages].reverse()
     .find((m) => m.role === 'assistant' && typeof m.content === 'string' && stripThink(m.content));
   const result = (lastAssistant && stripThink(lastAssistant.content)) || stripThink(text) || '(no output)';
