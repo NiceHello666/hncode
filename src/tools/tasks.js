@@ -43,7 +43,8 @@ export const TaskOutputSpec = {
     const capped = args.head_limit ? lines.slice(0, args.head_limit) : lines;
     const tail = lines.length > capped.length;
     const label = STATUS_LABEL[t.status] || t.status;
-    let out = `#${t.taskId} [${label}] (pid ${t.pid || '-'})\n${capped.join('\n')}`;
+    const head = `#${t.taskId} [${label}] (pid ${t.pid || '-'})`;
+    let out = capped.length ? `${head}\n${capped.join('\n')}` : `${head}\n(no output yet)`;
     if (tail) out += `\n... [${lines.length - capped.length} more lines; use head_limit]`;
     return out;
   },

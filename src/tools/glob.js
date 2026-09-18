@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeInput } from './utils.js';
 import { walkFiles } from './ignore.js';
-import { globRegex, expandBraces } from './matchers.js';
+import { globToRegexSource, expandBraces } from './matchers.js';
 
 export const spec = {
   name: 'Glob',
@@ -35,11 +35,16 @@ export const spec = {
     if (!fs.existsSync(base)) return `Error: path does not exist: ${fromDir}`;
     if (!fs.statSync(base).isDirectory()) return `Error: --path is not a directory: ${fromDir}`;
 
-    const alts = expandBraces(args.pattern);
-    const re = new RegExp('^(?:' + alts.map((a) => globRegex(a).source.slice(1, -1)).join('|') + ')$');
+const alts = expandBraces(args.pattern);
+    // Each alt is already anchored (globToRegexSource includes ^ and $), so
+    // join them into one anchored alternation. The previous code inferred the
+    // anchors by slicing the first/last char off globRegex(), which was fragile:
+    // a brace pattern has per-alt anchors that slicing stripped into the wrong
+    // shape.
+    const re = new RegExp('^(?:' + alts.map((a) => globToRegexSource(a)).join('|') + ')$');
 
 
-    const files = walkFiles(base, { includeIgnored: !!args.include_ignored, includeDirs: false });
+    const files = walkFiles(base, { includeIgnored: !!args.include_ignored, includeDirs: !!args.include_dirs });
     const matches = [];
     for (const abs of files) {
       const rel = path.relative(base, abs).split(path.sep).join('/');

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { parse } from './toml.js';
+import { pluginConfigDefaults } from './plugin.js';
 
 const home = os.homedir();
 
@@ -194,6 +195,11 @@ function loadBaseToml() {
 
 export function resolveConfig() {
   const root = loadBaseToml() || {};
+  // Merge plugin-provided defaults UNDER the user's config: an explicitly set
+  // user value always wins.
+  for (const [k, v] of Object.entries(pluginConfigDefaults || {})) {
+    if (!(k in root)) root[k] = v;
+  }
 
   const providers = root.providers || {};
   const models = root.models || {};
@@ -234,8 +240,11 @@ export function resolveConfig() {
   // The base URL is used EXACTLY as configured — we only append the API path.
   // (No `/v1` is injected: if the user's base ends in /v1, the result is
   // `<base>/chat/completions`; if it doesn't, it's `<base>/chat/completions` too.)
-  const b = baseUrl.replace(/\/+$/, '');
-  const endpoint = protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`;
+const b = baseUrl.replace(/\/+$/, '');
+  // An empty base URL produces a relative endpoint like "/chat/completions",
+  // which fetch() rejects with a URL-scheme error the model can't decode. Leave
+  // the endpoint empty instead so the caller can show "not set".
+  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`);
 
   // Context window: an explicit env/root override wins, then the model's own
   // `contextLength` (discovered from the provider's /v1/models), then the
@@ -283,22 +292,47 @@ export function resolveConfig() {
 
 export function saveConfig(overlay) {
   const dir = hncodeConfigFile();
+  const entries = Object.entries(overlay || {});
+  if (entries.length === 0) return dir;
+  // Render the overlay to TOML lines, preserving key order.
   let out = '';
-  for (const [k, v] of Object.entries(overlay)) out += toTomlLine(k, v) + '\n';
+  for (const [k, v] of entries) out += toTomlLine(k, v) + '\n';
   fs.mkdirSync(path.dirname(dir), { recursive: true });
-  
+
   // Check if file exists and has content
   try {
     if (fs.statSync(dir).isFile()) {
       const existing = fs.readFileSync(dir, 'utf8');
       if (existing.trim().length > 0) {
-        // Append to existing config instead of overwriting
-        fs.writeFileSync(dir, existing + '\n' + out, 'utf8');
+        // Append to existing config instead of overwriting — but only for keys
+        // that are NOT already present as top-level lines, so two saveConfig
+        // calls for the same key never produce duplicate keys. Reuse the same
+        // "top-level before any [table] header" rule as setConfigString.
+        const keys = new Set(entries.map(([k]) => k));
+        const lines = existing.split(/\r?\n/);
+        const seen = new Set();       // top-level keys already in the file
+        let inTable = false;
+        for (const ln of lines) {
+          if (/^\s*\[/.test(ln)) inTable = true;
+          if (!inTable) {
+            const km = /^\s*([A-Za-z0-9_]+)\s*=\s*/.exec(ln);
+            if (km) seen.add(km[1]);
+          }
+        }
+        // Nothing to add: every overlay key is already present top-level.
+        let add = '';
+        for (const [k, v] of entries) {
+          if (!seen.has(k)) add += toTomlLine(k, v) + '\n';
+        }
+        if (add) {
+          const sep = existing.endsWith('\n') ? '' : '\n';
+          fs.writeFileSync(dir, existing + sep + '\n' + add.trimEnd() + '\n', 'utf8');
+        }
         return dir;
       }
     }
   } catch {}
-  
+
   // New file or empty file
   fs.writeFileSync(dir, out, 'utf8');
   return dir;
@@ -634,6 +668,20 @@ export function effectiveSnapshot(cfg) {
 // sub-table takes precedence (it's the point of switching); env vars set at boot
 // are already baked into `cfg` and only remain in effect when the provider table
 // does not override a given field.
+// Recompute the context window for a given model key. `resolveConfig` picks the
+// window from the model's [models.*] entry (context_length), an env/root
+// override, or the default. resolveProvider / resolveModelArg must reuse the
+// SAME rule when the user switches provider/model mid-session, otherwise the
+// status-bar context gauge (state.ctxMax) keeps the stale previous model's value.
+function contextForModel(cfg, modelName) {
+  const root = (cfg && cfg.raw) || {};
+  const models = (root.models) || {};
+  const overrideContext = process.env.HNCODE_MAX_CONTEXT || root.max_context_size || root.max_context_tokens;
+  const entry = models[modelName] || {};
+  const modelContext = Number(entry.contextLength || entry.context_length || entry.max_context_size || 0);
+  return Number(overrideContext || modelContext || DEFAULTS.maxContextTokens);
+}
+
 export function resolveProvider(cfg, providerName, innerModel) {
   const pr = (cfg.raw && cfg.raw.providers) || {};
   const prov = pr[providerName] || {};
@@ -642,8 +690,11 @@ export function resolveProvider(cfg, providerName, innerModel) {
   const protocol = (prov.protocol) || cfg.protocol;
   const inner = prov.model || (innerModel != null ? innerModel : cfg.innerModel);
   const b = String(baseUrl || '').replace(/\/+$/, '');
-  const endpoint = protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`;
-  return { ...cfg, provider: providerName, innerModel: inner, baseUrl: b, endpoint, apiKey, protocol };
+  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`);
+  // Provider switch may move the active model too; refresh the context window
+  // so the gauge reflects the newly active model, not the old one.
+  const maxContextTokens = contextForModel(cfg, cfg.model);
+  return { ...cfg, provider: providerName, innerModel: inner, baseUrl: b, endpoint, apiKey, protocol, maxContextTokens };
 }
 
 // Switch model, optionally moving to a provider declared via [models.NAME].
@@ -655,7 +706,9 @@ export function resolveModelArg(cfg, modelName) {
   const entry = models[modelName] || {};
   const provider = entry.provider || cfg.provider;
   const inner = bareModelId(provider, modelName, entry);
-  return { ...resolveProvider(cfg, provider, inner), model: modelName };
+  // Refresh the context window for the newly selected model.
+  const maxContextTokens = contextForModel(cfg, modelName);
+  return { ...resolveProvider(cfg, provider, inner), model: modelName, maxContextTokens };
 }
 
 export default { resolveConfig, saveConfig, effectiveSnapshot, resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, rememberModel, hncodeConfigFile };

@@ -111,7 +111,23 @@ let llmToolsList = [];
 export function setToolsList(list) { llmToolsList = list; }
 
 export class LLM {
-  constructor(cfg) { this.cfg = cfg; this.controller = null; }
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.controller = null;
+    // Inline-reasoning state carried ACROSS requests. Our system prompt tells the
+    // model to put all its reasoning inside one <think> span, and tool calls happen
+    // inside that span — so the span outlives a single request. Reset when the turn
+    // ends (see resetThink).
+    this._inThink = false;
+    this._tagPending = '';
+  }
+
+  // Called by the agent at the end of a turn: the next turn starts a fresh
+  // reasoning block, even if the previous one never saw its closing tag.
+  resetThink() {
+    this._inThink = false;
+    this._tagPending = '';
+  }
 
   // Abort an in-flight request (Esc / Ctrl-C while the agent is running).
   abort() {
@@ -219,7 +235,15 @@ export class LLM {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    const state = { tools: new Map(), indexToId: {}, doneEmitted: false };
+    // The inline-reasoning state (`inThink` / `tagPending`) is carried on the LLM
+    // instance, NOT recreated per request. A model that opens <think>, runs a tool,
+    // and only writes </think> in the NEXT step would otherwise have everything
+    // after the tool call reclassified as the ANSWER — the reasoning text and the
+    // literal `</think>` tag both showed up in the transcript.
+    const state = {
+      tools: new Map(), indexToId: {}, doneEmitted: false,
+      inThink: !!this._inThink, tagPending: this._tagPending || '',
+    };
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -242,6 +266,12 @@ export class LLM {
       return;
     } finally {
       reader.releaseLock?.();
+      // Carry the inline-reasoning state forward on EVERY exit path — a normal end,
+      // [DONE], an abort and an error all pass through here. The model may resume an
+      // open <think> span after a tool call in the next step, so this belongs to the
+      // turn, not to one request.
+      this._inThink = !!state.inThink;
+      this._tagPending = state.tagPending || '';
     }
     finish(state, onEvent);
   }
@@ -249,15 +279,28 @@ export class LLM {
 
 // ---- inline reasoning tags -------------------------------------------------
 // Some OpenAI-compatible servers do not send a separate `reasoning_content`
-// field: they put the chain of thought INLINE in `content`, wrapped in a tag
-// such as ` thinking…<｜end▁of▁thinking｜>` or `<thinking>…</thinking>`. Without splitting
-// those out, the raw tags and the whole reasoning trace are rendered as the
-// assistant's answer (and counted as output tokens). This is a streaming state
-// machine: a tag can be split across chunks, so a trailing partial tag is held
-// back until the next chunk decides what it is.
-const THINK_OPEN_TAGS = [' thinking', '<thinking>'];
+// field: they put the chain of thought INLINE in `content`, wrapped in a tag.
+// Three spellings have to be supported, because they come from three places:
+//   ` thinking…`                 — the DeepSeek-R1 token markers, as emitted by
+//                               vLLM / llama.cpp builds of that model
+//   `<thinking>…</thinking>`    — what several OpenAI-compatible servers wrap it in
+//   `<think>…</think>`          — what OUR OWN system prompt asks for (agent.js
+//                               and prompt-presets.js both instruct this)
+// The last one was missing, so a model that followed our prompt had its whole
+// reasoning trace rendered as the ANSWER, raw tags and all.
+//
+// The three are mutually distinguishable, which is what makes supporting all of
+// them safe: `</think>` does not occur inside `</thinking>`, `<think>` does not
+// occur inside `<thinking>`, and `' thinking'` does not occur inside `<think>`.
+// So an early match can never be caused by the longer tag.
+//
+// Without splitting these out, the raw tags and the whole reasoning trace are
+// rendered as the assistant's answer (and counted as output tokens). This is a
+// streaming state machine: a tag can be split across chunks, so a trailing partial
+// tag is held back until the next chunk decides what it is.
+const THINK_OPEN_TAGS = [' thinking', '<thinking>', '<think>'];
 // Closing tags. If none of these appear, the block stays in think mode to EOI.
-const THINK_CLOSE_TAGS = ['<｜end▁of▁thinking｜>', '</thinking>'];
+const THINK_CLOSE_TAGS = ['<｜end▁of▁thinking｜>', '</thinking>', '</think>'];
 
 // Longest suffix of `buf` that is a proper prefix of one of `tags`.
 // A single trailing space is deliberately NOT a candidate: `' '` is a prefix of
@@ -313,7 +356,13 @@ function flushContent(onEvent, state) {
 function finish(state, onEvent) {
   // close any tool calls that started but never got an explicit end
   if (state.doneEmitted) return;
-  flushContent(onEvent, state);
+  // A still-OPEN reasoning block is deliberately NOT flushed here. The model can
+  // continue it after a tool call in the next step — our own system prompt tells it
+  // to put ALL reasoning in one <think> span, and tool calls happen inside that
+  // span. Flushing would dump the held-back partial tag and end the block early, so
+  // the rest of the reasoning would be reclassified as the ANSWER. The caller keeps
+  // `inThink`/`tagPending` on the LLM instance and the block resumes there.
+  if (!state.inThink) flushContent(onEvent, state);
   for (const [, t] of state.tools) {
     if (!t.done) onEvent({ type: 'tool_end', id: t.id });
   }

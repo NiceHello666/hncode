@@ -26,7 +26,12 @@ const SWARM_CONCURRENCY = 4;
 export function planSwarm(args) {
   const items = Array.isArray(args.items) ? args.items.map((s) => String(s).trim()).filter(Boolean) : [];
   const template = args.prompt_template == null ? '' : String(args.prompt_template);
-  const resumeMap = (args.resume_agent_ids && typeof args.resume_agent_ids === 'object')
+  // `typeof [] === 'object'`, so an array was previously accepted and turned
+  // into [['0', ...], ['1', ...]] — the swarm then tried to resume agents
+  // named "0"/"1". Require a plain object.
+  const resumeMap = (args.resume_agent_ids
+    && typeof args.resume_agent_ids === 'object'
+    && !Array.isArray(args.resume_agent_ids))
     ? Object.entries(args.resume_agent_ids).map(([id, p]) => [String(id).trim(), String(p).trim()])
     : [];
 

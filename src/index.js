@@ -8,8 +8,11 @@ import * as sess from './session.js';
 import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { llmTools } from './tools/index.js';
 import { setToolsList } from './llm.js';
+import { localVersion } from './version.js';
 
-export const VERSION = '0.1.0';
+// The version shown by `hncode -V` and the help banner. Read from package.json
+// (via version.js) so it can never drift from the published version again.
+export const VERSION = localVersion();
 
 const HELP = `hncode ${VERSION} — a Kimi Code-style coding agent.
 
@@ -53,17 +56,31 @@ export function parseArgs(argv) {
       else { key = a.slice(2); val = null; }
       if (key === 'resume') key = 'session'; // `--resume <id>` is an alias for `--session <id>`
       if (['session'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
-      else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir') {
-        if (val === null) { val = argv[++i]; }
-        out[key] = key === 'add-dir' ? (out[key] || []).concat([val]) : val;
+else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir') {
+        if (val === null) {
+          const nx = argv[i + 1];
+          // Only consume the next token if it is a real value, not another flag
+          // or the end of argv. Previously `--model -y` and a trailing `--model`
+          // swallowed or mangled the value, breaking the real flag.
+          val = (nx !== undefined && !nx.startsWith('-')) ? argv[++i] : undefined;
+        }
+out[key] = (key === 'add-dir' && val !== undefined)
+        ? (out[key] || []).concat([val])
+        : val;
       } else if (val !== null) { out[key] = val === 'true' ? true : val === 'false' ? false : val; }
       else out[key] = true;
     } else if (a.startsWith('-') && a.length > 1) {
       const key = a.slice(1);
       const short = { V: 'version', S: 'session', c: 'continue', y: 'yolo', auto: 'auto', m: 'model', p: 'prompt', h: 'help' };
-      if (key === 'S' || key === 'm' || key === 'p') {
-        let val = argv[++i];
-        out[short[key]] = val;
+if (key === 'S' || key === 'm' || key === 'p') {
+        const nx = argv[i + 1];
+        // Take the next token as the value only if it exists and is not another
+        // flag. Previously `-S -y` swallowed `-y` as the session id and a bare
+        // trailing `-m` became undefined; both silently broke the real flag.
+        const hasVal = nx !== undefined && !nx.startsWith('-');
+        if (hasVal) { out[short[key]] = argv[i + 1]; i++; }
+        else if (key === 'S') { out.session = true; }  // "-S" with no id => pick interactively
+        // '-m' / '-p' with no usable value: leave unset (same as a missing arg).
       } else out[short[key]] = true;
     } else {
       out.positional.push(a);

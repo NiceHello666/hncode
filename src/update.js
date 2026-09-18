@@ -11,24 +11,12 @@
 // timers / startup without awaiting.
 
 import { spawn, execSync } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { localVersion } from './version.js';
 
 const PKG_NAME = '@hncode/hncode';
 // How often the auto-check runs once we are past the startup check.
 export const AUTO_UPDATE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-
-// The version installed locally, read from this package's own package.json.
-export function localVersion() {
-  try {
-    const here = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    const pkg = JSON.parse(fs.readFileSync(here, 'utf8'));
-    return pkg.version || '';
-  } catch {
-    return '';
-  }
-}
+export { localVersion };
 
 // Latest version published to npm, or '' if the registry is unreachable /
 // not installed / not a package.

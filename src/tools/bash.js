@@ -53,7 +53,8 @@ function decodeChunks(chunks) {
 
 function killTree(child) {
   try {
-    if (child.killed) return;
+    const exit = child.exitCode !== null || child.signalCode !== null;
+    if (exit || child.killed) return;
     if (process.platform === 'win32') {
       try { cp.spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
     } else {
@@ -215,6 +216,11 @@ function registerBackgroundTask(args, child, ctx, existingChunks) {
 
 function spawnBackground(args, cwd, ctx) {
   const command = args.command;
+  // Detached + piped stdio is not a real detach: when the parent exits, the
+  // pipes close and the child gets SIGPIPE. Redirect stdout/stderr to the
+  // task's output file instead, so the process survives and TaskOutput can
+  // still read it. (In the TUI the parent rarely exits, but headless -p mode
+  // does, and a background job should outlive the prompt.)
   const child = cp.spawn('pwsh', ['-Command', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const task = createTask(ctx, 'process', {
     description: args.description || args.command,

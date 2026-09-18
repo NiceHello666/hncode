@@ -34,9 +34,10 @@ import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks
 import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
 import { renderSwarmProgress } from './swarm-progress.js';
 import { sortedTasks, getTask, settleTask, STATUS_LABEL } from './agent-task.js';
+import { localVersion } from './version.js';
 
 const ESC = '\x1b';
-const VERSION = '0.1.0';
+const VERSION = localVersion();
 
 // ---- Slash command registry ----
 // Mirrors kimi-code-cli's BUILTIN_SLASH_COMMANDS (registry.ts): name, aliases,
@@ -2412,7 +2413,13 @@ export function composeFrame(state, cols, rows) {
   // topTrim below), which eats the box's own top border and header and leaves a
   // dangling `│`. Cap it so the box plus the composer always fit, and let the
   // transcript shrink to zero instead.
-  const chromeH = todoH + queueH + workingH + composerBoxH + menuItems + STATUS_H + confirmH + CTX_H;
+  // The `@file` list occupies the same rows as the `/` menu, so it counts against
+  // the same budget — otherwise the frame overflows and the top trim eats the
+  // transcript. Only one of the two can be open at a time (see refreshMention).
+  const mentionItems = (state.mentionOpen && state.mentionList.length && !dialog)
+    ? Math.min(state.mentionList.length, MAX_MENU) + 1
+    : 0;
+  const chromeH = todoH + queueH + workingH + composerBoxH + menuItems + mentionItems + STATUS_H + confirmH + CTX_H;
   // NOTE the extra `- 1`: `bodyH` below is clamped to a MINIMUM of 1 row, so that
   // row has to be reserved here too. Without it the total came out one over and
   // the top trim ate the box's `╭` border.
@@ -3109,6 +3116,31 @@ export function composeFrame(state, cols, rows) {
     lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})`, C.gray), insideW) + '│', C.border));
   }
 
+  // Inline `@file` candidate list — the same widget as the `/` menu above, so the
+  // two read as one mechanism. Shows the path, dims the directory prefix of a
+  // nested entry so the BASENAME is what your eye lands on.
+  if (state.mentionOpen && state.mentionList.length && !dialog && !state.menuOpen) {
+    const totalMatches = state.mentionList.length;
+    const sel = state.mentionSel + 1;
+    const off = state.mentionOffset || 0;
+    const shown = state.mentionList.slice(off, off + MAX_MENU);
+    shown.forEach((it, j) => {
+      const selected = off + j === state.mentionSel;
+      const mark = selected ? col('❯ ', C.cyan) : '  ';
+      const rel = String(it.rel || it.label || '');
+      const cut = rel.lastIndexOf('/') + 1;
+      const dirPart = cut > 0 ? rel.slice(0, cut) : '';
+      const basePart = rel.slice(cut);
+      const label = (dirPart ? col(dirPart, C.gray) : '')
+        + col(basePart, selected ? (C.cyan + C.bold) : C.gray);
+      const kind = it.isDir ? col('  dir', C.gray) : '';
+      const pad = Math.max(2, 40 - visualCol(rel) - visualCol(kind));
+      addHit(lines.length, 1, insideW, { kind: 'mentionItem', index: off + j });
+      lines.push(col('│' + fitAnsi(mark + label + kind + ' '.repeat(pad), insideW) + '│', C.border));
+    });
+    lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray), insideW) + '│', C.border));
+  }
+
   const cwd = state.cwd || '';
   const thinking = state.reasoning
     ? (state.effort && state.effort !== 'on' ? ` thinking: ${state.effort}` : ' thinking')
@@ -3216,7 +3248,15 @@ export function composeFrame(state, cols, rows) {
   } else {
     const menuH = (state.menuOpen && state.menuList.length && !dialog)
       ? Math.min(state.menuList.length, MAX_MENU) + 1 : 0;
-    const bottomChrome = STATUS_H + (state.confirmExit ? 1 : 0) + CTX_H + menuH;
+    // The `@file` list occupies the same rows as the `/` menu, and it pushes the
+    // composer UP by exactly that many. This formula derives the caret's screen row
+    // from the chrome BELOW the composer, so leaving the list out of `bottomChrome`
+    // kept the caret at its old row while the input box moved up — the caret sat
+    // several rows below the text it was editing. Must mirror `mentionItems` in the
+    // layout budget above.
+    const mentionH = (state.mentionOpen && state.mentionList.length && !dialog)
+      ? Math.min(state.mentionList.length, MAX_MENU) + 1 : 0;
+    const bottomChrome = STATUS_H + (state.confirmExit ? 1 : 0) + CTX_H + menuH + mentionH;
     const caretScreenRow = h - bottomChrome - 2 - (composer.rows.length - 1 - composer.caretRow);
     cursor = {
       row: Math.max(0, Math.min(caretScreenRow, h - 1)),
@@ -3384,6 +3424,13 @@ export function makeState({ cfg, session, opts }) {
     menuList: [],
     menuSel: 0,
     menuOffset: 0,
+    // Inline `@file` candidate list — the same widget as the `/` menu, rendered in
+    // the same place. Kept separate from menuList so the two can never both claim
+    // the ↑↓ keys.
+    mentionOpen: false,
+    mentionList: [],
+    mentionSel: 0,
+    mentionOffset: 0,
     objective: '',
     goalPaused: false,
     plan: !!(session && session.plan),
@@ -5168,6 +5215,121 @@ export async function startTUI(opts) {
     renderFrame();
   }
 
+  // ---- @ file completion ----------------------------------------------------
+  // Typing `@` shows an INLINE candidate list above the composer — the same widget
+  // `/` uses (state.mention*) — rather than taking over the screen. It used to be a
+  // silent rewrite of the input to the FIRST match of a single-directory listing:
+  // you could not see the candidates, could not descend into a subdirectory
+  // (`@src/` matched nothing), and hidden files were dropped.
+  //
+  // `walk` is bounded (depth + entry count) because it runs on a keystroke.
+  function collectWorkspaceFiles(root, { limit = 4000, maxDepth = 8 } = {}) {
+    const out = [];
+    const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'target', '__pycache__']);
+    const walk = (dir, rel, depth) => {
+      if (out.length >= limit || depth > maxDepth) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      // Deterministic order: directories first, then files, each alphabetical, so
+      // the list does not jump around between keystrokes.
+      entries.sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name));
+      for (const e of entries) {
+        if (out.length >= limit) return;
+        if (skip.has(e.name)) continue;
+        const relPath = rel ? rel + '/' + e.name : e.name;
+        if (e.isDirectory()) {
+          out.push({ label: relPath + '/', isDir: true, rel: relPath + '/' });
+          walk(path.join(dir, e.name), relPath, depth + 1);
+        } else {
+          out.push({ label: relPath, isDir: false, rel: relPath });
+        }
+      }
+    };
+    walk(root, '', 0);
+    return out;
+  }
+
+  // Everything after the last `@` that has no whitespace in it is the query.
+  function atQueryAt(input) {
+    const s = String(input || '');
+    const at = s.lastIndexOf('@');
+    if (at < 0) return null;
+    const after = s.slice(at + 1);
+    if (/\s/.test(after)) return null;      // an email-ish "@foo bar" is not a path
+    // Only treat it as a mention when `@` starts a word (start of input or after space).
+    if (at > 0 && !/\s/.test(s[at - 1])) return null;
+    return { at, query: after };
+  }
+
+  // The file index is CACHED per workspace root. Walking a real project on every
+  // keystroke measured 82 ms on a 3k-entry tree — a visible stall while typing —
+  // and a monorepo with node_modules is far worse. The cache is refreshed when it
+  // is older than MENTION_CACHE_MS or the root changes, so the list still tracks
+  // files created during the session without paying the walk on every character.
+  let mentionCache = null;   // { root, at, files }
+  const MENTION_CACHE_MS = 5000;
+
+  function mentionFiles(root) {
+    const now = Date.now();
+    if (mentionCache && mentionCache.root === root && now - mentionCache.at < MENTION_CACHE_MS) {
+      return mentionCache.files;
+    }
+    const files = collectWorkspaceFiles(root);
+    mentionCache = { root, at: now, files };
+    return files;
+  }
+
+  // Refresh the inline @ list from the current input. Called on every keystroke
+  // that touches the mention, and on Tab. Closes the list when the caret leaves the
+  // mention (e.g. a space was typed after it).
+  function refreshMention() {
+    const hit = atQueryAt(state.input || '');
+    if (!hit) {
+      state.mentionOpen = false;
+      state.mentionList = [];
+      state.mentionSel = 0;
+      state.mentionOffset = 0;
+      return;
+    }
+    const root = state.cwd || state.workspace || process.cwd();
+    const q = hit.query.toLowerCase();
+    const all = mentionFiles(root);
+    // Precompute the lowercase label + basename once per entry instead of inside
+    // the comparator: they were recomputed on every comparison of every sort.
+    const ranked = [];
+    for (const f of all) {
+      const label = f.label.toLowerCase();
+      if (q && !label.includes(q)) continue;
+      const base = label.slice(label.lastIndexOf('/') + 1);
+      ranked.push({ f, nameHit: q && base.startsWith(q) ? 0 : 1 });
+    }
+    ranked.sort((a, b) => {
+      if (a.nameHit !== b.nameHit) return a.nameHit - b.nameHit;
+      if (a.f.isDir !== b.f.isDir) return a.f.isDir ? -1 : 1;
+      return a.f.label.length - b.f.label.length || (a.f.label < b.f.label ? -1 : a.f.label > b.f.label ? 1 : 0);
+    });
+    state.mentionList = ranked.slice(0, 200).map((r) => r.f);
+    state.mentionSel = Math.min(state.mentionSel || 0, Math.max(0, state.mentionList.length - 1));
+    // Hitting Tab again after the list closed should start from the top.
+    state.mentionOffset = 0;
+    state.mentionOpen = state.mentionList.length > 0;
+  }
+
+  // Accept the highlighted candidate: replace the whole `@query` token.
+  function acceptMention() {
+    const it = (state.mentionList || [])[state.mentionSel || 0];
+    if (!it) return false;
+    const hit = atQueryAt(state.input || '');
+    if (!hit) return false;
+    state.input = String(state.input || '').slice(0, hit.at) + '@' + it.rel;
+    state.caret = state.input.length;
+    state.mentionOpen = false;
+    state.mentionList = [];
+    state.mentionSel = 0;
+    renderFrame();
+    return true;
+  }
+
   function openForm(spec) {
     const fields = (spec.fields || []).map((f) => ({
       key: f.key, label: f.label || f.key || '', value: f.value || '',
@@ -6538,6 +6700,8 @@ export async function startTUI(opts) {
     if (t.key === 'escape') {
       state.menuOpen = false; state.menuList = []; state.menuSel = 0;
       state.menuOffset = 0;
+      state.mentionOpen = false; state.mentionList = []; state.mentionSel = 0;
+      state.mentionOffset = 0;
       state.input = ''; state.caret = 0;
       state.pastes.clear(); state.pasteCounter = 0;
       state.composerSel = null;
@@ -6554,50 +6718,28 @@ export async function startTUI(opts) {
         return;
       }
     }
-    
-    // @ tab-completion for files/folders
-    if (t.key === 'tab' && !state.menuOpen) {
-      const input = state.input || '';
-      const atIdx = input.lastIndexOf('@');
-      if (atIdx >= 0) {
-        const prefix = input.slice(0, atIdx + 1); // include @
-        const suffix = input.slice(atIdx + 1);   // text after @
-        
-        // Collect files and folders from current workspace
-        const cwd = state.cwd || state.workspace || process.cwd();
-        let items = [];
-        try {
-          const entries = fs.readdirSync(cwd, { withFileTypes: true });
-          for (const entry of entries) {
-            const name = entry.name;
-            // Skip hidden files by default
-            if (name.startsWith('.')) continue;
-            
-            const fullPath = path.join(cwd, name);
-            if (entry.isDirectory()) {
-              items.push({ label: name + '/', type: 'dir', path: fullPath });
-            } else {
-              items.push({ label: name, type: 'file', path: fullPath });
-            }
-          }
-        } catch (e) {
-          // If we can't read the directory, just ignore
-        }
-        
-        // Filter by suffix
-        if (suffix) {
-          const lowerSuffix = suffix.toLowerCase();
-          items = items.filter((it) => it.label.toLowerCase().startsWith(lowerSuffix));
-        }
-        
-        if (items.length > 0) {
-          // Auto-complete to first match
-          const match = items[0];
-          state.input = prefix + match.label;
-          state.caret = state.input.length;
+    // The inline `@file` list owns ↑↓/Tab/Enter/Esc while it is open, exactly like
+    // the `/` menu above. Enter would otherwise SUBMIT the half-typed prompt.
+    if (state.mentionOpen) {
+      const n = state.mentionList.length;
+      if (t.key === 'up' || t.key === 'down') {
+        if (n) {
+          state.mentionSel = (state.mentionSel + (t.key === 'down' ? 1 : n - 1)) % n;
+          // Keep the selection inside the visible window.
+          if (state.mentionSel < state.mentionOffset) state.mentionOffset = state.mentionSel;
+          else if (state.mentionSel >= state.mentionOffset + MAX_MENU) state.mentionOffset = state.mentionSel - MAX_MENU + 1;
           renderFrame();
-          return;
         }
+        return;
+      }
+      if (t.key === 'tab' || t.key === 'enter') { acceptMention(); return; }
+      if (t.key === 'escape') {
+        state.mentionOpen = false;
+        state.mentionList = [];
+        state.mentionSel = 0;
+        state.mentionOffset = 0;
+        renderFrame();
+        return;
       }
     }
     if (t.key === 'up' || t.key === 'down') {
@@ -6789,7 +6931,11 @@ export async function startTUI(opts) {
           state.caret--;
         }
       }
-      refreshMenu(state); renderFrame(); state.composerSel = null; return;
+      // Deleting can also change the mention (or delete the `@` itself), so the
+      // inline list is refreshed the same way as on a printable key.
+      refreshMention();
+      if (!state.mentionOpen) refreshMenu(state);
+      renderFrame(); state.composerSel = null; return;
     }
     if (t.key === 'delete') {
       const sel = state.composerSel;
@@ -6819,9 +6965,15 @@ export async function startTUI(opts) {
       state.input = state.input.slice(0, state.caret) + t.ch + state.input.slice(state.caret);
       state.caret++;
       state.composerSel = null;
-      refreshMenu(state); renderFrame();
+      // Any printable character can extend or start an `@mention`, so refresh the
+      // inline list on every keystroke: typing `@` opens it, and typing after it
+      // narrows it — the same live-feedback the `/` menu gives.
+      refreshMention();
+      if (!state.mentionOpen) refreshMenu(state);
+      renderFrame();
     }
   }
+
 
   function rowStartOffsets(text, rowCount, insideW) {
     const starts = [];
@@ -6870,6 +7022,8 @@ export async function startTUI(opts) {
       state.pastes.clear(); state.pasteCounter = 0;
     }
     state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    state.mentionOpen = false; state.mentionList = []; state.mentionSel = 0;
+    state.mentionOffset = 0;
     state.historyIdx = -1;
     if (!text) { renderFrame(); return; }
     if (!state.running) {
@@ -7184,10 +7338,18 @@ export async function startTUI(opts) {
           return;
         }
         if (e.type === 'tool_start') {
+          // A tool call means the model finished this step's reasoning and is now
+          // acting on it. Settle the still-pending thinking block so its spinner
+          // stops instead of turning forever while the tool runs, and so the block
+          // reads as "reasoned, then acted" rather than as one endless thought.
+          // The NEXT `think` event opens a new block under the tool output.
+          const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
+          if (t) t.pending = false;
           const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (!dup) {
             state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now() });
           }
+        } else if (e.type === 'tool_args') {
         } else if (e.type === 'tool_args') {
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (entry) {

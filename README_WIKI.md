@@ -568,8 +568,6 @@ off();
 
 ---
 
----
-
 ## 14. For developers
 
 ### Project layout

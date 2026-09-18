@@ -445,6 +445,11 @@ export class Agent {
       });
     }
     if (!emittedEnd && this.onEvent) this.onEvent({ type: 'done' });
+    // The turn is over, so the inline-reasoning block it may have left open is
+    // abandoned: the NEXT user turn starts a fresh one. Without this, a model that
+    // never wrote its closing tag would leave the following turn's answer classified
+    // as reasoning.
+    if (typeof this.llm.resetThink === 'function') this.llm.resetThink();
     // Plugin lifecycle: the turn is over (normally, interrupted, or out of steps).
     // In a finally-equivalent position — every exit path above reaches here.
     await runHooks('onTurnEnd', { messages: this.messages, stopped: this.stopRequested });
