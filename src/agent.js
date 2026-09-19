@@ -7,6 +7,22 @@ import { tools, getTool, llmTools } from './tools/index.js';
 import { DELEGATION_TOOLS } from './subagent-types.js';
 import { estimateMessagesTokens } from './term.js';
 import { runHooks } from './plugin.js';
+import { loadHooks, runShellHooks } from './hooks.js';
+
+// A short, stable key for the prompt cache, derived from the conversation's
+// first user message. Stability is the whole point: the same conversation must
+// produce the same key on every turn, so a cheap deterministic hash beats a
+// random id. (Different conversations may collide — that is harmless, it only
+// means the provider's routing key is shared.)
+function hashKey(s) {
+  let h = 0x811c9dc5;
+  const str = String(s || '');
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(36) + '-' + str.length.toString(36);
+}
 
 // ---- completion guard --------------------------------------------------------
 // A turn is only complete when the model ends it with an actual answer. Models
@@ -118,9 +134,28 @@ export class Agent {
     // tool a live getter over this agent's own messages instead of a copy, so the
     // snapshot is taken at spawn time and reflects everything up to that point.
     this.ctx._parentMessages = this.messages;
+    // Prompt-cache key: identify the SESSION, not the request, so the cached
+    // prefix is reused across turns instead of thrashing. The caller may pass one
+    // (the TUI knows the session id); otherwise derive a stable value from the
+    // first user message so repeated runs of the same conversation still share a
+    // prefix. A subagent inherits the parent's key (same conversation family).
+    if (cfg.sessionId == null) {
+      const firstUser = (Array.isArray(messages) ? messages : []).find((m) => m.role === 'user' && typeof m.content === 'string');
+      cfg = { ...cfg, sessionId: firstUser ? hashKey(firstUser.content) : 'default' };
+      this.cfg = cfg;
+    }
     this.llm = new LLM(cfg);
     this.stopRequested = false;
     this.onApproval = onApproval; // async (toolName, args) => boolean
+    // Shell hooks (Claude Code-style): user-configured commands run at lifecycle
+    // events. ALWAYS stored as a `{ hooks: {Event: [...]} }` config, which is the
+    // shape runShellHooks() reads. A caller may inject one (tests / the TUI,
+    // which reloads per turn); otherwise it is read from disk for this workspace.
+    this.hookConfig = cfg.hookConfig
+      ? (cfg.hookConfig.hooks ? cfg.hookConfig : { hooks: cfg.hookConfig })
+      : { hooks: loadHooks(cfg.workspace).hooks };
+    // The turn's user prompt, for the UserPromptSubmit hook. Set by run().
+    this._turnPrompt = '';
     // Messages the user types while the agent is streaming. They are injected
     // as user messages right AFTER the current round of tool calls, so the
     // model sees "tool callback / user steer" together on the next request —
@@ -147,6 +182,19 @@ export class Agent {
     // block at the end of this method. Both are awaited and both swallow plugin
     // errors (see runHooks), so a broken plugin cannot abort a turn.
     await runHooks('onTurnStart', { messages: this.messages });
+    // SHELL HOOK: SessionStart fires once per agent run (the first turn of a
+    // session). A hook failure never blocks — it is a convenience signal.
+    await runShellHooks(this.hookConfig, 'SessionStart', { messages: this.messages }, this.cfg.workspace);
+    // SHELL HOOK: UserPromptSubmit fires with the latest user message. It cannot
+    // block (Claude Code's can add context; blocking the user's own prompt is a
+    // worse failure than a missing hook), so the result is only logged.
+    {
+      const lastUser = [...this.messages].reverse().find((m) => m.role === 'user' && typeof m.content === 'string');
+      if (lastUser) {
+        this._turnPrompt = lastUser.content;
+        await runShellHooks(this.hookConfig, 'UserPromptSubmit', { prompt: lastUser.content }, this.cfg.workspace);
+      }
+    }
     let text = '';
     let toolCalls = [];
     let emittedEnd = false;
@@ -232,6 +280,10 @@ export class Agent {
       let usedNow = estimateMessagesTokens(this.messages, this.cfg);
       if (maxCtx > 0 && usedNow >= maxCtx * 0.85) {
         const before = usedNow;
+        // SHELL HOOK: PreCompact — a chance to back up the transcript before the
+        // older half is summarized away. Never blocks (the trim must go ahead).
+        await runShellHooks(this.hookConfig, 'PreCompact',
+          { tokens: usedNow, messages: this.messages }, this.cfg.workspace);
         const keepN = Math.max(1, Math.ceil(this.messages.length * 0.2));
         const keep = this.messages.slice(-keepN);
         const dropped = this.messages.slice(0, this.messages.length - keepN);
@@ -389,6 +441,21 @@ export class Agent {
           result = `Error: unknown tool "${tc.name}".`;
           allOk = false;
         } else {
+          // SHELL HOOK: PreToolUse. A non-zero exit blocks the tool, and its
+          // message goes back to the model in place of the tool result — that is
+          // the whole point of a pre-hook (e.g. refuse a write that fails a lint
+          // gate). Checked BEFORE approving/executing so a blocked call never
+          // touches the filesystem.
+          const pre = await runShellHooks(this.hookConfig, 'PreToolUse',
+            { toolName: tc.name, toolArgs: tc.args }, this.ctx.cwd || this.cfg.workspace);
+          if (pre.blocked) {
+            result = `Blocked by a PreToolUse hook: ${pre.reason}`;
+            this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+            this.messages.push({ role: 'tool', toolCallId: tc.id, content: result });
+            this.onEvent({ type: 'tool_result', id: tc.id, name: tc.name, content: result });
+            allOk = false;
+            continue;
+          }
           if (this.onToolStart) this.onToolStart(tc.name, tc.args);
           this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
           // Plugin hook: onToolExecute fires BEFORE the tool runs and receives the
@@ -404,6 +471,10 @@ export class Agent {
           this.ctx.lastResult = result;
           // Plugin hook: onToolResult fires with the tool's output.
           await runHooks('onToolResult', tc.name, result, this.ctx);
+          // SHELL HOOK: PostToolUse. Never blocks (the tool already ran); a
+          // failure is logged. This is where "format after every edit" lives.
+          await runShellHooks(this.hookConfig, 'PostToolUse',
+            { toolName: tc.name, toolArgs: tc.args, toolResult: result }, this.ctx.cwd || this.cfg.workspace);
           // Surface the live TODO list so the TUI can render its panel.
           if (tc.name === 'TodoList') {
             this.onEvent({ type: 'todos', todos: this.ctx.todoState || [] });
@@ -453,5 +524,9 @@ export class Agent {
     // Plugin lifecycle: the turn is over (normally, interrupted, or out of steps).
     // In a finally-equivalent position — every exit path above reaches here.
     await runHooks('onTurnEnd', { messages: this.messages, stopped: this.stopRequested });
+    // SHELL HOOK: Stop fires when the turn ends, whether it finished or was
+    // interrupted. Never blocks.
+    await runShellHooks(this.hookConfig, 'Stop',
+      { messages: this.messages, stopped: this.stopRequested, prompt: this._turnPrompt }, this.cfg.workspace);
   }
 }

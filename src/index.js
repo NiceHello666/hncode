@@ -9,6 +9,7 @@ import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { llmTools } from './tools/index.js';
 import { setToolsList } from './llm.js';
 import { localVersion } from './version.js';
+import { EXIT, FORMATS, isValidFormat, buildResult, exitCodeFor, resultLine, createRunTracker, trackEvent, finalReply } from './ci.js';
 
 // The version shown by `hncode -V` and the help banner. Read from package.json
 // (via version.js) so it can never drift from the published version again.
@@ -29,7 +30,11 @@ Options:
   --auto                        Never ask; everything runs automatically.
   -m, --model <model>           Model alias to use for this invocation.
   -p, --prompt <prompt>         Run one prompt non-interactively and print the reply.
-  --output-format <format>      Output format for prompt mode: text (default) or stream-json.
+  --output-format <format>      Prompt mode output: text (default), json, or stream-json.
+                                json prints one result object; stream-json streams events then a result.
+                                Exit code reflects the outcome: 0 ok, 1 failure, 2 config, 3 no answer, 4 interrupted.
+  --control                     Expose a local control socket (prompt/status/interrupt) while the TUI runs.
+  --control <path>              Same, at an explicit socket path.
   --plan                        Start in plan mode (research only, no writes).
   --add-dir <dir>               Add an additional workspace directory. Repeatable.
   -h, --help                    Show help.
@@ -40,6 +45,12 @@ Commands:
   doctor config [path]          Validate a config.toml (default: merged config).
   init                          Create ~/.hncode/config.toml with defaults.
   export [id]                   Export a session to ~/.hncode/export/<id>.json.
+  control status                Ask a running session (started with --control) for its status.
+  control prompt <text>         Queue a prompt on a running session.
+  control interrupt             Interrupt the running turn.
+  hooks list                    Show configured shell hooks.
+  skills list                   List installed skills.
+  mcp list                      Show configured MCP servers.
 `;
 
 function printHelp() { process.stdout.write(HELP); }
@@ -55,7 +66,7 @@ export function parseArgs(argv) {
       if (eq >= 0) { key = a.slice(2, eq); val = a.slice(eq + 1); }
       else { key = a.slice(2); val = null; }
       if (key === 'resume') key = 'session'; // `--resume <id>` is an alias for `--session <id>`
-      if (['session'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
+      if (['session', 'control'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
 else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir') {
         if (val === null) {
           const nx = argv[i + 1];
@@ -177,14 +188,42 @@ const SUBCOMMANDS = {
   'doctor': { 'config': cmdDoctorConfig },
   'init': cmdInit,
   'export': cmdExport,
+  'control': {
+    // Subcommands pass only positional[2] to their handler, so bind the op.
+    'status': (rest) => cmdControl('status', rest),
+    'prompt': (rest) => cmdControl('prompt', rest),
+    'interrupt': (rest) => cmdControl('interrupt', rest),
+  },
 };
+
+// ---- control (talk to a running --control session) --------------------------
+// `hncode control status|prompt|interrupt` — the client half of the control
+// socket the TUI opens with --control. Prints the JSON reply so a script can
+// parse it; exits non-zero when the running session could not be reached.
+async function cmdControl(sub, arg) {
+  const { sendControl } = await import('./ci.js');
+  const op = sub || 'status';
+  if (!['status', 'prompt', 'interrupt'].includes(op)) {
+    console.error(`unknown control op: ${op}. Use status | prompt <text> | interrupt.`);
+    return 1;
+  }
+  const req = { op };
+  if (op === 'prompt') {
+    const text = String(arg || '').trim();
+    if (!text) { console.error('control prompt requires text.'); return 1; }
+    req.text = text;
+  }
+  const res = await sendControl(req, { path: process.env.HNCODE_CONTROL_SOCKET || undefined });
+  console.log(JSON.stringify(res));
+  return res && res.ok ? 0 : 1;
+}
 
 // ---- headless prompt mode ----
 async function runPrompt({ cfg, prompt, format, session, modelArg }) {
   cfg = resolveModelArg(cfg, modelArg);
   if (!cfg.apiKey) {
     console.error('hncode: no api_key configured. Set HNCODE_API_KEY or configure a provider first. Run `hncode doctor config` to check.');
-    return 2;
+    return EXIT.CONFIG;
   }
   const messages = [];
   if (session && session.messages) for (const m of session.messages.slice(-30)) messages.push(m);
@@ -195,19 +234,28 @@ async function runPrompt({ cfg, prompt, format, session, modelArg }) {
   if (personal) sysText += '\n\n' + personal;
   messages.push({ role: 'system', content: sysText });
   const saved = session || { id: sess.newId(), title: prompt.slice(0, 60), workspace: path.resolve(process.cwd()), model: cfg.model, createdAt: Date.now(), messages: [] };
+  const tracker = createRunTracker();
+  const startedAt = Date.now();
+  let fatal = null;
   const agent = new Agent({
     cfg,
     messages,
     // Uncapped: run until the model finishes (see agent.js).
     onEvent: (e) => {
-      if (format === 'stream-json') {
-        if (e.type === 'context') return; // TUI-only gauge; not part of the JSON stream
-        const line = { type: e.type };
-        if (e.text) line.text = e.text;
-        if (e.name) line.name = e.name;
-        if (e.id) line.id = e.id;
-        if (e.content != null) line.content = e.content;
-        process.stdout.write(JSON.stringify(line) + '\n');
+      trackEvent(tracker, e);
+      if (e.type === 'error') fatal = (e.error && e.error.message) || String(e.error);
+      if (format === 'stream-json' || format === 'json') {
+        // `json` mode keeps stdout clean for the final envelope, so events go to
+        // stderr there. `stream-json` is the streaming contract: one event/line.
+        if (format === 'stream-json') {
+          if (e.type === 'context') return; // TUI-only gauge; not part of the stream
+          const line = { type: e.type };
+          if (e.text) line.text = e.text;
+          if (e.name) line.name = e.name;
+          if (e.id) line.id = e.id;
+          if (e.content != null) line.content = e.content;
+          process.stdout.write(JSON.stringify(line) + '\n');
+        }
       } else if (e.type === 'data') {
         process.stdout.write(e.text);
       }
@@ -216,8 +264,30 @@ async function runPrompt({ cfg, prompt, format, session, modelArg }) {
   saved.messages = messages;
   await agent.run();
   sess.saveSession(saved);
-  if (format !== 'stream-json') process.stdout.write('\n');
-  return 0;
+
+  const reply = finalReply(messages, tracker.text);
+  const result = buildResult({
+    reply,
+    toolCalls: tracker.toolCalls,
+    files: tracker.files,
+    error: fatal || (tracker.errors.length ? tracker.errors[tracker.errors.length - 1] : null),
+    stopped: !!agent.stopRequested,
+    durationMs: Date.now() - startedAt,
+    model: cfg.model,
+    sessionId: saved.id,
+  });
+
+  if (format === 'json') {
+    // Exactly one JSON object on stdout, so `| jq` / `tail -1` works.
+    process.stdout.write(resultLine(result) + '\n');
+  } else if (format === 'stream-json') {
+    // A terminating event tells a streaming reader the run is over and carries
+    // the same envelope, so both formats end with a `result` record.
+    process.stdout.write(resultLine(result) + '\n');
+  } else {
+    process.stdout.write('\n');
+  }
+  return exitCodeFor(result, false);
 }
 
 // ---- TUI dispatch ----
@@ -286,17 +356,44 @@ export async function main(argv) {
     await loadPlugins(cfg.pluginDir);
   }
 
+  // Connect configured MCP servers and register their tools, so a headless
+  // `-p` run and the TUI both see them. Failures are reported but never fatal:
+  // an unreachable server must not stop the session from starting.
+  if (cfg.mcp !== false) {
+    try {
+      const mcp = await import('./mcp.js');
+      const { API } = await import('./plugin.js');
+      const mcpCfg = mcp.loadMcpConfig(cfg.workspace);
+      if (Object.keys(mcpCfg.servers).length) {
+        const res = await mcp.connectAll(mcpCfg, (spec) => API.registerTool(spec));
+        mcp.setLiveConnections(res.servers);
+        if (process.env.HNCODE_MCP_VERBOSE === '1') {
+          for (const s of res.servers) {
+            console.error(s.ok ? `[hncode-mcp] ${s.name}: ${s.toolCount} tool(s)` : `[hncode-mcp] ${s.name}: ${s.error}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`hncode: MCP setup failed: ${e.message}`);
+    }
+  }
+
   // headless prompt
   if (args.prompt) {
+    const format = args['output-format'];
+    if (!isValidFormat(format)) {
+      console.error(`hncode: unknown --output-format "${format}". Use one of: ${FORMATS.join(', ')}.`);
+      return EXIT.CONFIG;
+    }
     let session = null;
     if (args.session) session = typeof args.session === 'string' ? sess.loadSession(args.session) : sess.latestSession(undefined, undefined, { skipEmpty: true });
     else if (args.continue) session = sess.latestSession(undefined, undefined, { skipEmpty: true });
-    return runPrompt({ cfg, prompt: args.prompt, format: args['output-format'], session, modelArg: args.model });
+    return runPrompt({ cfg, prompt: args.prompt, format, session, modelArg: args.model });
   }
 
   if (!process.stdout.isTTY) {
     console.error('hncode: interactive mode requires a TTY. Use `hncode -p "prompt"` for non-interactive use.');
-    return 1;
+    return EXIT.FAILURE;
   }
 
   const opts = {
@@ -308,10 +405,13 @@ export async function main(argv) {
     auto: !!args.auto,
     plan: !!args.plan,
     addDirs: args['add-dir'] || [],
+    // Remote control: expose a local socket so a script can queue a prompt or
+    // query status on the running session (see ci.js).
+    control: args.control === true ? '' : (typeof args.control === 'string' ? args.control : null),
     session: loadOrCreateSession(args, cfg),
   };
   await startTui(opts);
-  return 0;
+  return EXIT.OK;
 }
 
 // main() is invoked by bin/hncode (the CLI entry point), which imports this module

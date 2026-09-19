@@ -12,6 +12,7 @@ import * as fetchUrlMod from './fetch-url.js';
 import * as webSearchMod from './web-search.js';
 import * as readMediaFileMod from './read-media-file.js';
 import * as fileLinesMod from './file-lines.js';
+import * as gitMod from './git.js';
 import * as askUserQuestionMod from './ask-user-question.js';
 import { spec as agentSpec } from './agent.js';
 import { spec as agentSwarmSpec } from './agent-swarm.js';
@@ -31,6 +32,7 @@ const builtinTools = [
   webSearchMod.spec,
   readMediaFileMod.spec,
   fileLinesMod.spec,
+  gitMod.spec,
   askUserQuestionMod.spec,
   agentSpec,
   agentSwarmSpec,

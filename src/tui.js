@@ -28,6 +28,7 @@ import * as sess from './session.js';
 import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor } from './config.js';
 import { pluginCommands } from './plugin.js';
 import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
+import { getTool } from './tools/index.js';
 import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
@@ -35,6 +36,12 @@ import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task
 import { renderSwarmProgress } from './swarm-progress.js';
 import { sortedTasks, getTask, settleTask, STATUS_LABEL } from './agent-task.js';
 import { localVersion } from './version.js';
+import { listSkills, readSkill, importSkill, deleteSkill, skillPrompt, skillCompletions, normalizeSkillName, SKILL_PREFIX, skillsDir } from './skills.js';
+import { loadHooks, describeHooks, runShellHooks, HOOK_EVENTS } from './hooks.js';
+import * as gitmod from './git.js';
+import { reviewLines, savePlan, filesReferenced, planStats, listPlans, plansDir } from './plan.js';
+import { loadMcpConfig, describeServers, getLiveConnections } from './mcp.js';
+import { startControlServer } from './ci.js';
 
 const ESC = '\x1b';
 const VERSION = localVersion();
@@ -82,6 +89,15 @@ export const COMMANDS = [
   { name: 'move', desc: 'Move current session to another directory (must exist)', priority: 60, argumentHint: '<path>' },
   { name: 'reload', desc: 'Reload config.toml settings', priority: 60 },
   { name: 'plugins', desc: 'List loaded plugins and their status', priority: 60 },
+  { name: 'skills', desc: 'List installed skills, or remove one', priority: 60, argumentHint: '[remove <name>]' },
+  { name: 'import-skill', desc: 'Import a Markdown file as a skill (a duplicate name is overwritten)', priority: 60, argumentHint: '<file.md> [name]' },
+  { name: 'hooks', desc: 'Show configured shell hooks, or test one', priority: 60, argumentHint: '[list | test <event>]' },
+  { name: 'git', desc: 'Show repository status (branch, changes, remote)', priority: 62 },
+  { name: 'commit', desc: 'Stage and commit with a message (or let the agent draft one)', priority: 62, argumentHint: '[message]' },
+  { name: 'branch', desc: 'List, create, or switch git branches', priority: 62, argumentHint: '[list | <name> | -c <name>]' },
+  { name: 'worktree', desc: 'List, add, or remove git worktrees for parallel work', priority: 60, argumentHint: '[list | add <dir> [branch] | remove <dir>]' },
+  { name: 'pr', desc: 'Show the URL to open a pull request for the current branch', priority: 60, argumentHint: '[base]' },
+  { name: 'cache', desc: 'Toggle prompt caching for long stable prefixes (saves input tokens)', priority: 58, argumentHint: '[on|off]' },
   { name: 'logout', aliases: ['disconnect'], desc: 'Log out of a configured provider', priority: 40 },
   { name: 'feedback', aliases: ['bug'], desc: 'Send feedback to the maintainers', priority: 60 },
   { name: 'update', desc: 'Check for and install a newer version', priority: 40, argumentHint: '[-y]' },
@@ -191,6 +207,7 @@ export function extractPlan(text) {
 
 export const TIPS = [
   'Press Esc to interrupt the current turn at any time',
+  '!git status runs a shell command directly — no model round-trip',
   '/init generates an AGENTS.md from your codebase for smarter agent context',
   'Use /mcp to manage MCP servers for additional tool integration',
   'The context line shows real-time token usage — watch it grow as the agent works',
@@ -820,8 +837,17 @@ function wrapWithOffsets(text, width) {
 // not use it — they render their own inputs (search box, form fields).
 // The prompt glyph matches the transcript's user marker (`❯`) so the composer
 // reads as "the same kind of thing" as a sent user message.
+//
+// SHELL MODE (`!`) — modelled on kimi-code's editor. Typing `!` on an EMPTY
+// composer flips a mode flag instead of inserting the character; the `!` is
+// rendered as the PREFIX. That is what keeps it from appearing twice:
+//   - the buffer holds only the command (`git status`), never the bang
+//   - the caret never has to step over a marker it is not editing
+//   - submit never has to strip anything
+// The mode ends on Esc/Backspace while the buffer is empty, or on submit.
 export function composerInput(state) {
-  return { text: state.input || '', caret: state.caret || 0, prefix: '❯ ' };
+  const shell = state.inputMode === 'bash';
+  return { text: state.input || '', caret: state.caret || 0, prefix: shell ? '! ' : '❯ ' };
 }
 
 // Marker text for a collapsed multi-line paste, e.g. `[paste #1 +12 lines]`.
@@ -969,7 +995,7 @@ export function caretBlock(row, col) {
 // prefix; wrapped continuation rows are indented to match. Explicit newlines
 // start a fresh row. Returns the rows plus the caret's (row, col) within them
 // (col already includes the leading border column).
-function composerLayout(state, insideW) {
+export function composerLayout(state, insideW) {
   const { text: rawText, caret: rawCaret, prefix } = composerInput(state);
   const text = rawText;
   const caret = Math.max(0, Math.min(text.length, rawCaret));
@@ -1072,6 +1098,7 @@ function msgColorFor(role, text) {
   if (role === 'system' && typeof text === 'string' && text.startsWith('[turn took')) return C.gray;
   if (role === 'system') return C.teal;
   if (role === 'user') return C.cyan;
+  if (role === 'bash') return C.shellMode;   // ! shell-mode echo: violet, like kimi
   if (role === 'warn') return C.orange;    // unfinished-turn warning
   if (role === 'queued') return C.gray;    // pending, not yet sent
   if (role === 'steer') return C.yellow;   // injected into the running turn
@@ -1470,13 +1497,23 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
 
     // Write: stream the file content while the model is still emitting it.
     if (name === 'Write' && typeof msg.streamContent === 'string' && msg.streamContent.length) {
-      const lines = sanitizeText(msg.streamContent).replace(/\r\n/g, '\n').split('\n');
+      // Only the first MAX lines are drawn, so sanitize+split a bounded PREFIX.
+      // Doing it over the whole accumulated content re-processed every byte on
+      // each frame — O(n²) over the stream, which blocked the main thread on a
+      // large file. The cut is generous (64 KB) to cover MAX long lines; the
+      // line count for the "… N more lines" note is taken from the message,
+      // which tracks the true size cheaply.
+      const SCAN_BYTES = 64 * 1024;
+      const head = msg.streamContent.length > SCAN_BYTES ? msg.streamContent.slice(0, SCAN_BYTES) : msg.streamContent;
+      const lines = sanitizeText(head).replace(/\r\n/g, '\n').split('\n');
       const MAX = 20;
-      const wNum = String(lines.length).length;
+      const totalLines = msg._streamLineCount || lines.length;
+      const wNum = String(totalLines).length;
       lines.slice(0, MAX).forEach((ln, i) => {
         out.push({ text: col(`${String(i + 1).padStart(wNum)} ${ln}`, C.gray), ind: i === 0 ? '↳ ' : indent, raw: true });
       });
-      if (lines.length > MAX) out.push({ text: col(`… ${lines.length - MAX} more lines`, C.gray), ind: indent, raw: true });
+      const shown = Math.min(lines.length, MAX);
+      if (totalLines > shown) out.push({ text: col(`… ${totalLines - shown} more lines`, C.gray), ind: indent, raw: true });
     }
 
     // The Edit diff is NOT drawn here: it rides on the tool_result message and is
@@ -1668,6 +1705,7 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
   switch (msg.role) {
     case 'system': icon = ''; break;
     case 'user': icon = '❯'; break;
+    case 'bash': icon = '!'; break;   // shell-mode echo
     case 'warn': icon = '⚑'; break;   // ⚑ unfinished-turn warning
     // `queued` keeps the SAME marker as a user message: it is a user message, just
     // not sent yet. Its pending state is shown by the colour (gray) and the queue
@@ -1685,8 +1723,8 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
   // The marker keeps the theme colour (cyan) while a USER message renders its
   // text in white — the whole line used to inherit the role colour, so user
   // text came out cyan too. `indColor` colours the marker only.
-  const indColor = msg.role === 'user' ? C.cyan : fg;
-  const bodyFg = msg.role === 'user' ? C.white : fg;
+  const indColor = msg.role === 'user' ? C.cyan : msg.role === 'bash' ? C.shellMode : fg;
+  const bodyFg = msg.role === 'user' ? C.white : msg.role === 'bash' ? C.shellMode : fg;
   const codeFg = C.cyan;
   const lines = [];
   // Only assistant/thinking output benefits from Markdown; user/system/tool
@@ -1959,6 +1997,10 @@ function rowToLine(r) {
 // Pull the string values that are ALREADY complete out of a partially streamed
 // JSON argument blob, so a tool row can render its key argument while the model
 // is still emitting it. Only complete `"key":"value"` pairs are returned.
+//
+// NOTE: this rescans the WHOLE blob and is O(n) per call. Callers that see one
+// call per streamed chunk must use createArgStream()/feedArgStream() instead —
+// see the comment there for why re-scanning freezes the UI.
 function extractPartialArgs(raw, prev) {
   const out = { ...(prev || {}) };
   const s = String(raw || '');
@@ -1970,6 +2012,186 @@ function extractPartialArgs(raw, prev) {
       .replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
       .replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     out[key] = val;
+  }
+  return out;
+}
+
+// Incremental scanner for a streamed JSON arguments blob.
+//
+// WHY THIS EXISTS: a tool call's arguments arrive in many small chunks, and the
+// TUI used to re-parse the ENTIRE accumulated blob on every chunk — one full
+// regex pass (extractPartialArgs) plus one full character-by-character decode
+// (extractJsonString) per chunk. That is O(n²) in the argument size, all of it
+// synchronous on the main thread between network reads, so the UI could not
+// repaint. Measured: streaming a 500 KB Write cost ~5.2 s of blocked main
+// thread, and a larger one hung the process.
+//
+// This scanner walks the blob ONCE: every character is consumed exactly once,
+// across all chunks, and the state carries forward. Closed pairs land in
+// `pairs`; the value still being read is available via argStreamValue() so a
+// Write can show its content live. Only flat string args are tracked, which is
+// all the tool schemas use and all the display reads.
+export function createArgStream() {
+  return {
+    pairs: {},       // complete "key":"value" pairs
+    mode: 'seekKey', // seekKey | inKey | seekColon | seekVal | inVal
+    key: '',
+    cur: '',         // key whose value is currently being read
+    val: '',
+    esc: false,      // previous char was a backslash inside a string
+    uni: null,       // non-null while collecting the 4 hex digits of \uXXXX
+    // Newlines in the value currently being read (or, once closed, in the pair
+    // stored under `lastKey`). Maintained as the value is decoded so the live
+    // Write preview never has to re-scan the whole content to count lines.
+    valLines: 1,
+    lastKey: '',
+    lastKeyLines: 1,
+  };
+}
+
+const ARG_ESCAPES = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '"': '"', '\\': '\\', '/': '/' };
+
+// Feed one chunk into the stream. Returns the stream for chaining.
+export function feedArgStream(st, chunk) {
+  const s = String(chunk == null ? '' : chunk);
+  if (!st || !s) return st;
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (st.mode === 'seekKey') {
+      if (c === '"') { st.mode = 'inKey'; st.key = ''; }
+      continue;
+    }
+    if (st.mode === 'inKey') {
+      if (st.esc) { st.key += c; st.esc = false; continue; }
+      if (c === '\\') { st.esc = true; continue; }
+      if (c === '"') { st.mode = 'seekColon'; continue; }
+      st.key += c;
+      continue;
+    }
+    if (st.mode === 'seekColon') {
+      if (c === ':') { st.mode = 'seekVal'; continue; }
+      if (/\s/.test(c)) continue;
+      // A quoted string that is NOT followed by `:` is not a key — it is an array
+      // element such as `["x"]`. Abandon it and re-scan this char in seekKey so
+      // the scan stays in sync (the original flat regex never matched those, and
+      // treating one as a key desynced everything after it).
+      st.mode = 'seekKey';
+      i--;
+      continue;
+    }
+    if (st.mode === 'seekVal') {
+      if (/\s/.test(c)) continue;
+      if (c === '"') { st.mode = 'inVal'; st.val = ''; st.cur = st.key; st.valLines = 1; continue; }
+      // A non-string value (number/bool/null/object/array). We do not track those,
+      // so resume scanning for the next key. Every char is still consumed once.
+      st.mode = 'seekKey';
+      continue;
+    }
+    // mode === 'inVal'
+    if (st.uni !== null) {
+      st.uni += c;
+      if (st.uni.length === 4) {
+        const cp = parseInt(st.uni, 16) || 0;
+        st.val += String.fromCharCode(cp);
+        if (cp === 10) st.valLines++;
+        st.uni = null;
+      }
+      continue;
+    }
+    if (st.esc) {
+      st.esc = false;
+      if (c === 'u') { st.uni = ''; continue; }
+      const dec = ARG_ESCAPES[c] !== undefined ? ARG_ESCAPES[c] : c;
+      st.val += dec;
+      if (dec === '\n') st.valLines++;
+      continue;
+    }
+    if (c === '\\') { st.esc = true; continue; }
+    if (c === '"') {
+      st.pairs[st.cur] = st.val;
+      st.lastKey = st.cur;
+      st.lastKeyLines = st.valLines;
+      st.cur = ''; st.val = '';
+      st.mode = 'seekKey';
+      continue;
+    }
+    // Fast path: copy the whole run of ordinary characters (no quote, backslash
+    // or newline) in ONE slice instead of char by char. Most of a streamed value
+    // is plain text, and this is what keeps a multi-MB Write from pinning the
+    // main thread in the per-character loop.
+    {
+      let j = i;
+      while (j < s.length) {
+        const cj = s.charCodeAt(j);
+        if (cj === 34 /* " */ || cj === 92 /* \ */ || cj === 10 /* \n */) break;
+        j++;
+      }
+      if (j > i) { st.val += s.slice(i, j); i = j - 1; continue; }
+    }
+    st.val += c;
+    if (c === '\n') st.valLines++;
+  }
+  return st;
+}
+
+// The value of `key` — the completed one when the pair has closed, otherwise the
+// partial text decoded so far (which is what a live Write preview needs).
+export function argStreamValue(st, key) {
+  if (!st) return '';
+  if (Object.prototype.hasOwnProperty.call(st.pairs, key)) return st.pairs[key];
+  if (st.mode === 'inVal' && st.cur === key) return st.val;
+  return '';
+}
+
+// Line count of `key`'s value, tracked incrementally (no re-scan). Used by the
+// streaming Write preview for its "… N more lines" note.
+export function argStreamLineCount(st, key) {
+  if (!st) return 1;
+  if (st.mode === 'inVal' && st.cur === key) return st.valLines;
+  if (st.lastKey === key) return st.lastKeyLines;
+  const v = argStreamValue(st, key);
+  if (!v) return 1;
+  let n = 1;
+  for (let i = 0; i < v.length; i++) if (v.charCodeAt(i) === 10) n++;
+  return n;
+}
+
+// Cheap fingerprint of a string for render-cache keys.
+//
+// It must NOT index or slice a LARGE string: `argStreamValue()` returns a cons
+// string built by repeated `+=`, and any read beyond `.length` forces V8 to
+// FLATTEN the whole rope — O(n). Doing that once per streamed chunk is O(n²) and
+// measured at ~4.5 s for a 10 MB Write, which is exactly the main-thread block
+// this fix exists to remove.
+//
+// So: small strings are embedded verbatim (accurate); large ones are represented
+// by their LENGTH only, which is O(1) even on a cons string. That is sufficient
+// here because every string keyed this way is append-only while it is being
+// streamed (assistant text and a Write's content only ever grow), and is written
+// once when a turn completes. A large equal-length replacement does not occur on
+// these fields — the diff/content that can change arbitrarily live elsewhere.
+const FP_VERBATIM_MAX = 4096;
+function fp(s) {
+  if (s == null) return '0';
+  const str = String(s);
+  const n = str.length;
+  return n <= FP_VERBATIM_MAX ? n + ':' + str : n + ':';
+}
+
+// Fingerprint of a tool-args object for the render-cache key. `JSON.stringify`
+// was used here and stringified EVERY argument — including a streaming Write's
+// whole file content — on every frame. The rendered tool line only shows the key
+// argument (see keyArgument), so hashing each value's length plus a bounded
+// sample is enough to detect the change, and is O(#keys) instead of O(bytes).
+function fpArgs(args) {
+  if (!args || typeof args !== 'object') return '0';
+  const keys = Object.keys(args);
+  if (!keys.length) return '0';
+  let out = '';
+  for (const k of keys) {
+    const v = args[k];
+    out += k + '=' + (typeof v === 'string' ? fp(v) : (v === undefined ? 'u' : String(v).slice(0, 32))) + ';';
   }
   return out;
 }
@@ -1988,7 +2210,9 @@ function renderChatLines(state, w) {
     // like the input box it was typed into.
     // `steer` gets NO box: it is injected into the turn already in progress, so a
     // box would falsely suggest a separate turn had started.
-    const bordered = msg.role === 'user' || msg.role === 'queued';
+    const bordered = msg.role === 'user' || msg.role === 'queued' || msg.role === 'bash';
+    // A bash-mode echo uses the violet shellMode frame — same hue as kimi.
+    const boxColor = msg.role === 'bash' ? C.shellMode : C.border;
     // The box spans one column less than the full inner width, so the right edge
     // has a 1-column margin (matching the left margin from `PAD`).
     const boxW = innerW - 2;                   // total box width, including both │
@@ -1996,8 +2220,8 @@ function renderChatLines(state, w) {
     // One column of padding inside each wall, mirroring the composer box.
     const boxPad = Math.min(1, Math.max(0, boxInner - 1));
     const boxText = Math.max(1, boxInner - boxPad * 2);
-    const topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', C.border);
-    const botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', C.border);
+    const topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', boxColor);
+    const botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', boxColor);
     // A box always needs its TOP border — including when the message is the first
     // row of the transcript. (The earlier `out.length > 0` guard came from the
     // rule-only version, where a leading divider looked wrong; a box without a
@@ -2019,8 +2243,8 @@ function renderChatLines(state, w) {
     // its spinner is substituted outside the cache (see SPIN_PLACEHOLDER), so
     // the 80ms tick no longer re-wraps the reasoning preview every frame.
     const spinKey = (msg.role === 'tool' && msg.pending) ? (state.spin || 0) : 0;
-    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${spinKey}\u0000${msg.text || ''}\u0000${msg.streamContent || ''}`
-        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${JSON.stringify(msg.toolArgs || null)}`
+    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${spinKey}\u0000${fp(msg.text)}\u0000${fp(msg.streamContent)}`
+        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${fpArgs(msg.toolArgs)}`
         + `\u0000${msg.diff ? msg.diff.length : 0}\u0000${msg._diffCounts ? msg._diffCounts.length : 0}`;
     let cached = msg._cache;
     if (!cached || cached.key !== key) {
@@ -2038,7 +2262,7 @@ function renderChatLines(state, w) {
     if (bordered) {
       const pad = ' '.repeat(boxPad);
       for (const r of cached.rows) {
-        out.push(PAD + col('│', C.border) + pad + fitAnsi(live(r), boxText) + pad + col('│', C.border));
+        out.push(PAD + col('│', boxColor) + pad + fitAnsi(live(r), boxText) + pad + col('│', boxColor));
       }
     } else {
       for (const r of cached.rows) out.push(PAD + live(r));
@@ -2361,6 +2585,35 @@ function sliceAnsi(s, width) {
   return out + (out.includes('\x1b') ? C.reset : '');
 }
 
+// ---- git status for the status line ----------------------------------------
+// The badge shows the branch and the uncommitted diff totals. Computing that
+// costs a handful of git subprocesses, so it is NEVER done from the render path:
+// composeFrame only reads `state._gitInfo`. It is refreshed from exactly two
+// places —
+//   1. a 15s timer while the TUI is idle (see GIT_REFRESH_MS), and
+//   2. the end of every turn (the agent's edits land there), plus explicit
+//      commands like /git and /move.
+// Frame-rate polling was the previous design and cost a git spawn per keystroke;
+// a fixed cadence is both cheaper and more predictable.
+const GIT_REFRESH_MS = 15000;
+export function refreshGitInfo(state, opts = {}) {
+  const cwd = state.cwd || state.workspace || '';
+  if (!cwd) return;
+  const now = Date.now();
+  const force = opts.force === true;
+  // Mid-turn the agent is about to write more files, so a poll would only produce
+  // a value that is stale on arrival. The turn-end refresh covers it. Explicit
+  // callers (the timer between turns, /git) still get through with force.
+  if (!force && state.running) return;
+  state._gitCwd = cwd;
+  state._gitAt = now;
+  try {
+    state._gitInfo = gitmod.statuslineInfo(cwd);
+  } catch {
+    state._gitInfo = null;   // a git failure must never break rendering
+  }
+}
+
 // ---- pure frame composer (no TTY side effects) ----
 // kimi-code-cli layout: NO top chrome. Top-to-bottom it is:
 //   chat (fills the top) / composer box / [command menu] / status line /
@@ -2369,6 +2622,8 @@ function sliceAnsi(s, width) {
 export function composeFrame(state, cols, rows) {
   const w = Math.max(20, cols | 0);
   const h = Math.max(12, rows | 0);
+  // NOTE: no git call here. The render path only READS state._gitInfo; refreshing
+  // it is driven by a 15s timer and by turn-end (see refreshGitInfo).
   // Full-screen takeovers (kimi's screen-takeover): the /tasks browser and its
   // output viewer own the ENTIRE screen, so they short-circuit the normal
   // layout ? no chat, no composer, no status bar.
@@ -3033,19 +3288,21 @@ export function composeFrame(state, cols, rows) {
     lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
   }
 
-  // Plan approval: shown once the model hands over a <plan> in Plan mode. Same
-  // box shape as the tool approval above so the two read as the same kind of
-  // prompt. Enter approves (turn Plan off and execute); Esc keeps planning.
+  // Plan review: shown once the model hands over a <plan> in Plan mode. Same box
+  // shape as the tool approval above so the two read as the same kind of prompt.
+  // It shows WHAT the plan will touch (step/file counts and the files named), so
+  // approving is an informed decision rather than a guess from prose.
   if (state.planPending && !dialog) {
-    const pp = state.planPending;
     const promptW = insideW;
     const innerW = Math.max(1, promptW - 2);
     const bar = (ch) => col(ch, C.border);
     const boxRow = (content) => bar('│') + ' ' + fitAnsi(content, innerW) + ' ' + bar('│');
     lines.push(bar('╭' + '─'.repeat(promptW) + '╮'));
-    lines.push(boxRow(col('Approve', C.white + C.bold) + ' ' + col('this plan?', C.cyan + C.bold)));
-    // The plan is ALREADY shown in its table above - do not repeat it here.
-    lines.push(boxRow(col('Enter to approve & execute | Esc to keep planning', C.gray)));
+    lines.push(boxRow(col('Review', C.white + C.bold) + ' ' + col('this plan', C.cyan + C.bold)));
+    // The plan body is ALREADY shown in its table above — summarise it here.
+    let review = [];
+    try { review = reviewLines(state.planPending.plan, state.workspace); } catch { review = []; }
+    for (const r of review) lines.push(boxRow(col(r, C.gray)));
     lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
   }
   
@@ -3059,7 +3316,11 @@ export function composeFrame(state, cols, rows) {
     // it rather than added on top — otherwise the box came out 2 columns short.
     const CPAD = ' ';
     const cInner = Math.max(1, insideW - 1);
-    lines.push(CPAD + col('╭' + '─'.repeat(cInner) + '╮', C.border));
+    // In shell mode the whole editor frame shifts to the violet shellMode hue
+    // (same token kimi-code uses for its bash-mode border), so it reads as
+    // "shell mode" rather than the cyan prompt frame.
+    const shellBorder = state.inputMode === 'bash' ? C.shellMode : C.border;
+    lines.push(CPAD + col('╭' + '─'.repeat(cInner) + '╮', shellBorder));
     for (let ri = 0; ri < composer.rows.length; ri++) {
       addHit(lines.length, 2, cInner, { kind: 'composerRow', rowIdx: ri });
       // Colour the prompt glyph like the transcript's user marker (cyan) and keep
@@ -3081,7 +3342,10 @@ export function composeFrame(state, cols, rows) {
         const highlighted = (sel && sel.anchor !== sel.head)
           ? highlightSelection(textPart, textStart, sel.anchor, sel.head)
           : textPart;
-        rowAnsi = ' ' + col(pre, C.cyan) + C.white +
+        // The `!` (shell mode) prefix is BOLD: it is a mode marker, not punctuation,
+        // and it should out-weigh the `❯` prompt glyph at a glance.
+        const preCol = state.inputMode === 'bash' ? (C.shellMode + C.bold) : C.cyan;
+        rowAnsi = ' ' + col(pre, preCol) + C.white +
           fitAnsi(highlighted, Math.max(1, textW - visualCol(pre))) + ' ';
       } else {
         const textStart = rowMeta.start != null ? rowMeta.start : 0;
@@ -3091,10 +3355,10 @@ export function composeFrame(state, cols, rows) {
         rowAnsi = ' ' + C.white + fitAnsi(highlighted, textW) + ' ';
       }
       lines.push(
-        CPAD + col('│', C.cyan) + rowAnsi + C.reset + col('│', C.cyan)
+        CPAD + col('│', shellBorder) + rowAnsi + C.reset + col('│', shellBorder)
       );
     }
-    lines.push(CPAD + col('╰' + '─'.repeat(cInner) + '╯', C.border));
+    lines.push(CPAD + col('╰' + '─'.repeat(cInner) + '╯', shellBorder));
   }
 
   
@@ -3122,21 +3386,28 @@ export function composeFrame(state, cols, rows) {
   if (state.mentionOpen && state.mentionList.length && !dialog && !state.menuOpen) {
     const totalMatches = state.mentionList.length;
     const sel = state.mentionSel + 1;
-    const off = state.mentionOffset || 0;
+    // Render the VISIBLE WINDOW, but decide "is this row the selected one" by the
+    // entry's GLOBAL index. The window start is re-derived here from the selection
+    // rather than trusted from state: whatever offset the caller left behind, the
+    // selected row is inside the slice, so it is always the one that highlights.
+    const off = windowOffset(state.mentionSel, state.mentionOffset, totalMatches);
     const shown = state.mentionList.slice(off, off + MAX_MENU);
     shown.forEach((it, j) => {
-      const selected = off + j === state.mentionSel;
+      const globalIndex = off + j;
+      const selected = globalIndex === state.mentionSel;
       const mark = selected ? col('❯ ', C.cyan) : '  ';
       const rel = String(it.rel || it.label || '');
-      const cut = rel.lastIndexOf('/') + 1;
-      const dirPart = cut > 0 ? rel.slice(0, cut) : '';
-      const basePart = rel.slice(cut);
-      const label = (dirPart ? col(dirPart, C.gray) : '')
-        + col(basePart, selected ? (C.cyan + C.bold) : C.gray);
-      const kind = it.isDir ? col('  dir', C.gray) : '';
-      const pad = Math.max(2, 40 - visualCol(rel) - visualCol(kind));
-      addHit(lines.length, 1, insideW, { kind: 'mentionItem', index: off + j });
-      lines.push(col('│' + fitAnsi(mark + label + kind + ' '.repeat(pad), insideW) + '│', C.border));
+      const isDir = !!it.isDir;
+      // The SELECTED row highlights its WHOLE path; unselected rows use the dim
+      // colour. Previously the part before the last `/` was always rendered dim,
+      // so a selected `src/tools/` showed bright `tools/` next to a grey `src/` —
+      // even though the very same `src/` was bright when it was selected itself.
+      // That inconsistency is what the per-segment split caused; there is no
+      // longer a split, so the row reads as one selected (or unselected) item.
+      const label = col(rel, selected ? (C.cyan + C.bold) : C.gray);
+      const pad = Math.max(2, 40 - visualCol(rel));
+      addHit(lines.length, 1, insideW, { kind: 'mentionItem', index: globalIndex });
+      lines.push(col('│' + fitAnsi(mark + label + ' '.repeat(pad), insideW) + '│', C.border));
     });
     lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray), insideW) + '│', C.border));
   }
@@ -3182,6 +3453,28 @@ export function composeFrame(state, cols, rows) {
     if (agentTasks > 0) parts.push(col(`[${agentTasks} agent${agentTasks === 1 ? '' : 's'} running]`, C.spring));
   }
   if (state.slCwd !== false && cwd) parts.push(col(cwd, C.gray));
+  // GIT badge: branch, then the working-tree diff totals. Placed AFTER the path so
+  // it reads as "where I am → what branch → how much is uncommitted". Rendered
+  // from state._gitInfo, which a 15s timer and turn-end refresh — the render path
+  // itself never spawns git (see refreshGitInfo).
+  if (state.slGit !== false) {
+    const gi = state._gitInfo;
+    if (gi && gi.branch) {
+      // Branch name: pale yellow + bold. Branch and its diff are ONE part, joined
+      // by a SINGLE space, so it reads as `main +1 -1` (tight). The outer
+      // parts.join('  ') uses two spaces, so this still separates the git badge
+      // from the path/model with two spaces while keeping branch↔diff at one.
+      let badge = C.bold + col(gi.branch, C.branch);
+      if (gi.insertions || gi.deletions) {
+        // Two colours so the direction is readable at a glance: +N green, -N red.
+        const bits = [];
+        if (gi.insertions) bits.push(col(`+${gi.insertions}`, C.green));
+        if (gi.deletions) bits.push(col(`-${gi.deletions}`, C.red));
+        badge += ' ' + bits.join(' ');
+      }
+      parts.push(badge);
+    }
+  }
   const statusLeft = parts.join('  ');
   const statusRight = (state.slTips !== false && state.tip) ? col(state.tip, C.gray) : '';
   lines.push(justify(statusLeft, statusRight, w));
@@ -3405,6 +3698,10 @@ export function makeState({ cfg, session, opts }) {
     hoverHit: null,
     input: '',
     caret: 0,
+    // 'prompt' (talk to the model) or 'bash' (run the line in the shell). Typing
+    // `!` on an empty composer flips this; the `!` itself never enters `input`.
+    // See composerInput() for why that matters.
+    inputMode: 'prompt',
     composerSel: null,
     pastes: new Map(),
     pasteCounter: 0,
@@ -3445,6 +3742,13 @@ export function makeState({ cfg, session, opts }) {
     addDirs: [],
     tasks: {},
     slMode: true, slModel: true, slEffort: true, slCwd: true, slTasks: true, slTips: true,
+    // Git badge in the status line: branch + working-tree diff totals. Refreshed
+    // on a TTL, never per frame — each refresh costs a few git subprocesses and
+    // composeFrame runs on every keystroke.
+    slGit: true,
+    _gitInfo: null,       // { branch, insertions, deletions, changed, untracked }
+    _gitAt: 0,            // last refresh time (ms)
+    _gitCwd: '',          // directory the cached info belongs to
     picker: null,
     pickerQuery: '',
     pickerCategory: null,  // active filter category (null = "All")
@@ -3491,21 +3795,48 @@ function stripTipPrefix(s) {
 }
 
 export function reconstructChat(s) {
-  const chat = [];
-  for (const m of (s && s.messages) || []) {
+  // Shell commands the user ran with `!` are shown on resume at the position they
+  // originally ran. Each entry's `anchor` is how many REAL conversation messages
+  // (session.messages items) preceded it, so we inject it beside that message.
+  // They live in session.shellHistory, never in session.messages — the model
+  // never sees them.
+  const shellByAnchor = new Map();
+  const shells = (s && s.shellHistory) || [];
+  for (const sh of shells) {
+    const a = Number(sh.anchor != null ? sh.anchor : 0);
+    if (!shellByAnchor.has(a)) shellByAnchor.set(a, []);
+    shellByAnchor.get(a).push(sh);
+  }
+  // Emit the shell block for anchor `a` (command + its output) onto `out`.
+  const emitShells = (out, a) => {
+    for (const sh of shellByAnchor.get(a) || []) {
+      out.push({ role: 'bash', text: String(sh.cmd || '') });
+      if (sh.result) out.push({ role: 'tool_result', text: sh.result, failed: sh.ok === false });
+    }
+  };
+
+  const out = [];
+  const msgs = (s && s.messages) || [];
+  for (let mi = 0; mi < msgs.length; mi++) {
+    const m = msgs[mi];
     const role = m.role;
     const text = typeof m.content === 'string' ? m.content : '';
-    if (role === 'user') chat.push({ role: 'user', text });
+    // Inject shell commands that anchored BEFORE this message (in the slot after
+    // the previous message).
+    emitShells(out, mi);
+    if (role === 'user') out.push({ role: 'user', text });
     else if (role === 'assistant') {
-      chat.push({ role: 'assistant', text });
+      out.push({ role: 'assistant', text });
       for (const tc of (m.toolCalls || [])) {
-        chat.push({ role: 'tool', toolName: tc.name, toolArgs: tc.args || {}, pending: false });
+        out.push({ role: 'tool', toolName: tc.name, toolArgs: tc.args || {}, pending: false });
       }
     } else if (role === 'tool') {
-      chat.push({ role: 'tool_result', text });
+      out.push({ role: 'tool_result', text });
     }
   }
-  return chat;
+  // Any shell commands anchored at/past the end land at the very tail.
+  emitShells(out, msgs.length);
+  return out;
 }
 
 export function pickerFiltered(state) {
@@ -3537,22 +3868,49 @@ export function refreshMenu(state) {
     return;
   }
   const prefix = val.slice(1).toLowerCase();
+  // `/skill:` and `/skill:<partial>` list the installed skills as menu entries so
+  // they are tab-completable exactly like a built-in command. The entry's `name`
+  // is the full `skill:<name>` token, so accepting it types the whole thing.
+  if (prefix.startsWith(SKILL_PREFIX)) {
+    const partial = prefix.slice(SKILL_PREFIX.length);
+    state.menuList = skillCompletions(partial).map((s) => ({
+      name: s.insert,
+      description: s.description || 'skill',
+      _skill: true,
+    }));
+    state.menuSel = Math.min(state.menuSel, Math.max(0, state.menuList.length - 1));
+    state.menuOpen = state.menuList.length > 0;
+    ensureMenuVisible(state);
+    return;
+  }
   state.menuList = allCommands().filter((c) => c.name.startsWith(prefix));
   state.menuSel = Math.min(state.menuSel, Math.max(0, state.menuList.length - 1));
   state.menuOpen = state.menuList.length > 0;
   ensureMenuVisible(state);
 }
 
+// Scroll a fixed-height selection window so the selected row stays visible.
+// Shared by the `/` menu and the `@` candidate list: both render at most
+// MAX_MENU rows starting at `offset`, so a selection outside that window would
+// highlight NOTHING — which is exactly the "some entries never highlight" bug
+// the @ list had (it force-reset offset to 0 on every keystroke while the
+// selection could sit anywhere).
+export function windowOffset(sel, offset, count, max = MAX_MENU) {
+  if (!count) return 0;
+  const s = Math.max(0, Math.min(sel || 0, count - 1));
+  let off = Math.max(0, Math.min(offset || 0, Math.max(0, count - max)));
+  if (s < off) off = s;
+  else if (s > off + max - 1) off = Math.max(0, s - max + 1);
+  return off;
+}
+
 function ensureMenuVisible(state) {
   if (!state.menuList.length) return;
-  const off = state.menuOffset || 0;
-  const last = off + MAX_MENU - 1;
-  if (state.menuSel < off) state.menuOffset = state.menuSel;
-  else if (state.menuSel > last) state.menuOffset = Math.max(0, state.menuSel - MAX_MENU + 1);
+  state.menuOffset = windowOffset(state.menuSel, state.menuOffset, state.menuList.length);
 }
 
 // ---- command dispatch ----
-async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrame) {
+export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrame) {
   const { addChat, openPicker, openForm, notice, sendPrompt, quit, saveSession, openEditor } = h;
   const entry = findCommand(cmdRaw);
   const cmd = entry ? entry.name : String(cmdRaw || '').replace(/^\//, '');
@@ -3587,6 +3945,17 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
 
     case 'plan': {
       const a = raw.toLowerCase();
+      // `/plan saved` lists the plans persisted to <workspace>/.hncode/plans.
+      if (a === 'saved' || a === 'list') {
+        const items = listPlans(state.workspace || cfg.workspace);
+        if (!items.length) { say('No saved plans yet. Approve a plan in Plan mode to save it.'); return; }
+        h.openPanel('hncode — saved plans', [
+          `${items.length} plan(s) in ${plansDir(state.workspace || cfg.workspace)}:`,
+          '',
+          ...items.map((p) => `  ${p.name}   ${new Date(p.mtimeMs).toISOString().slice(0, 16).replace('T', ' ')}`),
+        ]);
+        return;
+      }
       if (a === 'clear') { state.plan = false; state.planPath = null; persist(); app('Plan cleared.'); return; }
       if (a === 'on') state.plan = true;
       else if (a === 'off') state.plan = false;
@@ -3961,7 +4330,6 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       const cwd = path.resolve(state.cwd || state.workspace || process.cwd());
       // Filter to only show sessions from the current workspace.
       const list = all.filter((s) => {
-        if (!Array.isArray(s.messages) || s.messages.length === 0) return false;
         const sessionCwd = s.workspace ? path.resolve(s.workspace) : null;
         return sessionCwd === cwd;
       });
@@ -3974,12 +4342,18 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
           id: s.id,
         })),
         onPick: (it) => {
-          const hit = list.find((s) => s.id === it.id);
-          if (hit) {
+          const meta = list.find((s) => s.id === it.id);
+          if (meta) {
+            // The list only carries METADATA (no messages — readSessionMeta strips
+            // them). Assigning it straight onto `session` wiped the transcript, so
+            // the resumed session appeared empty or stale. Load the FULL session
+            // file (like --continue / --resume do), then merge its settings.
+            const full = sess.loadSession(meta.id);
+            if (!full) { app(`Could not load session ${meta.id}`); return true; }
             const keepModel = cfg.model;
             const keepInner = cfg.innerModel;
             const keepProvider = cfg.provider;
-            Object.assign(session, hit);
+            Object.assign(session, full);
             cfg.model = keepModel;
             cfg.innerModel = keepInner;
             cfg.provider = keepProvider;
@@ -3996,7 +4370,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
             state.ctxPercent = usagePercent(approx, state.ctxMax);
             
             const dur = session.lastTurnMs ? ` · last turn ${fmtDuration(session.lastTurnMs)}` : '';
-            app(`Resumed ${hit.id} (${hit.title || 'untitled'}) · ${(session.messages || []).length} messages.${dur}`);
+            app(`Resumed ${meta.id} (${meta.title || 'untitled'}) · ${(session.messages || []).length} messages.${dur}`);
           }
           return true;
         },
@@ -4414,6 +4788,11 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       h.openPanel('hncode — commands', [
         ...allCommands().map((c) => `  /${c.name.padEnd(14)} ${(c.argumentHint || '').padEnd(26)} ${c.desc}`),
         '',
+        'Skills',
+        `  /${SKILL_PREFIX}<name>     run an installed skill (Tab completes the name)`,
+        '  /import-skill <file.md>  add or overwrite a skill from a Markdown file',
+        '  /skills                  list installed skills',
+        '',
         'Shortcuts',
         '  Enter          send the message',
         '  Ctrl-J         insert a newline',
@@ -4421,6 +4800,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
         '  Ctrl+Shift+V   paste the clipboard (multi-line pastes collapse)',
         '  ↑ / ↓          input history (empty composer) · scroll the chat',
         '  /              open the command menu · Tab completes',
+        '  !              on an empty prompt: switch to shell mode (Esc/Backspace to leave)',
         '  Esc            cancel the menu / dialog · interrupt the turn',
         '  Ctrl+E         open config.toml in editor',
         '  Ctrl-B         move a running Bash command to the background',
@@ -4498,16 +4878,19 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
     case 'version': app(`hncode v${VERSION}`); return;
 
     case 'mcp': {
-      const mcpFile = path.join(os.homedir(), '.hncode', 'mcp.json');
-      let doc = { mcpServers: {} };
-      try { doc = JSON.parse(fs.readFileSync(mcpFile, 'utf8')); } catch {}
-      const names = Object.keys(doc.mcpServers || {});
-      say(names.length
-        ? `MCP servers (${names.length}):\n` + names.map((n) => {
-            const e = doc.mcpServers[n];
-            return `  ${n}  ${e.url ? e.url : `${e.command || ''} ${(e.args || []).join(' ')}`.trim()}`;
-          }).join('\n')
-        : 'No MCP servers configured. Run /mcp-config to add one.');
+      // Show REAL connection state (from startup) alongside the configured
+      // servers, plus each server's discovered tools. `/mcp tools` lists them.
+      const cfgMcp = loadMcpConfig(state.workspace || cfg.workspace);
+      const conns = getLiveConnections();
+      const lines = describeServers(cfgMcp, conns);
+      if (cfgMcp.errors.length) lines.push('', 'Config problems:', ...cfgMcp.errors.map((e) => `  ! ${e}`));
+      const showTools = String(raw || '').toLowerCase() === 'tools';
+      if (showTools) {
+        const found = conns.filter((c) => c.ok).map((c) => `  ${c.name}: ${c.toolCount} tool(s)`);
+        lines.push('', found.length ? 'Discovered tools:' : 'No servers connected — they connect at startup.');
+        lines.push(...found);
+      }
+      h.openPanel('hncode — mcp', lines);
       return;
     }
     case 'mcp-config': {
@@ -4542,7 +4925,7 @@ async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, ren
       return;
     }
 
-case 'statusline':
+    case 'statusline':
       openPicker({
         title: 'Status line items',
         items: [
@@ -4550,6 +4933,7 @@ case 'statusline':
           { label: 'model name', kind: 'toggle', isOn: state.slModel !== false },
           { label: 'thinking effort', kind: 'toggle', isOn: state.slEffort !== false },
           { label: 'current directory', kind: 'toggle', isOn: state.slCwd !== false },
+          { label: 'git branch & diff', kind: 'toggle', isOn: state.slGit !== false },
           { label: 'background tasks', kind: 'toggle', isOn: state.slTasks !== false },
           { label: 'rotating tips', kind: 'toggle', isOn: state.slTips !== false },
         ],
@@ -4557,8 +4941,9 @@ case 'statusline':
         onPick: (it) => {
           it.isOn = !it.isOn;
           it.sub = it.isOn ? 'on' : 'off';
-          const key = { 'permission mode': 'slMode', 'model name': 'slModel', 'thinking effort': 'slEffort', 'current directory': 'slCwd', 'background tasks': 'slTasks', 'rotating tips': 'slTips' }[it.label];
+          const key = { 'permission mode': 'slMode', 'model name': 'slModel', 'thinking effort': 'slEffort', 'current directory': 'slCwd', 'git branch & diff': 'slGit', 'background tasks': 'slTasks', 'rotating tips': 'slTips' }[it.label];
           state[key] = it.isOn;
+          if (key === 'slGit') refreshGitInfo(state, { force: true });
           app(`Status line: ${it.label} → ${it.isOn ? 'shown' : 'hidden'}`);
           return false;
         },
@@ -4704,6 +5089,12 @@ case 'statusline':
       sess.saveSession(newSession);
       // Update state to use the new session.
       session = newSession;
+      // The directory changed, so the status line (path + git badge) must follow.
+      // It previously kept showing the OLD path because state.cwd was never
+      // updated here.
+      state.cwd = target;
+      state.workspace = target;
+      refreshGitInfo(state, { force: true });
       state.chat = reconstructChat(session);
       state.scroll = 0;
       state.rounds = session.rounds || 0;
@@ -4737,6 +5128,210 @@ case 'statusline':
         lines.push('', 'Plugin commands:', ...pluginCommands.map((c) => `  /${c.name.padEnd(14)} ${c.description || ''}`));
       }
       h.openPanel('hncode — plugins', lines);
+      return;
+    }
+    case 'skills': {
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        const name = parts[1];
+        if (!name) { appErr('Usage: /skills remove <name>'); return; }
+        const ok = deleteSkill(name);
+        app(ok ? `Skill removed: ${normalizeSkillName(name)}` : `No such skill: ${name}`);
+        return;
+      }
+      if (sub === 'list' || sub === '') {
+        const items = listSkills();
+        if (!items.length) {
+          say(`No skills installed. Add one with /import-skill <file.md> (dir: ${skillsDir()}).`);
+          return;
+        }
+        h.openPanel('hncode — skills', [
+          `Installed skills (${items.length}) — activate with /${SKILL_PREFIX}<name>:`,
+          '',
+          ...items.map((s) => `  /${SKILL_PREFIX}${s.name}${s.description ? '  — ' + s.description : ''}`),
+          '',
+          `Directory: ${skillsDir()}`,
+          'Remove one with /skills remove <name>.',
+        ]);
+        return;
+      }
+      appErr(`Usage: /skills [list] | remove <name>`);
+      return;
+    }
+    case 'import-skill': {
+      // Usage: /import-skill <file.md> [name]
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const file = parts[0];
+      const nameArg = parts[1];
+      if (!file) { appErr('Usage: /import-skill <file.md> [name]'); return; }
+      const res = importSkill(file, nameArg);
+      if (!res.ok) { appErr(res.error); return; }
+      app(`${res.replaced ? 'Skill overwritten' : 'Skill imported'}: ${res.name} → ${res.path}`);
+      say(`Activate it with /${SKILL_PREFIX}${res.name}`);
+      return;
+    }
+    case 'hooks': {
+      const workspace = state.workspace || cfg.workspace || process.cwd();
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (sub === 'test') {
+        const event = parts[1];
+        if (!event || !HOOK_EVENTS.includes(event)) {
+          appErr(`Usage: /hooks test <event>  (events: ${HOOK_EVENTS.join(', ')})`);
+          return;
+        }
+        const { hooks } = loadHooks(workspace);
+        const res = await runShellHooks({ hooks }, event, { toolName: 'Bash', toolArgs: { command: 'echo hi' }, prompt: 'test' }, workspace);
+        if (!(hooks[event] || []).length) { app(`No ${event} hooks configured.`); return; }
+        const lines = res.results.map((r) => {
+          const head = r.ok ? `✔ ${r.entry.command}` : `✖ ${r.entry.command} (${r.message})`;
+          const body = (r.stderr || r.stdout || '').trim();
+          return body ? `${head}\n${body}` : head;
+        });
+        h.openPanel(`hncode — hooks: ${event} (test)`, [
+          `Ran ${res.results.length} hook(s)${res.blocked ? ' — the tool WOULD be blocked' : ''}.`,
+          '',
+          ...lines,
+        ]);
+        return;
+      }
+      const { hooks, errors } = loadHooks(workspace);
+      const lines = describeHooks({ hooks });
+      if (errors.length) lines.push('', 'Config problems:', ...errors.map((e) => `  ! ${e}`));
+      h.openPanel('hncode — hooks', lines);
+      return;
+    }
+    case 'git': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      refreshGitInfo(state, { force: true });   // keep the badge in sync with this view
+      const branch = gitmod.currentBranch(cwd);
+      const s = gitmod.status(cwd);
+      const info = gitmod.parseRemote(gitmod.remoteUrl(cwd));
+      const lines = [
+        `branch:  ${branch || '(unknown)'}`,
+        `head:    ${gitmod.headSha(cwd)}`,
+        info ? `remote:  ${info.owner}/${info.repo}  (${info.host})` : 'remote:  (none)',
+        '',
+        `changes (${s.ok ? s.entries.length : '?'}):`,
+        ...gitmod.statusLines(cwd).map((l) => '  ' + l),
+      ];
+      h.openPanel('hncode — git', lines);
+      return;
+    }
+    case 'commit': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      // `/commit <message>` commits what is already staged, staging everything
+      // when the index is empty (the common "commit my changes" case).
+      // `/commit` with NO message hands the job to the model, which can read the
+      // diff and draft a message — that is the point of having an agent.
+      const message = String(raw || '').trim();
+      if (!message) {
+        const s = gitmod.status(cwd);
+        if (s.ok && !s.entries.length) { app('Nothing to commit — working tree is clean.'); return; }
+        const branch = gitmod.currentBranch(cwd);
+        const pending = gitmod.statusLines(cwd).slice(0, 40).join('\n');
+        await submit(
+          `Create a git commit for the current changes.\n\n`
+          + `Repository state (branch: ${branch}):\n${pending}\n\n`
+          + `Steps: run \`git diff\` (and \`git status\`) to review the changes, stage the relevant files, then commit with a concise message `
+          + `that explains the intent. Match the repository's existing commit-message style. Do not push. `
+          + `Finally, report the commit hash and a one-line summary of what was committed.`,
+        );
+        return;
+      }
+      if (!gitmod.hasStagedChanges(cwd)) {
+        const st = gitmod.stage([], cwd);
+        if (!st.ok) { appErr(`git add failed: ${st.error}`); return; }
+      }
+      const res = gitmod.commit(message, cwd);
+      if (!res.ok) { appErr(`Commit failed: ${res.error}`); return; }
+      app(`Committed ${res.sha}: ${message.split('\n')[0]}`);
+      const files = res.stdout.split('\n').slice(0, 8).join('\n');
+      say(`Committed ${res.sha}\n${files}`);
+      return;
+    }
+    case 'branch': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        const cur = gitmod.currentBranch(cwd);
+        const branches = gitmod.listBranches(cwd);
+        if (!branches.length) { app(`No branches yet (current: ${cur}).`); return; }
+        say(`Branches (current: ${cur}):\n` + branches.map((b) => `  ${b === cur ? '* ' : '  '}${b}`).join('\n'));
+        return;
+      }
+      if (sub === '-c' || sub === 'create' || sub === 'new') {
+        const name = parts[1];
+        if (!name) { appErr('Usage: /branch -c <name> [from]'); return; }
+        const r = gitmod.createBranch(name, cwd, parts[2]);
+        if (!r.ok) { appErr(`Could not create branch: ${r.error}`); return; }
+        app(`Switched to new branch: ${name}`);
+        return;
+      }
+      const r = gitmod.switchBranch(parts[0], cwd);
+      if (!r.ok) { appErr(`Could not switch branch: ${r.error}`); return; }
+      app(`Switched to branch: ${parts[0]}`);
+      return;
+    }
+    case 'pr': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const base = String(raw || '').trim() || 'main';
+      const url = gitmod.prUrl(cwd, base);
+      if (!url) { appErr('No git remote named "origin" — cannot build a PR URL.'); return; }
+      const branch = gitmod.currentBranch(cwd);
+      say(`Open a pull request for ${branch} → ${base}:\n  ${url}`);
+      app('PR link copied to the transcript (Ctrl+Shift+C to copy).');
+      return;
+    }
+    case 'cache': {
+      // Prompt caching: explicit cache breakpoints for the stable prefix (tools +
+      // system + conversation head). Saves input tokens on every turn after the
+      // first. Anthropic gets cache_control markers; OpenAI-compatible providers
+      // get a stable prompt_cache_key.
+      const a = String(raw || '').toLowerCase();
+      const want = a === 'on' ? true : a === 'off' ? false : !(cfg.promptCache !== false);
+      cfg.promptCache = want;
+      try { setConfigString('prompt_cache', want ? 'true' : 'false'); } catch { /* best-effort persist */ }
+      app(`Prompt caching: ${want ? 'ON' : 'OFF'}`);
+      say(want
+        ? 'The stable prefix (tools + system + conversation head) is marked cacheable.\n'
+          + 'Providers bill cached input at a fraction of the normal rate. Effective\n'
+          + 'for: anthropic (cache_control), openai-compatible (prompt_cache_key).'
+        : 'Prompt caching disabled — every request sends the full prompt as fresh input.');
+      return;
+    }
+    case 'worktree': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        const list = gitmod.listWorktrees(cwd);
+        say(`Worktrees (${list.length}):\n` + list.map((w) => `  ${w.path}  ${w.branch ? '[' + w.branch + ']' : w.detached ? '(detached)' : ''}`).join('\n'));
+        return;
+      }
+      if (sub === 'add') {
+        const dir = parts[1];
+        if (!dir) { appErr('Usage: /worktree add <dir> [branch]'); return; }
+        const r = gitmod.addWorktree(dir, parts[2], cwd);
+        if (!r.ok) { appErr(`Could not add worktree: ${r.error}`); return; }
+        app(r.reused ? `Worktree already exists: ${r.path}` : `Worktree created: ${r.path}${r.branch ? ` [${r.branch}]` : ''}`);
+        return;
+      }
+      if (sub === 'remove' || sub === 'rm') {
+        const dir = parts[1];
+        if (!dir) { appErr('Usage: /worktree remove <dir>'); return; }
+        const r = gitmod.removeWorktree(dir, cwd, { force: parts.includes('--force') });
+        app(r.ok ? `Worktree removed: ${dir}` : `Could not remove worktree: ${r.error}`);
+        return;
+      }
+      appErr('Usage: /worktree [list] | add <dir> [branch] | remove <dir>');
       return;
     }
     case 'logout': {
@@ -4774,7 +5369,23 @@ case 'statusline':
     }
     case 'exit': quit(); return;
 
-    default:
+    default: {
+      // A skill activation: /skill:<name> [extra args]. The skill's body is sent
+      // as the turn's prompt, so it behaves like a saved prompt fragment the user
+      // can recall by name (tab-completed in the composer).
+      const rawName = String(cmdRaw || '').replace(/^\/+/, '');
+      if (rawName.toLowerCase().startsWith(SKILL_PREFIX)) {
+        const name = normalizeSkillName(rawName);
+        const sk = readSkill(name);
+        if (!sk || !sk.body) {
+          appErr(`No such skill: ${name}. Use /skills to list them, or /import-skill to add one.`);
+          return;
+        }
+        const extra = String(raw || '').trim();
+        const prompt = skillPrompt(sk) + (extra ? `\n\n${extra}` : '');
+        await submit(prompt);
+        return;
+      }
       // Check if this is a plugin-registered command.
       if (isPluginCommand(cmd)) {
         const pc = findCommand(cmd);
@@ -4787,6 +5398,7 @@ case 'statusline':
       // Unknown command: show error message
       appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
       return;
+    }
   }
 }
 
@@ -5310,8 +5922,10 @@ export async function startTUI(opts) {
     });
     state.mentionList = ranked.slice(0, 200).map((r) => r.f);
     state.mentionSel = Math.min(state.mentionSel || 0, Math.max(0, state.mentionList.length - 1));
-    // Hitting Tab again after the list closed should start from the top.
-    state.mentionOffset = 0;
+    // Keep the window on the selected row. This used to reset the offset to 0,
+    // which left a selection beyond MAX_MENU rows invisible — the renderer only
+    // walks [offset, offset+MAX_MENU), so nothing at all appeared highlighted.
+    state.mentionOffset = windowOffset(state.mentionSel, state.mentionOffset, state.mentionList.length);
     state.mentionOpen = state.mentionList.length > 0;
   }
 
@@ -5537,9 +6151,23 @@ export async function startTUI(opts) {
   // and doing it lazily on the first Ctrl+Shift+V made the shortcut look dead.
   warmClipboard();
   setTip(state);
+  // Populate the git badge before the first paint so the status line is correct
+  // immediately (from then on the 15s timer / turn-end keep it current).
+  refreshGitInfo(state, { force: true });
   renderFrame();
 
   const tipTimer = setInterval(() => { setTip(state); renderFrame(); }, TIP_INTERVAL);
+  // Git badge: a fixed 15s cadence. Deliberately NOT tied to the frame loop (that
+  // spawned git per keystroke) and NOT run mid-turn (the agent is still writing;
+  // the turn-end refresh picks up its edits). Repaints only when something
+  // actually changed, so an idle session stays quiet.
+  const gitTimer = setInterval(() => {
+    if (state.running) return;
+    const before = state._gitInfo && `${state._gitInfo.branch}|${state._gitInfo.insertions}|${state._gitInfo.deletions}`;
+    refreshGitInfo(state, { force: true });
+    const after = state._gitInfo && `${state._gitInfo.branch}|${state._gitInfo.insertions}|${state._gitInfo.deletions}`;
+    if (before !== after) renderFrame();
+  }, GIT_REFRESH_MS);
   const spinTimer = setInterval(() => {
     if (!state.running) return;
     // Monotonic tick counter — do NOT wrap it at SPINNER.length, or the
@@ -5671,6 +6299,14 @@ export async function startTUI(opts) {
   function dispatchHit(hb) {
     if (!hb) return false;
     switch (hb.kind) {
+      case 'mentionItem': {
+        // Mirror menuItem: clicking an @candidate selects AND accepts it. The
+        // case was simply missing, so a click fell through to `default: false`
+        // and did nothing at all.
+        state.mentionSel = hb.index;
+        acceptMention();
+        return true;
+      }
       case 'menuItem': {
         state.menuSel = hb.index;
         const cmd = state.menuList[hb.index];
@@ -5981,16 +6617,25 @@ export async function startTUI(opts) {
   function insertComposerPaste(raw) {
     const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n');
     if (!text) return false;
-    const lineCount = text.split('\n').length;
-    let insert = text;
+    // A paste starting with `!` into an EMPTY prompt means "run this in the
+    // shell" — enter shell mode and drop the marker, exactly like typing it. Same
+    // rule as kimi-code's editor, so a copied `!git status` behaves identically.
+    let body = text;
+    if (state.inputMode !== 'bash' && (state.input || '').length === 0 && body.startsWith('!')) {
+      state.inputMode = 'bash';
+      body = body.replace(/^!+/, '');
+    }
+    const lineCount = body.split('\n').length;
+    let insert = body;
     if (lineCount > 1) {
       const id = ++state.pasteCounter;
-      state.pastes.set(id, { text, lines: lineCount });
+      state.pastes.set(id, { text: body, lines: lineCount });
       insert = pasteMarker(id, lineCount);
     }
     state.input = (state.input || '').slice(0, state.caret) + insert + (state.input || '').slice(state.caret);
     state.caret += insert.length;
-    refreshMenu(state);
+    // Shell mode offers no `/` commands or `@` files.
+    if (state.inputMode !== 'bash') refreshMenu(state);
     return true;
   }
   // Async so the notice can be painted BEFORE the clipboard read: a cold
@@ -6151,25 +6796,20 @@ export async function startTUI(opts) {
       // keep drafting while deciding.
       if (t.key === 'c-c') return;
     }
-    // Plan approval: the model produced a <plan> and Plan mode is waiting.
-    // Enter = approve (Plan turns off, the plan is sent back to be executed).
-    // Esc  = keep planning, do NOT execute.
+    // Plan review: the model produced a <plan> and Plan mode is waiting.
+    // Enter/Space = approve & execute, e = edit first, Esc = keep planning.
     if (state.planPending) {
-      if (t.key === 'enter' || t.key === ' ') {
+      const settle = (outcome) => {
         const resolve = state.planPending.resolve;
         state.planPending = null;
-        resolve(true);
+        resolve(outcome);
         renderFrame();
-        return;
-      }
-      if (t.key === 'escape') {
-        const resolve = state.planPending.resolve;
-        state.planPending = null;
-        resolve(false);
-        renderFrame();
-        return;
-      }
+      };
+      if (t.key === 'enter' || t.key === ' ') { settle('approve'); return; }
+      if (t.key === 'escape') { settle('keep'); return; }
+      if (t.ch === 'e' || t.ch === 'E') { settle('edit'); return; }
       if (t.key === 'c-c') return;   // do not exit while a plan is under review
+      return;                        // swallow other keys while reviewing
     }
     if (t.key === 'c-c') {
       // An open overlay consumes Ctrl+C: close it instead of interrupting the
@@ -6407,7 +7047,14 @@ export async function startTUI(opts) {
     // transcript. Without this guard the running block below stole those keys.
     // The modal editor (e.g. from /set-system-prompt) is included so that Esc and
     // arrow keys are handled by it, not by the running-turn interrupt/scroll logic.
-    const overlayOpen = !!(state.picker || state.form || state.panel || state.menuOpen || state.editor);
+    //
+    // `mentionOpen` MUST be in this list: it is the inline `@file` candidate list,
+    // which is a keyboard-owning overlay just like the `/` menu. Leaving it out
+    // meant that while the agent was streaming, ↑/↓ scrolled the transcript
+    // (instead of moving the selection) and Esc interrupted the turn (instead of
+    // dismissing the list) — the keys never reached the mention block below.
+    const overlayOpen = !!(state.picker || state.form || state.panel || state.menuOpen
+      || state.mentionOpen || state.editor);
     if (state.running && !overlayOpen) {
       if (t.key === 'escape') {
         if (state.agent) state.agent.interrupt();
@@ -6422,13 +7069,32 @@ export async function startTUI(opts) {
         renderFrame(); return;
       }
       if (t.key === 'up' || t.key === 'down') {
+        // ↑/↓ only scroll when the COMPOSER has no use for the key. While the
+        // agent streams you are usually typing the next instruction, so a
+        // multi-line draft must still move its caret — swallowing the key for
+        // scrolling unconditionally is what made ↑/↓ "always scroll". When the
+        // caret is already on the first/last row the key falls through to the
+        // scroll below, so both behaviours are available.
+        const insideW = Math.max(0, dims().cols - 2);
+        const layout = composerLayout(state, insideW - 3);
+        const dir = t.key === 'down' ? 1 : -1;
+        const targetRow = layout.caretRow + dir;
+        if (targetRow >= 0 && targetRow < layout.rows.length) {
+          const starts = rowStartOffsets(state.input || '', layout.rows.length, insideW);
+          const colInRow = Math.max(0, layout.caretCol - 1);
+          const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
+          state.caret = Math.min((state.input || '').length, targetStart + colInRow);
+          state.composerSel = null;
+          renderFrame(); return;
+        }
         scrollChat(state, t.key === 'up' ? 3 : -3);
         renderFrame(); return;
       }
     }
     else {
       if (t.key === 'up' || t.key === 'down') {
-        const overlay = state.picker || state.form || state.panel || state.menuOpen || state.editor;
+        const overlay = state.picker || state.form || state.panel || state.menuOpen
+          || state.mentionOpen || state.editor;
         const cur = state.input || '';
         if (!overlay && cur === '' && state.history.length) {
           if (state.historyIdx === -1) state.historyIdx = state.history.length;
@@ -6698,6 +7364,13 @@ export async function startTUI(opts) {
     }
 
     if (t.key === 'escape') {
+      // In shell mode a bare Esc on an empty buffer exits the mode (nothing to
+      // clear); with text present it falls through and clears as usual.
+      if (state.inputMode === 'bash' && state.input.length === 0) {
+        state.inputMode = 'prompt';
+        renderFrame();
+        return;
+      }
       state.menuOpen = false; state.menuList = []; state.menuSel = 0;
       state.menuOffset = 0;
       state.mentionOpen = false; state.mentionList = []; state.mentionSel = 0;
@@ -6705,6 +7378,7 @@ export async function startTUI(opts) {
       state.input = ''; state.caret = 0;
       state.pastes.clear(); state.pasteCounter = 0;
       state.composerSel = null;
+      state.inputMode = 'prompt';
       refreshMenu(state);
       renderFrame();
       return;
@@ -6726,8 +7400,7 @@ export async function startTUI(opts) {
         if (n) {
           state.mentionSel = (state.mentionSel + (t.key === 'down' ? 1 : n - 1)) % n;
           // Keep the selection inside the visible window.
-          if (state.mentionSel < state.mentionOffset) state.mentionOffset = state.mentionSel;
-          else if (state.mentionSel >= state.mentionOffset + MAX_MENU) state.mentionOffset = state.mentionSel - MAX_MENU + 1;
+          state.mentionOffset = windowOffset(state.mentionSel, state.mentionOffset, n);
           renderFrame();
         }
         return;
@@ -6795,6 +7468,16 @@ export async function startTUI(opts) {
         const cur = Math.min(state.menuSel, n - 1);
         state.menuSel = (cur + (t.key === 'wheeldown' ? 1 : n - 1)) % n;
         ensureMenuVisible(state);
+        renderFrame();
+        return;
+      }
+      // The @ candidate list scrolls its own selection, exactly like /menu —
+      // otherwise a wheel notch scrolled the transcript behind an open list.
+      if (state.mentionOpen && state.mentionList.length) {
+        const n = state.mentionList.length;
+        const cur = Math.min(state.mentionSel, n - 1);
+        state.mentionSel = (cur + (t.key === 'wheeldown' ? 1 : n - 1)) % n;
+        state.mentionOffset = windowOffset(state.mentionSel, state.mentionOffset, n);
         renderFrame();
         return;
       }
@@ -6914,6 +7597,14 @@ export async function startTUI(opts) {
       return;
     }
     if (t.key === 'backspace') {
+      // In shell mode with an empty buffer there is nothing to delete, so the
+      // Backspace reads as "remove the `!`" and drops back to prompt mode —
+      // exactly the kimi-code behaviour.
+      if (state.inputMode === 'bash' && state.input.length === 0 && !(state.composerSel && state.composerSel.anchor !== state.composerSel.head)) {
+        state.inputMode = 'prompt';
+        renderFrame();
+        return;
+      }
       const sel = state.composerSel;
       if (sel && sel.anchor !== sel.head) {
         const a = Math.min(sel.anchor, sel.head);
@@ -6962,14 +7653,27 @@ export async function startTUI(opts) {
       renderFrame(); return;
     }
     if (t.ch) {
+      // `!` on an EMPTY prompt toggles shell mode instead of being inserted — the
+      // `!` becomes the prefix, so the buffer holds only the command. Mirrors
+      // kimi-code's editor: the marker never enters the text, so the caret never
+      // steps over it and submit never strips it.
+      if (t.ch === '!' && state.inputMode !== 'bash' && state.input.length === 0) {
+        state.inputMode = 'bash';
+        state.composerSel = null;
+        renderFrame();
+        return;
+      }
       state.input = state.input.slice(0, state.caret) + t.ch + state.input.slice(state.caret);
       state.caret++;
       state.composerSel = null;
       // Any printable character can extend or start an `@mention`, so refresh the
       // inline list on every keystroke: typing `@` opens it, and typing after it
-      // narrows it — the same live-feedback the `/` menu gives.
-      refreshMention();
-      if (!state.mentionOpen) refreshMenu(state);
+      // narrows it — the same live-feedback the `/` menu gives. In shell mode
+      // there are no @mentions or slash-commands to offer, so skip both.
+      if (state.inputMode !== 'bash') {
+        refreshMention();
+        if (!state.mentionOpen) refreshMenu(state);
+      }
       renderFrame();
     }
   }
@@ -7037,6 +7741,16 @@ export async function startTUI(opts) {
     }
     
     if (state.history[state.history.length - 1] !== text) state.history.push(text);
+    // Shell passthrough. The MODE is authoritative (the `!` never entered the
+    // buffer); a leading `!` in the text is still honoured so a pasted line like
+    // `!git status` behaves the same as typing it.
+    if (state.inputMode === 'bash' || text.startsWith('!')) {
+      const cmd = text.replace(/^!+/, '').trim();
+      state.inputMode = 'prompt';   // one command per activation, like kimi
+      if (!cmd) { renderFrame(); return; }
+      await runShellCommand(cmd);
+      return;
+    }
     // Commands are handled immediately, never queued: queuing them delayed a
     // /plan or /model until the running turn finished, which is not what
     // typing a command means.
@@ -7059,6 +7773,80 @@ export async function startTUI(opts) {
     }
 
     await runAgent(text);
+  }
+
+  // `!command` — run a shell command directly, without the model.
+  //
+  // The composer path is deliberately bypassed: the command runs through the same
+  // Bash tool the agent uses (so it gets the same timeout, cwd, output
+  // sanitising and truncation), but its result is rendered as a `↳` receipt and
+  // NOT sent to the model. That is the point — a quick `git add -A && git push`
+  // should be instant and predictable, not a round-trip the agent might reword.
+  //
+  // The command is echoed into the transcript so the scrollback shows what was
+  // run, and it is kept out of `session.messages` so it does not pollute the
+  // conversation the model sees.
+  async function runShellCommand(cmd) {
+    const started = Date.now();
+    // Echo the command as a dedicated `bash` role so the transcript renders it
+    // with SHELL MODE styling (violet frame + `!` glyph). It is recorded in
+    // session.shellHistory (persisted, shown on resume) but NEVER in
+    // session.messages, so the model never sees the command.
+    addChat({ role: 'bash', text: cmd });
+    // Record the command for the NEXT session's display. It lives in its own
+    // field, not session.messages, so it survives a restart for the user to see
+    // but is never sent to the model. `anchor` remembers WHERE in the
+    // conversation this shell command ran (how many real messages came before
+    // it), so a resume can put it back in that spot instead of appending it at
+    // the very end. The result/exit is patched once it runs.
+    if (session) {
+      session.shellHistory = session.shellHistory || [];
+      session.shellHistory.push({ cmd, ts: Date.now(), ok: null, anchor: (session.messages || []).length });
+    }
+    state.scroll = 0;
+    state.running = true;
+    state.startAnim = { start: Date.now() };
+    renderFrame();
+
+    let out = '';
+    let failed = false;
+    try {
+      const bash = getTool('Bash');
+      if (!bash) {
+        out = 'Error: the Bash tool is unavailable.';
+        failed = true;
+      } else {
+        const result = await bash.execute(
+          { command: cmd, description: 'shell passthrough' },
+          { ...cfg, cwd: state.cwd || state.workspace, workspace: state.workspace || state.cwd, allowExternal: true },
+        );
+        out = String(result == null ? '' : result);
+        failed = isFailureResult(out, 'Bash');
+      }
+    } catch (e) {
+      out = `Error running command: ${e.message}`;
+      failed = true;
+    } finally {
+      state.running = false;
+    }
+
+    addChat({ role: 'tool_result', text: out, failed });
+    const ms = Date.now() - started;
+    addChat({ role: 'system', text: `[${cmd.split('\n')[0]} — ${failed ? 'failed' : 'done'} in ${fmtDuration(ms)}]` });
+    // Close the tail of the shellHistory entry pushed at the start: mark it
+    // done/failed with a short result preview, then persist the session so the
+    // command (and its outcome) survives a restart.
+    if (session && Array.isArray(session.shellHistory) && session.shellHistory.length) {
+      const last = session.shellHistory[session.shellHistory.length - 1];
+      last.ok = !failed;
+      last.doneAt = Date.now();
+      last.result = String(out || '').slice(0, 500);   // keep a peek, bound it
+      try { sess.saveSession(session); } catch { /* best-effort */ }
+    }
+    // A shell command can change the working tree, so refresh the git badge now
+    // rather than waiting for the next TTL tick.
+    refreshGitInfo(state, { force: true });
+    renderFrame();
   }
 
   // `asSystem` injects the text as a SYSTEM message instead of a user message and
@@ -7119,6 +7907,17 @@ export async function startTUI(opts) {
     const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
     if (agents) {
       sysText += '\n\n' + agents;
+    }
+    // GIT CONTEXT: the current branch and how many files are uncommitted. Cheap
+    // (two git calls) and it stops the model guessing whether the tree is dirty
+    // or which branch it is on. Skipped silently outside a repository.
+    {
+      const gitCwd = state.cwd || state.workspace || cfg.workspace;
+      let gitsum = '';
+      try { gitsum = gitmod.summary(gitCwd); } catch { gitsum = ''; }
+      if (gitsum) {
+        sysText += '\n\nGIT WORKING TREE (this repository, as of now):\n' + gitsum;
+      }
     }
     let messages = [{ role: 'system', content: sysText }];
     if (session.messages && session.messages.length) {
@@ -7267,7 +8066,12 @@ export async function startTUI(opts) {
     });
     const agent = new Agent({
       // maxSteps omitted: the agent loop is uncapped (see agent.js).
-      cfg, messages, onApproval,
+      // sessionId makes the prompt-cache key stable per session (see cache.js).
+      cfg: { ...cfg, sessionId: (session && session.id) || cfg.sessionId },
+      messages, onApproval,
+      // Shell hooks are re-read per turn so an edit to hooks.json (or a /hooks
+      // change) takes effect on the next message without restarting.
+      hookConfig: loadHooks(cfg.workspace).hooks,
       onEvent: (e) => {
         // Everything the MODEL streams counts toward the tok/s meter: reasoning
         // chunks carry `text` just like answer chunks do.
@@ -7350,14 +8154,22 @@ export async function startTUI(opts) {
             state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now() });
           }
         } else if (e.type === 'tool_args') {
-        } else if (e.type === 'tool_args') {
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (entry) {
-            entry._argsRaw = (entry._argsRaw || '') + e.chunk;
+            // Incremental scan: each chunk is parsed ONCE and the parse state
+            // carries forward. Re-parsing the whole accumulated blob per chunk was
+            // O(n²) and froze the UI on a large Write (see createArgStream).
+            if (!entry._argStream) entry._argStream = createArgStream();
+            feedArgStream(entry._argStream, e.chunk);
             // Track the key argument as it streams so "Using Bash (cmd)" shows
             // the command DURING the run rather than only once it has finished.
-            entry.toolArgs = extractPartialArgs(entry._argsRaw, entry.toolArgs || {});
-            if (entry.toolName === 'Write') entry.streamContent = extractJsonString(entry._argsRaw, 'content');
+            entry.toolArgs = { ...(entry.toolArgs || {}), ...entry._argStream.pairs };
+            if (entry.toolName === 'Write') {
+              entry.streamContent = argStreamValue(entry._argStream, 'content');
+              // Incremental line count so the preview's "… N more lines" note is
+              // exact without re-scanning the whole content every frame.
+              entry._streamLineCount = argStreamLineCount(entry._argStream, 'content');
+            }
           }
           renderSoon(); return;
         } else if (e.type === 'tool_output') {
@@ -7521,20 +8333,60 @@ export async function startTUI(opts) {
         else addChat({ role: 'plan', text: planText });
         if (lastAssistant) {
           lastAssistant.text = String(lastAssistant.text).replace(/<\/?plan>/gi, '').trim();
+          // This is a REPLACEMENT, not an append, so the length-based render-cache
+          // fingerprint could coincide with the previous value and leave a stale
+          // frame. Drop the cache explicitly.
+          lastAssistant._cache = null;
           if (!lastAssistant.text.trim()) {
             const i = state.chat.indexOf(lastAssistant);
             if (i >= 0) state.chat.splice(i, 1);
           }
         }
         // ask / yolo -> the user decides; auto -> approved without asking, which
-        // is the whole point of "Never Ask".
+        // is the whole point of "Never Ask". The review resolves to one of
+        // 'approve' | 'edit' | 'keep':
+        //   approve — execute the plan as written
+        //   edit    — open the plan in the editor, then execute the EDITED text
+        //   keep    — stay in Plan mode, do not execute
         const cur = state.mode || 'ask';
-        const ok = cur === 'auto' ? true : await new Promise((resolve) => {
+        let outcome = cur === 'auto' ? 'approve' : await new Promise((resolve) => {
           state.planPending = { plan: planText, resolve };
           renderFrame();
         });
         state.planPending = null;
-        if (ok) approvedPlan = planText;
+        if (outcome === 'edit') {
+          // Let the user revise the plan before it is executed. The editor is
+          // synchronous from the agent's point of view: we wait for save.
+          const edited = await new Promise((resolve) => {
+            openEditor({
+              title: 'Review plan — edit before executing',
+              text: planText,
+              caretRow: 0,
+              caretCol: 0,
+              onSave: (value) => resolve(String(value || '').trim()),
+              onCancel: () => resolve(null),
+            });
+            renderFrame();
+          });
+          if (edited) {
+            // Keep the on-screen bubble in sync with the edited text.
+            const bubble = [...state.chat].reverse().find((m) => m.role === 'plan');
+            if (bubble) { bubble.text = edited; bubble._cache = null; }
+            approvedPlan = edited;
+            outcome = 'approve';
+          } else {
+            outcome = 'keep';
+          }
+        }
+        if (outcome === 'approve') {
+          approvedPlan = planText;
+          // Persist the approved plan next to the project so it survives the
+          // session and can be reviewed with the change (or handed to an issue).
+          try {
+            const saved = savePlan(planText, state.workspace || cfg.workspace);
+            if (saved.ok) addChat({ role: 'system', text: `Plan saved: ${saved.path}` });
+          } catch { /* persistence is best-effort */ }
+        }
       }
     }
 
@@ -7577,6 +8429,10 @@ export async function startTUI(opts) {
     // Also clear startAnim if it's still active (should be cleared already by composeFrame)
     state.startAnim = null;
     state.running = false;
+    // The agent may have written or edited files this turn: refresh the git badge
+    // now so the diff totals reflect it immediately, instead of waiting for the
+    // 15s timer.
+    refreshGitInfo(state, { force: true });
 
     if (turnMs > 0) {
       state.lastTurnMs = turnMs;
@@ -7706,6 +8562,7 @@ export async function startTUI(opts) {
     }
     if (proseIdx >= 0) {
       state.chat[proseIdx].text = trimmed;
+      state.chat[proseIdx]._cache = null;   // replacement, not append: see fp()
       if (!trimmed.trim()) state.chat.splice(proseIdx, 1);   // nothing left: drop it
     } else if (trimmed.trim()) {
       state.chat.unshift({ role: 'assistant', text: trimmed });
@@ -7717,6 +8574,7 @@ export async function startTUI(opts) {
     let last = state.chat[state.chat.length - 1];
     if (last && last.role === 'plan') {
       last.text = planSoFar;
+      last._cache = null;   // replacement, not append: see fp()
     } else {
       state.chat.push({ role: 'plan', text: planSoFar });
     }
@@ -7810,6 +8668,36 @@ export async function startTUI(opts) {
     if (stopped) return;
     try { stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l' + alternateScreen(false) + showCursor()); } catch {}
   });
+
+  // REMOTE CONTROL (--control): expose a local socket so a script can queue a
+  // prompt on this running session, query its status, or interrupt it. Opt-in —
+  // nothing listens unless the user asked for it. Failures are non-fatal (a
+  // second instance may already hold the socket).
+  let control = null;
+  if (opts.control != null) {
+    try {
+      control = await startControlServer({
+        prompt: async (text) => { await submit(text); },
+        status: async () => ({
+          busy: !!(state.running),
+          session: (session && session.id) || '',
+          model: cfg.model || '',
+          cwd: state.cwd || cfg.workspace || '',
+          queued: (state.queued || []).length,
+        }),
+        interrupt: async () => { if (state.agent && typeof state.agent.interrupt === 'function') state.agent.interrupt(); },
+      }, { path: opts.control || undefined });
+      if (control.error) {
+        try { stdout.write(`\r\n  control socket unavailable: ${control.error}\r\n`); } catch {}
+      } else {
+        addChat({ role: 'system', text: `Remote control listening on ${control.path}` });
+        renderFrame();
+      }
+    } catch (e) {
+      try { stdout.write(`\r\n  control socket failed: ${e.message}\r\n`); } catch {}
+    }
+  }
+  if (control && control.server) process.on('exit', () => { try { control.close(); } catch {} });
 
   // Keep the process alive for the whole session. startTUI is async and returns
   // as soon as the TUI is wired up; without a pending promise, main()'s await

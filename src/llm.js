@@ -9,6 +9,7 @@
 
 import { llmTools } from './tools/index.js';
 import { effortWire } from './config.js';
+import { applyPromptCache } from './cache.js';
 
 export function openAiToolDefs(tools) {
   return tools.map((t) => ({
@@ -101,9 +102,20 @@ function buildBody(cfg, messages, streaming = true) {
   const wire = effortWire(cfg, cfg.effort) || {};
   if (cfg.protocol === 'anthropic') {
     const { system, messages: am } = toAnthropic(messages);
-    return JSON.stringify({ model: cfg.innerModel, system, messages: am, tools: anthropicToolDefs(llmToolsList), ...common, ...wire });
+    const body = { model: cfg.innerModel, system, messages: am, tools: anthropicToolDefs(llmToolsList), ...common, ...wire };
+    // Prompt caching: mark the stable prefix (tools + system + conversation head)
+    // so the provider bills it as a cache READ instead of fresh input. The key is
+    // the SESSION id, so it stays identical across turns and never thrashes.
+    return JSON.stringify(applyPromptCache('anthropic', body, {
+      enabled: cfg.promptCache !== false,
+      sessionKey: cfg.sessionId,
+    }));
   }
-  return JSON.stringify({ model: cfg.innerModel, messages: toOpenAi(messages), tools: openAiToolDefs(llmToolsList), ...common, ...wire });
+  const body = { model: cfg.innerModel, messages: toOpenAi(messages), tools: openAiToolDefs(llmToolsList), ...common, ...wire };
+  return JSON.stringify(applyPromptCache('openai', body, {
+    enabled: cfg.promptCache !== false,
+    sessionKey: cfg.sessionId,
+  }));
 }
 
 // tool list used for defs (injected via setTools)

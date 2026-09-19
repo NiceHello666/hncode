@@ -13,7 +13,7 @@ import { hashRegion as hashLines } from './read.js';
 
 export const spec = {
   name: 'Edit',
-description: 'Edit a file. PREFERRED: line-range mode (path + start_line/end_line/new_content) — replace by line numbers when you have Read the file and know the positions. Use line-range mode whenever possible; fall back to exact-substring mode (path + old_string/new_string) only when the exact text is known and a line range is not convenient.',
+  description: 'Edit a file. THE TWO MODES ARE MUTUALLY EXCLUSIVE — NEVER combine them:\n  - LINE-RANGE mode: path + start_line + end_line + new_content. Replaces lines [start_line, end_line] with new_content. PREFERRED — use it whenever you have Read the file and know the line numbers.\n  - EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use ONLY when the exact text is known and a line range is not convenient.\nDo NOT pass start_line/end_line together with old_string/new_string in one call, and do NOT pass any of these four keys when you are not using that mode. Omitting new_content or new_string is an error, not an empty replacement.',
   parameters: {
     type: 'object',
     properties: {
@@ -21,13 +21,13 @@ description: 'Edit a file. PREFERRED: line-range mode (path + start_line/end_lin
       old_string: { type: 'string', description: 'Exact text to replace, including whitespace and newlines. Omit when using start_line/end_line.' },
       new_string: { type: 'string', description: 'Replacement text for old_string.' },
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
-start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_content). Use this line-range mode first.' },
+      start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_content). Use this line-range mode first.' },
       end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line).' },
       new_content: { type: 'string', description: 'PREFERRED MODE. Replacement text for the line range [start_line, end_line]. Requires start_line and end_line.' },
     },
-// Either line-range mode (start_line+end_line+new_content) OR exact-substring
-    // mode (old_string+new_string). Line-range is the preferred route — see the
-    // tool description and the PREFERRED MODE notes on the params.
+    // Either line-range mode (start_line+end_line+new_content) OR exact-substring
+    // mode (old_string+new_string).
+    // Line-range is the preferred route.
     anyOf: [
       { required: ['path', 'start_line', 'end_line', 'new_content'] },
       { required: ['path', 'old_string', 'new_string'] },
@@ -39,6 +39,14 @@ start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based
     let content;
     try { content = fs.readFileSync(p, 'utf8'); } catch (e) { return `Error reading ${args.path}: ${e.message}`; }
     const { start_line, end_line, new_content } = args;
+    // The two modes are MUTUALLY EXCLUSIVE: sending line-range AND substring
+    // parameters together is ambiguous — reject it rather than guessing which
+    // one the caller meant. Only one family may be present in `args`.
+    const hasRangeKeys = args.start_line != null || args.end_line != null || args.new_content != null;
+    const hasSubKeys = args.old_string != null || args.new_string != null;
+    if (hasRangeKeys && hasSubKeys) {
+      return `Error: do not mix line-range mode and substring mode. Use EITHER (start_line/end_line/new_content) OR (old_string/new_string), never both.`;
+    }
 
     // ---- LINE-RANGE mode ---------------------------------------------------
     // `start_line`..`end_line` replace the lines at those 1-based positions,
@@ -47,6 +55,9 @@ start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based
     // self-contained: validate -> check the Read cache -> splice -> write ->
     // refresh the cache -> return.
     if (start_line != null && end_line != null) {
+      // Neither start/end alone is a valid range, and new_content is required —
+      // a missing one would put the literal string "undefined" in the file.
+      if (new_content == null) return `Error: new_content is required for line-range mode.`;
       const start = Number(start_line) | 0, end = Number(end_line) | 0;
       if (start < 1 || end < start) {
         return `Error: invalid line range ${start_line}-${end_line} (expected 1-based, start <= end).`;
@@ -90,6 +101,7 @@ start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based
     // ---- SUBSTRING mode (old_string -> new_string) --------------------------
     let { old_string, new_string, replace_all = false } = args;
     if (old_string === '' || old_string == null) return `Error: old_string must not be empty.`;
+    if (new_string == null) return `Error: new_string is required for substring mode.`;
 
     // --- Newline normalization (Windows CRLF) ---
     // The Read tool normalizes \r\n -> \n, so an agent builds old_string/new_string

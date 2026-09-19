@@ -286,6 +286,13 @@ const b = baseUrl.replace(/\/+$/, '');
     autoUpdate: process.env.HNCODE_AUTO_UPDATE
       ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_UPDATE)
       : (root.auto_update === true || root.auto_update === 'true'),
+    // PROMPT CACHE (/cache): explicit cache breakpoints for long stable prefixes.
+    // Default ON — it only ever adds provider-recognised markers, and an
+    // unsupported field on a non-caching gateway is filtered out in cache.js.
+    // Set HNCODE_PROMPT_CACHE=0 or `prompt_cache = false` to disable.
+    promptCache: process.env.HNCODE_PROMPT_CACHE
+      ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_PROMPT_CACHE)
+      : (root.prompt_cache === false || root.prompt_cache === 'false' ? false : true),
     raw: root,
   };
 }

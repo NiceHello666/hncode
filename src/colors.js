@@ -88,6 +88,16 @@ export const C = {
   // first attempt and read as plain GREEN — its red channel is lifted to 95 and
   // green pins at 255, which is a spring green, not a green-tinted cyan.
   spring: TRUECOLOR ? rgb(0, 215, 175) : '\x1b[38;5;43m',
+  // Git branch in the status line: yellow pulled about half way toward white, so
+  // it stays clearly "yellow" (not cream/ivory) while reading brighter than the
+  // plain 93 yellow on a dark background. rgb(255,219,110) keeps red at max,
+  // green near it, and blue around 43% — that ratio is what keeps the hue
+  // yellow rather than dropping into orange.
+  branch: TRUECOLOR ? rgb(255, 219, 110) : '\x1b[38;5;222m',
+  // Shell-mode (`!`) accent — violet, matching kimi-code's shellMode token so the
+  // bash-mode editor border and the `!` read as "shell", distinct from the cyan
+  // prompt and the yellow git badge. #BD93F9 dark / #7C3AED light.
+  shellMode: TRUECOLOR ? rgb(189, 147, 249) : '\x1b[38;5;141m',
   bgRed: '\x1b[41m',
   bgGreen: '\x1b[42m',
   // Selection highlight (mouse text selection) and the scrollbar gutter.
@@ -168,6 +178,14 @@ export function setTheme(name) {
   if (t.green)  C.green  = rgb(...t.green);
   if (t.yellow) C.yellow = rgb(...t.yellow);
   if (t.orange) C.orange = rgb(...t.orange);
+  // The git branch colour is derived per theme: the pale yellow that reads well
+  // on the dark background is nearly invisible on white, so on a light theme it
+  // is darkened (keeping the same hue) instead of being left as-is.
+  if (t.bg && t.bg[0] > 128) {
+    C.branch = rgb(146, 106, 0);           // dark amber for light backgrounds
+  } else {
+    C.branch = TRUECOLOR ? rgb(255, 219, 110) : '\x1b[38;5;222m';
+  }
 
   return true;
 }
