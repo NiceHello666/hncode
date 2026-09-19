@@ -41,7 +41,7 @@ export const SUBAGENT_TYPES = {
     // An explicit allowlist (not `null` = everything) so Agent/AgentSwarm are
     // excluded. Mirrors kimi's CODER_TOOLS.
     tools: [
-      'Read', 'Write', 'Edit', 'Glob', 'Grep', 'FileLines', 'Bash',
+      'Read', 'Write', 'Edit', 'Glob', 'Grep', 'FileLines', 'Bash', 'Git',
       'TodoList', 'FetchURL', 'WebSearch', 'ReadMediaFile',
       'TaskList', 'TaskOutput', 'TaskStop', 'TaskWait',
     ],

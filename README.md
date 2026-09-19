@@ -13,10 +13,53 @@ A cyan-blue terminal user interface (TUI) coding agent inspired by [Kimi Code](h
 - **Cyan-blue TUI**: Raw terminal renderer for perfect Windows Terminal compatibility
 - **Dual Protocol Support**: Works with both OpenAI-compatible APIs and Anthropic
 - **Smart Context Management**: Auto-compaction at 85% usage, AI-summarized history retention
+- **Prompt Caching**: Explicit cache breakpoints for the stable prefix (`/cache`)
 - **MCP-style Toolbelt**: Read, Write, Edit, Bash, Glob, Grep, TodoList, WebSearch, etc.
+- **MCP Client**: Connect real Model Context Protocol servers (stdio + HTTP) and use their tools
+- **Skills**: Package reusable prompts as Markdown (`/import-skill`, `/skill:<name>` with tab-completion)
+- **Shell Hooks**: Run your own commands at lifecycle events (`PreToolUse`, `PostToolUse`, …)
+- **Git Workflow**: `/git`, `/commit`, `/branch`, `/worktree`, `/pr` plus a `Git` tool for the agent
+- **Plan Review**: Review what a plan will touch, edit it, then approve before any file changes
 - **Plugin System**: Extend with custom tools, commands, and hooks
 - **Session Persistence**: Resume conversations across sessions
 - **Permission Modes**: Ask, YOLO, or Auto modes for different workflows
+- **Shell Passthrough**: type `!` on an empty prompt to switch the composer into shell mode — no model round-trip
+- **CI / Scripting**: Headless `-p` with `json` / `stream-json` output and outcome-based exit codes
+- **Remote Control**: `--control` exposes a local socket to prompt/status/interrupt a running session
+
+### CI usage
+
+```bash
+# One prompt, machine-readable result, exit code reflects the outcome.
+hncode -p "fix the failing tests" --output-format json
+# -> {"type":"result","ok":true,"reply":"…","toolCalls":["Bash"],"files":["src/a.js"],…}
+
+# Exit codes: 0 ok · 1 failure · 2 config · 3 no answer · 4 interrupted
+hncode -p "run the linter and fix everything" --output-format stream-json | jq -c 'select(.type=="result")'
+```
+
+### Shell passthrough
+
+Type `!` on an **empty** prompt to switch the composer into shell mode — the `!`
+becomes the prompt symbol and the line runs directly, with no model involved:
+
+```
+! git add -A && git push
+! npm test
+```
+
+The `!` is a mode marker, not part of what you type, so it appears exactly once.
+Press `Esc` or `Backspace` on an empty line to leave the mode. Output appears in
+the transcript as a `↳` receipt.
+
+### Remote control
+
+```bash
+hncode --control                       # in one terminal (TUI)
+hncode control status                  # in another
+hncode control prompt "run the tests"  # queue a prompt on the running session
+hncode control interrupt
+```
 
 ---
 
