@@ -34,7 +34,7 @@ import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
 import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
 import { renderSwarmProgress } from './swarm-progress.js';
-import { sortedTasks, getTask, settleTask, STATUS_LABEL } from './agent-task.js';
+import { sortedTasks, getTask, settleTask, STATUS_LABEL, backgroundTaskCard } from './agent-task.js';
 import { localVersion } from './version.js';
 import { listSkills, readSkill, importSkill, deleteSkill, skillPrompt, skillCompletions, normalizeSkillName, SKILL_PREFIX, skillsDir } from './skills.js';
 import { loadHooks, describeHooks, runShellHooks, HOOK_EVENTS } from './hooks.js';
@@ -97,11 +97,18 @@ export const COMMANDS = [
   { name: 'branch', desc: 'List, create, or switch git branches', priority: 62, argumentHint: '[list | <name> | -c <name>]' },
   { name: 'worktree', desc: 'List, add, or remove git worktrees for parallel work', priority: 60, argumentHint: '[list | add <dir> [branch] | remove <dir>]' },
   { name: 'pr', desc: 'Show the URL to open a pull request for the current branch', priority: 60, argumentHint: '[base]' },
+  { name: 'add', aliases: ['stage'], desc: 'Stage changes (all by default, or given paths)', priority: 62, argumentHint: '[<path> ...]' },
+  { name: 'diff', desc: 'Show uncommitted changes', priority: 62, argumentHint: '[--staged] [<path>]' },
+  { name: 'log', desc: 'Show recent commits', priority: 62, argumentHint: '[count] [<path>]' },
+  { name: 'push', desc: 'Push the current branch (asks first)', priority: 62, argumentHint: '[branch] [-f]' },
+  { name: 'stash', desc: 'Stash changes: list / push / pop', priority: 60, argumentHint: '[list | push [msg] | pop]' },
+  { name: 'rebase', desc: 'Rebase the current branch onto another (asks first)', priority: 60, argumentHint: '<branch>' },
   { name: 'cache', desc: 'Toggle prompt caching for long stable prefixes (saves input tokens)', priority: 58, argumentHint: '[on|off]' },
   { name: 'logout', aliases: ['disconnect'], desc: 'Log out of a configured provider', priority: 40 },
   { name: 'feedback', aliases: ['bug'], desc: 'Send feedback to the maintainers', priority: 60 },
   { name: 'update', desc: 'Check for and install a newer version', priority: 40, argumentHint: '[-y]' },
   { name: 'auto-update', desc: 'Toggle automatic background updates (check at startup + every 30 min)', priority: 40, argumentHint: '[on|off]' },
+  { name: 'auto-compact', aliases: ['autocompact'], desc: 'Toggle automatic context compaction at 85% of the window', priority: 40, argumentHint: '[on|off]' },
   { name: 'version', desc: 'Show version information', priority: 20 },
   { name: 'exit', aliases: ['quit', 'q'], desc: 'Exit the application', priority: 20 },
 ].sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.name.localeCompare(b.name));
@@ -1561,6 +1568,37 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     return out;
   }
 
+  // A BACKGROUND TASK lifecycle card (kimi-style):
+  //     ● agent task completed in background (review the diff)
+  //     ✗ bash task failed in background (npm test · exit 1)
+  // The bullet is `●` normally and `✗` for a failure; the colour follows the
+  // phase. The task's conclusion sits underneath, indented, and is capped like
+  // a tool result so one chatty subagent cannot flood the transcript.
+  if (msg.role === 'bg_task') {
+    const card = msg.card || { phase: 'completed', headline: 'background task finished', detail: undefined };
+    const tone = card.phase === 'started' ? C.cyan : card.phase === 'completed' ? C.green : C.red;
+    const bullet = card.phase === 'failed' ? '✗ ' : '● ';
+    const out = [];
+    const detail = card.detail ? col(` (${card.detail})`, C.gray) : '';
+    out.push({ text: col(bullet, tone) + col(card.headline, tone) + detail, ind: '', raw: true });
+    const body = String(msg.text || '').trim();
+    if (body) {
+      const indent = '  ';
+      const avail = Math.max(1, width - visualCol(indent));
+      const lines = body.replace(/\r\n/g, '\n').split('\n');
+      const MAX = expanded ? 200 : 6;
+      for (const ln of lines.slice(0, MAX)) {
+        for (const w of (ln === '' ? [''] : wrapWords(ln, avail))) {
+          out.push({ text: col(w, C.gray), ind: indent, raw: true });
+        }
+      }
+      if (lines.length > MAX) {
+        out.push({ text: col(`… ${lines.length - MAX} more lines, ctrl+o to expand`, C.gray), ind: indent, raw: true });
+      }
+    }
+    return out;
+  }
+
   // Tool output: a single "↳ " marker on the first line, then the output
   // indented by 2 columns. Long output is capped (kimi caps result previews
   // too) so one command cannot flood the whole transcript.
@@ -2607,11 +2645,22 @@ export function refreshGitInfo(state, opts = {}) {
   if (!force && state.running) return;
   state._gitCwd = cwd;
   state._gitAt = now;
-  try {
-    state._gitInfo = gitmod.statuslineInfo(cwd);
-  } catch {
-    state._gitInfo = null;   // a git failure must never break rendering
-  }
+  // ASYNC: does not block the caller. On the startup path this is what lets the
+  // first frame draw immediately — the badge appears a moment later when git
+  // answers, instead of freezing the TUI behind four spawnSync calls. `seq`
+  // discards a stale reply if another refresh started while this one ran.
+  const seq = (state._gitSeq = (state._gitSeq || 0) + 1);
+  gitmod.statuslineInfoAsync(cwd)
+    .then((info) => {
+      if (state._gitSeq !== seq) return;      // superseded by a newer refresh
+      state._gitInfo = info;
+      if (typeof state._requestRender === 'function') state._requestRender();
+    })
+    .catch(() => {
+      if (state._gitSeq !== seq) return;
+      state._gitInfo = null;   // a git failure must never break rendering
+      if (typeof state._requestRender === 'function') state._requestRender();
+    });
 }
 
 // ---- pure frame composer (no TTY side effects) ----
@@ -3987,7 +4036,8 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           { label: 'provider', sub: 'manage AI providers' },
           { label: 'statusline', sub: 'configure status line items' },
           { label: 'add-dir', sub: 'add an additional workspace directory' },
-          { label: 'auto-update', sub: 'check npm for updates at startup + every 30 min' },
+          { label: 'auto-update', sub: `check npm for updates at startup + every 30 min — currently ${cfg.autoUpdate ? 'on' : 'off'}` },
+          { label: 'auto-compact', sub: `summarize older history at 85% of the window — currently ${cfg.autoCompact === false ? 'off' : 'on'}` },
         ],
         onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
       });
@@ -4858,6 +4908,22 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         : 'Auto-update OFF');
       return;
     }
+    case 'auto-compact': {
+      // Toggle /auto-compact. Persists to config.toml so it survives restarts.
+      const a = raw.toLowerCase();
+      let want;
+      if (a === 'on') want = true;
+      else if (a === 'off') want = false;
+      else want = cfg.autoCompact === false;   // flip from the current state
+      try { setConfigString('auto_compact', want ? 'true' : 'false'); }
+      catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+      cfg.autoCompact = want;
+      cfg.raw.auto_compact = want;
+      app(want
+        ? 'Auto-compaction ON — older history is summarized once a request reaches 85% of the context window'
+        : 'Auto-compaction OFF — history is no longer trimmed automatically (use /compact manually)');
+      return;
+    }
     case 'update': {
       // Manual update check. This is the ONLY place an update is ever reported;
       // the automatic background check stays completely silent.
@@ -4928,28 +4994,35 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
     case 'statusline':
       openPicker({
         title: 'Status line items',
-        items: [
-          { label: 'permission mode', kind: 'toggle', isOn: state.slMode !== false },
-          { label: 'model name', kind: 'toggle', isOn: state.slModel !== false },
-          { label: 'thinking effort', kind: 'toggle', isOn: state.slEffort !== false },
-          { label: 'current directory', kind: 'toggle', isOn: state.slCwd !== false },
-          { label: 'git branch & diff', kind: 'toggle', isOn: state.slGit !== false },
-          { label: 'background tasks', kind: 'toggle', isOn: state.slTasks !== false },
-          { label: 'rotating tips', kind: 'toggle', isOn: state.slTips !== false },
-        ],
+        items: (() => {
+          // `sub` must be set here, not only in onPick: the picker renders
+          // item.sub, so without an initial value every toggle showed a blank
+          // state until the user toggled it once.
+          const toggles = [
+            ['permission mode', 'slMode'],
+            ['model name', 'slModel'],
+            ['thinking effort', 'slEffort'],
+            ['current directory', 'slCwd'],
+            ['git branch & diff', 'slGit'],
+            ['background tasks', 'slTasks'],
+            ['rotating tips', 'slTips'],
+          ];
+          return toggles.map(([label, key]) => {
+            const isOn = state[key] !== false;
+            return { label, key, kind: 'toggle', isOn, sub: isOn ? 'on' : 'off' };
+          });
+        })(),
         hint: '↑↓ navigate · Enter toggle · Esc close',
         onPick: (it) => {
           it.isOn = !it.isOn;
           it.sub = it.isOn ? 'on' : 'off';
-          const key = { 'permission mode': 'slMode', 'model name': 'slModel', 'thinking effort': 'slEffort', 'current directory': 'slCwd', 'git branch & diff': 'slGit', 'background tasks': 'slTasks', 'rotating tips': 'slTips' }[it.label];
-          state[key] = it.isOn;
-          if (key === 'slGit') refreshGitInfo(state, { force: true });
+          state[it.key] = it.isOn;
+          if (it.key === 'slGit') refreshGitInfo(state, { force: true });
           app(`Status line: ${it.label} → ${it.isOn ? 'shown' : 'hidden'}`);
           return false;
         },
       });
       return;
-
     case 'export-md': {
       const msgs = session.messages || [];
       if (!msgs.length) { appErr('Nothing to export (empty session).'); return; }
@@ -5220,6 +5293,122 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       h.openPanel('hncode — git', lines);
       return;
     }
+    case 'add': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      // `/add` stages everything (`git add -A`); `/add <path> ...` stages just
+      // those paths. This is the explicit staging step /commit does implicitly.
+      const paths = raw.split(/\s+/).filter(Boolean);
+      const r = gitmod.stage(paths, cwd);
+      if (!r.ok) { appErr(`git add failed: ${r.error}`); return; }
+      const staged = gitmod.stagedFiles(cwd);
+      app(paths.length ? `Staged ${paths.length} path(s).` : 'Staged all changes.');
+      say(`Index now holds ${staged.length} file(s):\n` + staged.map((f) => '  ' + f).join('\n'));
+      return;
+    }
+    case 'diff': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const staged = /--staged|--cached/.test(raw);
+      const path = raw.replace(/--staged|--cached/g, '').trim();
+      const r = gitmod.diffText(cwd, { staged, path: path || undefined });
+      if (!r.ok) { appErr(`git diff failed: ${r.error}`); return; }
+      if (r.empty) { say(staged ? 'No staged changes.' : 'No uncommitted changes.'); return; }
+      say((staged ? 'Staged changes' : 'Uncommitted changes') + (path ? ` in ${path}` : '') + ':\n' + r.text);
+      return;
+    }
+    case 'log': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const count = parts[0] && /^\d+$/.test(parts[0]) ? parts.shift() : undefined;
+      const path = parts.join(' ') || undefined;
+      const r = gitmod.logText(cwd, { count, path });
+      if (!r.ok) { appErr(`git log failed: ${r.error}`); return; }
+      if (r.empty) { say('No commits yet.'); return; }
+      say(`Recent commits${path ? ` for ${path}` : ''}:\n` + r.text);
+      return;
+    }
+    case 'push': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const force = parts.includes('-f') || parts.includes('--force');
+      const branchArg = parts.find((x) => !x.startsWith('-')) || '';
+      const branch = branchArg || gitmod.currentBranch(cwd);
+      const upstream = gitmod.hasUpstream(cwd, branch);
+      const state2 = gitmod.aheadBehind(cwd, branch);
+      const detail = `${branch}${upstream ? '' : ' (no upstream — will set one)'}${state2 ? ` — ${state2}` : ''}`;
+      // Push is OUTBOUND: always confirm first, and say exactly what will happen.
+      h.openPicker({
+        title: `Push ${branch}?`,
+        items: [
+          { label: 'Push', sub: `git push ${force ? '--force-with-lease ' : ''}origin ${detail}` },
+          { label: 'Cancel', sub: 'do not push' },
+        ],
+        searchable: false,
+        hint: '↑↓ navigate · Enter select · Esc cancel',
+        onPick: (it) => {
+          if (it.label !== 'Push') { app('Push cancelled.'); return true; }
+          const r = gitmod.push(cwd, { branch: branchArg || undefined, force, setUpstream: !upstream });
+          if (!r.ok) appErr(`Push failed: ${r.error}`);
+          else { app(`Pushed ${branch}.`); say(`git push output:\n${r.output}`); }
+          return true;
+        },
+      });
+      return;
+    }
+    case 'stash': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        const list = gitmod.stashList(cwd);
+        say(list.length ? `Stashes (${list.length}):\n` + list.map((s) => '  ' + s).join('\n') : 'No stashes.');
+        return;
+      }
+      if (sub === 'push' || sub === 'save') {
+        const msg = parts.slice(1).join(' ') || undefined;
+        const r = gitmod.stashPush(cwd, msg);
+        if (!r.ok) { appErr(`git stash failed: ${r.error}`); return; }
+        app('Stashed changes.'); say(r.output || 'Changes stashed.');
+        return;
+      }
+      if (sub === 'pop') {
+        const r = gitmod.stashPop(cwd);
+        if (!r.ok) { appErr(`git stash pop failed: ${r.error}`); return; }
+        app('Restored from stash.'); say(r.output || 'Stash popped.');
+        return;
+      }
+      appErr('Usage: /stash [list] | push [message] | pop');
+      return;
+    }
+    case 'rebase': {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
+      const onto = String(raw || '').trim();
+      if (!onto) { appErr('Usage: /rebase <branch>'); return; }
+      const cur = gitmod.currentBranch(cwd);
+      // Rewrites history on the current branch: confirm before running.
+      h.openPicker({
+        title: `Rebase ${cur} onto ${onto}?`,
+        items: [
+          { label: 'Rebase', sub: `git rebase ${onto}` },
+          { label: 'Cancel', sub: 'leave the branch as is' },
+        ],
+        searchable: false,
+        hint: '↑↓ navigate · Enter select · Esc cancel',
+        onPick: (it) => {
+          if (it.label !== 'Rebase') { app('Rebase cancelled.'); return true; }
+          const r = gitmod.rebase(cwd, onto);
+          if (!r.ok) appErr(`Rebase failed (resolve conflicts, then /rebase --continue or git rebase --abort): ${r.error}`);
+          else { app(`Rebased ${cur} onto ${onto}.`); say(r.output || 'Rebase complete.'); }
+          return true;
+        },
+      });
+      return;
+    }
     case 'commit': {
       const cwd = state.cwd || cfg.workspace || process.cwd();
       if (!gitmod.isRepo(cwd)) { appErr(`Not a git repository: ${cwd}`); return; }
@@ -5477,6 +5666,11 @@ function commandPathsAreInside(state, cmd, cwd) {
 function applyModel(state, cfg, next) {
   cfg.model = next.model; cfg.innerModel = next.innerModel; cfg.provider = next.provider;
   cfg.baseUrl = next.baseUrl; cfg.endpoint = next.endpoint; cfg.apiKey = next.apiKey; cfg.protocol = next.protocol;
+  // Carry the resolved context window over too. resolveProvider/resolveModelArg
+  // compute `maxContextTokens` for the NEW model, but it lives on the returned
+  // object — without copying it here, cfg (and the gauge below) kept the previous
+  // model's window after a switch.
+  if (next.maxContextTokens != null) cfg.maxContextTokens = next.maxContextTokens;
   state.model = cfg.model; state.provider = cfg.provider;
   state.modelLabel = modelLabel(cfg) || cfg.model || '';
   state.seenThinking = false;
@@ -5784,6 +5978,9 @@ export async function startTUI(opts) {
     if (out) stdout.write(out);
   }
   function renderFrame() { paintNow(); }
+  // Let module-level helpers (refreshGitInfo) ask for a repaint once their async
+  // data lands, without holding a reference to this closure.
+  state._requestRender = renderFrame;
   // No frame-rate cap: paint on the next event-loop turn. Calls made within the
   // same tick still coalesce (paintScheduled), so a burst of stream deltas
   // produces one frame per tick at full speed instead of being throttled to
@@ -6151,10 +6348,45 @@ export async function startTUI(opts) {
   // and doing it lazily on the first Ctrl+Shift+V made the shortcut look dead.
   warmClipboard();
   setTip(state);
-  // Populate the git badge before the first paint so the status line is correct
-  // immediately (from then on the 15s timer / turn-end keep it current).
+  // Fill the git badge — asynchronously, AFTER the first paint. It used to run
+  // before renderFrame() with a blocking spawnSync git, which added ~330ms to
+  // startup; now the frame draws at once and the badge appears when git answers.
   refreshGitInfo(state, { force: true });
   renderFrame();
+
+  // MCP: connect in the BACKGROUND, now that the UI is on screen. Each server
+  // gets up to CONNECT_TIMEOUT_MS, so doing this before the first paint would
+  // stall the whole TUI; instead we start it and report the outcome as a notice
+  // ("MCP: connected to …") when it lands. Tools registered here become visible
+  // to the model on its next turn.
+  if (typeof opts.mcpConnect === 'function') {
+    Promise.resolve()
+      .then(() => opts.mcpConnect())
+      .then((res) => {
+        const servers = (res && res.servers) || [];
+        if (!servers.length) return;
+        // The notice line is a SINGLE status-line row, so report all servers in
+        // one message — looping notice() per server only left the last one
+        // visible. Failures are listed too, and the whole notice turns red when
+        // any server failed.
+        const okServers = servers.filter((s) => s.ok);
+        const bad = servers.filter((s) => !s.ok);
+        const parts = [];
+        if (okServers.length) {
+          const tools = okServers.reduce((n, s) => n + (s.toolCount || 0), 0);
+          const names = okServers.map((s) => s.name).join(', ');
+          parts.push(`MCP connected: ${names} (${tools} tool${tools === 1 ? '' : 's'})`);
+        }
+        if (bad.length) {
+          parts.push(`MCP failed: ${bad.map((s) => s.name).join(', ')}`);
+        }
+        notice(parts.join(' · '), bad.length ? 'error' : 'info');
+        // A connecting server may have changed the tool list; repaint so any
+        // tool-count readout is current.
+        renderFrame();
+      })
+      .catch(() => { /* MCP must never break the session */ });
+  }
 
   const tipTimer = setInterval(() => { setTip(state); renderFrame(); }, TIP_INTERVAL);
   // Git badge: a fixed 15s cadence. Deliberately NOT tied to the frame loop (that
@@ -8094,14 +8326,17 @@ export async function startTUI(opts) {
           renderSoon();
           return;
         }
+        if (e.type === 'compacting') {
+          // In-progress notice: the summary below is a full model round-trip, so
+          // show that work is happening instead of leaving the turn silent.
+          addChat({ role: 'system', text: `Context at ${fmtTokens(e.before || 0)} — auto-compacting…` });
+          renderSoon();
+          return;
+        }
         if (e.type === 'compacted') {
           state.ctxTokens = e.after || state.ctxTokens;
           state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
           addChat({ role: 'system', text: `Context auto-compacted (${fmtTokens(e.before || 0)} → ${fmtTokens(e.after || 0)} tokens).` });
-          return;
-        }
-        if (e.type === 'nudge') {
-          // Silent internal signal - don't show to user
           return;
         }
         if (e.type === 'incomplete') {
@@ -8127,8 +8362,16 @@ export async function startTUI(opts) {
         if (e.type === 'aborted') {
           const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
           if (t) t.pending = false;
+          // Settle any RUNNING tool rows too. A tool that was mid-flight when the
+          // user hit Esc never gets its tool_result, so its `pending` stayed true
+          // and the `Using <Tool>` name kept pulsing forever. Clearing it drops the
+          // name to plain cyan immediately.
+          for (const m of state.chat) {
+            if (m.role === 'tool' && m.pending) { m.pending = false; m.failed = true; }
+          }
           // Use a special role that won't show the ✓ icon
           state.chat.push({ role: 'aborted', text: C.red + 'interrupted' + C.reset });
+          renderFrame();
           return;
         }
         if (e.type === 'steer') {
@@ -8299,12 +8542,12 @@ export async function startTUI(opts) {
     if (agent.ctx) {
       agent.ctx._onBackgroundTaskDone = (task) => {
         if (!task) return;
-        const status = task.status || 'completed';
-        const head = status === 'completed'
-          ? `[background agent finished: ${task.taskId}]`
-          : `[background agent ${status}: ${task.taskId}${task.stopReason ? ' - ' + task.stopReason : ''}]`;
+        // kimi-style lifecycle card: bullet colour by phase, a headline naming
+        // the kind (agent / bash / question task) and what happened, and a dim
+        // detail line. The task's conclusion is kept as the expandable body.
+        const card = backgroundTaskCard(task);
         const body = String(task.output || '').trim();
-        addChat({ role: 'system', text: body ? `${head}\n${body}` : head });
+        addChat({ role: 'bg_task', card, text: body });
       };
     }
     await agent.run();
@@ -8630,6 +8873,10 @@ export async function startTUI(opts) {
       failed: !!(m && m.failed),
     };
     if (m && Array.isArray(m.diff)) out.diff = m.diff;
+    // Keep `card`: a background-task lifecycle card carries its phase/headline/
+    // detail here (see the `bg_task` renderer). Dropping it left the row with the
+    // fallback text instead of what actually happened.
+    if (m && m.card) out.card = m.card;
     return out;
   }
 

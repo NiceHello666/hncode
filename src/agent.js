@@ -24,20 +24,10 @@ function hashKey(s) {
   return h.toString(36) + '-' + str.length.toString(36);
 }
 
-// ---- completion guard --------------------------------------------------------
-// A turn is only complete when the model ends it with an actual answer. Models
-// do stop mid-task: the stream ends right after a reasoning block, or with an
-// empty assistant message, and the caller would report "done" for unfinished
-// work. When that happens we tell the model what it did and give it more steps.
-// Bounded, so a model that insists on stopping cannot loop forever.
-export const MAX_NUDGES = 5;
 
-export function nudgeMessage(why) {
-  return `[hncode] Your turn ended without a final answer: ${why}. `
-    + 'This usually means the task is not finished. If the work IS complete, reply with a short '
-    + 'summary of what changed and how you verified it. Otherwise keep going with the tools right '
-    + 'now — do not stop silently.';
-}
+// Final instruction appended to the system prompt (see SYSTEM_PROMPT).
+// (The wording lives in SYSTEM_PROMPT itself, under "Finishing a turn".)
+
 
 // Final instruction appended to the system prompt (see SYSTEM_PROMPT).
 // (The wording lives in SYSTEM_PROMPT itself, under "Finishing a turn".)
@@ -199,7 +189,6 @@ export class Agent {
     let toolCalls = [];
     let emittedEnd = false;
     let thought = '';
-    let nudges = 0;
     // decide whether running out of steps actually left the turn unfinished.
     let hadToolCallsOnFinalStep = false;
 
@@ -252,8 +241,6 @@ export class Agent {
     // No step cap: the loop runs until the model produces a final answer, the
     // user interrupts (Esc / Ctrl-C), or an error ends the turn. maxSteps is
     // kept only for callers that explicitly request a bound (0/undefined = none).
-    // Runaway safety comes from the completion guard (MAX_NUDGES) and the user's
-    // ability to interrupt, not from a fixed tool-round budget.
     const stepLimit = (this.maxSteps > 0) ? this.maxSteps : Infinity;
     for (let step = 0; step < stepLimit; step++) {
       // Process any steer messages collected during the previous step
@@ -278,36 +265,90 @@ export class Agent {
       // preserved rather than simply discarded.
       const maxCtx = this.cfg.maxContextTokens || 512000;
       let usedNow = estimateMessagesTokens(this.messages, this.cfg);
-      if (maxCtx > 0 && usedNow >= maxCtx * 0.85) {
+      if (this.cfg.autoCompact !== false && maxCtx > 0 && usedNow >= maxCtx * 0.85) {
         const before = usedNow;
         // SHELL HOOK: PreCompact — a chance to back up the transcript before the
         // older half is summarized away. Never blocks (the trim must go ahead).
         await runShellHooks(this.hookConfig, 'PreCompact',
           { tokens: usedNow, messages: this.messages }, this.cfg.workspace);
-        const keepN = Math.max(1, Math.ceil(this.messages.length * 0.2));
-        const keep = this.messages.slice(-keepN);
-        const dropped = this.messages.slice(0, this.messages.length - keepN);
-        this.messages = keep;
-        // Ask the model to summarize what was trimmed so far, then prepend it
-        // as a system message so the model retains the conversation arc.
+        // Tell the TUI the trim is under way. Summarizing is a full model
+        // round-trip, so without this the UI sat silent for seconds mid-turn
+        // with no sign anything was happening.
+        this.onEvent({ type: 'compacting', before: usedNow, keep: 0, dropped: 0 });
+        //
+        // ORDER: SUMMARIZE FIRST, THEN TRIM. The summary is generated from the
+        // FULL history so the summarizing model can see what just happened — the
+        // most recent exchange is what tells it what the session is doing now.
+        // Trimming first and summarizing the leftovers summarized only the OLD
+        // part and lost the information the summary needed most.
+        //
+        // The transcript fed to the summarizer is BOUNDED: the full history can
+        // itself exceed the window, in which case the call fails and the trim
+        // would drop everything with nothing to show for it. Keep the MOST RECENT
+        // messages within the budget — they carry the live state — and clip any
+        // single oversized message.
+        const SUMMARY_INPUT_CHARS = 120_000;
+        const perMsgCap = 8_000;
+        const summaryParts = [];
+        let summaryChars = 0;
+        for (let i = this.messages.length - 1; i >= 0; i--) {
+          const m = this.messages[i];
+          const raw = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+          const clipped = raw.length > perMsgCap ? raw.slice(0, perMsgCap) + '\n…[clipped]' : raw;
+          const line = `${m.role}: ${clipped}`;
+          if (summaryChars + line.length > SUMMARY_INPUT_CHARS) break;
+          summaryChars += line.length;
+          summaryParts.unshift(line);
+        }
         let summary = '';
-        if (dropped.length > 0) {
+        if (this.messages.length > 0) {
           const summaryPrompt = [
             { role: 'system', content: 'Summarize the conversation history that follows. Capture the user\'s goals, the key decisions made, files created/modified, and the current state of any ongoing work. Be concise but thorough.' },
-            ...dropped,
+            { role: 'user', content: summaryParts.join('\n\n') },
           ];
           const cfgCopy = { ...this.cfg, maxOutputTokens: Math.min(this.cfg.maxOutputTokens || 4096, 2048) };
           const llm = new LLM(cfgCopy);
           try { summary = await llm.requestText(summaryPrompt); } catch { summary = ''; }
-          if (summary) {
-            this.messages = [{
-              role: 'system',
-              content: `[hncode] Earlier conversation context was auto-compacted to stay within the context window. Summary of what was trimmed:\n\n${summary}`,
-            }, ...this.messages];
-          }
         }
+        // NOW trim. Keep under a TOKEN budget, not a message count: sizes vary by
+        // orders of magnitude (one Read result can dwarf fifty short turns), so a
+        // fixed 20%-of-messages slice could still leave the request above the
+        // threshold or throw away far more than needed. Walk backwards until the
+        // retained tail reaches ~30% of the window; always keep at least the last
+        // two so the newest exchange survives.
+        const keepBudget = Math.max(1, Math.floor(maxCtx * 0.3));
+        let keepFrom = this.messages.length;
+        let keptTokens = 0;
+        while (keepFrom > 0) {
+          const n = this.messages.length - keepFrom;   // already-kept count
+          if (n >= 2 && keptTokens >= keepBudget) break;
+          const cand = this.messages[keepFrom - 1];
+          const t = estimateMessagesTokens([cand], this.cfg) - estimateMessagesTokens([], this.cfg);
+          // Always take at least the last two messages, however big they are.
+          if (n >= 2 && keptTokens + t > keepBudget) break;
+          keptTokens += t;
+          keepFrom--;
+        }
+        // BOUNDARY FIX: never let the kept slice START on a `tool` message whose
+        // assistant(toolCalls) was dropped — most APIs reject a tool result with
+        // no preceding call. Pull the boundary back over any leading tool rows.
+        while (keepFrom > 0 && keepFrom < this.messages.length && this.messages[keepFrom].role === 'tool') {
+          keepFrom--;
+        }
+        const keep = this.messages.slice(keepFrom);
+        const droppedCount = keepFrom;
+        // Final shape: SUMMARY + the most recent messages.
+        // ALWAYS prepend a marker, even when summarization failed. Silently
+        // dropping history left the model (and the user) with no idea that context
+        // was lost; a one-line note makes the gap explicit.
+        this.messages = [{
+          role: 'system',
+          content: summary
+            ? `[hncode] Earlier conversation context was auto-compacted to stay within the context window. Summary of the conversation so far:\n\n${summary}`
+            : `[hncode] ${droppedCount} earlier message(s) were dropped to stay within the context window, and no summary could be generated. Their detail is no longer available.`,
+        }, ...keep];
         usedNow = estimateMessagesTokens(this.messages, this.cfg);
-        this.onEvent({ type: 'compacted', before, after: usedNow, kept: keepN });
+        this.onEvent({ type: 'compacted', before, after: usedNow, kept: keep.length });
       }
       // Live context gauge: report the estimated size of the request about to be
       // sent, so the TUI's context readout is refreshed at every step rather than
@@ -363,18 +404,8 @@ export class Agent {
         for (const msg of steers) this.messages.push({ role: 'user', content: msg });
         continue;
       } else if (!hasText) {
-        if (nudges < MAX_NUDGES) {
-          nudges++;
-          const why = thought.trim()
-            ? 'your last output was reasoning/thinking only, with no answer text'
-            : 'your final message was empty';
-          this.onEvent({ type: 'nudge', reason: why, attempt: nudges, max: MAX_NUDGES });
-          const last = this.messages[this.messages.length - 1];
-          const body = nudgeMessage(why);
-          if (last && last.role === 'user' && typeof last.content === 'string') last.content += '\n\n' + body;
-          else this.messages.push({ role: 'user', content: body });
-          continue;
-        }
+        // No tool calls and no answer text: the model stopped without saying
+        // anything. End the turn.
         break;
       } else {
         // The model produced its answer. A steer typed WHILE that answer was
@@ -512,7 +543,6 @@ export class Agent {
       this.onEvent({
         type: 'incomplete',
         reason: 'the step budget was exhausted while tools were still being called',
-        usedNudges: nudges,
       });
     }
     if (!emittedEnd && this.onEvent) this.onEvent({ type: 'done' });

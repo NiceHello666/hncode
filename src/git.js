@@ -330,3 +330,172 @@ export function statuslineInfo(cwd) {
     changed: unstaged.files + staged.files,
   };
 }
+// ---- diff / log / push / stash / rebase -------------------------------------
+// Thin wrappers over `git` for the TUI's slash commands. Each returns
+// { ok, ... } and never throws, so a command handler can just print the result.
+
+// Working-tree diff. `staged` shows the index, `path` limits to one file.
+// `stat` returns only the summary line (cheap); otherwise the patch, bounded so a
+// huge change cannot flood the transcript.
+export function diffText(cwd, opts = {}) {
+  const args = ['diff'];
+  if (opts.staged) args.push('--cached');
+  const paths = opts.path ? [opts.path] : [];
+  if (opts.stat) args.push('--stat');
+  const r = runGit(paths.length ? args.concat(['--', ...paths]) : args, cwd);
+  if (!r.ok) return { ok: false, error: r.stderr.trim() || r.error || 'git diff failed', text: '' };
+  let text = r.stdout;
+  if (text.length > 200 * 1024) text = text.slice(0, 200 * 1024) + '\n... [diff truncated]';
+  return { ok: true, text, empty: !text.trim(), error: null };
+}
+
+// Commit history, one commit per line: `<short-sha> <date> <subject>`.
+// `count` defaults to 15; `path` limits to a file's history.
+export function logText(cwd, opts = {}) {
+  const n = Math.max(1, Math.min(500, Number(opts.count) || 15));
+  const args = ['log', `-${n}`, '--pretty=format:%h %ad %s', '--date=short'];
+  if (opts.path) args.push('--', opts.path);
+  const r = runGit(args, cwd);
+  if (!r.ok) return { ok: false, error: r.stderr.trim() || r.error || 'git log failed', text: '' };
+  return { ok: true, text: r.stdout.trim(), empty: !r.stdout.trim(), error: null };
+}
+
+// Push the current (or a named) branch. This is an OUTBOUND operation, so the
+// caller must have confirmed first. `setUpstream` adds -u when the branch has no
+// upstream yet. `force` is opt-in only.
+export function push(cwd, opts = {}) {
+  const branch = String(opts.branch || '').trim();
+  const remote = String(opts.remote || 'origin').trim();
+  const args = ['push'];
+  if (opts.setUpstream) args.push('-u');
+  if (opts.force) args.push('--force-with-lease');   // safer than --force
+  args.push(remote);
+  if (branch) args.push(branch);
+  const r = runGit(args, cwd, { timeoutMs: 120_000 });
+  if (!r.ok) return { ok: false, error: r.stderr.trim() || r.error || 'git push failed', output: r.stdout.trim() };
+  return { ok: true, output: (r.stdout + r.stderr).trim(), error: null };
+}
+
+// Does the branch have an upstream? Used to decide whether push needs -u.
+export function hasUpstream(cwd, branch) {
+  const b = branch || currentBranch(cwd);
+  if (!b) return false;
+  const r = runGit(['rev-parse', '--abbrev-ref', `${b}@{upstream}`], cwd);
+  return r.ok;
+}
+
+// Commits the local branch is ahead/behind its upstream, e.g. "ahead 2, behind 0".
+export function aheadBehind(cwd, branch) {
+  const b = branch || currentBranch(cwd);
+  if (!b) return '';
+  const r = runGit(['rev-list', '--left-right', '--count', `${b}...${b}@{upstream}`], cwd);
+  if (!r.ok) return '';
+  const [ahead, behind] = r.stdout.trim().split(/\s+/);
+  const parts = [];
+  if (Number(ahead)) parts.push(`ahead ${ahead}`);
+  if (Number(behind)) parts.push(`behind ${behind}`);
+  return parts.join(', ');
+}
+
+// ---- stash ------------------------------------------------------------------
+
+export function stashList(cwd) {
+  const r = runGit(['stash', 'list'], cwd);
+  return r.ok ? r.stdout.split('\n').filter(Boolean) : [];
+}
+
+export function stashPush(cwd, message) {
+  const args = ['stash', 'push'];
+  if (message) args.push('-m', String(message));
+  const r = runGit(args, cwd);
+  return r.ok ? { ok: true, output: r.stdout.trim(), error: null }
+    : { ok: false, error: r.stderr.trim() || r.error || 'git stash failed' };
+}
+
+export function stashPop(cwd) {
+  const r = runGit(['stash', 'pop'], cwd);
+  return r.ok ? { ok: true, output: r.stdout.trim(), error: null }
+    : { ok: false, error: r.stderr.trim() || r.error || 'git stash pop failed' };
+}
+
+// ---- rebase -----------------------------------------------------------------
+
+// Rebase the current branch onto `onto`. Returns the git output; on conflict the
+// caller shows git's own message (the user resolves it outside, or with a prompt).
+export function rebase(cwd, onto) {
+  const target = String(onto || '').trim();
+  if (!target) return { ok: false, error: 'a target branch is required' };
+  const r = runGit(['rebase', target], cwd, { timeoutMs: 120_000 });
+  if (!r.ok) return { ok: false, error: (r.stderr || r.stdout).trim() || 'git rebase failed' };
+  return { ok: true, output: r.stdout.trim(), error: null };
+}
+
+// ---- async variants (never block the event loop) ----------------------------
+// `runGit` uses spawnSync: on the STARTUP path that freezes the TUI before its
+// first paint, and a cold `git` was measured at ~80-100ms per call (×4 calls).
+// The async form below runs the same command off the main thread, so the frame
+// draws immediately and the badge fills in when the data arrives.
+
+export function runGitAsync(args, cwd, opts = {}) {
+  return new Promise((resolve) => {
+    let child;
+    const timeout = opts.timeoutMs || 30_000;
+    try {
+      child = cp.spawn('git', [...GIT_ENV, ...args], {
+        cwd: cwd || process.cwd(),
+        windowsHide: true,
+        env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' },
+      });
+    } catch (e) {
+      resolve({ ok: false, stdout: '', stderr: '', code: null, error: e.message });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ ok: false, stdout: '', stderr: '', code: null, error: 'git timed out' });
+    }, timeout);
+    if (child.stdout) child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    if (child.stderr) child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    child.on('error', (e) => finish({ ok: false, stdout: '', stderr: '', code: null, error: e.message }));
+    child.on('close', (code) => finish({ ok: code === 0, stdout, stderr, code, error: null }));
+  });
+}
+
+// Async twin of statuslineInfo(). Same shape, same parser — only the four git
+// invocations are concurrent instead of blocking. Each sub-call fails soft, so a
+// non-repo (or a missing git) yields null exactly like the sync version.
+export async function statuslineInfoAsync(cwd) {
+  const inside = await runGitAsync(['rev-parse', '--is-inside-work-tree'], cwd);
+  if (!inside.ok) return null;
+
+  const stat = async (args) => {
+    const r = await runGitAsync(['diff', ...args, '--shortstat'], cwd);
+    if (!r.ok) return { files: 0, insertions: 0, deletions: 0 };
+    const s = r.stdout.trim();
+    const files = /(\d+) files? changed/.exec(s);
+    const ins = /(\d+) insertions?\(\+\)/.exec(s);
+    const del = /(\d+) deletions?\(-\)/.exec(s);
+    return {
+      files: files ? Number(files[1]) : 0,
+      insertions: ins ? Number(ins[1]) : 0,
+      deletions: del ? Number(del[1]) : 0,
+    };
+  };
+
+  const [branchRes, unstaged, staged] = await Promise.all([
+    runGitAsync(['rev-parse', '--abbrev-ref', 'HEAD'], cwd),
+    stat([]),
+    stat(['--cached']),
+  ]);
+  const branch = branchRes.ok ? branchRes.stdout.trim() : '';
+  return {
+    branch: branch || '',
+    insertions: unstaged.insertions + staged.insertions,
+    deletions: unstaged.deletions + staged.deletions,
+    changed: unstaged.files + staged.files,
+  };
+}
