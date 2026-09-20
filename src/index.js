@@ -356,35 +356,46 @@ export async function main(argv) {
     await loadPlugins(cfg.pluginDir);
   }
 
-  // Connect configured MCP servers and register their tools, so a headless
-  // `-p` run and the TUI both see them. Failures are reported but never fatal:
-  // an unreachable server must not stop the session from starting.
-  if (cfg.mcp !== false) {
+  // Connect configured MCP servers and register their tools.
+  //
+  // This is a FUNCTION rather than an inline block because the two modes want
+  // different timing:
+  //   * headless (`-p`) MUST wait — the prompt runs immediately and its model
+  //     request has to see the MCP tools in the tool list.
+  //   * the TUI must NOT wait — connecting can take seconds (8s per wedged
+  //     server), and blocking the first paint for that is unacceptable. The TUI
+  //     starts this in the background and reports the result as a notice.
+  // Failures are reported but never fatal: an unreachable server must not stop
+  // the session from starting.
+  const connectMcp = async () => {
+    if (cfg.mcp === false) return { servers: [], toolCount: 0 };
     try {
       const mcp = await import('./mcp.js');
       const { API } = await import('./plugin.js');
       const mcpCfg = mcp.loadMcpConfig(cfg.workspace);
-      if (Object.keys(mcpCfg.servers).length) {
-        const res = await mcp.connectAll(mcpCfg, (spec) => API.registerTool(spec));
-        mcp.setLiveConnections(res.servers);
-        if (process.env.HNCODE_MCP_VERBOSE === '1') {
-          for (const s of res.servers) {
-            console.error(s.ok ? `[hncode-mcp] ${s.name}: ${s.toolCount} tool(s)` : `[hncode-mcp] ${s.name}: ${s.error}`);
-          }
+      if (!Object.keys(mcpCfg.servers).length) return { servers: [], toolCount: 0 };
+      const res = await mcp.connectAll(mcpCfg, (spec) => API.registerTool(spec));
+      mcp.setLiveConnections(res.servers);
+      if (process.env.HNCODE_MCP_VERBOSE === '1') {
+        for (const s of res.servers) {
+          console.error(s.ok ? `[hncode-mcp] ${s.name}: ${s.toolCount} tool(s)` : `[hncode-mcp] ${s.name}: ${s.error}`);
         }
       }
+      return res;
     } catch (e) {
       console.error(`hncode: MCP setup failed: ${e.message}`);
+      return { servers: [], toolCount: 0 };
     }
-  }
+  };
 
-  // headless prompt
+  // headless prompt: MCP must be live BEFORE the request goes out.
   if (args.prompt) {
     const format = args['output-format'];
     if (!isValidFormat(format)) {
       console.error(`hncode: unknown --output-format "${format}". Use one of: ${FORMATS.join(', ')}.`);
       return EXIT.CONFIG;
     }
+    await connectMcp();
     let session = null;
     if (args.session) session = typeof args.session === 'string' ? sess.loadSession(args.session) : sess.latestSession(undefined, undefined, { skipEmpty: true });
     else if (args.continue) session = sess.latestSession(undefined, undefined, { skipEmpty: true });
@@ -408,6 +419,9 @@ export async function main(argv) {
     // Remote control: expose a local socket so a script can queue a prompt or
     // query status on the running session (see ci.js).
     control: args.control === true ? '' : (typeof args.control === 'string' ? args.control : null),
+    // MCP runs in the BACKGROUND once the TUI is up (see startTUI): connecting
+    // can take seconds and must not delay the first paint.
+    mcpConnect: connectMcp,
     session: loadOrCreateSession(args, cfg),
   };
   await startTui(opts);

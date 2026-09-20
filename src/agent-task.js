@@ -176,3 +176,81 @@ export function statusColor(status) {
   if (status === 'completed') return 'gray';
   return 'red';
 }
+
+// ---- background-task transcript card (mirrors kimi-code) --------------------
+// A background task reports its lifecycle as a one-line card in the transcript:
+//
+//     ● agent task completed in background (review the diff)
+//     ✗ bash task failed in background (npm test · exit 1)
+//
+// `phase` drives the bullet colour (started / completed / failed); `headline`
+// and the dim `detail` carry the rest. Ported from kimi-code's
+// formatBackgroundTaskTranscript (apps/kimi-code/src/tui/utils/background-task-status.ts)
+// so the two tools read the same way.
+
+const BG_DETAIL_MAX = 240;
+
+function bgTruncate(value) {
+  if (value === undefined || value === null) return undefined;
+  const collapsed = String(value).trim().replace(/\s+/g, ' ');
+  if (!collapsed) return undefined;
+  return collapsed.length <= BG_DETAIL_MAX ? collapsed : collapsed.slice(0, BG_DETAIL_MAX - 1) + '…';
+}
+
+export function backgroundTaskPhase(status) {
+  if (status === 'running') return 'started';
+  if (status === 'completed') return 'completed';
+  return 'failed';   // failed / timed_out / killed / lost
+}
+
+function bgSubject(kind) {
+  if (kind === 'agent') return 'agent task';
+  if (kind === 'question') return 'question task';
+  return 'bash task';
+}
+
+function bgHeadline(status, kind) {
+  const subject = bgSubject(kind);
+  switch (status) {
+    case 'running': return `${subject} started in background`;
+    case 'completed': return `${subject} completed in background`;
+    case 'failed': return `${subject} failed in background`;
+    case 'timed_out': return `${subject} timed out`;
+    case 'killed': return `${subject} stopped`;
+    case 'lost': return `${subject} lost`;
+    default: return `${subject} ${status}`;
+  }
+}
+
+function bgDetail(task) {
+  const parts = [];
+  const description = bgTruncate(task.description);
+  if (description !== undefined) parts.push(description);
+
+  if (task.status === 'completed' || task.status === 'failed') {
+    if (task.kind === 'process' && task.exitCode !== null && task.exitCode !== undefined) {
+      parts.push(`exit ${task.exitCode}`);
+    }
+  }
+  if (task.status === 'killed') {
+    const reason = bgTruncate(task.stopReason);
+    parts.push(reason !== undefined ? `stopped — ${reason}` : 'stopped');
+  }
+  if (task.status === 'failed') {
+    const reason = bgTruncate(task.stopReason);
+    if (reason !== undefined) parts.push(reason);
+  }
+  if (task.status === 'timed_out') parts.push('timed out');
+  if (task.status === 'lost') parts.push('session restarted before completion');
+
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+// Build the card payload for a task snapshot.
+export function backgroundTaskCard(task) {
+  return {
+    phase: backgroundTaskPhase(task.status),
+    headline: bgHeadline(task.status, task.kind),
+    detail: bgDetail(task),
+  };
+}

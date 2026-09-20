@@ -32,6 +32,11 @@ import cp from 'node:child_process';
 export const PROTOCOL_VERSION = '2024-11-05';
 export const CLIENT_INFO = { name: 'hncode', version: '0.3.1' };
 
+// How long a server gets to complete the initialize + tools/list handshake. This
+// runs BEFORE the TUI opens, so it is deliberately short: a wedged server should
+// cost a few seconds, not the 30s a tool call is allowed.
+export const CONNECT_TIMEOUT_MS = 8_000;
+
 // Live connections made at startup, shared by every consumer of the MCP client
 // (the CLI startup and the TUI's /mcp). Kept in this module rather than passed
 // around so the status view can always see the real state.
@@ -222,7 +227,10 @@ export function parseSseForId(body, id) {
 // Connect to one server, handshake, and list its tools.
 // Returns { ok, tools, error, serverInfo, transport, isHttp } — never throws.
 export async function connectServer(name, def, opts = {}) {
-  const timeoutMs = opts.timeoutMs || 30_000;
+  // CONNECT_TIMEOUT (not the 30s tool-call timeout): this runs during startup, so
+  // a wedged server must not hold the session hostage. 8s is generous for a
+  // handshake while keeping a dead server's cost to single-digit seconds.
+  const timeoutMs = opts.timeoutMs || CONNECT_TIMEOUT_MS;
   let transport;
   const isHttp = !!def.url;
   try {
@@ -314,16 +322,15 @@ export function toHncodeSpec(server, tool, transport, isHttp) {
 // Connect every configured server and register its tools through the plugin API.
 // Returns { servers: [...], toolCount }.
 export async function connectAll(config, registerTool, opts = {}) {
-  const servers = [];
-  let toolCount = 0;
   const only = opts.only;
-  for (const [name, def] of Object.entries((config && config.servers) || {})) {
-    if (only && !only.includes(name)) continue;
+  const entries = Object.entries((config && config.servers) || {}).filter(([name]) => !only || only.includes(name));
+  // Connect in PARALLEL. This runs on the startup path, before the TUI opens, so
+  // a serial loop meant one slow/wedged server delayed every later one — N dead
+  // servers cost N × timeout before the user saw anything. Runs concurrently, the
+  // whole set costs the SLOWEST single server instead of their sum.
+  const results = await Promise.all(entries.map(async ([name, def]) => {
     const conn = await connectServer(name, def, opts);
-    if (!conn.ok) {
-      servers.push({ name, ok: false, toolCount: 0, error: conn.error, serverInfo: {} });
-      continue;
-    }
+    if (!conn.ok) return { name, ok: false, toolCount: 0, error: conn.error, serverInfo: {} };
     let registered = 0;
     let err = null;
     for (const tool of conn.tools) {
@@ -336,11 +343,12 @@ export async function connectAll(config, registerTool, opts = {}) {
         err = err || `tool "${tool.name}": ${e.message}`;
       }
     }
-    toolCount += registered;
-    servers.push({ name, ok: true, toolCount: registered, error: err, serverInfo: conn.serverInfo, transport: conn.transport, isHttp: conn.isHttp });
-  }
-  return { servers, toolCount };
+    return { name, ok: true, toolCount: registered, error: err, serverInfo: conn.serverInfo, transport: conn.transport, isHttp: conn.isHttp };
+  }));
+  const toolCount = results.reduce((n, r) => n + (r.toolCount || 0), 0);
+  return { servers: results, toolCount };
 }
+// Disconnect every connected server (kills stdio children). HTTP needs nothing.
 
 // Disconnect every connected server (kills stdio children). HTTP needs nothing.
 export function disconnectAll(connections) {

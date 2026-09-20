@@ -10,26 +10,48 @@
 // resolve to a status string, never throw to the caller. The TUI calls them from
 // timers / startup without awaiting.
 
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { localVersion } from './version.js';
 
 const PKG_NAME = '@hncode/hncode';
+// Spawn npm portably. On Windows npm is a `.cmd` shim, and Node refuses to spawn
+// a `.cmd` directly (EINVAL) — it must go through a shell. Using
+// `cmd.exe /c npm ...` keeps that behaviour while avoiding `shell: true`, which
+// Node warns about (with a shell, args are concatenated rather than escaped).
+function spawnNpm(args, opts) {
+  if (process.platform === 'win32') return spawn('cmd.exe', ['/c', 'npm', ...args], opts);
+  return spawn('npm', args, opts);
+}
 // How often the auto-check runs once we are past the startup check.
 export const AUTO_UPDATE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 export { localVersion };
 
 // Latest version published to npm, or '' if the registry is unreachable /
 // not installed / not a package.
-export function remoteVersion() {
-  try {
-    const out = execSync(`npm view ${PKG_NAME} version --silent`, {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 15000,
-    }).toString().trim();
-    return out || '';
-  } catch {
-    return '';
-  }
+//
+// ASYNC on purpose: `execSync` blocks the whole event loop, so a cold `npm view`
+// (measured at ~15s on a slow registry, vs ~2s warm) froze the TUI — no key
+// handling, no repaint — for the entire duration. `spawn` runs the same command
+// off the main thread, and the timeout kills it rather than waiting it out.
+export function remoteVersion(timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnNpm(['view', PKG_NAME, 'version', '--silent'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      resolve('');
+      return;
+    }
+    let out = '';
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish(''); }, timeoutMs);
+    if (child.stdout) child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', () => finish(''));
+    child.on('close', () => finish((out || '').trim()));
+  });
 }
 
 // Parse a semver-ish "x.y.z" (ignore prerelease tags) into comparable numbers.
@@ -55,10 +77,9 @@ export function updateBackground() {
   return new Promise((resolve) => {
     try {
       // `npm install -g` needs to run detached; no need to wait here.
-      const child = spawn('npm', ['install', '-g', `${PKG_NAME}@latest`], {
+      const child = spawnNpm(['install', '-g', `${PKG_NAME}@latest`], {
         detached: true,
         stdio: 'ignore',
-        shell: process.platform === 'win32', // npm is npm.cmd on Windows
       });
       child.unref();
       child.on('error', (e) => resolve({ ok: false, error: e.message }));
@@ -77,7 +98,7 @@ export function updateBackground() {
 export async function checkAndUpdate() {
   const local = localVersion();
   if (!local) return { status: 'none', message: "can't read local version" };
-  const remote = remoteVersion();
+  const remote = await remoteVersion();
   if (!remote) return { status: 'none', message: 'npm registry unreachable' };
 
   if (isNewer(remote, local)) {

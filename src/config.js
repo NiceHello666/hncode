@@ -286,6 +286,12 @@ const b = baseUrl.replace(/\/+$/, '');
     autoUpdate: process.env.HNCODE_AUTO_UPDATE
       ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_UPDATE)
       : (root.auto_update === true || root.auto_update === 'true'),
+    // AUTO-COMPACTION (/auto-compact): when true, the agent summarizes older
+    // history once a request reaches 85% of the model context. Default ON. Set
+    // `auto_compact = false` (or HNCODE_AUTO_COMPACT=0) to turn it off.
+    autoCompact: process.env.HNCODE_AUTO_COMPACT
+      ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_COMPACT)
+      : !(root.auto_compact === false || root.auto_compact === 'false'),
     // PROMPT CACHE (/cache): explicit cache breakpoints for long stable prefixes.
     // Default ON — it only ever adds provider-recognised markers, and an
     // unsupported field on a non-caching gateway is filtered out in cache.js.
