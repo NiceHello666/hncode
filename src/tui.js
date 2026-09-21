@@ -261,7 +261,7 @@ export const TIPS = [
   '/yolo auto-approves anything inside the workspace — risky paths still ask',
   '/auto never interrupts you; everything runs and is decided automatically',
   'Shift+Arrow selects text in the composer; Backspace or Delete removes it',
-  'Ctrl+J inserts a newline without sending the message',
+  'Shift+Enter inserts a newline without sending the message',
   'Ctrl+T expands or collapses the todo panel',
   'Ctrl+O expands or collapses tool output, thinking blocks and Edit diffs',
   'Ctrl+B moves a long-running foreground Bash command to the background',
@@ -677,17 +677,25 @@ function wrapWords(str, width) {
   width = Math.max(1, width | 0);
   const out = [];
   let line = '';
+  // Running width of `line`. It used to be recomputed with
+  // `visualCol(line + ' ' + w)` on EVERY word, which is O(line) per word and so
+  // O(n²) per paragraph — a single long line (a streamed paragraph, a wide table
+  // row) cost ~46ms at 20KB and froze the UI on every markdown chunk. Widths are
+  // additive for the plain text this receives (no ANSI is present until
+  // inlineMarkdown runs later), so accumulate instead of re-measuring.
+  let lineW = 0;
   // Expand tabs first: visualCol counts '\t' as 0 columns but the terminal
   // advances to the next tab stop, which made the row wider than computed and
   // wrapped it onto the following line.
   const words = expandTabs(str).split(' ');
-  for (let w of words) {
+  for (const w of words) {
+    const wW = visualCol(w);
     // A word longer than the line must be hard-split. This MUST measure visual
     // columns (not string length): CJK characters occupy two cells, so slicing
     // by `.length` would emit lines twice as wide as the box and the terminal
     // would wrap them onto the next row, corrupting the layout.
-    if (visualCol(w) > width) {
-      if (line) { out.push(line); line = ''; }
+    if (wW > width) {
+      if (line) { out.push(line); line = ''; lineW = 0; }
       let chunk = '';
       let cw = 0;
       for (const ch of w) {
@@ -695,12 +703,18 @@ function wrapWords(str, width) {
         if (cw + chw > width) { out.push(chunk); chunk = ''; cw = 0; }
         chunk += ch; cw += chw;
       }
-      if (chunk) line = chunk;
+      if (chunk) { line = chunk; lineW = cw; }
       continue;
     }
-    const cand = line ? line + ' ' + w : w;
-    if (visualCol(cand) <= width) line = cand;
-    else { if (line) out.push(line); line = w; }
+    const sep = line ? 1 : 0;              // the single space we would add
+    if (lineW + sep + wW <= width) {
+      line = line ? line + ' ' + w : w;
+      lineW += sep + wW;
+    } else {
+      if (line) out.push(line);
+      line = w;
+      lineW = wW;
+    }
   }
   if (line) out.push(line);
   else if (out.length === 0) out.push('');
@@ -2209,13 +2223,33 @@ export function argStreamLineCount(st, key) {
 // streamed (assistant text and a Write's content only ever grow), and is written
 // once when a turn completes. A large equal-length replacement does not occur on
 // these fields — the diff/content that can change arbitrarily live elsewhere.
+// Fingerprint memo. `fp()` used to build `${len}:${text}` for every field of
+// every message on EVERY frame — for a 3.4k-message transcript the key strings
+// alone measured ~60ms per frame, which starved the 80ms animation tick and
+// made the startup animation visibly stall. Text fields change rarely, so the
+// fingerprint is memoised per string VALUE: the same immutable string returns
+// the same fingerprint without re-measuring. The map is bounded so a long
+// session with ever-growing streamed text cannot grow it without limit.
 const FP_VERBATIM_MAX = 4096;
+const FP_CACHE_MAX = 8192;
+const fpCache = new Map();
 function fp(s) {
   if (s == null) return '0';
-  const str = String(s);
+  const str = typeof s === 'string' ? s : String(s);
+  const hit = fpCache.get(str);
+  if (hit !== undefined) return hit;
   const n = str.length;
-  return n <= FP_VERBATIM_MAX ? n + ':' + str : n + ':';
+  // Short strings keep the text inline (cheap and collision-free); long ones use
+  // the length alone, as before.
+  const out = n <= FP_VERBATIM_MAX ? n + ':' + str : n + ':';
+  if (fpCache.size >= FP_CACHE_MAX) {
+    const oldest = fpCache.keys().next().value;
+    if (oldest !== undefined) fpCache.delete(oldest);
+  }
+  fpCache.set(str, out);
+  return out;
 }
+
 
 // Fingerprint of a tool-args object for the render-cache key. `JSON.stringify`
 // was used here and stringified EVERY argument — including a streaming Write's
@@ -2234,81 +2268,157 @@ function fpArgs(args) {
   return out;
 }
 
-function renderChatLines(state, w) {
+export function renderChatLines(state, w, viewport) {
   const out = [];
   const expanded = !!state.expanded;
-  // One blank column on the left of the whole transcript, so the markers (❯, ●,
-  // ↳) do not sit flush against the screen edge.
   const PAD = ' ';
   const padW = visualCol(PAD);
   const innerW = Math.max(1, w - padW);
-  for (const msg of state.chat) {
-    // A `user` / `queued` message is drawn inside a COMPOSER-STYLE BOX: rounded
-    // corners with `─`, and a `│` down each side — so a sent prompt looks exactly
-    // like the input box it was typed into.
-    // `steer` gets NO box: it is injected into the turn already in progress, so a
-    // box would falsely suggest a separate turn had started.
-    const bordered = msg.role === 'user' || msg.role === 'queued' || msg.role === 'bash';
-    // A bash-mode echo uses the violet shellMode frame — same hue as kimi.
-    const boxColor = msg.role === 'bash' ? C.shellMode : C.border;
-    // The box spans one column less than the full inner width, so the right edge
-    // has a 1-column margin (matching the left margin from `PAD`).
-    const boxW = innerW - 2;                   // total box width, including both │
-    const boxInner = Math.max(1, boxW - 2);    // span the two │s occupy
-    // One column of padding inside each wall, mirroring the composer box.
-    const boxPad = Math.min(1, Math.max(0, boxInner - 1));
-    const boxText = Math.max(1, boxInner - boxPad * 2);
-    const topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', boxColor);
-    const botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', boxColor);
-    // A box always needs its TOP border — including when the message is the first
-    // row of the transcript. (The earlier `out.length > 0` guard came from the
-    // rule-only version, where a leading divider looked wrong; a box without a
-    // top is simply broken.) For adjacent bordered messages the previous box's
-    // bottom already serves as this one's top, so skip the duplicate.
-    if (bordered && out[out.length - 1] !== topRule) out.push(topRule);
-    // The cache key MUST include everything messageLines() reads. toolArgs was
-    // missing, so a tool row rendered at `tool_start` (args still {}) kept its
-    // stale "Using Bash" line even after `tool_use` delivered the command —
-    // the row only appeared once some OTHER keyed field changed. liveOutput is
-    // keyed because it grows while a command runs; `failed` flips the bullet
-    // and the result colour red once the tool reports a non-zero exit.
-    // The row WIDTH is keyed (not `w`) because the rows are laid out to it:
-    // `boxText` for a bordered message (inside the box padding), `innerW` otherwise.
-    const rowW = bordered ? boxText : innerW;
-    // The cache key MUST include everything messageLines() reads. `spin` is
-    // keyed ONLY for a pending TOOL row: formatToolLine sweeps the tool name's
-    // colour with it. The pending THINKING row deliberately does not key it —
-    // its spinner is substituted outside the cache (see SPIN_PLACEHOLDER), so
-    // the 80ms tick no longer re-wraps the reasoning preview every frame.
-    const spinKey = (msg.role === 'tool' && msg.pending) ? (state.spin || 0) : 0;
-    const key = `${rowW}\u0000${expanded ? 1 : 0}\u0000${spinKey}\u0000${fp(msg.text)}\u0000${fp(msg.streamContent)}`
-        + `\u0000${msg.liveOutput ? msg.liveOutput.length : 0}\u0000${msg.failed ? 1 : 0}\u0000${fpArgs(msg.toolArgs)}`
-        + `\u0000${msg.diff ? msg.diff.length : 0}\u0000${msg._diffCounts ? msg._diffCounts.length : 0}`;
-    let cached = msg._cache;
-    if (!cached || cached.key !== key) {
-      const rows = messageLines(msg, rowW, state.cwd, expanded, state.spin, state.pulseStart);
-      cached = { key, rows: rows.map(rowToLine) };
-      msg._cache = cached;
-    }
-    // Swap the live spinner frame into any row that carries the placeholder.
-    // Done AFTER the cache, so the glyph animates without invalidating it.
-    const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
-    const live = (r) => (r.indexOf(SPIN_PLACEHOLDER) >= 0 ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r);
-    // The margin is added here (outside the cache) so it is not baked into the
-    // cached rows. A bordered message also gets its side walls, laid out to the
-    // box's inner width so it lines up with the composer exactly.
-    if (bordered) {
-      const pad = ' '.repeat(boxPad);
-      for (const r of cached.rows) {
-        out.push(PAD + col('│', boxColor) + pad + fitAnsi(live(r), boxText) + pad + col('│', boxColor));
-      }
+  const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
+  const chat = state.chat;
+  const n = chat.length;
+
+  // Pass 1: exact row count per message (and the total). Every message's cache
+  // is validated/rebuilt here so the counts are exact; only the STRING assembly
+  // is limited to the visible window.
+  const rowStart = new Int32Array(n);
+  const msgLen = new Int32Array(n);
+  let cursor = 0;
+  for (let mi = 0; mi < n; mi++) {
+    const m = chat[mi];
+    const border = m.role === 'user' || m.role === 'queued' || m.role === 'bash';
+    const ww = border ? Math.max(1, Math.min(1, innerW - 4)) : innerW; // placeholder
+    void ww;
+    rowStart[mi] = cursor;
+    // Reuse/minimal layout for the row count: same width/border arithmetic as
+    // the layout path below. We need boxText for bordered messages.
+    const boxInner = Math.max(1, innerW - 4);
+    const boxText = Math.max(1, boxInner - Math.min(1, Math.max(0, boxInner - 1)) * 2);
+    const rowWidth = border ? boxText : innerW;
+    const cached = m._cache;
+    const valid = cached
+      && cached.rowW === rowWidth && cached.expanded === expanded
+      && cached.textRef === m.text && cached.streamRef === m.streamContent
+      && cached.liveRef === m.liveOutput && cached.failed === m.failed
+      && cached.diffRef === m.diff && cached.countsRef === m._diffCounts
+      && cached.keyArgs === (m.toolArgs ? fpArgs(m.toolArgs) : '0')
+      && cached.spinKey === (m.role === 'tool' && m.pending ? (state.spin || 0) : 0)
+      && cached.isPending === (m.pending ? 1 : 0);
+    if (valid) {
+      msgLen[mi] = cached.rows.length + (border ? 2 : 0);
     } else {
-      for (const r of cached.rows) out.push(PAD + live(r));
+      const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart);
+      const wrapped = rows.map(rowToLine);
+      const spinKey2 = (m.role === 'tool' && m.pending) ? (state.spin || 0) : 0;
+      const isPending2 = m.pending ? 1 : 0;
+      const cc = {
+        rowW: rowWidth, expanded, spinKey: spinKey2, isPending: isPending2,
+        textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
+        failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
+        keyArgs: m.toolArgs ? fpArgs(m.toolArgs) : '0',
+        rows: wrapped, spinRows: null,
+      };
+      for (let i = 0; i < wrapped.length; i++)
+        if (wrapped[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
+          if (!cc.spinRows) cc.spinRows = new Set();
+          cc.spinRows.add(i);
+        }
+      m._cache = cc;
+      msgLen[mi] = wrapped.length + (border ? 2 : 0);
     }
-    if (bordered && out[out.length - 1] !== botRule) out.push(botRule);
+    cursor += msgLen[mi];
+  }
+  const total = cursor;
+  state._chatTotal = total;
+
+  // Visible window: [total - bodyH - scroll, total - scroll), with a small
+  // margin above so a message crossing the boundary renders whole. When no
+  // viewport is given, render everything (full render).
+  let visibleFrom = 0, visibleTo = -1;
+if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
+    const bodyH = viewport.bodyH;
+    // Clamp scroll against the total we just computed, so a stale scroll value
+    // cannot push the window past the end (missing the tail).
+    const maxScroll = Math.max(0, total - bodyH);
+    const scroll = Math.min(maxScroll, Math.max(0, viewport.scroll || 0));
+    const end = total - scroll;
+    const start = end - bodyH;
+    visibleFrom = Math.max(0, start - 12);
+    visibleTo = Math.min(total, end + 12);
+  }
+
+  // Pass 2: assemble final strings, but only for messages that overlap the
+  // visible range (or the whole transcript when no viewport).
+  cursor = 0;
+  for (let mi = 0; mi < n; mi++) {
+    const msg = chat[mi];
+    const bordered = msg.role === 'user' || msg.role === 'queued' || msg.role === 'bash';
+    const boxColor = msg.role === 'bash' ? C.shellMode : C.border;
+    let topRule = null, botRule = null, boxPad = 1, boxText = innerW;
+    if (bordered) {
+      const boxW = innerW - 2;
+      const boxInner = Math.max(1, boxW - 2);
+      boxPad = Math.min(1, Math.max(0, boxInner - 1));
+      boxText = Math.max(1, boxInner - boxPad * 2);
+      topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', boxColor);
+      botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', boxColor);
+    }
+    const cc = msg._cache || { rows: [] };
+    // Shared wall with the previous bordered message (its bottom rule is ours).
+    let shared = false;
+    if (bordered && mi > 0) {
+      const prev = chat[mi - 1];
+      shared = (prev.role === 'user' || prev.role === 'queued' || prev.role === 'bash')
+        && rowStart[mi - 1] + msgLen[mi - 1] === cursor;
+    }
+    const len = msgLen[mi];
+    const visible = visibleTo < 0 || (cursor + len > visibleFrom && cursor < visibleTo);
+    if (visible) {
+      const spinRows = cc.spinRows;
+      const liveAt = (r, i) => (spinRows && spinRows.has(i) ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r);
+      if (bordered && !shared) out.push(topRule);
+      if (bordered) {
+        const pad = ' '.repeat(boxPad);
+        const wall = col('│', boxColor);
+        for (let i = 0; i < cc.rows.length; i++)
+          out.push(PAD + wall + pad + fitAnsi(liveAt(cc.rows[i], i), boxText) + pad + wall);
+      } else {
+        for (let i = 0; i < cc.rows.length; i++) out.push(PAD + liveAt(cc.rows[i], i));
+      }
+      if (bordered) out.push(botRule);
+    } else {
+      for (let i = 0; i < len; i++) out.push('');
+    }
+    cursor += len;
   }
   return out;
 }
+
+// ---- scroll anchoring --------------------------------------------------------
+// Keep a scrolled-up viewport pinned to the SAME content while new rows arrive.
+//
+// `state.scroll` counts rows up from the bottom, so when the transcript grows by
+// N rows the offset must grow by N as well — otherwise the new rows push the
+// content the user is reading off the top of the screen (the "it scrolls on its
+// own while the agent is talking" bug: measured as the viewed line moving up one
+// row per streamed chunk).
+//
+// The subtlety is the BASELINE. The previous version returned early while the
+// view was pinned (`scroll === 0`) and only recorded `_anchorRows` otherwise, so
+// during a turn the baseline went stale. The first append after the user
+// scrolled up then found `prev == null` (or an ancient value), skipped the
+// compensation, and the view drifted. Recording the baseline on EVERY call —
+// pinned or not — makes `rows - prev` always "rows added since the last paint".
+//
+// Pure: takes the state and the current chat row count, returns the new `scroll`.
+export function anchorScrollNext(state, rows) {
+  const prev = state._anchorRows;
+  state._anchorRows = rows;
+  if ((state.scroll || 0) === 0) return 0;      // pinned: keep following the tail
+  if (prev != null && rows > prev) return (state.scroll || 0) + (rows - prev);
+  return state.scroll || 0;
+}
+
 
 // Serialise a Line (array of spans) to an ANSI string.
 function lineToString(line) {
@@ -3050,8 +3160,15 @@ export function composeFrame(state, cols, rows) {
   // this too and appended a whole extra viewport of rows ON TOP of the editor.
   // The frame then overflowed, the top trim ate the editor's own title and text,
   // and /personal & /set-system-prompt showed nothing but a stray caret.
-  if (!state.editor && !state.panel && !state.form && !state.picker) {
-    const chat = renderChatLines(state, w);
+if (!state.editor && !state.panel && !state.form && !state.picker) {
+    // Windowed: renderChatLines computes the visible tail from bodyH+scroll and
+    // fills the rest with padding. `chat` still has the full row count (holes
+    // are blank strings), so `chat.length` remains the true total and the
+    // slices below stay correct. `state._forceFullRender` (tests) bypasses the
+    // window so the full path can be compared.
+    const chat = state._forceFullRender
+      ? renderChatLines(state, w)
+      : renderChatLines(state, w, { bodyH, scroll: state.scroll || 0 });
     if (state.selection && state.selection.anchor && state.selection.head) {
       // Apply selection highlight directly on ANSI strings
       for (let i = 0; i < chat.length; i++) {
@@ -3691,6 +3808,46 @@ function fieldCaretCol(field, active) {
   const c = Math.max(0, Math.min(shown.length, field.caret || 0));
   return visualCol(shown.slice(0, c));
 }
+// ---- prompt history (persisted across restarts) -----------------------------
+// Kept in the hncode config directory so the history survives a restart; the
+// in-memory array alone meant every relaunch started with an empty ↑ list.
+const HISTORY_MAX = 500;
+
+function historyFile() {
+  try {
+    return path.join(path.dirname(hncodeConfigFile()), 'history.json');
+  } catch {
+    return path.join(os.homedir(), '.hncode', 'history.json');
+  }
+}
+
+export function loadHistory() {
+  try {
+    const raw = fs.readFileSync(historyFile(), 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((x) => typeof x === 'string' && x.trim() !== '').slice(-HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+export function saveHistory(list) {
+  try {
+    const file = historyFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // Newest last, capped, and de-duplicated while keeping order.
+    const seen = new Set();
+    const out = [];
+    for (const x of (list || []).slice(-HISTORY_MAX)) {
+      if (typeof x !== 'string' || !x.trim()) continue;
+      if (seen.has(x)) continue;
+      seen.add(x);
+      out.push(x);
+    }
+    fs.writeFileSync(file, JSON.stringify(out, null, 0), 'utf8');
+  } catch { /* history is a convenience; never break the session over it */ }
+}
 
 // ---- state factory ----
 export function makeState({ cfg, session, opts }) {
@@ -3821,7 +3978,7 @@ export function makeState({ cfg, session, opts }) {
     notice: '',
     noticeKind: 'info',
     confirmExit: false,
-    history: [],
+    history: loadHistory(),   // restored from disk so ↑ works across restarts
     historyIdx: -1,
     _tipIndex: 0,
   };
@@ -3852,6 +4009,9 @@ export function reconstructChat(s) {
   const shellByAnchor = new Map();
   const shells = (s && s.shellHistory) || [];
   for (const sh of shells) {
+    // A malformed entry must not take the whole resume down: `sh.anchor` on a
+    // null threw right here, before the guard inside emitShells() could help.
+    if (!sh || typeof sh !== 'object') continue;
     const a = Number(sh.anchor != null ? sh.anchor : 0);
     if (!shellByAnchor.has(a)) shellByAnchor.set(a, []);
     shellByAnchor.get(a).push(sh);
@@ -3859,8 +4019,11 @@ export function reconstructChat(s) {
   // Emit the shell block for anchor `a` (command + its output) onto `out`.
   const emitShells = (out, a) => {
     for (const sh of shellByAnchor.get(a) || []) {
+      // Same junk-entry guard as the messages loop: a malformed shellHistory
+      // entry must not take the whole resume down with it.
+      if (!sh || typeof sh !== 'object') continue;
       out.push({ role: 'bash', text: String(sh.cmd || '') });
-      if (sh.result) out.push({ role: 'tool_result', text: sh.result, failed: sh.ok === false });
+      if (sh.result) out.push({ role: 'tool_result', text: String(sh.result), failed: sh.ok === false });
     }
   };
 
@@ -3868,6 +4031,11 @@ export function reconstructChat(s) {
   const msgs = (s && s.messages) || [];
   for (let mi = 0; mi < msgs.length; mi++) {
     const m = msgs[mi];
+    // Skip junk entries. A session file can carry a null (older writer, hand
+    // edit, truncated write); reading `m.role` off it threw and the whole resume
+    // died with an unhandled TypeError instead of showing the rest of the
+    // conversation.
+    if (!m || typeof m !== 'object') continue;
     const role = m.role;
     const text = typeof m.content === 'string' ? m.content : '';
     // Inject shell commands that anchored BEFORE this message (in the slot after
@@ -3876,7 +4044,8 @@ export function reconstructChat(s) {
     if (role === 'user') out.push({ role: 'user', text });
     else if (role === 'assistant') {
       out.push({ role: 'assistant', text });
-      for (const tc of (m.toolCalls || [])) {
+      for (const tc of (Array.isArray(m.toolCalls) ? m.toolCalls : [])) {
+        if (!tc || typeof tc !== 'object') continue;
         out.push({ role: 'tool', toolName: tc.name, toolArgs: tc.args || {}, pending: false });
       }
     } else if (role === 'tool') {
@@ -4845,7 +5014,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         '',
         'Shortcuts',
         '  Enter          send the message',
-        '  Ctrl-J         insert a newline',
+        '  Shift+Enter    insert a newline',
         '  Ctrl+Shift+C   copy the selection (or the last answer)',
         '  Ctrl+Shift+V   paste the clipboard (multi-line pastes collapse)',
         '  ↑ / ↓          input history (empty composer) · scroll the chat',
@@ -5194,7 +5363,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
     case 'plugins': {
-      const { pluginCommands, loadedPlugins } = await import('../plugin.js');
+      const { pluginCommands, API } = await import('./plugin.js');
+      // `loadedPlugins` is module-private; the public way to read it is the
+      // API.plugins getter. Importing a non-exported name yielded `undefined`
+      // and crashed on `.length`.
+      const loadedPlugins = API.plugins;
       if (!loadedPlugins.length) { app('No plugins loaded. Check ~/.hncode/plugins/'); return; }
       const lines = ['Loaded plugins:', ...loadedPlugins.map((p) => `  • ${p.name} v${p.version} (${p.id})`)];
       if (pluginCommands.length) {
@@ -5578,12 +5751,21 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       // Check if this is a plugin-registered command.
       if (isPluginCommand(cmd)) {
         const pc = findCommand(cmd);
-        if (pc && pc._plugin && typeof pc.run === 'function') {
-          try { pc.run(raw, { state, cfg, session, h, app, appErr }); }
+        // NOTE: `pc` comes from the plugin registry, which does NOT carry the
+        // `_plugin` marker — that is only added by allCommands() for display. The
+        // old guard `pc._plugin` was therefore always falsy, so plugin commands
+        // fell through to "Unknown command" and never ran at all. isPluginCommand
+        // above already established that this name resolves to a plugin.
+        if (pc && typeof pc.run === 'function') {
+          // AWAIT the handler: plugins may register an async `run`, and without
+          // awaiting, a rejection escaped as an unhandled promise rejection and
+          // the catch below never saw it (the command appeared to fail silently).
+          try { await pc.run(raw, { state, cfg, session, h, app, appErr }); }
           catch (e) { appErr(`Plugin command "/${cmd}" failed: ${e.message}`); }
           return;
         }
       }
+      // Unknown command: show error message
       // Unknown command: show error message
       appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
       return;
@@ -5924,30 +6106,12 @@ export async function startTUI(opts) {
   const stdout = process.stdout;
   const addChat = (msg) => {
     state.chat.push(normalizeMsg(msg));
-    // Only auto-follow when the view is ALREADY pinned to the bottom. Forcing
-    // scroll = 0 unconditionally yanked the user back down whenever new output
-    // arrived — so reading history mid-turn was impossible.
-    //
-    // This used to be `if ((state.scroll||0) === 0) state.scroll = 0;`, i.e. a
-    // NO-OP. The comment promised "auto-follow" but nothing re-anchored the view,
-    // so appending a tall message (a long Read/Bash result) pushed the whole
-    // transcript up by its height in a single frame instead of scrolling by one
-    // row — the "everything jumps" report. When the user IS scrolled up we leave
-    // the offset alone, which is the other half of the original intent.
-    if ((state.scroll || 0) === 0) {
-      state.scroll = 0;              // pinned: keep following the newest message
-    } else {
-      // Scrolled up: grow the offset by exactly the number of rows this message
-      // added, so the content the user is reading does not move.
-      try {
-        const rows = renderChatLines(state, dims().cols).length;
-        if (state._addChatRows != null) {
-          const grew = Math.max(0, rows - state._addChatRows);
-          if (grew) state.scroll = (state.scroll || 0) + grew;
-        }
-        state._addChatRows = rows;
-      } catch { /* rendering is best-effort here; never break a message append */ }
-    }
+    // Auto-follow / re-anchor is delegated to anchorScroll() so exactly ONE place
+    // adjusts `scroll`. This block used to run its own row-delta compensation
+    // against a second baseline (_addChatRows) which — like anchorScroll's old
+    // one — was not refreshed while the view was pinned. After the user scrolled
+    // up, BOTH paths added the same rows, so the view jumped by twice the growth.
+    anchorScroll();
     renderFrame();
   };
   let noticeTimer = null;
@@ -7301,12 +7465,26 @@ export async function startTUI(opts) {
         renderFrame(); return;
       }
       if (t.key === 'up' || t.key === 'down') {
-        // ↑/↓ only scroll when the COMPOSER has no use for the key. While the
-        // agent streams you are usually typing the next instruction, so a
-        // multi-line draft must still move its caret — swallowing the key for
-        // scrolling unconditionally is what made ↑/↓ "always scroll". When the
-        // caret is already on the first/last row the key falls through to the
-        // scroll below, so both behaviours are available.
+        // ↑/↓ while the agent streams: FIRST give the composer its caret move
+        // (a multi-line draft must still navigate), then fall back to scrolling
+        // ONLY when there is nothing else to do. The scroll is what made ↑ feel
+        // stuck while output streamed, so it is now the last resort.
+        const cur = state.input || '';
+        if (cur === '') {
+          // Empty composer: the key belongs to HISTORY, not to the viewport.
+          // With no history the key does nothing at all — silently scrolling
+          // the transcript is what made a bare ↑ feel like it ate the key.
+          if (state.history.length) {
+            if (state.historyIdx === -1) state.historyIdx = state.history.length;
+            state.historyIdx = t.key === 'up'
+              ? Math.max(0, state.historyIdx - 1)
+              : Math.min(state.history.length, state.historyIdx + 1);
+            state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
+            state.caret = state.input.length;
+            refreshMenu(state); renderFrame();
+          }
+          return;
+        }
         const insideW = Math.max(0, dims().cols - 2);
         const layout = composerLayout(state, insideW - 3);
         const dir = t.key === 'down' ? 1 : -1;
@@ -7319,6 +7497,8 @@ export async function startTUI(opts) {
           state.composerSel = null;
           renderFrame(); return;
         }
+        // Draft is on its last/first row: the key is free. Scroll the transcript
+        // (useful while output streams and you want to read back).
         scrollChat(state, t.key === 'up' ? 3 : -3);
         renderFrame(); return;
       }
@@ -7327,13 +7507,36 @@ export async function startTUI(opts) {
       if (t.key === 'up' || t.key === 'down') {
         const overlay = state.picker || state.form || state.panel || state.menuOpen
           || state.mentionOpen || state.editor;
-        const cur = state.input || '';
-        if (!overlay && cur === '' && state.history.length) {
-          if (state.historyIdx === -1) state.historyIdx = state.history.length;
-          state.historyIdx = t.key === 'up' ? Math.max(0, state.historyIdx - 1) : Math.min(state.history.length, state.historyIdx + 1);
-          state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
-          state.caret = state.input.length;
-          refreshMenu(state); renderFrame(); return;
+        if (!overlay) {
+          const cur = state.input || '';
+          const insideW = Math.max(0, dims().cols - 2);
+          const layout = composerLayout(state, insideW - 3);
+          const dir = t.key === 'down' ? 1 : -1;
+          const targetRow = layout.caretRow + dir;
+          // The composer is MULTI-LINE: ↑/↓ move the caret between its rows
+          // first, and only when it is already on the first/last row does the
+          // key fall through to history. That is the usual shell/editor rule —
+          // typing a paragraph must not have ↑ yank the draft away.
+          if (cur !== '' && targetRow >= 0 && targetRow < layout.rows.length) {
+            const starts = rowStartOffsets(cur, layout.rows.length, insideW);
+            const colInRow = Math.max(0, layout.caretCol - 1);
+            const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
+            state.caret = Math.min(cur.length, targetStart + colInRow);
+            state.composerSel = null;
+            renderFrame();
+            return;
+          }
+          // First/last row (or an empty composer): this is history's turn.
+          if (state.history.length) {
+            if (state.historyIdx === -1) state.historyIdx = state.history.length;
+            state.historyIdx = t.key === 'up'
+              ? Math.max(0, state.historyIdx - 1)
+              : Math.min(state.history.length, state.historyIdx + 1);
+            state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
+            state.caret = state.input.length;
+            refreshMenu(state); renderFrame();
+          }
+          return;
         }
       }
     }
@@ -7649,15 +7852,20 @@ export async function startTUI(opts) {
     }
     if (t.key === 'up' || t.key === 'down') {
       const cur = state.input || '';
-      if (cur === '' && state.history.length) {
-        if (state.historyIdx === -1) state.historyIdx = state.history.length;
-        state.historyIdx = t.key === 'up'
-          ? Math.max(0, state.historyIdx - 1)
-          : Math.min(state.history.length, state.historyIdx + 1);
-        state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
-        state.caret = state.input.length;
-        state.composerSel = null;
-        refreshMenu(state); renderFrame(); return;
+      if (cur === '') {
+        // Empty composer: history owns the key. With NO history the key does
+        // nothing — it must not silently scroll the transcript.
+        if (state.history.length) {
+          if (state.historyIdx === -1) state.historyIdx = state.history.length;
+          state.historyIdx = t.key === 'up'
+            ? Math.max(0, state.historyIdx - 1)
+            : Math.min(state.history.length, state.historyIdx + 1);
+          state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
+          state.caret = state.input.length;
+          state.composerSel = null;
+          refreshMenu(state); renderFrame();
+        }
+        return;
       }
       const insideW = Math.max(0, dims().cols - 2);
       const layout = composerLayout(state, insideW - 3);
@@ -7671,10 +7879,23 @@ export async function startTUI(opts) {
         state.composerSel = null;
         renderFrame(); return;
       }
-      scrollChat(state, t.key === 'up' ? 3 : -3);
-      renderFrame(); return;
+      // Caret is already on the first/last row: the composer has no further use
+      // for the key, so it becomes HISTORY. (Scrolling the transcript is still
+      // available on PgUp/PgDn and the wheel — the arrows belong to the input.)
+      if (state.history.length) {
+        if (state.historyIdx === -1) state.historyIdx = state.history.length;
+        state.historyIdx = t.key === 'up'
+          ? Math.max(0, state.historyIdx - 1)
+          : Math.min(state.history.length, state.historyIdx + 1);
+        state.input = state.historyIdx >= state.history.length ? '' : (state.history[state.historyIdx] || '');
+        state.caret = state.input.length;
+        state.composerSel = null;
+        refreshMenu(state); renderFrame(); return;
+      }
+      return;
     }
     if (t.key === 'wheelup' || t.key === 'wheeldown') {
+      // With the pointer ON the scrollbar, scroll one line per notch: the bar is
       // With the pointer ON the scrollbar, scroll one line per notch: the bar is
       // the precision control, and 3-line steps there feel jumpy on a long
       // transcript. Everywhere else keeps the usual 3-line step.
@@ -7944,6 +8165,7 @@ export async function startTUI(opts) {
     state.scroll = Math.min(maxScroll, Math.max(0, (state.scroll || 0) + delta));
   }
 
+
   async function submit(forceText) {
     // `forceText` means the text came from somewhere other than the composer
     // (the queue drain). Clearing the composer in that case would throw away
@@ -7972,7 +8194,10 @@ export async function startTUI(opts) {
       state.pulseStart = null;
     }
     
-    if (state.history[state.history.length - 1] !== text) state.history.push(text);
+    if (state.history[state.history.length - 1] !== text) {
+      state.history.push(text);
+      saveHistory(state.history);   // persist so ↑ survives a restart
+    }
     // Shell passthrough. The MODE is authoritative (the `!` never entered the
     // buffer); a leading `!` in the text is still honoured so a pasted line like
     // `!git status` behaves the same as typing it.
@@ -8100,6 +8325,14 @@ export async function startTUI(opts) {
     state.rounds = (state.rounds || 0) + 1;
     state._stepsBase = state.steps || 0;
     state._turnSteps = 0;
+    // Re-base the start animation to THIS instant and paint immediately.
+    // submit() set startAnim before `running` was true, so nothing could render
+    // yet; by the time a frame was actually drawn the 1s animation had already
+    // run out and the type-out was never seen. Stamping it here — the first
+    // moment the row can be painted — makes the animation start on screen.
+    state.startAnim = { start: Date.now() };
+    state.pulseStart = null;
+    renderFrame();
     if (session) session.rounds = state.rounds;
     // system 固定在开头，且不持久化到 session（否则每轮都会堆一条）。
     // 历史里的旧 system 一律跳过，统一使用当前 system prompt：
@@ -8136,20 +8369,9 @@ export async function startTUI(opts) {
     // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
     // which is the precedence order codex documents. Previously /init wrote this
     // file and nothing ever loaded it.
-    const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
+const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
     if (agents) {
       sysText += '\n\n' + agents;
-    }
-    // GIT CONTEXT: the current branch and how many files are uncommitted. Cheap
-    // (two git calls) and it stops the model guessing whether the tree is dirty
-    // or which branch it is on. Skipped silently outside a repository.
-    {
-      const gitCwd = state.cwd || state.workspace || cfg.workspace;
-      let gitsum = '';
-      try { gitsum = gitmod.summary(gitCwd); } catch { gitsum = ''; }
-      if (gitsum) {
-        sysText += '\n\nGIT WORKING TREE (this repository, as of now):\n' + gitsum;
-      }
     }
     let messages = [{ role: 'system', content: sysText }];
     if (session.messages && session.messages.length) {
@@ -8167,10 +8389,10 @@ export async function startTUI(opts) {
     // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
     // from the harness, not something the user typed, and it must not show up as a
     // user bubble or be persisted as one.
-    messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
-    // 只持久化对话本身，system 不进 session。
+messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
+    // 只持久化对话本身，system 不进 session。转折保存交给 turn 结束处
+    // （agent.run 之后），中途不写盘以保持发消息流畅。
     Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
-    sess.saveSession(session);
 
     if (state.plan) {
       cfg.toolFilter = ['Read', 'Grep', 'Glob'];
@@ -8737,18 +8959,22 @@ export async function startTUI(opts) {
   // Appending streamed text can also add rows (the message wraps as it grows).
   // While the user is scrolled up, compensate so their view does not shift — the
   // same anchoring rule addChat applies for a whole new message.
-  function anchorScroll() {
-    if ((state.scroll || 0) === 0) return;      // pinned to the bottom: follow
-    const rows = renderChatLines(state, dims().cols).length;
-    const prev = state._anchorRows;
-    // On the first call after the user scrolled up, _anchorRows is unset — just
-    // record the current row count without adjusting scroll. Otherwise a large
-    // gap (prev=0 vs. rows=N) would jump the view to the top of the session.
-    if (prev != null) {
-      if (rows > prev) state.scroll = (state.scroll || 0) + (rows - prev);
-    }
-    state._anchorRows = rows;
+function anchorScroll() {
+    // The arithmetic lives in anchorScrollNext() (module level, unit-tested): it
+    // takes the current chat row count and returns the new `scroll`.
+    //   * the baseline is refreshed even while the view is pinned at the bottom,
+    //     so the first append after the user scrolls up has a real delta;
+    //   * the compensation is the rows added since the previous paint.
+    //
+    // The count comes from state._chatTotal, which composeFrame() refreshes on
+    // every paint. Calling renderChatLines() here (as this used to) laid out the
+    // WHOLE transcript a second time on every streamed chunk — a full ~25k-row
+    // render per chunk on top of the windowed one, which is what made markdown
+    // output appear to stall.
+    const rows = state._chatTotal || 0;
+    state.scroll = anchorScrollNext(state, rows);
   }
+
 
   // Live split of the streamed reply into prose vs. <plan> block.
   // While Plan mode is on and the model is inside <plan>…</plan>, the text is

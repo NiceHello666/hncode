@@ -319,12 +319,12 @@ Unknown `/commands` are reported as errors and are **not** sent to the model.
 | Key | Action |
 |-----|--------|
 | `Enter` | Send the message. |
-| `Ctrl-J` | Insert a newline in the composer. |
+| `Shift+Enter` | Insert a newline in the composer. |
 | `Ctrl-Shift-C` | Copy the current mouse selection (or the last answer if none). |
 | `Ctrl-Shift-V` | Paste the clipboard. Multi-line pastes collapse into a `[paste #N +L lines]` marker. |
 | `↑` / `↓` | With an empty composer: recall input history. Otherwise: scroll the chat. |
 | `/` | Open the command menu; `Tab` cycles entries. |
-| `@` | File/folder completion; `Tab` completes. |
+| `↑` / `↓` | In a multi-line draft: move the caret between lines; at the first/last line: recall input history. With an empty composer: recall input history. |
 | `Esc` | Cancel the menu/dialog, or interrupt the running turn. |
 | `Ctrl-E` | Open `config.toml` in your editor. |
 | `Ctrl-B` | Move the running Bash command to the background. |
@@ -367,20 +367,20 @@ The model can call these built-in tools. Each returns a string; failures are sho
 | `WebSearch` | Search the web. |
 | `ReadMediaFile` | Read an image/media file. |
 | `FileLines` | Count (or inspect) the lines of a file. |
-| `AskUserQuestion` | Ask the user 1-4 structured multiple-choice questions mid-turn and wait for the answer. An "Other" free-text option is always added per question, plus an "Add a note" row after the last one for a free-form supplement. The result is JSON: `{"answers":{"<question>":"<label>"},"additional":"<note>"}` — `additional` appears only when a note was written — or `{"answers":{},"note":"User dismissed…"}` when they press Esc. |
+| `AskUserQuestion` | Ask the user 1-4 multiple-choice questions mid-turn and wait for the answer. Every question also gets a free-text "Other" option, plus an optional notes row after the last one. If the user presses Esc the turn continues with no answer. |
 
 ### The Edit safety model
 
 `Edit` refuses to run blindly:
 
-- You must `Read` a file before `Edit`ing it, and the edited region must be inside a snapshot you actually read. Otherwise: `Edit rejected: you have not read the lines you are editing…`.
+- The file must have been read in this session before it can be edited. Otherwise: `Edit rejected: you have not read the lines you are editing…`.
 - If the file changed since you read it: `Edit rejected: <path> changed since it was Read…`. Re-read, then edit.
 
 These guards prevent clobbering concurrent changes.
 
 ### How failures are shown
 
-- **Bash**: a non-zero exit code turns the bullet red; the command's own output explains why. The internal `[exit code: N]` line is never shown to you.
+- **Bash**: a non-zero exit code turns the bullet red; the command's own output explains why.
 - **Edit / Write**: the body is replaced by the diff, so on failure a red reason line appears beneath the tool call.
 - **Read / Grep / Glob / …**: the full result is shown, in red when it failed.
 
@@ -415,7 +415,7 @@ You can also compact manually:
 /compact 0.3      # drop the oldest 30%, keep 70%
 ```
 
-Token usage is estimated with the same heuristic Kimi Code uses: `ceil(ASCII chars / 4) + non-ASCII chars`. The live gauge at the bottom of the screen is refreshed every step.
+Token usage is estimated as roughly 4 ASCII characters per token and 1 token per non-ASCII character. The live gauge at the bottom of the screen is refreshed every step.
 
 ---
 
@@ -633,11 +633,12 @@ hncode is built on the ideas of several open-source projects:
 
 ## 17. License
 
-[GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
+[PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
 
-1. ✅ Free to use, modify, and share.
-2. ✅ Must retain author attribution (NiceHello666) and link back to the repository.
-3. ❌ May not be used for commercial purposes.
+1. ✅ Free for noncommercial use — personal projects, learning, research, hobby work, and noncommercial organizations.
+2. ✅ You may modify and share it, provided you keep the license text and the noncommercial notice with any copy.
+3. ❌ No commercial use of any kind (selling it, shipping it inside a paid product, or using it to run a commercial service).
+4. ℹ️ Not a copyleft license: your own additions do not have to be published. Commercial use requires a separate license.
 
 ---
 

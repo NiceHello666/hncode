@@ -383,7 +383,7 @@ export function setConfigString(key, value) {
       const opensMultiline = /^"""|^'''/.test(rest) && !/^"""[\s\S]*"""\s*$/.test(rest);
       if (opensMultiline) skipping = true;
       if (!replaced && value !== '' && value != null) {
-        out.push(...renderTomlString(key, String(value)));
+        out.push(...renderTomlString(key, String(value)).split('\n'));
         replaced = true;
       }
       continue;
@@ -392,9 +392,9 @@ export function setConfigString(key, value) {
   }
   while (out.length && out[out.length - 1].trim() === '') out.pop();
   if (!replaced && value !== '' && value != null) {
-    // Insert new root-level keys BEFORE the first [table] section so they
-    // are parsed as root keys, not assigned to a table.
-    const rendered = renderTomlString(key, String(value));
+    // Insert new root-level keys BEFORE the first [table] section so they are
+    // parsed as root keys, not assigned to a table.
+    const rendered = renderTomlString(key, String(value)).split('\n');
     if (firstTableIdx >= 0) {
       out.splice(firstTableIdx, 0, '', ...rendered);
     } else {
@@ -409,13 +409,26 @@ export function setConfigString(key, value) {
 
 // Render `key = <value>` as TOML. Uses a multi-line basic string when the value
 // contains newlines (readable, and TOML-valid), a plain one otherwise.
+//
+// Layout matters: TOML DISCARDS the newline immediately after `"""`, so the
+// value begins on the following line and the closing `"""` must butt up against
+// the last character. The previous form (""" + \n + body + \n + """) parsed back
+// as `value + '\n'`, and because setConfigString writes back whatever it read,
+// every read→write cycle appended another newline (a system prompt gained a
+// blank line per edit).
+//
+//   key = """
+//   <value, verbatim>
+//   """
 function renderTomlString(key, value) {
   if (value.includes('\n')) {
     // Inside """…""" a backslash must be escaped; quotes are fine unless tripled.
     const body = value.replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
-    return [`${key} = """`, ...body.split('\n'), '"""'];
+    // `"""` then a newline (discarded by the parser), then the value, then the
+    // closing delimiter on the same line as the value's last line.
+    return [`${key} = """`, ...body.split('\n')].join('\n') + '"""';
   }
-  return [`${key} = "${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`];
+  return `${key} = "${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 // Append (or replace) a [providers.<name>] table in config.toml without
@@ -425,21 +438,30 @@ export function addProvider(name, { base_url, api_key, protocol } = {}) {
   let text = '';
   try { text = fs.readFileSync(file, 'utf8'); } catch { /* new file */ }
   const lines = text.split(/\r?\n/);
-  // drop any existing [providers.<name>] block (and its key lines) so we replace it
+  // Drop any existing [providers.<name>] block (and its key lines) so it is
+  // replaced rather than duplicated. Accepts the BARE and QUOTED header forms
+  // (this function writes the quoted one) and unescapes before comparing.
+  const unq = (s) => String(s).replace(/\\(.)/g, '$1');
+  const provRe = /^\s*\[providers\.\s*(?:"((?:[^"\\]|\\.)*)"|([^\]]+))\s*\]\s*$/;
   const out = [];
   let skipping = false;
   for (const ln of lines) {
-    const m = /^\s*\[providers\.([^\]]+)\]\s*$/.exec(ln);
-    if (m) { skipping = m[1] === name; if (skipping) continue; }
+    const m = provRe.exec(ln);
+    if (m) { skipping = unq(m[1] !== undefined ? m[1] : m[2]) === name; if (skipping) continue; }
     else if (/^\s*\[/.test(ln)) skipping = false;
     if (!skipping) out.push(ln);
   }
   while (out.length && out[out.length - 1].trim() === '') out.pop();
   out.push('');
-  out.push(`[providers.${name}]`);
-  if (base_url) out.push(`base_url = "${String(base_url).replace(/"/g, '\\"')}"`);
-  if (api_key) out.push(`api_key = "${String(api_key).replace(/"/g, '\\"')}"`);
-  if (protocol) out.push(`protocol = "${String(protocol).replace(/"/g, '\\"')}"`);
+  // Escape backslashes BEFORE quotes (the other order double-escapes), and quote
+  // the table key too. Raw interpolation meant a provider name or URL holding a
+  // backslash or a quote wrote invalid TOML and broke the ENTIRE config file —
+  // every later launch failed until it was repaired by hand.
+  const q = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  out.push(`[providers.${q(name)}]`);
+  if (base_url) out.push(`base_url = ${q(base_url)}`);
+  if (api_key) out.push(`api_key = ${q(api_key)}`);
+  if (protocol) out.push(`protocol = ${q(protocol)}`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, out.join('\n') + '\n', 'utf8');
   return file;
@@ -455,15 +477,25 @@ export function removeProvider(name) {
   const lines = text.split(/\r?\n/);
   const out = [];
   let skipping = false;
+  // Table headers may be BARE (`[providers.p]`) or QUOTED (`[providers."p"]`) —
+  // addProvider now quotes them so a name containing a quote or backslash stays
+  // valid TOML. Match both and unescape before comparing: with the quoted form
+  // the old bare-only regex captured `"p"` (quotes included), `=== name` never
+  // held, and removeProvider silently deleted nothing.
+  const unq = (s) => String(s).replace(/\\(.)/g, '$1');
+  const provRe = /^\s*\[providers\.\s*(?:"((?:[^"\\]|\\.)*)"|([^\]]+))\s*\]\s*$/;
   // A models key is `[models."provider/modelId"]`; match the provider prefix.
-  const modelRe = /^\s*\[models\."([^"]+)"\]\s*$/;
+  const modelRe = /^\s*\[models\.\s*"((?:[^"\\]|\\.)*)"\s*\]\s*$/;
   for (const ln of lines) {
-    const pm = /^\s*\[providers\.([^\]]+)\]\s*$/.exec(ln);
-    if (pm) { skipping = pm[1] === name; if (skipping) continue; }
+    const pm = provRe.exec(ln);
+    if (pm) {
+      skipping = unq(pm[1] !== undefined ? pm[1] : pm[2]) === name;
+      if (skipping) continue;
+    }
     const mm = modelRe.exec(ln);
     if (mm) {
       // The model key starts with `<provider>/`; skip it if it is this provider's.
-      const keyProvider = mm[1].split('/')[0];
+      const keyProvider = unq(mm[1]).split('/')[0];
       skipping = keyProvider === name;
       if (skipping) continue;
     } else if (/^\s*\[/.test(ln)) {
@@ -490,8 +522,14 @@ export function addModel(provider, modelId, opts = {}) {
   try { text = fs.readFileSync(file, 'utf8'); } catch {}
   const key = modelKey(provider, modelId);
   if (new RegExp(`^\\s*\\[models\\."${escapeRe(key)}"\\]`, 'm').test(text)) return file; // already there
-  const lines = [`[models."${key}"]`, `provider = "${provider}"`, `model = "${modelId}"`];
-  if (opts.display_name) lines.push(`display_name = "${String(opts.display_name).replace(/"/g, '\\"')}"`);
+  // EVERY interpolated string is escaped. These were written raw, so a model id
+  // (or provider) containing a quote or backslash produced malformed TOML and
+  // the ENTIRE config file stopped parsing — every later launch then failed
+  // until the file was repaired by hand. Provider ids and model ids come from
+  // remote APIs, so they are not trusted input.
+  const q = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const lines = [`[models.${q(key)}]`, `provider = ${q(provider)}`, `model = ${q(modelId)}`];
+  if (opts.display_name) lines.push(`display_name = ${q(opts.display_name)}`);
   // Persist the context window discovered from /v1/models so resolveConfig can
   // size the context bar per model (not a global 128k).
   if (opts.contextLength) lines.push(`context_length = ${Number(opts.contextLength)}`);

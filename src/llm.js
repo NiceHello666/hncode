@@ -12,7 +12,9 @@ import { effortWire } from './config.js';
 import { applyPromptCache } from './cache.js';
 
 export function openAiToolDefs(tools) {
-  return tools.map((t) => ({
+  // Guard: a caller that passes null/undefined (e.g. setToolsList(null)) used to
+  // throw on `.map`, failing the whole request. An empty tool list is valid.
+  return (Array.isArray(tools) ? tools : []).map((t) => ({
     type: 'function',
     function: {
       name: t.name,
@@ -23,7 +25,7 @@ export function openAiToolDefs(tools) {
 }
 
 export function anthropicToolDefs(tools) {
-  return tools.map((t) => ({
+  return (Array.isArray(tools) ? tools : []).map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.parameters,
@@ -120,7 +122,9 @@ function buildBody(cfg, messages, streaming = true) {
 
 // tool list used for defs (injected via setTools)
 let llmToolsList = [];
-export function setToolsList(list) { llmToolsList = list; }
+// Only ever store an array: `null`/undefined here would make every later request
+// throw when the defs are built.
+export function setToolsList(list) { llmToolsList = Array.isArray(list) ? list : []; }
 
 export class LLM {
   constructor(cfg) {
