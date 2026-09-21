@@ -261,7 +261,7 @@ export const TIPS = [
   '/yolo auto-approves anything inside the workspace — risky paths still ask',
   '/auto never interrupts you; everything runs and is decided automatically',
   'Shift+Arrow selects text in the composer; Backspace or Delete removes it',
-  'Shift+Enter inserts a newline without sending the message',
+  'Ctrl+J inserts a newline without sending the message',
   'Ctrl+T expands or collapses the todo panel',
   'Ctrl+O expands or collapses tool output, thinking blocks and Edit diffs',
   'Ctrl+B moves a long-running foreground Bash command to the background',
@@ -2268,128 +2268,161 @@ function fpArgs(args) {
   return out;
 }
 
-export function renderChatLines(state, w, viewport) {
+export function renderChatLines(state, w) {
   const out = [];
   const expanded = !!state.expanded;
+  // One blank column on the left of the whole transcript, so the markers (❯, ●,
+  // ↳) do not sit flush against the screen edge.
   const PAD = ' ';
   const padW = visualCol(PAD);
   const innerW = Math.max(1, w - padW);
-  const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
-  const chat = state.chat;
-  const n = chat.length;
-
-  // Pass 1: exact row count per message (and the total). Every message's cache
-  // is validated/rebuilt here so the counts are exact; only the STRING assembly
-  // is limited to the visible window.
-  const rowStart = new Int32Array(n);
-  const msgLen = new Int32Array(n);
-  let cursor = 0;
-  for (let mi = 0; mi < n; mi++) {
-    const m = chat[mi];
-    const border = m.role === 'user' || m.role === 'queued' || m.role === 'bash';
-    const ww = border ? Math.max(1, Math.min(1, innerW - 4)) : innerW; // placeholder
-    void ww;
-    rowStart[mi] = cursor;
-    // Reuse/minimal layout for the row count: same width/border arithmetic as
-    // the layout path below. We need boxText for bordered messages.
-    const boxInner = Math.max(1, innerW - 4);
-    const boxText = Math.max(1, boxInner - Math.min(1, Math.max(0, boxInner - 1)) * 2);
-    const rowWidth = border ? boxText : innerW;
-    const cached = m._cache;
-    const valid = cached
-      && cached.rowW === rowWidth && cached.expanded === expanded
-      && cached.textRef === m.text && cached.streamRef === m.streamContent
-      && cached.liveRef === m.liveOutput && cached.failed === m.failed
-      && cached.diffRef === m.diff && cached.countsRef === m._diffCounts
-      && cached.keyArgs === (m.toolArgs ? fpArgs(m.toolArgs) : '0')
-      && cached.spinKey === (m.role === 'tool' && m.pending ? (state.spin || 0) : 0)
-      && cached.isPending === (m.pending ? 1 : 0);
-    if (valid) {
-      msgLen[mi] = cached.rows.length + (border ? 2 : 0);
-    } else {
-      const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart);
-      const wrapped = rows.map(rowToLine);
-      const spinKey2 = (m.role === 'tool' && m.pending) ? (state.spin || 0) : 0;
-      const isPending2 = m.pending ? 1 : 0;
-      const cc = {
-        rowW: rowWidth, expanded, spinKey: spinKey2, isPending: isPending2,
-        textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
-        failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
-        keyArgs: m.toolArgs ? fpArgs(m.toolArgs) : '0',
-        rows: wrapped, spinRows: null,
-      };
-      for (let i = 0; i < wrapped.length; i++)
-        if (wrapped[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
-          if (!cc.spinRows) cc.spinRows = new Set();
-          cc.spinRows.add(i);
-        }
-      m._cache = cc;
-      msgLen[mi] = wrapped.length + (border ? 2 : 0);
-    }
-    cursor += msgLen[mi];
-  }
-  const total = cursor;
-  state._chatTotal = total;
-
-  // Visible window: [total - bodyH - scroll, total - scroll), with a small
-  // margin above so a message crossing the boundary renders whole. When no
-  // viewport is given, render everything (full render).
-  let visibleFrom = 0, visibleTo = -1;
-if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
-    const bodyH = viewport.bodyH;
-    // Clamp scroll against the total we just computed, so a stale scroll value
-    // cannot push the window past the end (missing the tail).
-    const maxScroll = Math.max(0, total - bodyH);
-    const scroll = Math.min(maxScroll, Math.max(0, viewport.scroll || 0));
-    const end = total - scroll;
-    const start = end - bodyH;
-    visibleFrom = Math.max(0, start - 12);
-    visibleTo = Math.min(total, end + 12);
-  }
-
-  // Pass 2: assemble final strings, but only for messages that overlap the
-  // visible range (or the whole transcript when no viewport).
-  cursor = 0;
-  for (let mi = 0; mi < n; mi++) {
-    const msg = chat[mi];
+  // FULL RENDER of the transcript. A windowed/tail variant was tried and
+  // REMOVED: predicting the skipped messages' row counts from their caches made
+  // the row indices wrong whenever a cache was invalidated (resize, Ctrl+O, a
+  // streaming message), which shifted everything below it. Correctness first;
+  // the real wins are the width fast paths and the reference-based cache key.
+  for (const msg of state.chat) {
+    // A `user` / `queued` message is drawn inside a COMPOSER-STYLE BOX: rounded
+    // corners with `─`, and a `│` down each side — so a sent prompt looks exactly
+    // like the input box it was typed into.
+    // `steer` gets NO box: it is injected into the turn already in progress, so a
+    // box would falsely suggest a separate turn had started.
     const bordered = msg.role === 'user' || msg.role === 'queued' || msg.role === 'bash';
+    // A bash-mode echo uses the violet shellMode frame — same hue as kimi.
     const boxColor = msg.role === 'bash' ? C.shellMode : C.border;
+    // Box metrics and the two rules are built LAZILY. They were computed for
+    // EVERY message, which meant two 100+-character strings (`'─'.repeat(...)`
+    // plus colour wrapping) allocated per message per frame even for the rows
+    // that never draw a box — 2000 plain rows cost ~4.5ms/frame in allocations
+    // that nothing ever read. Only `bordered` rows need them.
     let topRule = null, botRule = null, boxPad = 1, boxText = innerW;
     if (bordered) {
-      const boxW = innerW - 2;
-      const boxInner = Math.max(1, boxW - 2);
+      // The box spans one column less than the full inner width, so the right
+      // edge has a 1-column margin (matching the left margin from `PAD`).
+      const boxW = innerW - 2;                   // total box width, including both │
+      const boxInner = Math.max(1, boxW - 2);    // span the two │s occupy
+      // One column of padding inside each wall, mirroring the composer box.
       boxPad = Math.min(1, Math.max(0, boxInner - 1));
       boxText = Math.max(1, boxInner - boxPad * 2);
       topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', boxColor);
       botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', boxColor);
     }
-    const cc = msg._cache || { rows: [] };
-    // Shared wall with the previous bordered message (its bottom rule is ours).
-    let shared = false;
-    if (bordered && mi > 0) {
-      const prev = chat[mi - 1];
-      shared = (prev.role === 'user' || prev.role === 'queued' || prev.role === 'bash')
-        && rowStart[mi - 1] + msgLen[mi - 1] === cursor;
-    }
-    const len = msgLen[mi];
-    const visible = visibleTo < 0 || (cursor + len > visibleFrom && cursor < visibleTo);
-    if (visible) {
-      const spinRows = cc.spinRows;
-      const liveAt = (r, i) => (spinRows && spinRows.has(i) ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r);
-      if (bordered && !shared) out.push(topRule);
-      if (bordered) {
-        const pad = ' '.repeat(boxPad);
-        const wall = col('│', boxColor);
-        for (let i = 0; i < cc.rows.length; i++)
-          out.push(PAD + wall + pad + fitAnsi(liveAt(cc.rows[i], i), boxText) + pad + wall);
-      } else {
-        for (let i = 0; i < cc.rows.length; i++) out.push(PAD + liveAt(cc.rows[i], i));
+    // A box always needs its TOP border — including when the message is the first
+    // row of the transcript. (The earlier `out.length > 0` guard came from the
+    // rule-only version, where a leading divider looked wrong; a box without a
+    // top is simply broken.) For adjacent bordered messages the previous box's
+    // bottom already serves as this one's top, so skip the duplicate.
+    if (bordered && out[out.length - 1] !== topRule) out.push(topRule);
+    // The cache key MUST include everything messageLines() reads. toolArgs was
+    // missing, so a tool row rendered at `tool_start` (args still {}) kept its
+    // stale "Using Bash" line even after `tool_use` delivered the command —
+    // the row only appeared once some OTHER keyed field changed. liveOutput is
+    // keyed because it grows while a command runs; `failed` flips the bullet
+    // and the result colour red once the tool reports a non-zero exit.
+    // The row WIDTH is keyed (not `w`) because the rows are laid out to it:
+    // `boxText` for a bordered message (inside the box padding), `innerW` otherwise.
+    const rowW = bordered ? boxText : innerW;
+    // The cache key MUST include everything messageLines() reads. `spin` is
+    // keyed ONLY for a pending TOOL row: formatToolLine sweeps the tool name's
+    // colour with it. The pending THINKING row deliberately does not key it —
+    // its spinner is substituted outside the cache (see SPIN_PLACEHOLDER), so
+    // the 80ms tick no longer re-wraps the reasoning preview every frame.
+    const spinKey = (msg.role === 'tool' && msg.pending) ? (state.spin || 0) : 0;
+    // CACHE VALIDITY, by REFERENCE for the string fields.
+    //
+    // The previous key was a 100+ character template literal rebuilt for every
+    // message on every frame (3,985 of them) purely to compare it with the
+    // previous one — that allocation measured ~1.7ms/frame on a long session.
+    //
+    // Strings in JS are immutable, so a CHANGED string is always a DIFFERENT
+    // reference: `cached.textRef === msg.text` is an O(1) check that is exactly
+    // as accurate as comparing the contents. Every mutation site in this file
+    // assigns a fresh string (`+=`, `.trim()`, `.replace()`), so the reference
+    // changes whenever the rendered text would.
+    //
+    // The scalars are compared first because they short-circuit: a pending tool
+    // row's spin tick changes constantly, and that alone must invalidate it.
+    // `pending` is compared EXPLICITLY, not only through spinKey: spinKey folds
+    // to 0 for a settled row AND for a pending row whose tick happens to be 0, so
+    // flipping pending could leave the comparison equal and the row stuck on
+    // "Using …". It is a separate scalar for that reason.
+    const isPending = msg.pending ? 1 : 0;
+    const keyArgs = msg.toolArgs ? fpArgs(msg.toolArgs) : '0';
+    let cached = msg._cache;
+    if (!cached
+      || cached.rowW !== rowW
+      || cached.expanded !== expanded
+      || cached.spinKey !== spinKey
+      || cached.isPending !== isPending
+      || cached.textRef !== msg.text
+      || cached.streamRef !== msg.streamContent
+      || cached.liveRef !== msg.liveOutput
+      || cached.failed !== msg.failed
+      || cached.diffRef !== msg.diff
+      || cached.countsRef !== msg._diffCounts
+      || cached.keyArgs !== keyArgs) {
+      const rows = messageLines(msg, rowW, state.cwd, expanded, state.spin, state.pulseStart);
+      cached = {
+        rowW, expanded, spinKey, isPending,
+        textRef: msg.text, streamRef: msg.streamContent, liveRef: msg.liveOutput,
+        failed: msg.failed, diffRef: msg.diff, countsRef: msg._diffCounts,
+        keyArgs,
+        rows: rows.map(rowToLine), spinRows: null,
+      };
+      // Which rows carry the spinner placeholder? Recorded ONCE here instead of
+      // being rediscovered by scanning every row on every frame.
+      for (let i = 0; i < cached.rows.length; i++) {
+        if (cached.rows[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
+          if (!cached.spinRows) cached.spinRows = new Set();
+          cached.spinRows.add(i);
+        }
       }
-      if (bordered) out.push(botRule);
-    } else {
-      for (let i = 0; i < len; i++) out.push('');
+      msg._cache = cached;
     }
-    cursor += len;
+    // Swap the live spinner frame into any row that carries the placeholder.
+    // Done AFTER the cache, so the glyph animates without invalidating it.
+    //
+    // The set of rows carrying the placeholder is recorded at CACHE time so this
+    // scan does not run per row per frame: a long transcript builds tens of
+    // thousands of rows and only one or two hold a spinner, and the `indexOf`
+    // over every one of them measured ~7% of a frame.
+    const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
+    const spinRows = cached.spinRows;
+    // The margin is added here (outside the cache) so it is not baked into the
+    // cached rows. A bordered message also gets its side walls, laid out to the
+    // box's inner width so it lines up with the composer exactly.
+    //
+    // Two shapes, because the common case is "no spinner anywhere in this
+    // message": that path is a plain push loop with no per-row closure call or
+    // Set lookup. A long transcript contributes ~20k rows per frame, so even one
+    // extra call per row showed up in the profile.
+    if (bordered) {
+      const pad = ' '.repeat(boxPad);
+      const wall = col('│', boxColor);
+      const rowsArr = cached.rows;
+      if (spinRows) {
+        for (let i = 0; i < rowsArr.length; i++) {
+          const r = rowsArr[i];
+          const live = spinRows.has(i) ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r;
+          out.push(PAD + wall + pad + fitAnsi(live, boxText) + pad + wall);
+        }
+      } else {
+        for (let i = 0; i < rowsArr.length; i++) {
+          out.push(PAD + wall + pad + fitAnsi(rowsArr[i], boxText) + pad + wall);
+        }
+      }
+    } else {
+      const rowsArr = cached.rows;
+      if (spinRows) {
+        for (let i = 0; i < rowsArr.length; i++) {
+          const r = rowsArr[i];
+          out.push(PAD + (spinRows.has(i) ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r));
+        }
+      } else {
+        for (let i = 0; i < rowsArr.length; i++) out.push(PAD + rowsArr[i]);
+      }
+    }
+    if (bordered && out[out.length - 1] !== botRule) out.push(botRule);
   }
   return out;
 }
@@ -3160,15 +3193,8 @@ export function composeFrame(state, cols, rows) {
   // this too and appended a whole extra viewport of rows ON TOP of the editor.
   // The frame then overflowed, the top trim ate the editor's own title and text,
   // and /personal & /set-system-prompt showed nothing but a stray caret.
-if (!state.editor && !state.panel && !state.form && !state.picker) {
-    // Windowed: renderChatLines computes the visible tail from bodyH+scroll and
-    // fills the rest with padding. `chat` still has the full row count (holes
-    // are blank strings), so `chat.length` remains the true total and the
-    // slices below stay correct. `state._forceFullRender` (tests) bypasses the
-    // window so the full path can be compared.
-    const chat = state._forceFullRender
-      ? renderChatLines(state, w)
-      : renderChatLines(state, w, { bodyH, scroll: state.scroll || 0 });
+  if (!state.editor && !state.panel && !state.form && !state.picker) {
+    const chat = renderChatLines(state, w);
     if (state.selection && state.selection.anchor && state.selection.head) {
       // Apply selection highlight directly on ANSI strings
       for (let i = 0; i < chat.length; i++) {
@@ -5014,7 +5040,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         '',
         'Shortcuts',
         '  Enter          send the message',
-        '  Shift+Enter    insert a newline',
+        '  Ctrl-J         insert a newline',
         '  Ctrl+Shift+C   copy the selection (or the last answer)',
         '  Ctrl+Shift+V   paste the clipboard (multi-line pastes collapse)',
         '  ↑ / ↓          input history (empty composer) · scroll the chat',
@@ -5751,21 +5777,12 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       // Check if this is a plugin-registered command.
       if (isPluginCommand(cmd)) {
         const pc = findCommand(cmd);
-        // NOTE: `pc` comes from the plugin registry, which does NOT carry the
-        // `_plugin` marker — that is only added by allCommands() for display. The
-        // old guard `pc._plugin` was therefore always falsy, so plugin commands
-        // fell through to "Unknown command" and never ran at all. isPluginCommand
-        // above already established that this name resolves to a plugin.
-        if (pc && typeof pc.run === 'function') {
-          // AWAIT the handler: plugins may register an async `run`, and without
-          // awaiting, a rejection escaped as an unhandled promise rejection and
-          // the catch below never saw it (the command appeared to fail silently).
-          try { await pc.run(raw, { state, cfg, session, h, app, appErr }); }
+        if (pc && pc._plugin && typeof pc.run === 'function') {
+          try { pc.run(raw, { state, cfg, session, h, app, appErr }); }
           catch (e) { appErr(`Plugin command "/${cmd}" failed: ${e.message}`); }
           return;
         }
       }
-      // Unknown command: show error message
       // Unknown command: show error message
       appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
       return;
@@ -8369,9 +8386,20 @@ export async function startTUI(opts) {
     // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
     // which is the precedence order codex documents. Previously /init wrote this
     // file and nothing ever loaded it.
-const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
+    const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
     if (agents) {
       sysText += '\n\n' + agents;
+    }
+    // GIT CONTEXT: the current branch and how many files are uncommitted. Cheap
+    // (two git calls) and it stops the model guessing whether the tree is dirty
+    // or which branch it is on. Skipped silently outside a repository.
+    {
+      const gitCwd = state.cwd || state.workspace || cfg.workspace;
+      let gitsum = '';
+      try { gitsum = gitmod.summary(gitCwd); } catch { gitsum = ''; }
+      if (gitsum) {
+        sysText += '\n\nGIT WORKING TREE (this repository, as of now):\n' + gitsum;
+      }
     }
     let messages = [{ role: 'system', content: sysText }];
     if (session.messages && session.messages.length) {
@@ -8389,10 +8417,10 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
     // from the harness, not something the user typed, and it must not show up as a
     // user bubble or be persisted as one.
-messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
-    // 只持久化对话本身，system 不进 session。转折保存交给 turn 结束处
-    // （agent.run 之后），中途不写盘以保持发消息流畅。
+    messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
+    // 只持久化对话本身，system 不进 session。
     Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
+    sess.saveSession(session);
 
     if (state.plan) {
       cfg.toolFilter = ['Read', 'Grep', 'Glob'];
@@ -8959,22 +8987,18 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
   // Appending streamed text can also add rows (the message wraps as it grows).
   // While the user is scrolled up, compensate so their view does not shift — the
   // same anchoring rule addChat applies for a whole new message.
-function anchorScroll() {
+  function anchorScroll() {
     // The arithmetic lives in anchorScrollNext() (module level, unit-tested): it
-    // takes the current chat row count and returns the new `scroll`.
+    // takes the current chat row count and returns the new `scroll`. Keeping the
+    // row-count read here means the pure part stays testable.
     //   * the baseline is refreshed even while the view is pinned at the bottom,
     //     so the first append after the user scrolls up has a real delta;
     //   * the compensation is the rows added since the previous paint.
-    //
-    // The count comes from state._chatTotal, which composeFrame() refreshes on
-    // every paint. Calling renderChatLines() here (as this used to) laid out the
-    // WHOLE transcript a second time on every streamed chunk — a full ~25k-row
-    // render per chunk on top of the windowed one, which is what made markdown
-    // output appear to stall.
-    const rows = state._chatTotal || 0;
+    // See anchorScrollNext for why the old "early return while pinned" version
+    // let the transcript drift by one row per streamed chunk.
+    const rows = renderChatLines(state, dims().cols).length;
     state.scroll = anchorScrollNext(state, rows);
   }
-
 
   // Live split of the streamed reply into prose vs. <plan> block.
   // While Plan mode is on and the model is inside <plan>…</plan>, the text is

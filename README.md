@@ -118,12 +118,13 @@ Special thanks to the communities behind these projects for pushing the boundari
 
 ## 📄 License
 
-This project is licensed under the [GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
 
 **In short:**
-1. ✅ You can freely use, modify, and share this code
-2. ✅ Must retain author attribution (NiceHello666) and link back to this repository
-3. ❌ Cannot be used for commercial purposes (e.g., selling, as part of paid products)
+1. ✅ Free for noncommercial use — personal projects, learning, research, hobby work, and noncommercial organizations
+2. ✅ You may modify and share it, provided you keep the license text and the noncommercial notice with any copy
+3. ❌ No commercial use of any kind (selling it, shipping it inside a paid product, or using it to run a commercial service)
+4. ℹ️ This is *not* a copyleft license: your own additions do not have to be published. Commercial use requires a separate license from the author.
 
 ---
 

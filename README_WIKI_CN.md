@@ -320,7 +320,7 @@ hncode -p "列出 TODO" --output-format stream-json
 | 按键 | 作用 |
 |------|------|
 | `Enter` | 发送消息。 |
-| `Ctrl-J` | 在输入框中插入换行。 |
+| `Shift+Enter` | 在输入框中插入换行。 |
 | `Ctrl-Shift-C` | 复制当前鼠标选中内容（无选中则复制最后一条回答）。 |
 | `Ctrl-Shift-V` | 粘贴剪贴板。多行粘贴会折叠成 `[paste #N +L lines]` 标记。 |
 | `↑` / `↓` | 输入框为空时：调出历史输入。否则：滚动对话。 |
@@ -373,7 +373,7 @@ hncode -p "列出 TODO" --output-format stream-json
 ### Edit 的安全模型
 
 `Edit` 不会盲改：
-
+- 必须先 `Read` 文件再 `Edit`。否则报：`Edit rejected: you have not read the lines you are editing…`。
 - 必须先 `Read` 文件再 `Edit`，且被编辑区域必须在你实际读过的快照内。否则报：`Edit rejected: you have not read the lines you are editing…`。
 - 若文件在你读取后发生了变化：`Edit rejected: <path> changed since it was Read…`。重新 `Read` 再编辑。
 
@@ -629,11 +629,12 @@ hncode 建立在这几个开源项目的理念之上：
 
 ## 17. 许可证
 
-[GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE)。
+[PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE)。
 
-1. ✅ 可自由使用、修改和分享。
-2. ✅ 必须保留原作者署名（NiceHello666）并链接回本仓库。
-3. ❌ 不得用于商业目的。
+1. ✅ 非商业用途免费——个人项目、学习、研究、业余爱好，以及非商业组织。
+2. ✅ 可以修改和分享，但任何副本都必须附带许可证全文和「不得商用」的声明。
+3. ❌ 禁止任何形式的商业使用（出售、作为付费产品的一部分、或用于运营商业服务）。
+4. ℹ️ 这不是 copyleft 许可：你自己新增的部分无需开源。商业使用需向作者单独获取授权。
 
 ---
 

@@ -50,12 +50,46 @@ export function strWidth(s) {
 // renders East Asian / wide / some symbol glyphs as 2 columns. Must be used for any
 // cursor positioning and line wrapping so an I-shaped (insert) caret lines up.
 // Source of truth: Unicode wide ranges + a small set of CJK-fused symbol glyphs.
+//
+// PERFORMANCE (this is the hottest function in the whole TUI — a profile of a
+// 500-message transcript streaming markdown put ~48% of samples in this plus
+// clusterWidth/clusterGlyphWidth/isWideByDefault):
+//   * a printable-ASCII fast path returns the length immediately. Agent output
+//     is overwhelmingly ASCII, and measuring it cost ~30 range comparisons per
+//     character for nothing. 1MB of ASCII went from 219ms to ~0.
+//   * everything else is memoised (see WIDTH_CACHE_MAX). Rows are re-measured
+//     every frame while a reply streams, and the same substrings come back
+//     again and again.
 export function visualWidth(s) {
   if (!s) return 0;
-  // Measured per GRAPHEME CLUSTER (see clusterWidth): summing charWidth per
-  // codepoint made a ZWJ emoji sequence count 8 columns instead of 2.
-  return clusterWidth(s);
+  const str = typeof s === 'string' ? s : String(s);
+  // Fast path: printable ASCII measures exactly its length.
+  if (isPrintableAscii(str)) return str.length;
+  const hit = widthCache.get(str);
+  if (hit !== undefined) return hit;
+  const w = clusterWidth(str);
+  if (widthCache.size >= WIDTH_CACHE_MAX) {
+    // Cheap eviction: drop the oldest insertion (Map preserves order).
+    const oldest = widthCache.keys().next().value;
+    if (oldest !== undefined) widthCache.delete(oldest);
+  }
+  widthCache.set(str, w);
+  return w;
 }
+
+// All code units printable ASCII? `\t`/newline/escape all fail, which is what we
+// want: those have their own width rules (tab = 4, ESC starts an ANSI sequence).
+function isPrintableAscii(str) {
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x20 || c > 0x7e) return false;
+  }
+  return true;
+}
+
+const WIDTH_CACHE_MAX = 4096;
+const widthCache = new Map();
+
 
 // ---- East Asian Width tables (Unicode 15) --------------------------------
 // Wide/Fullwidth ranges -> 2 columns. Everything else is 1 unless it is a
@@ -151,69 +185,69 @@ export function charWidth(ch) {
   // Tab renders as 4 spaces in most terminals.
   if (c === 0x09) return 4;
   if (c < 0x20 || c === 0x7F) return 0;
+  // FAST PATH: plain printable ASCII is exactly one cell wide. Without this each
+  // ASCII character paid for isZeroWidth + isWideByDefault (≈30 range tests) + a
+  // binary search, which is most of what made width measurement the hottest
+  // function in the TUI.
+  if (c >= 0x20 && c <= 0x7e) return 1;
   if (isZeroWidth(c)) return 0;
   if (isWideByDefault(c)) return 2;
   if (inRanges(c, WIDE)) return 2;
   return 1;
 }
 
-// Split a string into grapheme clusters that a terminal renders as ONE glyph.
-// Minimal but covers what actually appears in agent output: ZWJ sequences
-// (👨‍👩‍👧), variation selectors (❤️), and flag pairs (🇺🇸).
-function nextCluster(s, i) {
-  // NOTE: every offset here is a UTF-16 INDEX (what slice() consumes). Mixing
-  // in codepoint offsets desynced the scan across surrogate pairs, so a ZWJ
-  // family measured 5 columns instead of 2.
-  const at = (idx) => s.codePointAt(idx);
-  const len = (cp) => cp > 0xFFFF ? 2 : 1;
-
-  const firstCp = at(i);
-  let end = i + len(firstCp);
-  const startedRegional = isRegional(firstCp);
-
-  for (;;) {
-    if (end >= s.length) break;
-    const cp = at(end);
-    if (cp === 0x200D) {                       // ZWJ: absorb the next base too
-      end += 1;
-      if (end >= s.length) break;
-      end += len(at(end));
-      continue;
-    }
-    if (isZeroWidth(cp) || cp === 0xFE0F) { end += len(cp); continue; }
-    // A regional-indicator PAIR forms one flag glyph.
-    if (startedRegional && isRegional(cp)) { end += len(cp); break; }
-    break;
-  }
-  return { text: s.slice(i, end), next: end };
-}
+// Shared native segmenter. `Intl.Segmenter` implements the full Unicode
+// grapheme-break algorithm in native code, so it is both more correct than the
+// hand-rolled scanner it replaces (ZWJ families, flags, combining marks) and
+// much cheaper — that scanner allocated a `{text, next}` object per character,
+// which showed up as GC pressure in profiles.
+const graphemeSegmenter = typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+  : null;
 
 // Width of a whole string measured by GRAPHEME CLUSTER: a ZWJ sequence or a
 // flag counts 2 columns total, not the sum of its codepoints (which used to
 // make 👨‍👩‍👧 measure 8 columns and break every row it appeared on).
 export function clusterWidth(s) {
   const str = String(s || '');
+  if (!str) return 0;
   let w = 0;
-  for (let i = 0; i < str.length;) {
-    const { text, next } = nextCluster(str, i);
-    i = next;
-    if (!text) { i++; continue; }
-    w += clusterGlyphWidth(text);
+  if (graphemeSegmenter) {
+    // NOTE: an "ASCII runs are free" split was tried here and made things WORSE
+    // (a 500KB markdown string went 97ms -> 544ms): slicing the string into a
+    // run per CJK character costs far more than handing the whole thing to the
+    // native segmenter. The real win is the printable-ASCII fast path in
+    // visualWidth() plus the memo cache, not micro-splitting here.
+    for (const { segment } of graphemeSegmenter.segment(str)) w += clusterGlyphWidth(segment);
+    return w;
   }
+  // Fallback for a runtime without Intl.Segmenter: per code point.
+  for (const ch of str) w += clusterGlyphWidth(ch);
   return w;
 }
+// Width of one grapheme cluster. Allocation-free on the common path: a
 
+// Width of one grapheme cluster. Allocation-free on the common path: a
+// single-code-point cluster (every ASCII character, most CJK) returns
+// charWidth directly instead of first building an array of code points.
 function clusterGlyphWidth(cluster) {
-  const cps = [...cluster].map((c) => c.codePointAt(0));
+  const first = cluster.codePointAt(0);
+  if (first === undefined) return 0;
+  if (cluster.length <= (first > 0xFFFF ? 2 : 1)) return charWidth(cluster);
+
+  const cps = [];
+  for (let i = 0; i < cluster.length;) {
+    const cp = cluster.codePointAt(i);
+    cps.push(cp);
+    i += cp > 0xFFFF ? 2 : 1;
+  }
   // ZWJ sequence / flag pair / VS16-presented symbol => 2 columns.
   if (cps.includes(0x200D)) return 2;
-  if (cps.filter(isRegional).length >= 1) return 2;
-  const base = cps[0];
+  if (cps.some(isRegional)) return 2;
   if (cps.includes(0xFE0F)) return 2;          // explicit emoji presentation
-  const baseW = charWidth(String.fromCodePoint(base));
-  let extra = 0;
-  for (let k = 1; k < cps.length; k++) extra += charWidth(String.fromCodePoint(cps[k]));
-  return baseW + extra;
+  let width = charWidth(String.fromCodePoint(cps[0]));
+  for (let k = 1; k < cps.length; k++) width += charWidth(String.fromCodePoint(cps[k]));
+  return width;
 }
 
 // Estimate the LLM token count of a plain string, matching kimi-code's
@@ -264,7 +298,11 @@ export function expandTabs(s, tabSize = 8) {
       continue;
     }
     out += ch;
-    col += clusterWidth(ch);
+    // Per CHARACTER, `charWidth` is the right measure and is far cheaper than
+    // clusterWidth here: the loop already iterates code points (so a surrogate
+    // pair arrives as a single `ch`), and clusterWidth would spin up the
+    // segmenter for every single character.
+    col += charWidth(ch);
   }
   return out;
 }
