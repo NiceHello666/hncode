@@ -1,0 +1,31 @@
+/* Self-hosted faces: JetBrains Mono for everything, Noto Sans SC for CJK.
+
+   This product is Chinese-first. The UI body, the side rail, the settings, the
+   status line and the transcript are all Chinese — and JetBrains Mono has NO CJK
+   glyphs, so without Noto every Chinese character falls through to the OS font
+   and the page stops looking like one designed thing. Order matters: the mono
+   face comes first so Latin text (paths, code, numbers) gets the designed face,
+   then Noto's unicode-range shards take over for CJK.
+
+   There is deliberately no separate sans stack. kimi-code's UI is English, so it
+   can pair a Latin UI face (Geist) with a mono code face; a Chinese UI would be
+   all-Noto for the CJK anyway, so a second Latin face only ever covers the few
+   latin glyphs, at the cost of a second font and a mismatched metric. One mono
+   face that falls back to Noto reads as one thing. */
+@import './fonts/noto-sans-sc.css';
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/JetBrainsMono-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('./fonts/JetBrainsMono-Bold.woff2') format('woff2');
+}

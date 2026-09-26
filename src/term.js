@@ -264,10 +264,15 @@ export function estimateTokens(text) {
   return Math.ceil(ascii / 4) + nonAscii;
 }
 
-// Estimate tokens for the whole request payload: system + tools + messages.
+// Estimate tokens for the MESSAGES only. The system prompt and tool definitions are
+// NOT included: `messages` usually already starts with the system prompt (the TUI
+// builds `[{ role: 'system', content: sysText }, ...]`), so adding `cfg.systemPrompt`
+// on top counted it twice — and the value in `cfg` is the RAW prompt, not the
+// assembled `sysText` (calm/plan/swarm/AGENTS.md appended), so it was also the wrong
+// number. Callers that want the whole request add it themselves via
+// estimateRequestOverhead().
 export function estimateMessagesTokens(messages, cfg) {
-  let total = estimateTokens(cfg && cfg.systemPrompt);
-  if (Array.isArray(cfg && cfg.toolFilter)) total += cfg.toolFilter.length * 8; // rough tool-def overhead
+  let total = 0;
   for (const m of messages || []) {
     total += estimateTokens(m.role || '');
     const c = m.content;
@@ -278,6 +283,17 @@ export function estimateMessagesTokens(messages, cfg) {
   }
   return total;
 }
+
+// The overhead a request carries BEYOND its messages: the system prompt plus the
+// tool definitions. Passed the assembled system text so the number matches what is
+// actually sent.
+export function estimateRequestOverhead(systemText, cfg) {
+  let total = estimateTokens(systemText || '');
+  const n = (cfg && Array.isArray(cfg.toolFilter)) ? cfg.toolFilter.length : 0;
+  if (n) total += n * 8;   // rough per-tool-definition overhead
+  return total;
+}
+
 
 // Expand TAB characters to spaces at 8-column tab stops. A terminal advances a
 // tab to the NEXT tab stop, but our width math (visualWidth) counts '\t' as 0,

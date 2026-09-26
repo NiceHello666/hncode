@@ -31,14 +31,65 @@ export function anthropicToolDefs(tools) {
     input_schema: t.parameters,
   }));
 }
+// ---------------------------------------------------------------------------
+// Multimodal content
+//
+// A tool may return `{ media: [...] }` instead of a string — ReadMediaFile does,
+// so a screenshot reaches the model as an IMAGE rather than as a description of
+// one. The entries are normalized here, once, into the shapes each protocol
+// wants; everything upstream (agent, tools) stays protocol-agnostic.
+//
+//   { type: 'image', mimeType: 'image/png', data: '<base64>' }
+//   { type: 'text',  text: '...' }
+//
+// `data` is base64 WITHOUT the `data:` prefix; the prefix is added per protocol.
+
+function isMediaContent(c) {
+  return !!c && typeof c === 'object' && Array.isArray(c.media);
+}
+
+function mediaText(c) {
+  return String(c.text == null ? '' : c.text);
+}
+
+/** OpenAI: content parts, `image_url` carries the data URL. */
+function toOpenAiContent(c) {
+  const parts = [];
+  const text = mediaText(c);
+  if (text) parts.push({ type: 'text', text });
+  for (const m of c.media) {
+    if (m && m.type === 'image' && m.data) {
+      parts.push({ type: 'image_url', image_url: { url: `data:${m.mimeType || 'image/png'};base64,${m.data}` } });
+    }
+  }
+  // A media block with no image and no text would serialise as an empty array,
+  // which some providers reject. Fall back to a plain string.
+  if (!parts.length) return text || '';
+  return parts;
+}
+
+/** Anthropic: content blocks, `image` carries source bytes. */
+function toAnthropicContent(c) {
+  const blocks = [];
+  const text = mediaText(c);
+  if (text) blocks.push({ type: 'text', text });
+  for (const m of c.media) {
+    if (m && m.type === 'image' && m.data) {
+      blocks.push({ type: 'image', source: { type: 'base64', media_type: m.mimeType || 'image/png', data: m.data } });
+    }
+  }
+  if (!blocks.length) return text || '';
+  return blocks;
+}
 
 // Internal canonical messages -> OpenAI request shape.
 export function toOpenAi(messages) {
   const out = [];
   for (const m of messages) {
     if (m.role === 'system') out.push({ role: 'system', content: m.content });
-    else if (m.role === 'user') out.push({ role: 'user', content: m.content });
-    else if (m.role === 'assistant') {
+    else if (m.role === 'user') {
+      out.push({ role: 'user', content: isMediaContent(m.content) ? toOpenAiContent(m.content) : m.content });
+    } else if (m.role === 'assistant') {
       const hasText = typeof m.content === 'string' && m.content.trim();
       const hasCalls = Array.isArray(m.toolCalls) && m.toolCalls.length;
       if (!hasText && !hasCalls) continue; // 上游不允许空 assistant，直接丢弃
@@ -52,7 +103,11 @@ export function toOpenAi(messages) {
       }
       out.push(msg);
     } else if (m.role === 'tool') {
-      out.push({ role: 'tool', tool_call_id: m.toolCallId, content: m.content });
+      out.push({
+        role: 'tool',
+        tool_call_id: m.toolCallId,
+        content: isMediaContent(m.content) ? toOpenAiContent(m.content) : m.content,
+      });
     }
   }
   return out;
@@ -64,9 +119,20 @@ export function toAnthropic(messages) {
   const out = [];
   for (const m of messages) {
     if (m.role === 'system') { sys.push(m.content); continue; }
-    if (m.role === 'user') { out.push({ role: 'user', content: [{ type: 'text', text: m.content }] }); continue; }
+    if (m.role === 'user') {
+      const c = isMediaContent(m.content) ? toAnthropicContent(m.content) : [{ type: 'text', text: m.content }];
+      out.push({ role: 'user', content: c });
+      continue;
+    }
     if (m.role === 'tool') {
-      out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.toolCallId, content: m.content }] });
+      out.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: m.toolCallId,
+          content: isMediaContent(m.content) ? toAnthropicContent(m.content) : m.content,
+        }],
+      });
       continue;
     }
     if (m.role === 'assistant') {
@@ -78,7 +144,7 @@ export function toAnthropic(messages) {
       out.push({ role: 'assistant', content: blocks });
     }
   }
-  return { system: sys.join('\n\n').trim(), messages: out };
+return { system: sys.join('\n\n').trim(), messages: out };
 }
 
 function authHeaders(cfg) {
@@ -94,17 +160,31 @@ function authHeaders(cfg) {
   return h;
 }
 
-function buildBody(cfg, messages, streaming = true) {
+function buildBody(cfg, messages, streaming = true, opts = {}) {
   const common = { stream: streaming, max_tokens: cfg.maxOutputTokens };
   if (cfg.temperature != null) common.temperature = cfg.temperature;
   // Thinking / reasoning. The wire form depends on the protocol and the chosen
   // effort (see config.effortWire): OpenAI-compatible sends `reasoning_effort`,
   // Anthropic sends a `thinking` budget. Models that think by default need no
   // flag, so nothing is sent when the effort is off/unset.
-  const wire = effortWire(cfg, cfg.effort) || {};
+  //
+  // `noReasoning` opts a request OUT of it. Internal one-shot requests that cap
+  // their output (the session title, the compaction summary) must not ask for
+  // thinking: a reasoning model spends the whole small budget on
+  // `reasoning_content`, returns `finish_reason: "length"` with empty `content`,
+  // and the request comes back as a failure that never even shows an error.
+  const wire = opts.noReasoning ? {} : (effortWire(cfg, cfg.effort) || {});
+  // Internal requests that have no use for tools must not carry the ~25 KB tool
+  // block: it is pure input cost on top of a request that only wants one line.
+  const defs = Object.prototype.hasOwnProperty.call(opts, 'tools') ? openAiToolDefs(opts.tools) : openAiToolDefs(llmToolsList);
   if (cfg.protocol === 'anthropic') {
     const { system, messages: am } = toAnthropic(messages);
-    const body = { model: cfg.innerModel, system, messages: am, tools: anthropicToolDefs(llmToolsList), ...common, ...wire };
+    const body = {
+      model: cfg.innerModel, system, messages: am,
+      tools: opts.noTools ? undefined : anthropicToolDefs(opts.tools || llmToolsList),
+      ...common, ...wire,
+    };
+    if (!body.tools || !body.tools.length) delete body.tools;
     // Prompt caching: mark the stable prefix (tools + system + conversation head)
     // so the provider bills it as a cache READ instead of fresh input. The key is
     // the SESSION id, so it stays identical across turns and never thrashes.
@@ -113,7 +193,11 @@ function buildBody(cfg, messages, streaming = true) {
       sessionKey: cfg.sessionId,
     }));
   }
-  const body = { model: cfg.innerModel, messages: toOpenAi(messages), tools: openAiToolDefs(llmToolsList), ...common, ...wire };
+  const body = {
+    model: cfg.innerModel, messages: toOpenAi(messages),
+    ...common, ...wire,
+  };
+  if (!opts.noTools) body.tools = defs;
   return JSON.stringify(applyPromptCache('openai', body, {
     enabled: cfg.promptCache !== false,
     sessionKey: cfg.sessionId,
@@ -153,14 +237,18 @@ export class LLM {
   // Simple non-streaming text request — used for internal tasks (e.g. context
   // summarization during compaction) that should not surface a tool plan to the
   // user. Returns the assistant's text content or null on failure.
-  async requestText(messages) {
+  //
+  // `opts.noReasoning` / `opts.noTools` exist for the small one-shot requests:
+  // a capped budget plus a reasoning model is what silently produced an empty
+  // title (see buildBody), and an internal request has no tools to call.
+  async requestText(messages, opts = {}) {
     const cfg = this.cfg;
     this.controller = new AbortController();
     try {
       const res = await fetch(cfg.endpoint, {
         method: 'POST',
         headers: authHeaders(cfg),
-        body: buildBody(cfg, messages, false),
+        body: buildBody(cfg, messages, false, opts),
         signal: this.controller.signal,
       });
       if (!res || !res.ok) {
@@ -179,7 +267,18 @@ export class LLM {
         const msg = json.choices && json.choices[0] && json.choices[0].message;
         if (msg && msg.content) text = msg.content;
       }
-      return text || null;
+      // An EMPTY reply that hit the output cap is a failure, not an answer. The
+      // title request used to receive `content: ""` + `finish_reason: "length"`
+      // and treat it as "the model had nothing to say", which is why the title
+      // was silently never generated (and never retried). Returning it marked
+      // lets the caller decide — the title path retries with a bigger budget.
+      if (!text) {
+        const truncated = cfg.protocol === 'anthropic'
+          ? (json.stop_reason === 'max_tokens')
+          : !!(json.choices && json.choices[0] && json.choices[0].finish_reason === 'length');
+        return truncated ? '' : null;
+      }
+      return text;
     } catch (e) {
       if (e && e.name === 'AbortError') return null;
       return null;
@@ -394,9 +493,16 @@ function processEvent(protocol, raw, onEvent, state) {
 }
 
 function processOpenAI(d, onEvent, state) {
-  const delta = d.choices && d.choices[0] && d.choices[0].delta;
+  const choice = d.choices && d.choices[0];
+  const delta = choice && choice.delta;
+  const finishReason = choice && choice.finish_reason;
+  // Some servers put the final chunk's content AND its finish_reason in the SAME
+  // frame, so the stop reason has to be handled AFTER the delta — checking it
+  // only on a delta-less frame missed the truncation marker entirely (a stream
+  // that reported `length` alongside the last token looked like a normal end).
   if (!delta) {
-    if (d.choices && d.choices[0] && d.choices[0].finish_reason) {
+    if (finishReason) {
+      if (finishReason === 'length') onEvent({ type: 'truncated' });
       onEvent({ type: 'end' });
       return 'end';
     }
@@ -440,6 +546,14 @@ function processOpenAI(d, onEvent, state) {
       }
     }
   }
+  // A frame can carry BOTH the last delta and the stop reason (see above). Now
+  // that the delta is consumed, report the cut and end the round — mirroring the
+  // `message_stop` path for Anthropic.
+  if (finishReason) {
+    if (finishReason === 'length') onEvent({ type: 'truncated' });
+    onEvent({ type: 'end' });
+    return 'end';
+  }
   return 'continue';
 }
 
@@ -447,6 +561,11 @@ function processAnthropic(d, onEvent, state) {
   const t = d.type;
   if (t === 'message_start' || t === 'message_delta' || t === 'message_stop') {
     if (t === 'message_stop') { onEvent({ type: 'end' }); return 'end'; }
+    // `message_delta` carries the stop reason; `max_tokens` there means the reply
+    // was cut off, not finished (see processOpenAI for the OpenAI spelling).
+    if (t === 'message_delta' && d.delta && d.delta.stop_reason === 'max_tokens') {
+      onEvent({ type: 'truncated' });
+    }
     return 'continue';
   }
   if (t === 'content_block_start') {
@@ -481,6 +600,7 @@ export function consumeNonStreaming(protocol, json, onEvent) {
   const state = { tagPending: '', inThink: false };
   if (protocol === 'anthropic') {
     const content = json.content || [];
+    if (json.stop_reason === 'max_tokens') onEvent({ type: 'truncated' });
     for (const cb of content) {
       if (cb.type === 'text' && cb.text) feedContent(cb.text, onEvent, state);
       else if (cb.type === 'tool_use') {
@@ -490,8 +610,11 @@ export function consumeNonStreaming(protocol, json, onEvent) {
       }
     }
   } else {
-    const msg = json.choices && json.choices[0] && json.choices[0].message;
+    const choice = json.choices && json.choices[0];
+    const msg = choice && choice.message;
     if (!msg) { onEvent({ type: 'error', error: new Error('empty LLM response') }); return; }
+    // Non-streaming: the truncation marker comes on the same object as the message.
+    if (choice.finish_reason === 'length') onEvent({ type: 'truncated' });
     if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) onEvent({ type: 'think', text: msg.reasoning_content });
     else if (typeof msg.reasoning === 'string' && msg.reasoning) onEvent({ type: 'think', text: msg.reasoning });
     else if (Array.isArray(msg.reasoning_details)) {

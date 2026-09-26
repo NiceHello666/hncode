@@ -18,6 +18,7 @@
 
 import { createTask, appendTaskOutput, settleTask } from '../agent-task.js';
 import { SUBAGENT_TYPES, DEFAULT_SUBAGENT_TYPE, availableTypes, toolsForSubagent } from '../subagent-types.js';
+import { runShellHooks } from '../hooks.js';
 
 // Live subagent registry, keyed by agent id. A resumed agent keeps its own
 // message list here, which is what makes `resume` work.
@@ -105,6 +106,16 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
     signal.addEventListener('abort', () => agent.interrupt(), { once: true });
   }
   await agent.run();
+  // SHELL HOOK: SubagentStop. The subagent finished (or was interrupted); the
+  // parent-side hook can log/archive it. Never blocks.
+  // `hookConfig` may be the raw `{event:[…]}` map or a `{hooks:{…}}` wrapper
+  // (agent.js normalises it to the wrapper) — accept either.
+  const hc = subCfg.hookConfig;
+  const hookCfg = hc ? (hc.hooks ? hc : { hooks: hc }) : null;
+  if (hookCfg) {
+    await runShellHooks(hookCfg, 'SubagentStop',
+      { agentId: agentId || '', subagentType: type, prompt }, cfg.workspace);
+  }
   // The parent must receive ONLY what the subagent concluded — never its tool
   // chatter, and never its reasoning. Two things could leak in:
   //   * the aggregate `data` stream, which also contains intermediate narration;

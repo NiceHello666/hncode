@@ -5,10 +5,19 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { parse } from './toml.js';
 import { pluginConfigDefaults } from './plugin.js';
 
-const home = os.homedir();
+// Where the per-user .hncode directory lives. HNCODE_HOME overrides it, mirroring
+// Claude Code's CLAUDE_CONFIG_DIR: it lets a test (or a user keeping config on
+// another drive) relocate the whole directory instead of writing into the real
+// home. Resolved per call, NOT captured once at module load — a test that sets the
+// variable has already imported this module by then, and a captured value silently
+// wrote into the developer's actual home directory.
+function homeDir() {
+  return process.env.HNCODE_HOME || os.homedir();
+}
 
 export const DEFAULTS = {
   model: '',
@@ -60,7 +69,7 @@ export async function fetchCatalog() {
 }
 
 export function hncodeConfigFile() {
-  return process.env.HNCODE_CONFIG || path.join(home, '.hncode', 'config.toml');
+  return process.env.HNCODE_CONFIG || path.join(homeDir(), '.hncode', 'config.toml');
 }
 
 // ---- personal preferences (/personal) ----
@@ -72,9 +81,67 @@ export function hncodeConfigFile() {
 // Both are OPTIONAL; a missing/empty file injects nothing. The files are read
 // fresh on each turn, so an edit through /personal takes effect immediately.
 export function personalPromptFile(scope, workspace) {
-  if (scope === 'global') return path.join(home, '.hncode', 'PERSONAL.md');
+  if (scope === 'global') return path.join(homeDir(), '.hncode', 'PERSONAL.md');
   return path.join(workspace || process.cwd(), '.hncode', 'PERSONAL.md');
 }
+
+// ---- agent memory (/memory) --------------------------------------------------
+// Notes the AGENT writes for itself, as opposed to /personal's user-authored
+// preferences. Same shape and same injection points, but a separate file so the
+// two never overwrite each other: the user owns PERSONAL.md, the model owns
+// MEMORY.md. Two scopes, project LAST so it can refine the global one.
+//   * global  — ~/.hncode/MEMORY.md
+//   * project — <workspace>/.hncode/MEMORY.md
+export function memoryFile(scope, workspace) {
+  if (scope === 'global') return path.join(homeDir(), '.hncode', 'MEMORY.md');
+  return path.join(workspace || process.cwd(), '.hncode', 'MEMORY.md');
+}
+
+// Header for injected memory. Deliberately hedged ("notes, verify before relying")
+// so a stale entry written several sessions ago cannot masquerade as fact.
+export const MEMORY_PROMPT_HEADER =
+  'AGENT MEMORY (notes you wrote in earlier sessions; treat as context, not as\n'
+  + 'verified fact — re-check anything a current task depends on):';
+
+export function readMemoryRaw(scope, workspace) {
+  try { return fs.readFileSync(memoryFile(scope, workspace), 'utf8'); } catch { return ''; }
+}
+
+export function writeMemoryRaw(scope, workspace, text) {
+  const file = memoryFile(scope, workspace);
+  const value = String(text == null ? '' : text);
+  if (!value.trim()) {
+    try { fs.unlinkSync(file); } catch { /* already gone */ }
+    return file;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, value.replace(/\s+$/, '') + '\n', 'utf8');
+  return file;
+}
+
+// Append one note to a scope's memory, creating the file if needed. Appending
+// (rather than replacing) is what a memory tool needs: the agent records a single
+// learning and must not have to re-emit everything it knew before.
+export function appendMemory(scope, workspace, note) {
+  const text = String(note == null ? '' : note).trim();
+  if (!text) return memoryFile(scope, workspace);
+  const existing = readMemoryRaw(scope, workspace).trim();
+  const stamp = new Date().toISOString().slice(0, 10);
+  const line = `- ${text.replace(/\s+/g, ' ')}  _(${stamp})_`;
+  const body = existing ? `${existing}\n${line}` : line;
+  return writeMemoryRaw(scope, workspace, body);
+}
+
+export function readMemory(workspace) {
+  const parts = [];
+  for (const scope of ['global', 'project']) {
+    const t = readMemoryRaw(scope, workspace).trim();
+    if (t) parts.push(t);
+  }
+  if (!parts.length) return '';
+  return MEMORY_PROMPT_HEADER + '\n' + parts.join('\n\n');
+}
+
 
 // Header placed before the injected preferences, so the model knows where the
 // text came from and how much authority it has.
@@ -193,8 +260,33 @@ function loadBaseToml() {
   return base;
 }
 
+
+// A TCP port from config.toml, or `fallback` when it is absent or nonsense. TOML
+// parses `web_port = 8765` as a number but `web_port = "8765"` as a string, and a
+// hand-edited file can hold anything, so both are accepted and everything else
+// falls back rather than making the daemon fail to bind on a garbage port.
+export function tomlPort(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 65535) return fallback;
+  return Math.floor(n);
+}
+
+// A 0-1 ratio from config.toml / env. Accepts a number (0.85), a whole number
+// (85 = 85%), or a percent string ("85%"). Anything outside (0,1) falls back.
+export function clampRatio(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const s = String(value).trim();
+  const pct = s.endsWith('%');
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return fallback;
+  const v = pct ? n / 100 : (n > 1 ? n / 100 : n);
+  return (v > 0 && v < 1) ? v : fallback;
+}
+
 export function resolveConfig() {
   const root = loadBaseToml() || {};
+  // Merge plugin-provided defaults UNDER the user's config: an explicitly set
   // Merge plugin-provided defaults UNDER the user's config: an explicitly set
   // user value always wins.
   for (const [k, v] of Object.entries(pluginConfigDefaults || {})) {
@@ -250,7 +342,7 @@ const b = baseUrl.replace(/\/+$/, '');
   // `contextLength` (discovered from the provider's /v1/models), then the
   // default. This is what stops every model from being pinned to 128k.
   const overrideContext = process.env.HNCODE_MAX_CONTEXT || root.max_context_size || root.max_context_tokens;
-  const modelContext = Number(modelEntry.contextLength || modelEntry.context_length || modelEntry.max_context_size || 0);
+  const modelContext = Number(modelEntry.contextLength || modelEntry.context_length || modelEntry.context_window || modelEntry.max_context_size || 0);
   const maxContext = Number(overrideContext || modelContext || DEFAULTS.maxContextTokens);
   const maxOutput = Number(process.env.HNCODE_MAX_OUTPUT || root.max_output_size || DEFAULTS.maxOutputTokens);
   const reasoning = process.env.HNCODE_REASONING ? /^(1|true|yes)$/i.test(process.env.HNCODE_REASONING) : !!root.reasoning;
@@ -262,10 +354,32 @@ const b = baseUrl.replace(/\/+$/, '');
     maxContextTokens: maxContext, maxOutputTokens: maxOutput, reasoning,
     workspace: process.env.HNCODE_WORKSPACE || root.workspace || DEFAULTS.workspace,
     allowExternal,
+    // Standing permission rules (see permissions.js). `[permissions]` in config.toml:
+    //   [permissions]
+    //   allow = ["Bash(npm run test *)", "Read(./src/**)"]
+    //   ask   = ["Bash(git push *)"]
+    //   deny  = ["Read(./.env)"]
+    // Checked before the mode rules, so a deny cannot be escaped by switching to
+    // Auto and an explicit ask still prompts inside it.
+    permissions: {
+      allow: Array.isArray(root.permissions && root.permissions.allow) ? root.permissions.allow.map(String) : [],
+      ask: Array.isArray(root.permissions && root.permissions.ask) ? root.permissions.ask.map(String) : [],
+      deny: Array.isArray(root.permissions && root.permissions.deny) ? root.permissions.deny.map(String) : [],
+    },
     // A user-supplied system prompt (set via /set-system-prompt). Empty means
     // "use the built-in SYSTEM_PROMPT". Read from config.toml so it persists
     // across restarts.
     systemPrompt: process.env.HNCODE_SYSTEM_PROMPT || root.system_prompt || '',
+    // ---- Web UI daemon -------------------------------------------------------
+    // One daemon serves EVERY hncode session on this machine: it holds the fixed
+    // port, proxies each session's requests to that session's own loopback
+    // server, and reads the sessions on disk for the ones whose TUI has exited.
+    // These live in config.toml so the address and the token stay the SAME across
+    // restarts — a browser bookmark and a saved token keep working, which is the
+    // whole point of a single global UI.
+    webHost: process.env.HNCODE_WEB_HOST || root.web_host || '127.0.0.1',
+    webPort: tomlPort(process.env.HNCODE_WEB_PORT || root.web_port, 8765),
+    webToken: process.env.HNCODE_WEB_TOKEN || root.web_token || '',
     // CALM MODE (/calm-mode): persisted boolean. When true an instruction is
     // appended to the system prompt to suppress narration.
     calmMode: process.env.HNCODE_CALM_MODE
@@ -287,12 +401,43 @@ const b = baseUrl.replace(/\/+$/, '');
       ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_UPDATE)
       : (root.auto_update === true || root.auto_update === 'true'),
     // AUTO-COMPACTION (/auto-compact): when true, the agent summarizes older
-    // history once a request reaches 85% of the model context. Default ON. Set
-    // `auto_compact = false` (or HNCODE_AUTO_COMPACT=0) to turn it off.
+    // history once a request reaches the trigger ratio of the model context.
+    // Default ON. Set `auto_compact = false` (or HNCODE_AUTO_COMPACT=0) to turn it off.
     autoCompact: process.env.HNCODE_AUTO_COMPACT
       ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_COMPACT)
       : !(root.auto_compact === false || root.auto_compact === 'false'),
-    // PROMPT CACHE (/cache): explicit cache breakpoints for long stable prefixes.
+    // COMPACTION TUNING (config.toml):
+    //   compact_threshold  — fraction of the model window at which auto-compaction
+    //                        fires (default 0.85 = 85%).
+    //   compact_keep_ratio — fraction of the CURRENT usage to KEEP after a
+    //                        compaction (default 0.2 = keep ~20% of what was used).
+    // Both accept a number (0-1) or a percent string ("85%"). Env overrides:
+    // HNCODE_COMPACT_THRESHOLD / HNCODE_COMPACT_KEEP_RATIO.
+    compactThreshold: clampRatio(
+      process.env.HNCODE_COMPACT_THRESHOLD || root.compact_threshold, 0.85,
+    ),
+    compactKeepRatio: clampRatio(
+      process.env.HNCODE_COMPACT_KEEP_RATIO || root.compact_keep_ratio, 0.2,
+    ),
+    // TOOL-RESULT TRIMMING (config.toml), the cheaper cousin of compaction: old
+    // tool outputs are elided from the REQUEST (never from the saved history) once
+    // it grows past the trigger, down to the keep fraction of the tool-result text.
+    //   auto_trim          — ON by default; `false` never trims automatically.
+    //   trim_threshold     — fire when the request reaches this fraction of the
+    //                        model window (default 0.5 = 50%).
+    //   trim_keep_ratio    — fraction of the tool-result text to KEEP (default
+    //                        0.3 = keep 30%, so ~70% of it is elided).
+    // Both accept a number (0-1) or a percent string ("50%"). Env overrides:
+    // HNCODE_AUTO_TRIM / HNCODE_TRIM_THRESHOLD / HNCODE_TRIM_KEEP_RATIO.
+    autoTrim: process.env.HNCODE_AUTO_TRIM
+      ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_AUTO_TRIM)
+      : !(root.auto_trim === false || root.auto_trim === 'false'),
+    trimThreshold: clampRatio(
+      process.env.HNCODE_TRIM_THRESHOLD || root.trim_threshold, 0.5,
+    ),
+    trimKeepRatio: clampRatio(
+      process.env.HNCODE_TRIM_KEEP_RATIO || root.trim_keep_ratio, 0.3,
+    ),
     // Default ON — it only ever adds provider-recognised markers, and an
     // unsupported field on a non-caching gateway is filtered out in cache.js.
     // Set HNCODE_PROMPT_CACHE=0 or `prompt_cache = false` to disable.
@@ -405,7 +550,46 @@ export function setConfigString(key, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, out.join('\n') + (out.length ? '\n' : ''), 'utf8');
   return file;
+  return file;
 }
+
+// The Web UI's access token, generated ONCE and persisted to config.toml.
+//
+// It is deliberately not regenerated per launch: the daemon outlives individual
+// sessions, and a token that changed on every restart would invalidate every
+// browser's saved cookie and force a re-login each time — which defeats having a
+// single stable UI. `HNCODE_WEB_TOKEN` overrides for scripted setups.
+export function ensureWebToken() {
+  const fromEnv = (process.env.HNCODE_WEB_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  const cfg = resolveConfig();
+  if (cfg.webToken) return cfg.webToken;
+  // 32 random bytes, base64url: 43 chars, URL- and cookie-safe, ~256 bits.
+  const token = crypto.randomBytes(32).toString('base64url');
+  try { setConfigString('web_token', token); }
+  catch { /* read-only config: the token lives for this run only */ }
+  return token;
+}
+
+// Write a boolean root-level key as a TOML LITERAL (`key = true`), not a string.
+
+// Write a boolean root-level key as a TOML LITERAL (`key = true`), not a string.
+// setConfigString() renders every value as a quoted string, so `true` would land
+// as `"true"` — which reads back as a truthy string rather than a boolean, and
+// would make `key = false` truthy. Reuses setConfigString for the surgery (it
+// already knows how to replace a key in place and where a new root key goes), then
+// rewrites the one line it produced.
+export function setConfigBool(key, value) {
+  const file = setConfigString(key, String(!!value));
+  let text = fs.readFileSync(file, 'utf8');
+  const wanted = `${key} = ${value ? 'true' : 'false'}`;
+  const re = new RegExp('^\\s*' + escapeRe(key) + '\\s*=\\s*.*$', 'm');
+  if (re.test(text)) text = text.replace(re, wanted);
+  else text = wanted + '\n' + text;
+  fs.writeFileSync(file, text, 'utf8');
+  return file;
+}
+
 
 // Render `key = <value>` as TOML. Uses a multi-line basic string when the value
 // contains newlines (readable, and TOML-valid), a plain one otherwise.
@@ -544,9 +728,16 @@ function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
 // Fetch the model list from a provider's API. The base URL is used as given and
 // we append only `/models` (so `https://host/v1` → `https://host/v1/models`).
 // Anthropic sends x-api-key + anthropic-version. Returns [{id, display}] or [].
-export async function fetchModels({ baseUrl, apiKey, protocol }) {
+export async function fetchModels({ baseUrl, apiKey, protocol, throwOnError = false }) {
   const b = String(baseUrl || '').replace(/\/+$/, '');
-  if (!b) return [];
+  if (!b) {
+    // `throwOnError` makes a failure LOUD instead of an empty list. The model
+    // pickers use the quiet form — "no models" is a normal state there — but a
+    // user who pressed "discover models" and got nothing needs to know whether
+    // the endpoint refused the key or simply has no catalogue.
+    if (throwOnError) throw new Error('no base URL');
+    return [];
+  }
   const url = `${b}/models`;
   const headers = { 'content-type': 'application/json' };
   if (protocol === 'anthropic') {
@@ -559,7 +750,10 @@ export async function fetchModels({ baseUrl, apiKey, protocol }) {
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
     const res = await fetch(url, { headers, signal: ctrl.signal });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      if (throwOnError) throw new Error(`${res.status} ${res.statusText || ''}`.trim());
+      return [];
+    }
     const json = await res.json();
     // OpenAI: { data: [{ id }] }  |  Anthropic: { data: [{ id, display_name }] }
     const arr = Array.isArray(json.data) ? json.data : (Array.isArray(json.models) ? json.models : []);
@@ -567,7 +761,7 @@ export async function fetchModels({ baseUrl, apiKey, protocol }) {
       id: String(m.id || m.name || ''),
       display: m.display_name || m.displayName || '',
       // Capability hints (servers vary in what they expose).
-      contextLength: m.context_length || m.contextLength || undefined,
+      contextLength: m.context_length || m.contextLength || m.context_window || undefined,
       maxTokens: m.max_tokens || undefined,          // NEW: per-model token limit from /v1/models
       maxOutputTokens: m.max_output_tokens || m.maxOutputTokens || undefined,
       ownedBy: m.owned_by || undefined,
@@ -577,9 +771,13 @@ export async function fetchModels({ baseUrl, apiKey, protocol }) {
         || undefined,
       efforts: m.reasoning_efforts || m.supported_efforts || undefined,
     })).filter((m) => m.id);
-  } catch { return []; }
-  finally { clearTimeout(timer); }
+  } catch (e) {
+    if (throwOnError) throw e;
+    return [];
+  } finally { clearTimeout(timer); }
 }
+
+// ---- thinking effort capability ----
 
 // ---- thinking effort capability ----
 // The set of selectable efforts for a model. Honours, in order:
@@ -643,10 +841,12 @@ export function bareModelId(provider, key, entry) {
   const e = entry || {};
   const providerName = e.provider || provider || '';
   const k = String(key || '');
-  // API 只需要 model id 本身（可能带子前缀，如 qoder/deepseek-flash），
-  // 不要 hncode 的 provider 前缀（traebuddy/）。所以剥掉 "<provider>/"。
+  // The API wants the model id on its own (it may carry a sub-prefix like
+  // "qoder/deepseek-flash"), NOT hncode's provider prefix ("traebuddy/"), so
+  // "<provider>/" is stripped off.
   if (providerName && k.startsWith(providerName + '/')) return k.slice(providerName.length + 1);
-  // key 没有 provider 前缀时，显式 model 字段优先；否则用 key 本身。
+  // When the key has no provider prefix, an explicit `model` field wins;
+  // otherwise the key itself is the id.
   const fromField = typeof e.model === 'string' ? e.model : '';
   return fromField || k;
 }
@@ -729,7 +929,7 @@ function contextForModel(cfg, modelName) {
   const models = (root.models) || {};
   const overrideContext = process.env.HNCODE_MAX_CONTEXT || root.max_context_size || root.max_context_tokens;
   const entry = models[modelName] || {};
-  const modelContext = Number(entry.contextLength || entry.context_length || entry.max_context_size || 0);
+  const modelContext = Number(entry.contextLength || entry.context_length || entry.context_window || entry.max_context_size || 0);
   return Number(overrideContext || modelContext || DEFAULTS.maxContextTokens);
 }
 

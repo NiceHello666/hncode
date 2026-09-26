@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>hncode</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="rail" data-i18n-aria-label="rail.ariaLabel">
+    <div class="rail-search">
+      <input id="rail-filter" type="text" autocomplete="off" spellcheck="false"
+             data-i18n-placeholder="rail.search">
+    </div>
+    <div class="rail-meta">
+      <span id="rail-count" class="rail-count mono"></span>
+      <span class="rail-sep"></span>
+      <span id="conn" class="dot dot-off"></span>
+      <span id="conn-text" class="rail-conn"></span>
+    </div>
+    <div id="rail-list" class="rail-list"></div>
+    <div class="rail-foot">
+      <a class="rail-link" href="/" data-i18n="rail.all"></a>
+      <button id="btn-settings" class="rail-link" data-i18n="settings.open"></button>
+      <span class="rail-spacer"></span>
+      <div class="nav-lang" id="lang-switch"></div>
+    </div>
+  </aside>
+
+  <!-- Tapping outside the rail drawer closes it. -->
+  <div id="rail-scrim" class="rail-scrim"></div>
+
+  <main class="main">
+
+
+
+    <div class="sess-head">
+      <!-- On a narrow screen the rail becomes a drawer, so the header carries
+           the button that opens it. It is hidden while the rail is a permanent
+           column, where opening is already done. -->
+      <button id="btn-rail" class="icon-btn rail-toggle" data-i18n-title="rail.open">
+        <span aria-hidden="true">&#9776;</span>
+      </button>
+      <span id="sess-title" class="sess-title"></span>
+      <span id="sess-id" class="sess-id mono"></span>
+      <span id="readonly-badge" class="readonly-badge" data-i18n="nav.readonly" hidden></span>
+      <span class="sess-spacer"></span>
+    </div>
+
+    <nav class="tabs" data-i18n-aria-label="nav.ariaLabel">
+      <button class="tab is-on" data-view="chat" data-i18n="nav.chat"></button>
+      <button class="tab" data-view="tasks" data-i18n="nav.tasks"></button>
+      <button class="tab" data-view="files" data-i18n="nav.files"></button>
+      <button class="tab" data-view="tools" data-i18n="nav.tools"></button>
+      <button class="tab" data-view="commands" data-i18n="nav.commands"></button>
+      <button class="tab" data-view="logs" data-i18n="nav.logs"></button>
+      <span class="tab-spacer"></span>
+
+      <span id="view-sub" class="tab-sub"></span>
+    </nav>
+
+    <div class="body">
+      <section id="view-chat" class="view">
+        <div id="stream" class="stream" tabindex="0"></div>
+      </section>
+
+      <section id="view-tasks" class="view" hidden>
+        <div id="tasks" class="cards"></div>
+      </section>
+
+      <section id="view-files" class="view" hidden>
+        <div id="files" class="cards"></div>
+      </section>
+
+      <section id="view-tools" class="view" hidden>
+        <div id="tools" class="cards"></div>
+      </section>
+
+      <section id="view-commands" class="view" hidden>
+        <div id="commands" class="cards"></div>
+      </section>
+
+      <section id="view-logs" class="view" hidden>
+        <div class="logs-bar">
+          <button id="logs-clear" class="btn-quiet" data-i18n="logs.clear"></button>
+        </div>
+        <div id="logs" class="logs"></div>
+      </section>
+    </div>
+
+<div class="stack">
+      <!-- Working heads the work area: what the agent is doing right now is the
+           most current thing, so it sits above the todo/queue panels and the
+           composer. When there is nothing else, it is the only row above input. -->
+      <div id="working" class="working" hidden><span id="working-text"></span></div>
+
+      <!-- Each panel's top edge is a rule that doubles as a DRAG HANDLE, and its
+           heading is the panel's TITLE (cyan, bold) — both matching the terminal,
+           which draws `───` then `  Todo` in `C.cyan + C.bold` and marks that
+           rule as the resize hitbox. -->
+      <div id="todo-panel" class="stack-panel" hidden>
+        <div class="stack-rule" data-resize="todo" role="separator" aria-orientation="horizontal"></div>
+        <span class="stack-label" data-i18n="side.todos"></span>
+        <ul id="st-todos" class="todos"></ul>
+      </div>
+      <div id="queue-panel" class="stack-panel" hidden>
+        <div class="stack-rule" data-resize="queue" role="separator" aria-orientation="horizontal"></div>
+        <span class="stack-label" data-i18n="side.queue"></span>
+        <ul id="st-queue" class="todos"></ul>
+      </div>
+<div id="complete" class="complete" hidden></div>
+
+      <form id="composer" class="composer">
+        <span id="pmode" class="pmode" data-i18n-title="chat.shellHint">&rsaquo;</span>
+        <textarea id="input" rows="1" spellcheck="false" data-i18n-placeholder="chat.placeholder"></textarea>
+        <!-- Interrupt lives next to the composer, not in the header. It is the
+             action you reach for WHILE a turn runs, and the composer is where
+             you already are; the header put it a screen away from the thing it
+             interrupts. It replaces Send while busy, so the two never compete
+             for the same edge. -->
+        <button type="button" id="btn-interrupt" class="btn is-stop" data-i18n="chat.interrupt" hidden></button>
+        <button type="submit" id="send" class="btn" data-i18n="chat.send"></button>
+      </form>
+
+
+      <div id="statusline" class="statusline"></div>
+    </div>
+  </main>
+</div>
+
+<div id="popover" class="popover" hidden>
+  <div class="popover-title" id="popover-title"></div>
+  <div class="popover-list" id="popover-list"></div>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-box" id="modal-box" role="dialog" aria-modal="true">
+    <div id="modal-title" class="modal-title"></div>
+    <div id="modal-body" class="modal-body"></div>
+    <div id="modal-actions" class="modal-actions"></div>
+  </div>
+</div>
+
+<div id="settings" class="overlay" hidden>
+  <div class="overlay-box" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <header class="overlay-head">
+      <h2 id="settings-title" data-i18n="settings.title"></h2>
+      <button id="settings-close" class="btn-quiet" data-i18n="settings.close"></button>
+    </header>
+    <div class="overlay-body">
+      <section class="set-group">
+        <h3 data-i18n="settings.session"></h3>
+        <div class="set-row">
+          <label for="set-title" data-i18n="settings.titleLabel"></label>
+          <input id="set-title" type="text" autocomplete="off" spellcheck="false">
+          <button id="set-title-save" class="btn-quiet" data-i18n="settings.save"></button>
+        </div>
+        <p id="set-session-id" class="muted mono"></p>
+      </section>
+      <section class="set-group">
+        <h3 data-i18n="settings.providers"></h3>
+        <div id="provider-list" class="set-list"></div>
+        <div class="set-row">
+          <input id="np-name" type="text" placeholder="name" data-i18n-placeholder="settings.phName" autocomplete="off" spellcheck="false">
+          <input id="np-url" type="text" placeholder="base URL" data-i18n-placeholder="settings.phUrl" autocomplete="off" spellcheck="false">
+          <input id="np-key" type="password" placeholder="API key" data-i18n-placeholder="settings.phKey" autocomplete="off">
+          <select id="np-proto"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select>
+          <button id="np-add" class="btn" data-i18n="settings.addProvider"></button>
+        </div>
+        <div class="set-row">
+          <button id="imp-known" class="btn-quiet" data-i18n="settings.importKnown"></button>
+          <input id="imp-filter" type="text" placeholder="filter" data-i18n-placeholder="settings.phFilter" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="known-list" class="set-list" hidden></div>
+      </section>
+      <section class="set-group">
+        <h3 data-i18n="settings.prefs"></h3>
+        <div id="pref-list" class="set-list"></div>
+      </section>
+      <section class="set-group">
+        <h3 data-i18n="settings.info"></h3>
+        <dl id="cfg-view" class="kv"></dl>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="notice" class="notice" hidden></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -32,13 +32,25 @@ export function newTaskId(prefix = 'task') {
 
 // Decode a task's buffered chunks for display. Buffer chunks (Bash) are UTF-8;
 // string chunks (Agent/AgentSwarm) are already text.
+//
+// Tolerant of a RESTORED task: after a session round-trip the chunks may be
+// strings, Buffers, `{type:'Buffer',data:[…]}` objects (what JSON.stringify does
+// to a Buffer), or nothing at all. Anything unrecognisable is stringified rather
+// than thrown on — a display helper must never be able to take the TUI down, and
+// the output panel is exactly where a half-restored task shows up.
 function decodeTaskOutput(chunks) {
-  const list = chunks || [];
+  if (chunks == null) return '';
+  const list = Array.isArray(chunks) ? chunks : [chunks];
   if (!list.length) return '';
-  const allStrings = list.every((c) => typeof c === 'string');
-  if (allStrings) return list.join('');
-  try { return Buffer.concat(list.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c))))).toString('utf8'); }
-  catch { return list.map((c) => String(c)).join(''); }
+  const normalize = (c) => {
+    if (Buffer.isBuffer(c)) return c;
+    if (c && c.type === 'Buffer' && Array.isArray(c.data)) return Buffer.from(c.data);
+    if (typeof c === 'string') return c;
+    return String(c);
+  };
+  const items = list.map(normalize);
+  try { return Buffer.concat(items.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(c)))).toString('utf8'); }
+  catch { return items.map((c) => String(c)).join(''); }
 }
 
 // The task store lives on the agent ctx (`ctx.tasks`), so every tool and the TUI
@@ -98,12 +110,22 @@ export function createTask(ctx, kind, options = {}) {
   //   * a process appends Buffer chunks -> decode as UTF-8
   //   * an agent/swarm appends strings  -> join
   // Callers may override this getter when they need a different decoding.
+  defineOutputGetter(task);
+  tasks[task.taskId] = task;
+  return task;
+}
+
+// Install the lazy `output` getter. Extracted so a RESTORED task can have it
+// reinstalled: JSON.stringify resolves the getter into a plain string property, so
+// a reloaded record carries a frozen snapshot instead of a live view (see
+// appendTaskOutput, which repairs both `_chunks` and the getter). `configurable`
+// must stay true or the reinstall would throw on an already-defined property.
+export function defineOutputGetter(task) {
   Object.defineProperty(task, 'output', {
     enumerable: true,
     configurable: true,
     get() { return decodeTaskOutput(this._chunks); },
   });
-  tasks[task.taskId] = task;
   return task;
 }
 
@@ -111,8 +133,56 @@ export function createTask(ctx, kind, options = {}) {
 export const MAX_TASK_OUTPUT_BYTES = 2 * 1024 * 1024;
 
 // Append raw bytes/chunks to a task, trimming the oldest past the cap.
+//
+// `_chunks` is repaired rather than assumed. The task store is reachable from
+// three directions — created in-process, restored with a SESSION
+// (`state.tasks`/`ctx.tasks` are copied verbatim into the session JSON and read
+// back), and handed around between tools — so a record can arrive here without an
+// array. A session round-trip also turns Buffers into `{type:'Buffer',data:[…]}`
+// plain objects (JSON has no Buffer), and a record that never produced output can
+// come back with no `_chunks` at all.
+//
+// This matters beyond tidiness: the only production callers are stdout/stderr
+// 'data' listeners on a ChildProcess, and a throw inside an event listener is NOT
+// caught by the surrounding tool. A missing array therefore surfaces as an
+// unhandledRejection that kills the whole TUI mid-tool-call, with nothing printed
+// (the exit handler wipes the alternate screen). Both observed shapes —
+// "undefined.push" and "null.push" — come from exactly this line.
 export function appendTaskOutput(task, chunk) {
   if (!task || chunk == null) return;
+  if (!Array.isArray(task._chunks)) {
+    // Salvage whatever the old value held: a single chunk, an array-like, or a
+    // serialized Buffer object. A Buffer must be revived from its JSON form or the
+    // decoder would later try to concat a plain object.
+    const prev = task._chunks;
+    const revived = [];
+    if (prev != null) {
+      const items = Array.isArray(prev) ? prev : [prev];
+      for (const item of items) {
+        if (item && item.type === 'Buffer' && Array.isArray(item.data)) revived.push(Buffer.from(item.data));
+        else if (item != null) revived.push(item);
+      }
+    }
+    task._chunks = revived;
+    // `_bytes` may be missing too on a restored record; recount from what we kept
+    // so the size cap works from here on instead of comparing against undefined.
+    task._bytes = revived.reduce((n, c) => n + (c.length || 0), 0);
+  }
+  // `JSON.stringify` does not preserve the `output` GETTER: it reads the getter and
+  // stores the resulting STRING as an ordinary own property. A restored task's
+  // `_chunks` is still an array, so the repair above does NOT run for it — but its
+  // `output` is a frozen snapshot that no longer tracks `_chunks`, and would keep
+  // reporting the pre-save text (or `undefined`) for the rest of the session.
+  // Reinstall the live getter whenever the property is a data value rather than an
+  // accessor. Checked on every append; after the first repair it is an accessor and
+  // this is a cheap no-op.
+  try {
+    const desc = Object.getOwnPropertyDescriptor(task, 'output');
+    if (!desc || !desc.get) {
+      if (desc) delete task.output;
+      defineOutputGetter(task);
+    }
+  } catch { /* a frozen record still appends correctly, only its display lags */ }
   task._chunks.push(chunk);
   task._bytes = (task._bytes || 0) + (chunk.length || 0);
   while (task._bytes > MAX_TASK_OUTPUT_BYTES && task._chunks.length > 1) {

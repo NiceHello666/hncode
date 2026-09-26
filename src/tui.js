@@ -25,10 +25,14 @@ import { visualWidth, estimateTokens, estimateMessagesTokens, expandTabs } from 
 import { Agent, SYSTEM_PROMPT } from './agent.js';
 import { LLM } from './llm.js';
 import * as sess from './session.js';
-import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor } from './config.js';
+import { convRowFor } from './session.js';
+import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, setConfigBool, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor, readMemory, readMemoryRaw, writeMemoryRaw, memoryFile, ensureWebToken, effectiveSnapshot } from './config.js';
 import { pluginCommands } from './plugin.js';
 import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
-import { getTool } from './tools/index.js';
+import { getTool, toolNames } from './tools/index.js';
+import { decideFromRules, describeRules } from './permissions.js';
+import { SessionHub } from './session-hub.js';
+import { startWebServer } from './web.js';
 import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
@@ -38,10 +42,13 @@ import { sortedTasks, getTask, settleTask, STATUS_LABEL, backgroundTaskCard } fr
 import { localVersion } from './version.js';
 import { listSkills, readSkill, importSkill, deleteSkill, skillPrompt, skillCompletions, normalizeSkillName, SKILL_PREFIX, skillsDir } from './skills.js';
 import { loadHooks, describeHooks, runShellHooks, HOOK_EVENTS } from './hooks.js';
+import { beginTurn, rewind as rewindFiles, describeRewind } from './file-history.js';
+import { trimToolResults } from './tool-result.js';
 import * as gitmod from './git.js';
 import { reviewLines, savePlan, filesReferenced, planStats, listPlans, plansDir } from './plan.js';
 import { loadMcpConfig, describeServers, getLiveConnections } from './mcp.js';
 import { startControlServer } from './ci.js';
+import { attachToDaemon } from './web-daemon-client.js';
 
 const ESC = '\x1b';
 const VERSION = localVersion();
@@ -50,14 +57,17 @@ const VERSION = localVersion();
 // Mirrors kimi-code-cli's BUILTIN_SLASH_COMMANDS (registry.ts): name, aliases,
 // description, and an argument hint. Commands are sorted by priority so the
 // most useful appear first in the `/` menu.
+// Monotonic counter for /search: each query bumps it so a slow ripgrep result
+// from an earlier keystroke is discarded instead of overwriting newer hits.
+let searchSeq = 0;
 export const COMMANDS = [
-  { name: 'yolo', aliases: ['yes'], desc: 'Ask When Needed mode: anything inside the workspace (edits, writes, commands) runs automatically; paths outside it, destructive commands, questions and plans still ask.', priority: 101 },
+  { name: 'yolo', aliases: ['yes'], desc: 'Yolo mode: anything inside the workspace (edits, writes, commands) runs automatically; paths outside it, destructive commands, questions and plans still ask.', priority: 101 },
   { name: 'permission', desc: 'Select permission mode', priority: 100 },
   { name: 'settings', aliases: ['config'], desc: 'Open settings (model / permission / statusline)', priority: 100 },
   { name: 'plan', desc: 'Toggle plan mode', priority: 100, argumentHint: '[on|off|clear]' },
   { name: 'focus', desc: 'Toggle Focus mode (minimal tools first, full tools after)', priority: 98, argumentHint: '[on|off]' },
-  { name: 'auto', desc: 'Never Ask mode: never interrupts you; everything runs and is decided automatically.', priority: 99 },
-  { name: 'ask', aliases: ['manual'], desc: 'Always Ask mode: read-only runs automatically; every other action asks first.', priority: 99 },
+  { name: 'auto', desc: 'Auto mode: never interrupts you; everything runs and is decided automatically.', priority: 99 },
+  { name: 'ask', aliases: ['manual'], desc: 'Ask mode: read-only runs automatically; every other action asks first.', priority: 99 },
   { name: 'model', desc: 'Switch LLM model', priority: 100 },
   { name: 'effort', aliases: ['thinking'], desc: 'Switch thinking effort', priority: 95, argumentHint: '[off|on|high|medium|low]' },
   { name: 'provider', aliases: ['providers'], desc: 'Manage AI providers (add / delete)', priority: 95 },
@@ -71,10 +81,14 @@ export const COMMANDS = [
   { name: 'goal', aliases: ['objective'], desc: 'Start or manage an autonomous goal', priority: 80, argumentHint: '[status|pause|resume|cancel] | <objective>' },
   { name: 'init', desc: 'Generate or update AGENTS.md from the codebase', priority: 70, argumentHint: '[instructions]' },
   { name: 'fork', desc: 'Fork the current session into a copy without switching to it', priority: 80 },
-  { name: 'undo', desc: 'Withdraw the last prompt from the transcript', priority: 80, argumentHint: '[count]' },
+  { name: 'undo', desc: 'Withdraw the last prompt: transcript + files it changed', priority: 80, argumentHint: '[count]' },
+  { name: 'trim', desc: 'Trim old tool results now, down to the keep ratio (manual)', priority: 40, argumentHint: '[0.3]' },
+  { name: 'auto-trim', aliases: ['autotrim'], desc: 'Auto tool-result trimming: toggle, or set the trigger/keep ratios', priority: 40, argumentHint: '[on|off | threshold <n> | keep <n>]' },
   { name: 'title', aliases: ['rename'], desc: 'Set or show session title (also sets window title)', priority: 60, argumentHint: '<title>' },
   { name: 'status', desc: 'Show current session and runtime status', priority: 60 },
   { name: 'usage', desc: 'Show session tokens + context window', priority: 60 },
+  { name: 'context', aliases: ['ctx'], desc: 'Break down what fills the context window', priority: 60 },
+  { name: 'search', aliases: ['grep'], desc: 'Search the project and insert the hit into the composer', priority: 60, argumentHint: '[query]' },
   { name: 'mcp', desc: 'Show MCP server status', priority: 60 },
   { name: 'mcp-config', desc: 'Configure MCP servers (list / add / remove)', priority: 60 },
   { name: 'statusline', desc: 'Configure which items appear in the status line', priority: 60 },
@@ -84,6 +98,9 @@ export const COMMANDS = [
   { name: 'copy', desc: 'Copy the last assistant message to the clipboard', priority: 40 },
   { name: 'set-system-prompt', aliases: ['system-prompt'], desc: 'Edit the system prompt, or load one of the model-family presets', priority: 60 },
   { name: 'personal', aliases: ['preferences'], desc: 'Edit personal preferences injected into every prompt (global or per-project)', priority: 60, argumentHint: '[global|project]' },
+  { name: 'permissions', aliases: ['rules'], desc: 'Show or edit standing allow/ask/deny rules for tools', priority: 60, argumentHint: '[edit]' },
+  { name: 'external', aliases: ['allow-external'], desc: 'Toggle access to paths outside the workspace (persisted)', priority: 60, argumentHint: '[on|off]' },
+  { name: 'web', desc: 'Serve this session to a browser (token-protected; loopback by default)', priority: 60, argumentHint: '[bindIp] [port] | off' },
   { name: 'calm-mode', desc: 'Terse replies: stop the model narrating what it will do and why unless asked', priority: 60, argumentHint: '[on|off]' },
   { name: 'add-dir', desc: 'Add or list an additional workspace directory', priority: 60, argumentHint: '[list] | <path>' },
   { name: 'move', desc: 'Move current session to another directory (must exist)', priority: 60, argumentHint: '<path>' },
@@ -105,13 +122,30 @@ export const COMMANDS = [
   { name: 'rebase', desc: 'Rebase the current branch onto another (asks first)', priority: 60, argumentHint: '<branch>' },
   { name: 'cache', desc: 'Toggle prompt caching for long stable prefixes (saves input tokens)', priority: 58, argumentHint: '[on|off]' },
   { name: 'logout', aliases: ['disconnect'], desc: 'Log out of a configured provider', priority: 40 },
-  { name: 'feedback', aliases: ['bug'], desc: 'Send feedback to the maintainers', priority: 60 },
+  { name: 'feedback', aliases: ['bug'], desc: 'Open a prefilled GitHub issue (title + body)', priority: 60, argumentHint: '<title> | <body>' },
   { name: 'update', desc: 'Check for and install a newer version', priority: 40, argumentHint: '[-y]' },
   { name: 'auto-update', desc: 'Toggle automatic background updates (check at startup + every 30 min)', priority: 40, argumentHint: '[on|off]' },
-  { name: 'auto-compact', aliases: ['autocompact'], desc: 'Toggle automatic context compaction at 85% of the window', priority: 40, argumentHint: '[on|off]' },
+  { name: 'auto-compact', aliases: ['autocompact'], desc: 'Auto context compaction: toggle, or set the trigger/keep ratios', priority: 40, argumentHint: '[on|off | threshold <n> | keep <n>]' },
   { name: 'version', desc: 'Show version information', priority: 20 },
   { name: 'exit', aliases: ['quit', 'q'], desc: 'Exit the application', priority: 20 },
 ].sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.name.localeCompare(b.name));
+
+// The shortcuts the web UI shows as buttons. They are ordinary slash commands —
+// the browser runs them through the same `dispatch` the keyboard uses, so nothing
+// here needs its own implementation.
+export const QUICK_COMMANDS = [
+  { label: 'compact', cmd: '/compact' },
+  { label: 'usage', cmd: '/usage' },
+  { label: 'status', cmd: '/status' },
+  { label: 'git', cmd: '/git' },
+  { label: 'diff', cmd: '/diff' },
+  { label: 'permissions', cmd: '/permissions' },
+  { label: 'external', cmd: '/external' },
+  { label: 'memory', cmd: '/memory' },
+  { label: 'tasks', cmd: '/tasks' },
+  { label: 'plan', cmd: '/plan' },
+];
+
 
 // Plugin commands are merged into the built-in list at runtime. Plugins are
 // loaded before the TUI starts, so this reflects any registered commands.
@@ -234,7 +268,7 @@ export const TIPS = [
   '/steer injects a message directly into the running turn',
   'Ctrl+R reloads the current session from disk',
   '/help shows available commands at any time',
-  '/undo rolls the transcript back to before your last prompt',
+  '/undo rolls the transcript AND the files back to before your last prompt',
   '/fork copies the current session so you can explore a branch without losing the original',
   '/sessions lists every saved conversation in this workspace',
   '/title sets a human-readable name for the current session',
@@ -242,12 +276,18 @@ export const TIPS = [
   '/tasks lists background Bash jobs started with run_in_background',
   '/status prints the current model, provider, endpoint, and session id',
   '/statusline toggles which items appear in the bottom status bar',
+  '/memory shows or edits the notes the agent saved for future sessions',
+  '/personal edits your own standing preferences, injected into every prompt',
+  '/permissions shows or edits standing allow/ask/deny rules for tools',
+  '/external toggles access to paths outside the workspace (persisted)',
+  '/web serves this session to a browser — token-protected, /web off to stop',
+  '/add-dir grants the agent access to another directory for this session',
   '/add-dir grants the agent access to another directory for this session',
   '/reload re-reads config.toml without restarting hncode',
   '/plugins lists the plugins loaded from ~/.hncode/plugins',
   '/logout clears the stored API key for a provider',
   '/version prints the hncode version string',
-  '/feedback writes a bug report to ~/.hncode/feedback for the maintainers',
+  '/feedback <title> | <body> opens a prefilled GitHub issue in your browser',
   '/copy puts the last assistant message on your system clipboard',
   '/export-md writes the whole session to a Markdown file on disk',
   '/import-session attaches a Markdown file to the next prompt without a Read call',
@@ -256,7 +296,7 @@ export const TIPS = [
   '/goal resume continues a paused autonomous objective',
   '/plan on turns every tool read-only so you can sketch without side effects',
   '/focus on gives the agent only Read, Write, Edit, and Bash',
-  '/permission opens the picker for Always Ask / Ask When Needed / Never Ask',
+  '/permission opens the picker for Ask / Yolo / Auto',
   '/settings opens the combined settings menu',
   '/yolo auto-approves anything inside the workspace — risky paths still ask',
   '/auto never interrupts you; everything runs and is decided automatically',
@@ -283,9 +323,9 @@ export const TIPS = [
   'Enter on a `/` menu item runs the highlighted command',
   'Tab on a `/` menu item completes the command name into the composer',
   'The context gauge turns red as you approach the model context limit',
-  'Auto-compaction triggers at 85% of the model context and keeps the last 20%',
-  '/compact with no argument keeps the newest 20% and summarizes the rest',
-  '/compact 0.3 keeps the newest 70% and summarizes the older 30%',
+  'Auto-compaction triggers at 85% of the model context, keeping ~20% of the usage (set with /auto-compact threshold|keep)',
+  'Old tool results are elided from the request at 50% of the window, keeping ~30% of them — the removed text stays on disk (/auto-trim to tune, /trim to do it now)',
+  '/compact with no argument keeps the newest 20% of the current usage and summarizes the rest',
   'Tool results longer than the visible window collapse — Ctrl+O expands them',
   'A red bullet next to a tool call means the command exited non-zero',
   'A green bullet next to a tool call means it finished successfully',
@@ -643,6 +683,26 @@ export function sanitizeText(s) {
     .replace(/[\x00-\x06\x0e-\x1f\x7f]/g, '');
 }
 
+/**
+ * How much of a running command's output to KEEP, not just display.
+ *
+ * This string is mirrored into the hub row (and so into the SSE patch the
+ * browser applies on every frame), which means an unbounded buffer grows the
+ * terminal's row, the hub's row and the browser's copy at the same time. Only
+ * the tail is ever drawn, so only the tail is worth holding.
+ */
+export const LIVE_OUTPUT_MAX_CHARS = 64 * 1024;
+
+/** The last `max` CHARACTERS of `s`, cut on a line boundary so the tail never
+    starts mid-line. */
+export function tailChars(s, max) {
+  const str = String(s == null ? '' : s);
+  if (str.length <= max) return str;
+  const cut = str.slice(str.length - max);
+  const nl = cut.indexOf('\n');
+  return nl >= 0 ? cut.slice(nl + 1) : cut;
+}
+
 function visualCol(s) { return visualWidth(stripAnsi(String(s))); }
 function col(text, c) { return c + String(text) + C.reset; }
 
@@ -757,10 +817,14 @@ export function extractJsonString(json, key) {
   return out;
 }
 
-// Minimal line diff for the Edit tool: a compact LCS-based diff rendered as
-//   - removed line
-//   + added line
-//   (unchanged context lines are omitted)
+// Line diff for the Edit tool, rendered as a unified diff with context:
+//     <n>   unchanged line      (dim)
+//     <n> - removed line
+//     <n> + added line
+// Unchanged lines are kept but trimmed to CONTEXT_LINES on each side of a change
+// (claude-code's rule), so the diff reads as a patch rather than two orphaned
+// blocks — an edit of 5 lines no longer dumps all 5 unchanged rows.
+const DIFF_CONTEXT_LINES = 3;
 export function lineDiff(oldStr, newStr, startLine = 1) {
   const a = String(oldStr == null ? '' : oldStr).replace(/\r\n/g, '\n').split('\n');
   const b = String(newStr == null ? '' : newStr).replace(/\r\n/g, '\n').split('\n');
@@ -772,17 +836,31 @@ export function lineDiff(oldStr, newStr, startLine = 1) {
       dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
   }
-  const out = [];
+  const raw = [];
   let i = 0, j = 0;
   // Line numbers as they appear in the real file (startLine = first old line).
   let oldNo = startLine, newNo = startLine;
   while (i < n && j < m) {
-    if (a[i] === b[j]) { out.push({ type: 'ctx', text: a[i], no: oldNo }); i++; j++; oldNo++; newNo++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ type: 'del', text: a[i], no: oldNo }); i++; oldNo++; }
-    else { out.push({ type: 'add', text: b[j], no: newNo }); j++; newNo++; }
+    if (a[i] === b[j]) { raw.push({ type: 'ctx', text: a[i], no: oldNo }); i++; j++; oldNo++; newNo++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { raw.push({ type: 'del', text: a[i], no: oldNo }); i++; oldNo++; }
+    else { raw.push({ type: 'add', text: b[j], no: newNo }); j++; newNo++; }
   }
-  while (i < n) { out.push({ type: 'del', text: a[i], no: oldNo }); i++; oldNo++; }
-  while (j < m) { out.push({ type: 'add', text: b[j], no: newNo }); j++; newNo++; }
+  while (i < n) { raw.push({ type: 'del', text: a[i], no: oldNo }); i++; oldNo++; }
+  while (j < m) { raw.push({ type: 'add', text: b[j], no: newNo }); j++; newNo++; }
+  // Keep at most DIFF_CONTEXT_LINES unchanged rows adjacent to a change; drop the
+  // rest (an elision row is inserted where rows were removed).
+  const out = [];
+  const isChange = (k) => raw[k] && raw[k].type !== 'ctx';
+  for (let k = 0; k < raw.length; k++) {
+    if (raw[k].type !== 'ctx') { out.push(raw[k]); continue; }
+    // Distance to the NEAREST change on either side; keep when within the window.
+    let dist = Infinity;
+    for (let t = k - 1; t >= 0 && t >= k - DIFF_CONTEXT_LINES; t--) { if (isChange(t)) { dist = Math.min(dist, k - t); break; } }
+    for (let t = k + 1; t < raw.length && t <= k + DIFF_CONTEXT_LINES; t++) { if (isChange(t)) { dist = Math.min(dist, t - k); break; } }
+    if (dist <= DIFF_CONTEXT_LINES) { out.push(raw[k]); continue; }
+    // Elide this context row, marking the gap once.
+    if (out.length && out[out.length - 1].type !== 'gap') out.push({ type: 'gap' });
+  }
   return out;
 }
 
@@ -910,8 +988,12 @@ export function highlightSelection(text, textStart, selAnchor, selHead) {
   for (let i = 0; i < text.length; i++) {
     const globalIdx = textStart + i;
     const want = globalIdx >= a && globalIdx < h;
+    // Selection only changes the BACKGROUND; the foreground keeps its own colour.
+    // Leaving the selection resets just the background (bgReset = ESC[49m), NOT the
+    // whole style — a bare reset would also kill the foreground, so a cyan/white
+    // run after the highlight reverted to grey.
     if (want && !inSel) { out += C.selBg; inSel = true; }
-    else if (!want && inSel) { out += C.reset; inSel = false; }
+    else if (!want && inSel) { out += C.bgReset; inSel = false; }
     out += text[i];
   }
   if (inSel) out += C.reset;
@@ -1116,8 +1198,14 @@ export function failureReason(text, toolName) {
 }
 
 function msgColorFor(role, text) {
+  // 'rich' output (e.g. /context, /usage panels) carries its OWN ANSI colours — do
+  // not wrap it in a single role colour, or the whole panel comes out one shade.
+  if (role === 'rich') return '';
   if (role === 'system' && typeof text === 'string' && text.startsWith('[turn took')) return C.gray;
-  if (role === 'system') return C.teal;
+  // System/status lines are NEUTRAL grey, not the brand teal: the deep teal showed
+  // up on every command result and one-line notice, and at that frequency it read
+  // as noise. Grey keeps them quiet; the accents stay for user/tool/working rows.
+  if (role === 'system') return C.gray;
   if (role === 'user') return C.cyan;
   if (role === 'bash') return C.shellMode;   // ! shell-mode echo: violet, like kimi
   if (role === 'warn') return C.orange;    // unfinished-turn warning
@@ -1461,8 +1549,14 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
     const bodyW = Math.max(1, width - visualCol('● '));
     const wrapped = wrapAnsiWords(body, bodyW);
+    // Mark every CONTINUATION boundary with a trailing `…` so a wrapped command
+    // never looks like it ended at a quote or `;`. Without this, a command like
+    // `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest …` broke right
+    // after the closing quote, and the first row read as the whole command.
+    // The last row keeps whatever `keyArgument` already put there (its own `…`
+    // when the text itself was truncated).
     const out = wrapped.map((t, i) => ({
-      text: t,
+      text: i < wrapped.length - 1 ? t + col('…', C.gray) : t,
       ind: i === 0 ? pre : '  ',
       raw: true,   // text already contains ANSI; do not wrap in another colour
     }));
@@ -1661,22 +1755,36 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       // preview by default, everything once Ctrl+O expands. 16 rows (not 12)
       // because a change renders as a PAIR: `- old` then `+ new`.
       const MAX = expanded ? Infinity : 16;
-      const changed = msg.diff.filter((d) => d.type !== 'ctx');
-      const wNo = Math.max(1, ...changed.map((d) => String(d.no || 0).length));
-      for (const d of changed.slice(0, MAX)) {
+      // Show the unified diff WITH context rows (ctx = dim, marked by a space in
+      // the sign column) so a change is not two orphaned blocks; `gap` rows mark
+      // where unchanged lines were elided.
+      const total = msg.diff.length;
+      const wNo = Math.max(1, ...msg.diff.map((d) => String(d.no || 0).length));
+      let emitted = 0;
+      for (const d of msg.diff) {
+        if (emitted >= MAX) break;
+        if (d.type === 'gap') {
+          diffRows.push({ text: col('  ⋮', C.gray), ind: cont, raw: true });
+          emitted++;
+          continue;
+        }
         const no = String(d.no || 0).padStart(wNo);
-        const mark = d.type === 'add' ? '+' : '-';
-        const color = d.type === 'add' ? C.green : C.red;
+        const mark = d.type === 'add' ? '+' : d.type === 'del' ? '-' : ' ';
+        // Unchanged context lines are WHITE (they are real file content); the
+        // added/removed lines carry the green/red. Grey made the context recede
+        // so far the diff read as two disconnected change blocks.
+        const color = d.type === 'add' ? C.green : d.type === 'del' ? C.red : C.white;
         // Diff lines are FILE content and can carry escapes; show them as `^[`.
         diffRows.push({ text: col(`${no} ${mark} ${sanitizeText(d.text)}`, color), ind: cont, raw: true });
+        emitted++;
       }
-      if (changed.length > MAX) {
+      if (total > emitted) {
         diffRows.push({
-          text: col(`… (${changed.length - MAX} more changed lines, ctrl+o to expand)`, C.gray),
+          text: col(`… (${total - emitted} more lines, ctrl+o to expand)`, C.gray),
           ind: cont, raw: true,
         });
       }
-      if (msg.diff.length > 0 && changed.length === 0) diffRows.push({ text: col('(no changes)', C.gray), ind: cont, raw: true });
+      if (total === 0) diffRows.push({ text: col('(no changes)', C.gray), ind: cont, raw: true });
       // The receipt: one line per source line of the tool's own message.
       for (const ln of shown) {
         const color = failed ? C.red : C.gray;
@@ -1710,6 +1818,52 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     }
     // Nothing to show (empty output) -> render no row at all rather than a
     // dangling "↳ ".
+    return out;
+  }
+
+  // Compaction block, matching kimi-code's CompactionComponent:
+  //   running   -> blinking bullet + "Compacting context…" (+ optional instruction)
+  //   done      -> solid green bullet + "Compaction complete (X → Y tokens)"
+  //                + " (Ctrl-O to show/hide compaction summary)"
+  //   cancelled -> warning bullet + "Compaction cancelled"
+  // Expanded state is the SHARED Ctrl+O one, so one key reveals tool output and
+  // compaction summaries alike.
+  if (msg.role === 'compaction') {
+    const INDENT = '  ';
+    const done = msg.phase === 'done';
+    const canceled = msg.phase === 'cancelled';
+    const bulletColor = done ? C.green : canceled ? C.yellow : C.white;
+    // Blink off `spin` — the same monotonic tick the tool-call bullets use. It has
+    // to be a STATE-driven phase, NOT `Date.now()`: the render cache is validated
+    // against `spinKey`, so a clock-derived phase changes without invalidating the
+    // cache and the bullet renders once and then freezes.
+    const on = ((spin || 0) >> 3) % 2 === 0;
+    const bullet = (!done && !canceled && !on) ? '  ' : col('● ', bulletColor);
+    let head;
+    if (done) {
+      const detail = (msg.tokensBefore != null && msg.tokensAfter != null)
+        ? col(` (${fmtTokens(msg.tokensBefore)} → ${fmtTokens(msg.tokensAfter)} tokens)`, C.gray) : '';
+      const hint = (msg.text || '').trim()
+        ? col(` (Ctrl-O to ${expanded ? 'hide' : 'show'} compaction summary)`, C.gray) : '';
+      head = bullet + col('Compaction complete', C.green + C.bold) + detail + hint;
+    } else if (canceled) {
+      head = bullet + col('Compaction cancelled', C.yellow + C.bold);
+    } else {
+      head = bullet + col('Compacting context…', C.cyan + C.bold);
+    }
+    const out = [{ text: head, ind: '', raw: true }];
+    if (msg.instruction) {
+      out.push({ text: INDENT + col(String(msg.instruction), C.gray), ind: INDENT, raw: true });
+    }
+    if (done && expanded && (msg.text || '').trim()) {
+      const bodyW = Math.max(1, width - visualCol(INDENT));
+      for (const ln of String(msg.text).replace(/\r\n/g, '\n').split('\n')) {
+        if (ln === '') { out.push({ text: '', ind: INDENT, raw: true }); continue; }
+        for (const w of wrapWords(ln, bodyW)) {
+          out.push({ text: INDENT + col(w, C.gray), ind: INDENT, raw: true });
+        }
+      }
+    }
     return out;
   }
 
@@ -1779,6 +1933,15 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
   const bodyFg = msg.role === 'user' ? C.white : msg.role === 'bash' ? C.shellMode : fg;
   const codeFg = C.cyan;
   const lines = [];
+  // 'rich' panels already contain their own ANSI; emit each source line VERBATIM
+  // (raw), because wrapWords would treat the escape bytes as text and shred them.
+  if (msg.role === 'rich') {
+    for (const raw of String(msg.text || '').split('\n')) {
+      lines.push({ text: raw, ind: '', raw: true });
+    }
+    if (lines.length === 0) lines.push({ text: '', ind: '', raw: true });
+    return lines;
+  }
   // Only assistant/thinking output benefits from Markdown; user/system/tool
   // stay plain so their text is never mangled. Assistant text should be WHITE by default.
   const useMd = msg.role === 'assistant';
@@ -2296,23 +2459,28 @@ export function renderChatLines(state, w, viewport) {
     const boxText = Math.max(1, boxInner - Math.min(1, Math.max(0, boxInner - 1)) * 2);
     const rowWidth = border ? boxText : innerW;
     const cached = m._cache;
+    // Which rows animate? A pending tool call and a running compaction block both
+    // derive their look from `state.spin`, so the cached layout must be invalidated
+    // when that tick advances. Setting spinKey to 0 for everything else keeps
+    // static rows cached across ticks.
+    const animating = (m.role === 'tool' && m.pending) || (m.role === 'compaction' && m.phase === 'running');
+    const spinKeyNow = animating ? (state.spin || 0) : 0;
     const valid = cached
       && cached.rowW === rowWidth && cached.expanded === expanded
       && cached.textRef === m.text && cached.streamRef === m.streamContent
       && cached.liveRef === m.liveOutput && cached.failed === m.failed
       && cached.diffRef === m.diff && cached.countsRef === m._diffCounts
       && cached.keyArgs === (m.toolArgs ? fpArgs(m.toolArgs) : '0')
-      && cached.spinKey === (m.role === 'tool' && m.pending ? (state.spin || 0) : 0)
+      && cached.spinKey === spinKeyNow
       && cached.isPending === (m.pending ? 1 : 0);
     if (valid) {
       msgLen[mi] = cached.rows.length + (border ? 2 : 0);
     } else {
       const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart);
       const wrapped = rows.map(rowToLine);
-      const spinKey2 = (m.role === 'tool' && m.pending) ? (state.spin || 0) : 0;
       const isPending2 = m.pending ? 1 : 0;
       const cc = {
-        rowW: rowWidth, expanded, spinKey: spinKey2, isPending: isPending2,
+        rowW: rowWidth, expanded, spinKey: spinKeyNow, isPending: isPending2,
         textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
         failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
         keyArgs: m.toolArgs ? fpArgs(m.toolArgs) : '0',
@@ -2337,10 +2505,38 @@ export function renderChatLines(state, w, viewport) {
   let visibleFrom = 0, visibleTo = -1;
 if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
     const bodyH = viewport.bodyH;
-    // Clamp scroll against the total we just computed, so a stale scroll value
-    // cannot push the window past the end (missing the tail).
     const maxScroll = Math.max(0, total - bodyH);
-    const scroll = Math.min(maxScroll, Math.max(0, viewport.scroll || 0));
+    const asked = Math.max(0, viewport.scroll || 0);
+
+    // ---- scroll anchoring --------------------------------------------------
+    // `scroll` counts rows UP from the bottom, so content ABOVE the viewport
+    // growing (streamed text, a new tool row) would push what the user is reading
+    // off the top of the screen. The old fix inferred that growth by comparing
+    // `state._chatTotal` with the PREVIOUS paint's count — a value it read before
+    // this function ran — so the correction always landed one chunk late and
+    // accumulated error. The row count is exact here, so the view is anchored by
+    // ROW instead: `_anchorPin` remembers the last paint's `{ total, scroll }`,
+    // and the rows added above the pinned row move `scroll` by the same amount.
+    //
+    // `viewport.scroll` is NOT read while a pin exists: this function overwrites
+    // `state.scroll`, and composeFrame() feeds that same value back in, so
+    // treating it as "what the user asked for" made the anchoring self-feeding.
+    // A deliberate move (wheel, drag, jump, a new message) clears the pin through
+    // dropScrollPin(), and the position is taken from the caller on that paint.
+    const pin = state._anchorPin;
+    let scroll;
+    if (pin && pin.bodyH === bodyH) {
+      // The view has not been moved deliberately since the last paint, so carry
+      // the anchor across the rows added above it. `pin.scroll === 0` means the
+      // view is pinned to the tail and must keep following it as it grows.
+      scroll = pin.scroll === 0 ? 0 : pin.scroll + (total - pin.total);
+    } else {
+      scroll = asked;
+    }
+    scroll = Math.min(maxScroll, Math.max(0, scroll));
+    state.scroll = scroll;
+    state._anchorPin = { total, scroll, bodyH };
+
     const end = total - scroll;
     const start = end - bodyH;
     visibleFrom = Math.max(0, start - 12);
@@ -2395,29 +2591,19 @@ if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
 }
 
 // ---- scroll anchoring --------------------------------------------------------
-// Keep a scrolled-up viewport pinned to the SAME content while new rows arrive.
+// The view is anchored by ROW inside renderChatLines(), where the exact row count
+// (`total`) and the visible window are both known. `state._anchorPin` carries the
+// previous paint's `{ total, scroll, bodyH }`; when the transcript grows, the
+// delta is added to `scroll` so the same row stays at the top of the screen.
 //
-// `state.scroll` counts rows up from the bottom, so when the transcript grows by
-// N rows the offset must grow by N as well — otherwise the new rows push the
-// content the user is reading off the top of the screen (the "it scrolls on its
-// own while the agent is talking" bug: measured as the viewed line moving up one
-// row per streamed chunk).
-//
-// The subtlety is the BASELINE. The previous version returned early while the
-// view was pinned (`scroll === 0`) and only recorded `_anchorRows` otherwise, so
-// during a turn the baseline went stale. The first append after the user
-// scrolled up then found `prev == null` (or an ancient value), skipped the
-// compensation, and the view drifted. Recording the baseline on EVERY call —
-// pinned or not — makes `rows - prev` always "rows added since the last paint".
-//
-// Pure: takes the state and the current chat row count, returns the new `scroll`.
-export function anchorScrollNext(state, rows) {
-  const prev = state._anchorRows;
-  state._anchorRows = rows;
-  if ((state.scroll || 0) === 0) return 0;      // pinned: keep following the tail
-  if (prev != null && rows > prev) return (state.scroll || 0) + (rows - prev);
-  return state.scroll || 0;
+// Nothing needs to be compensated when the transcript grows — the pin just needs
+// to be DROPPED whenever `scroll` is set from outside (wheel, drag, jump to
+// bottom), because that is a deliberate move and the old pin no longer describes
+// where the user is looking.
+function dropScrollPin(state) {
+  state._anchorPin = null;
 }
+
 
 
 // Serialise a Line (array of spans) to an ANSI string.
@@ -2434,12 +2620,15 @@ function lineToString(line) {
 }
 
 function modeLabel(mode) {
-  // Short, uniform names — the long forms ("Always Ask", "Ask When Needed",
-  // "Never Ask") made the status group wrap awkwardly next to Plan/Focus.
+  // One word per mode, matching the command names (/ask, /yolo, /auto) so the
+  // status line, the /permission picker and /status all read the same. The old
+  // long forms ("Always Ask", "Ask When Needed", "Never Ask") also wrapped the
+  // status group awkwardly next to Plan/Focus.
   if (mode === 'auto') return 'Auto';
   if (mode === 'yolo') return 'Yolo';
   return 'Ask';
 }
+
 function trimDecimal(v) {
   const s = v.toFixed(1);
   return s.endsWith('.0') ? s.slice(0, -2) : s;
@@ -2458,6 +2647,40 @@ function fmtTokens(n) {
     return (k >= 100 ? Math.round(k) : trimDecimal(k)) + 'k';
   }
   return String(n);
+  return String(n);
+}
+
+// A tiny ASCII line chart for a numeric series (context growth over steps).
+// Renders `height` rows; each column is one sample, scaled to the series max.
+// No dependency — Claude Code pulls in `asciichart`, we do not need it.
+function sparkChart(values, width, height) {
+  const series = (values || []).filter((v) => Number.isFinite(v));
+  if (series.length < 2) return [];
+  // Downsample to `width` columns by taking evenly spaced samples.
+  const cols = Math.min(width, series.length);
+  const sampled = [];
+  for (let i = 0; i < cols; i++) {
+    sampled.push(series[Math.round(i / (cols - 1) * (series.length - 1))]);
+  }
+  const max = Math.max(...sampled, 1);
+  const min = Math.min(...sampled, 0);
+  const span = Math.max(1, max - min);
+  const rows = [];
+  const BLOCK = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+  // Single-row sparkline.
+  if (height <= 1) {
+    rows.push(sampled.map((v) => BLOCK[Math.min(8, Math.round((v - min) / span * 8))]).join(''));
+    return rows;
+  }
+  for (let r = height - 1; r >= 0; r--) {
+    let line = '';
+    for (const v of sampled) {
+      const level = (v - min) / span * (height - 1);
+      line += level >= r ? '█' : ' ';
+    }
+    rows.push(line);
+  }
+  return rows;
 }
 
 // Usage as a whole-number percentage of `max`, ceiled so any non-zero usage
@@ -2691,10 +2914,15 @@ function highlightAnsiRange(row, c0, c1, w) {
     const want = col >= c0 && col < c1;
 
     if (want && !inSel) {
+      // Selection changes only the BACKGROUND; the foreground (documented colour)
+      // is left intact so a cyan/teal markdown span stays its colour inside the
+      // highlight.
       out += C.selBg;
       inSel = true;
     } else if (!want && inSel) {
-      out += C.reset;
+      // Leave the selection: reset just the background (ESC[49m), keeping the
+      // row's foreground. A bare reset would also clear the foreground.
+      out += C.bgReset;
       inSel = false;
     }
 
@@ -2845,8 +3073,17 @@ export function composeFrame(state, cols, rows) {
 
   const lines = [];
   let dialogCaret = null;
+  // The AskUserQuestion box's free-text caret, recorded as an absolute frame row
+  // (the box sits mid-frame, not at the top), corrected with topPad/topTrim below.
+  let questionCaret = null;
   const hits = [];
   const addHit = (row, col0, col1, hit) => hits.push({ row, col0, col1, ...hit });
+  // Cleared every frame: the body records its origin only when it is actually
+  // drawn, and the `+= topPad - topTrim` correction at the end of this function
+  // must not run twice against a stale value (a dialog frame leaves the body
+  // unpainted, and the mouse handler relies on null meaning "no body on screen").
+  state._bodyScreenTop = null;
+
 
   if (state.editor) {
     // A simple modal multiline editor: the text, a caret we draw ourselves, and a
@@ -2962,97 +3199,6 @@ export function composeFrame(state, cols, rows) {
     while (lines.length < bodyH) lines.push(' '.repeat(w));
     if (dialogCaret) dialogCaret.row += padTop;
   }
-  // AskUserQuestion prompt: rendered as a BOX sitting directly above the
-  // composer — the same treatment as the approval prompt — instead of a
-  // full-screen dialog. It is a prompt about the turn, not a separate screen, and
-  // taking over the whole viewport hid the conversation the question refers to.
-  if (state.question && !dialog) {
-    const qs = state.question;
-    const cur = qs.items[qs.index] || { question: '', options: [] };
-    const promptW = insideW;
-    const innerW = Math.max(1, promptW - 2);
-    const bar = (ch) => col(ch, C.border);
-    const boxRow = (content) => bar('│') + ' ' + fitAnsi(content, innerW) + ' ' + bar('│');
-    const counter = qs.items.length > 1 ? ` ${qs.index + 1}/${qs.items.length}` : '';
-    lines.push(bar('╭' + '─'.repeat(promptW) + '╮'));
-    // Body rows are built into `box` FIRST so the whole thing can be clamped to
-    // `questionH` before any of it reaches `lines`. Pushing the border/header
-    // straight into `lines` (as this used to) meant the budget below did not
-    // count them, so the box overflowed by one row and the top trim ate its `╭`.
-    const box = [];
-    box.push(boxRow(
-      col('Question', C.cyan + C.bold)
-      + (cur.header ? col(' ' + cur.header, C.yellow) : '')
-      + col(counter, C.gray),
-    ));
-    // The question text itself, wrapped by DISPLAY width so CJK cannot push the
-    // right border out.
-    for (const seg of wrapWords(cur.question, innerW - 2)) {
-      box.push(boxRow(col('  ' + seg, C.white)));
-    }
-    // Options, then the per-question free-text row, then (last question only) the
-    // global supplement row. All three are appended by US, never by the model.
-    const isLast = qs.index === qs.items.length - 1;
-    const opts = cur.options.map((o) => ({ label: o.label, description: o.description, kind: 'option' }));
-    opts.push({ label: OTHER_LABEL, description: 'Type your own answer', kind: 'other' });
-    if (isLast) opts.push({ label: SUPPLEMENT_LABEL, description: 'Optional notes for the whole request', kind: 'supplement' });
-    // The hint/entry row is the LAST body row; when space runs out it is the first
-    // thing to drop (the keys still work, the reminder is just not shown).
-    // `questionH` counts the WHOLE box, so the two border rows and the question
-    // rows already in `box` come OUT of the budget before anything is added.
-    const boxBudget = (questionH || Infinity) - 2 - box.length;
-    const showHint = boxBudget >= opts.length + 1;
-    const bodyBudget = Math.max(0, boxBudget - (showHint ? 1 : 0));
-    // Scroll the option window so the selected row stays visible when the list is
-    // taller than the budget (a 4-option question on a 12-row terminal).
-    let firstOpt = 0;
-    if (opts.length > bodyBudget && bodyBudget > 0) {
-      firstOpt = Math.min(Math.max(0, qs.sel - bodyBudget + 1), opts.length - bodyBudget);
-    }
-    const shownOpts = opts.slice(firstOpt, firstOpt + (bodyBudget || opts.length));
-    const itemRows = [];
-    shownOpts.forEach((o, k) => {
-      const j = firstOpt + k;
-      const isSel = j === qs.sel;
-      const ptr = isSel ? col('❯ ', C.cyan) : '  ';
-      const chosen = qs.picked.has(j);
-      // Only real options get checkboxes: Other/supplement are free text.
-      const box2 = (cur.multiSelect && o.kind === 'option')
-        ? (chosen ? col('[x] ', C.green) : col('[ ] ', C.gray)) : '';
-      // Echo what was already typed, so leaving the editor is not a dead end.
-      const typed = (o.kind === 'supplement' && qs.supplement) ? `: ${qs.supplement}`
-        : (o.kind === 'other' && qs.otherText) ? `: ${qs.otherText}` : '';
-      const label = col(String(o.label) + typed, isSel ? (C.cyan + C.bold) : C.white);
-      const desc = o.description ? col('  ' + o.description, C.gray) : '';
-      // The marker column is 2 wide, so the rest gets innerW - 2.
-      itemRows.push({ boxIdx: box.length, index: j });
-      box.push(boxRow(ptr + box2 + fitAnsi(label + desc, Math.max(1, innerW - 4))));
-    });
-    let caretInBox = -1;
-    if (qs.editing && showHint) {
-      // Free-text entry; the caret is drawn on this row.
-      const which = qs.editing === 'supplement' ? SUPPLEMENT_LABEL : OTHER_LABEL;
-      const label = which + ': ';
-      caretInBox = box.length;
-      box.push(boxRow(col(label, C.gray) + col(qs.editingText || '', C.white)));
-    } else if (showHint) {
-      const hint = cur.multiSelect
-        ? '↑↓ move · Space toggle · Enter confirm · Esc dismiss'
-        : '↑↓ move · Enter select · Esc dismiss';
-      box.push(boxRow(col(hint, C.gray)));
-    }
-    // Emit the box. `boxTop` is where row 0 of `box` lands in `lines`.
-    const boxTop = lines.length;
-    for (const b of box) lines.push(b);
-    lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
-    // Mouse hitboxes: the box rows are pushed into `lines`, and composeFrame's
-    // hitbox pass shifts them to final screen coordinates.
-    itemRows.forEach((r) => addHit(boxTop + r.boxIdx, 0, w - 1, { kind: 'questionItem', index: r.index }));
-    if (caretInBox >= 0) {
-      const which = qs.editing === 'supplement' ? SUPPLEMENT_LABEL : OTHER_LABEL;
-      dialogCaret = { row: boxTop + caretInBox, col: visualCol(which + ': ') + visualCol(qs.editingText || '') };
-    }
-  }
   if (state.picker) {
     const pick = state.picker;
     const query = state.pickerQuery || '';
@@ -3104,6 +3250,11 @@ export function composeFrame(state, cols, rows) {
     if (first + maxItems > list.length) first = Math.max(0, list.length - maxItems);
     const shown = list.slice(first, first + maxItems);
     const itemBodyRows = [];
+    // Empty state: distinguish "still searching" from "no hits".
+    if (!shown.length) {
+      const msg = pick._loading ? 'Searching…' : (pick.searchable !== false && query ? 'No matches' : '');
+      if (msg) body.push(col('  ' + msg, C.gray));
+    }
     shown.forEach((item, j) => {
       const idx = first + j;
       const isSel = idx === selIdx;
@@ -3200,6 +3351,11 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     const showBar = total > bodyH && w > 4;
     const sb = showBar ? scrollbarGeometry({ total, bodyH, scroll }) : null;
 
+    // Body row 0's index inside `lines`, captured BEFORE the loop pushes anything.
+    // Whatever is already in `lines` (a plan table, a prompt box) precedes the
+    // body, so `lines.length` here IS the body's origin; deriving it afterwards as
+    // `lines.length - bodyH` assumes nothing came before it, which is false.
+    const bodyScreenTop = lines.length;
     for (let i = 0; i < bodyH; i++) {
       const idx = start + i;
       let row = '';
@@ -3219,10 +3375,133 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     state._sb = sb;
     state._bodyTop = start;
     state._bodyH = bodyH;
+    // Where body row 0 lands in the FINAL `lines` array. `start` is a transcript
+    // row number, but the mouse reports a SCREEN row, and the two are only equal
+    // when the chat happens to begin at screen row 0. Anything pushed before the
+    // body (nothing today, but the padding below is enough) shifts it, so the
+    // mapping is recorded here rather than assumed — hitboxes already do the same
+    // `+ topPad - topTrim` correction (see the end of this function) and the mouse
+    // mapping did not, which is what made a drag copy the wrong lines.
+    state._bodyScreenTop = lines.length - bodyH;
     // How many blank padding rows precede the first body row on screen. When
     // the transcript is shorter than the body, `start` is negative and those
     // rows are padding; a click there must NOT map to a transcript line.
     state._bodyPadTop = Math.max(0, -start);
+  }
+
+  // AskUserQuestion prompt: a box sitting directly above the composer (not a
+  // full-screen dialog) so the transcript the question refers to stays visible.
+  //
+  // Layout:
+  //   |Q1| Q2            <- question tabs (Tab switches), current lit
+  //   用哪种权限模式？      <- the question text
+  //   > A  读取自动执行…   <- option: marker + label + dim desc on the same row
+  //     B  什么都不问
+  //     Other
+  //   ↑↓ 移动 · Enter 选择 · Esc 取消
+  // Single-select marker is `> `; multi-select uses an empty/filled square.
+  if (state.question && !dialog) {
+    const qs = state.question;
+    const cur = qs.items[qs.index] || { question: '', options: [] };
+    const promptW = insideW;
+    const innerW = Math.max(1, promptW - 2);
+    const bar = (ch) => col(ch, C.border);
+    const boxRow = (content) => bar('│') + ' ' + fitAnsi(content, innerW) + ' ' + bar('│');
+    lines.push(bar('╭' + '─'.repeat(promptW) + '╮'));
+    const box = [];
+    // ---- tab bar: each question, plus a trailing "Other" (whole-request note) ----
+    // `qs.index` selects a question; `qs.index === qs.items.length` selects the
+    // Other tab. The current tab is highlighted (background).
+    const onOtherTab = qs.index >= qs.items.length;
+    {
+      let tabs = '';
+      const tabName = (i) => {
+        const it = qs.items[i];
+        return String((it && it.header) || `Q${i + 1}`).trim() || `Q${i + 1}`;
+      };
+      for (let i = 0; i <= qs.items.length; i++) {
+        const name = i === qs.items.length ? OTHER_LABEL : tabName(i);
+        const on = i === qs.index;
+        tabs += on ? col(' ' + name + ' ', C.selBg + C.cyan + C.bold) : col(' ' + name + ' ', C.gray);
+        tabs += ' ';
+      }
+      box.push(boxRow(fitAnsi(tabs, innerW - 2)));
+    }
+    const itemRows = [];
+    let caretInBox = -1;
+    let caretColInBox = -1;
+    if (onOtherTab) {
+      // The Other tab holds the whole-request free-text note (may be blank).
+      for (const seg of wrapWords('Add extra context for the whole request (optional).', innerW - 2)) {
+        box.push(boxRow(col('  ' + seg, C.gray)));
+      }
+      const label = OTHER_LABEL + ': ';
+      const text = String(qs.supplement || (qs.editing === 'supplement' ? qs.editingText : '') || '');
+      const ec = Math.max(0, Math.min(text.length, qs.editing === 'supplement' && qs.editingCaret != null ? qs.editingCaret : text.length));
+      caretInBox = box.length;
+      caretColInBox = visualCol(label) + visualCol(text.slice(0, ec));
+      box.push(boxRow(col(label, C.gray) + col(text, C.white)));
+      box.push(boxRow(col('Enter submit · Tab/arrows switch', C.gray)));
+    } else {
+    // ---- the question text, wrapped by DISPLAY width (CJK-safe) ----
+    for (const seg of wrapWords(cur.question, innerW - 2)) {
+      box.push(boxRow(col('  ' + seg, C.white)));
+    }
+    // Options: the model's options, then our per-question "Other" (free answer).
+    const opts = cur.options.map((o) => ({ label: o.label, description: o.description, kind: 'option' }));
+    opts.push({ label: OTHER_LABEL, description: '', kind: 'other' });
+    const boxBudget = (questionH || Infinity) - 2 - box.length;
+    const showHint = boxBudget >= opts.length + 1;
+    const bodyBudget = Math.max(0, boxBudget - (showHint ? 1 : 0));
+    let firstOpt = 0;
+    if (opts.length > bodyBudget && bodyBudget > 0) {
+      firstOpt = Math.min(Math.max(0, qs.sel - bodyBudget + 1), opts.length - bodyBudget);
+    }
+    const shownOpts = opts.slice(firstOpt, firstOpt + (bodyBudget || opts.length));
+    shownOpts.forEach((o, k) => {
+      const j = firstOpt + k;
+      const isSel = j === qs.sel;
+      const chosen = qs.picked.has(j);
+      // Marker: single-select draws `> ` on the current row; multi-select shows an
+      // empty/filled square (filled = picked). Plain block glyphs, never emoji.
+      let marker;
+      if (cur.multiSelect) marker = chosen ? '\u25a0 ' : '\u25a1 ';
+      else marker = isSel ? '> ' : '  ';
+      // The current row is marked by `> ` (single) / the filled square (multi); no
+      // background highlight.
+      const markerPaint = isSel ? C.cyan : (chosen ? C.cyan : C.gray);
+      const labelPaint = isSel ? (C.cyan + C.bold) : (chosen ? C.cyan : C.white);
+      const typed = (o.kind === 'other' && qs.otherText) ? `: ${qs.otherText}` : '';
+      const head = col(marker, markerPaint) + col(String(o.label) + typed, labelPaint);
+      const desc = o.description ? col('  ' + o.description, C.gray) : '';
+      itemRows.push({ boxIdx: box.length, index: j });
+      box.push(boxRow(fitAnsi(head + desc, innerW - 2)));
+    });
+    if (qs.editing === 'other' && showHint) {
+      const label = OTHER_LABEL + ': ';
+      const text = String(qs.editingText || '');
+      const ec = Math.max(0, Math.min(text.length, qs.editingCaret == null ? text.length : qs.editingCaret));
+      caretInBox = box.length;
+      caretColInBox = visualCol(label) + visualCol(text.slice(0, ec));
+      box.push(boxRow(col(label, C.gray) + col(text, C.white)));
+    } else if (showHint) {
+      const hint = cur.multiSelect
+        ? '↑↓ move · Space toggle · Enter confirm · Esc dismiss'
+        : '↑↓ move · Enter select · Esc dismiss';
+      box.push(boxRow(col(hint, C.gray)));
+    }
+    }
+    const boxTop = lines.length;
+    for (const b of box) lines.push(b);
+    lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
+    itemRows.forEach((r) => addHit(boxTop + r.boxIdx, 0, w - 1, { kind: 'questionItem', index: r.index }));
+    if (caretInBox >= 0) {
+      // The box is mid-frame (chat above, composer below), NOT pinned to the top,
+      // so its caret is recorded as an absolute frame row and corrected with the
+      // same `topPad - topTrim` shift the hitboxes get at the end of this function.
+      // Column: 2 (border + space) + the label + the text BEFORE the field caret.
+      questionCaret = { row: boxTop + caretInBox, col: 2 + caretColInBox };
+    }
   }
 
   if (workingH) {
@@ -3533,17 +3812,28 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     const sel = state.menuSel + 1;
     const off = state.menuOffset || 0;
     const shown = state.menuList.slice(off, off + MAX_MENU);
+    // The second level lists ARGUMENT words, whose `name` is only the completion
+    // SUFFIX. Showing "reshold" for `/auto-trim th` would be nonsense, so the row
+    // displays the WHOLE word (prefix + suffix) while still inserting just the
+    // suffix. `_argWord` marks which level a row belongs to.
+    const isArgLevel = shown.some((c) => c._argWord);
     shown.forEach((cmd, j) => {
       const selected = off + j === state.menuSel;
       const mark = selected ? col('❯ ', C.cyan) : '  ';
-      const nameField = col(cmd.name, selected ? (C.cyan + C.bold) : C.gray);
+      const label = isArgLevel && cmd._argWord
+        ? (cmd._argPrefix || '') + cmd.name
+        : cmd.name;
+      const nameField = col(label, selected ? (C.cyan + C.bold) : C.gray);
       const hint = cmd.argumentHint ? col(' ' + cmd.argumentHint, C.gray) : '';
-      const pad = Math.max(2, 18 - visualCol(cmd.name) - visualCol(hint));
+      const pad = Math.max(2, 18 - visualCol(label) - visualCol(hint));
       const desc = col(cmd.desc, C.gray);
       addHit(lines.length, 1, insideW, { kind: 'menuItem', index: off + j });
       lines.push(col('│' + fitAnsi(mark + nameField + hint + ' '.repeat(pad) + desc, insideW) + '│', C.border));
     });
-    lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})`, C.gray), insideW) + '│', C.border));
+    const footer = isArgLevel
+      ? `(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`
+      : `(${sel}/${totalMatches})`;
+    lines.push(col('│' + fitAnsi(col(footer, C.gray), insideW) + '│', C.border));
   }
 
   // Inline `@file` candidate list — the same widget as the `/` menu above, so the
@@ -3681,6 +3971,10 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   const hitboxes = hits
     .map((hb) => ({ ...hb, row: hb.row + topPad - topTrim }))
     .filter((hb) => hb.row >= 0 && hb.row < h);
+  // The body's screen origin needs the SAME correction the hitboxes just got:
+  // rows pushed above it (topPad) and any trimmed off the top both move it. It is
+  // adjusted here because only at this point is the final geometry known.
+  if (state._bodyScreenTop != null) state._bodyScreenTop += topPad - topTrim;
 
   if (state.hoverHit) {
     const hv = state.hoverHit;
@@ -3700,6 +3994,16 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     // /personal and /set-system-prompt). The hitboxes below already apply the pad;
     // the caret did not.
     cursor = { row: Math.min(dialogCaret.row + topPad, h - 1), col: Math.min(dialogCaret.col, w - 1) };
+    cursorVisible = true;
+  } else if (questionCaret) {
+    // The AskUserQuestion box sits MID-frame (chat above, composer below), so its
+    // caret row is an absolute frame index: apply the SAME `topPad - topTrim`
+    // correction the hitboxes got, or the block caret lands rows off when the
+    // frame was padded/trimmed.
+    cursor = {
+      row: Math.max(0, Math.min(questionCaret.row + topPad - topTrim, h - 1)),
+      col: Math.min(questionCaret.col, w - 1),
+    };
     cursorVisible = true;
   } else if (dialog) {
     cursor = { row: 0, col: 0 };
@@ -3874,10 +4178,16 @@ export function makeState({ cfg, session, opts }) {
     turnStart: 0,
     steps: (session && session.steps) || 0,
     lastTurnMs: (session && session.lastTurnMs) || 0,
+    // Step-size history for /usage's trend chart, persisted on the session so it
+    // survives a --resume (in-memory only otherwise). Bounded at write time.
+    tokenHistory: (session && Array.isArray(session.tokenHistory)) ? session.tokenHistory.slice() : [],
     _stepsBase: 0,
     _turnSteps: 0,
+    // How many times the session-naming request has been tried this run. Capped
+    // so a permanently failing namer does not pay for a request every turn (see
+    // the `needsTitle` block in runAgent).
+    titleAttempts: 0,
     tokRate: 0,
-    _tokTimes: [],
     chat: [],
     scroll: 0,
     selection: null,
@@ -3947,15 +4257,12 @@ export function makeState({ cfg, session, opts }) {
     // Theme removed - forced dark only
     addDirs: [],
     tasks: {},
-    slMode: true, slModel: true, slEffort: true, slCwd: true, slTasks: true, slTips: true,
-    // Git badge in the status line: branch + working-tree diff totals. Refreshed
-    // on a TTL, never per frame — each refresh costs a few git subprocesses and
-    // composeFrame runs on every keystroke.
-    slGit: true,
-    _gitInfo: null,       // { branch, insertions, deletions, changed, untracked }
-    _gitAt: 0,            // last refresh time (ms)
-    _gitCwd: '',          // directory the cached info belongs to
-    picker: null,
+    // Output-token timestamps behind the tok/s readout, and the last computed rate.
+    // Declared HERE, with the rest of the state, because the producer
+    // (the agent onEvent) pushes on every streamed token: a field that only /new
+    // creates is a crash the moment a session is restored instead of started.
+    _tokTimes: [],
+    tokRate: 0,
     pickerQuery: '',
     pickerCategory: null,  // active filter category (null = "All")
     pickerCategories: null,
@@ -4000,6 +4307,49 @@ function stripTipPrefix(s) {
   return String(s).replace(/^Tip #\d+:\s*/i, '');
 }
 
+// `convRowFor` lives in session.js now: the Web daemon needs the same
+// message -> rows expansion for a finished session, and it must NOT import this
+// module (that would drag in the renderer, the agent and the LLM client). See the
+// import at the top of this file.
+
+// Split a history into { kept, dropped } for compaction. Pure, so the boundary
+// rules can be tested without a model or a TTY.
+//
+// Two rules matter and used to be missing from the manual `/compact` path:
+//   * the kept tail is budgeted by TOKENS, because one Read result can dwarf fifty
+//     short turns — a count-based slice either fails to get under the threshold or
+//     drops far more than necessary;
+//   * the tail may never START on a `tool` message whose assistant(toolCalls) was
+//     dropped. Most APIs reject a tool result with no preceding call, so that
+//     boundary would break the next request outright.
+export function planCompaction(msgs, cfg, ratio, maxCtx) {
+  const list = Array.isArray(msgs) ? msgs : [];
+  // With an explicit ratio, keep `1 - ratio` OF THE CURRENT HISTORY. Without one,
+  // keep `cfg.compactKeepRatio` (default 0.2) of the CURRENT usage — the same rule
+  // auto-compaction uses, so /compact and the automatic path agree.
+  const used = estimateMessagesTokens(list, cfg);
+  const keepRatio = (cfg && typeof cfg.compactKeepRatio === 'number'
+    && cfg.compactKeepRatio > 0 && cfg.compactKeepRatio < 1) ? cfg.compactKeepRatio : 0.2;
+  const keepBudget = (ratio !== null)
+    ? Math.max(1, Math.floor(used * (1 - ratio)))
+    : Math.max(1, Math.floor((used || (maxCtx || 512000) * 0.85) * keepRatio));
+
+  const tokOf = (m) => estimateMessagesTokens([m], cfg) - estimateMessagesTokens([], cfg);
+  let keepFrom = list.length;
+  let keptTokens = 0;
+  while (keepFrom > 0) {
+    const n = list.length - keepFrom;              // already-kept count
+    if (n >= 2 && keptTokens >= keepBudget) break;
+    const t = tokOf(list[keepFrom - 1]);
+    // Always keep at least the last two messages, however big they are.
+    if (n >= 2 && keptTokens + t > keepBudget) break;
+    keptTokens += t;
+    keepFrom--;
+  }
+  while (keepFrom > 0 && keepFrom < list.length && list[keepFrom].role === 'tool') keepFrom--;
+  return { kept: list.slice(keepFrom), dropped: list.slice(0, keepFrom) };
+}
+
 export function reconstructChat(s) {
   // Shell commands the user ran with `!` are shown on resume at the position they
   // originally ran. Each entry's `anchor` is how many REAL conversation messages
@@ -4023,14 +4373,31 @@ export function reconstructChat(s) {
       // entry must not take the whole resume down with it.
       if (!sh || typeof sh !== 'object') continue;
       out.push({ role: 'bash', text: String(sh.cmd || '') });
+      // `ok` is null while the command is still running (the entry is written
+      // before it executes). Reporting that as success turned an interrupted run
+      // green on resume, so an unfinished entry stays unmarked.
       if (sh.result) out.push({ role: 'tool_result', text: String(sh.result), failed: sh.ok === false });
+      // The `[cmd — done in 1s]` receipt is added to the transcript AFTER the
+      // command runs and is never in session.messages, so a resume used to drop
+      // it and the block looked truncated. Rebuild it from the persisted timing.
+      if (sh.ok === true || sh.ok === false) {
+        const ms = (sh.doneAt && sh.ts) ? Math.max(0, sh.doneAt - sh.ts) : 0;
+        const label = `${String(sh.cmd || '').split('\n')[0]} — ${sh.ok ? 'done' : 'failed'} in ${fmtDuration(ms)}`;
+        out.push({ role: 'system', text: `[${label}]` });
+      }
     }
   };
+
 
   const out = [];
   const msgs = (s && s.messages) || [];
   for (let mi = 0; mi < msgs.length; mi++) {
     const m = msgs[mi];
+    // Inject shell commands that anchored BEFORE this message (in the slot after
+    // the previous message). This runs BEFORE the junk-entry skip below: a
+    // malformed message at index `mi` used to `continue` past the emit, so a
+    // shell command anchored at that index was dropped from the resume entirely.
+    emitShells(out, mi);
     // Skip junk entries. A session file can carry a null (older writer, hand
     // edit, truncated write); reading `m.role` off it threw and the whole resume
     // died with an unhandled TypeError instead of showing the rest of the
@@ -4038,20 +4405,14 @@ export function reconstructChat(s) {
     if (!m || typeof m !== 'object') continue;
     const role = m.role;
     const text = typeof m.content === 'string' ? m.content : '';
-    // Inject shell commands that anchored BEFORE this message (in the slot after
-    // the previous message).
-    emitShells(out, mi);
-    if (role === 'user') out.push({ role: 'user', text });
-    else if (role === 'assistant') {
-      out.push({ role: 'assistant', text });
-      for (const tc of (Array.isArray(m.toolCalls) ? m.toolCalls : [])) {
-        if (!tc || typeof tc !== 'object') continue;
-        out.push({ role: 'tool', toolName: tc.name, toolArgs: tc.args || {}, pending: false });
-      }
-    } else if (role === 'tool') {
-      out.push({ role: 'tool_result', text });
-    }
+
+    // `_conv` marks a row as mirroring an entry in session.messages. Rows that
+    // exist only on screen (shell echoes, receipts, notices) leave it unset, so
+    // /compact can rebuild the transcript from the conversation alone instead of
+    // guessing where the tail starts.
+    for (const row of convRowFor(m)) out.push({ ...row, _conv: true });
   }
+
   // Any shell commands anchored at/past the end land at the very tail.
   emitShells(out, msgs.length);
   return out;
@@ -4076,13 +4437,153 @@ export function pickerFiltered(state) {
   return filtered;
 }
 
+// ---- argument completion (the second level of the `/` menu) ----
+//
+// Once a command name is followed by a SPACE, the command menu used to close and
+// the user was left typing blind — no way to see that `/auto-trim` takes
+// `threshold`/`keep`, or that `/effort` takes `off|on|high|medium|low`. The hint
+// text shown in the first-level list already names those words, so they are
+// PARSED from it rather than kept in a second table that could drift out of sync.
+//
+// Only bare word alternatives are extracted. A hint like `[count]` or `<path>`
+// describes a value the user has to supply, and offering it as a completion would
+// just insert a placeholder; those are skipped.
+
+
+export function argCompletionsFor(name) {
+  const entry = allCommands().find((c) => c.name === name);
+  if (!entry || !entry.argumentHint) return [];
+  // The hint is a small grammar: `|` separates alternatives, `[...]` wraps an
+  // optional group, `<...>` is a value the USER must supply. Walk it one `|`-chunk
+  // at a time and keep only chunks that are a bare literal word.
+  //
+  // A chunk is skipped when it is (or contains) a placeholder, because completing
+  // `[count]` or `<path>` would just insert the word "count"/"path" as if it were a
+  // choice. That test has to happen BEFORE brackets are stripped — `[ratio]` and
+  // `[on|off]` look the same once you remove them, and the first is a value while
+  // the second is a set of words.
+  const words = [];
+  const chunks = String(entry.argumentHint).split('|');
+  for (let i = 0; i < chunks.length; i++) {
+    let chunk = chunks[i].trim();
+    if (!chunk) continue;
+    // Strip an optional-group bracket, but only from THIS chunk: `[on|off` splits
+    // into `[on` and `off]`, and a `]` closing the group must not be treated as
+    // part of the word. `[msg]` / `[count]` are self-contained and handled below.
+    const openedOnly = chunk.startsWith('[') && !chunk.endsWith(']');
+    const closedOnly = chunk.endsWith(']') && !chunk.startsWith('[');
+    let inner = chunk.replace(/^\[/, '').replace(/\]$/, '').trim();
+    // A self-contained single-word group is a VALUE, not a choice: `[count]`,
+    // `[ratio]`, `[msg]`, `[branch]`. Offering it would insert the placeholder name.
+    if (!openedOnly && !closedOnly && /^\[[^\s\]]+\]$/.test(chunk)) continue;
+    // `<path>`, `<file.md>`, but ALSO `threshold <n>`: take the literal word that
+    // precedes the placeholder, and drop the chunk when the placeholder comes first.
+    if (/</.test(inner)) {
+      const head = inner.split(/</)[0].trim();
+      if (!head) continue;
+      inner = head;
+      // A chunk that was ONLY a placeholder (`<objective>`) leaves nothing usable.
+      if (/^[^\s<]*>/.test(chunk.replace(/^\[/, ''))) continue;
+    }
+    if (/>/.test(inner)) inner = inner.split(/>/).pop().trim();
+    // `-f`, `--staged`, numbers, `50%`: not something to offer as a word.
+    const first = inner.split(/\s+/)[0] || '';
+    if (!/^[a-z][a-z0-9-]*$/i.test(first)) continue;
+    if (!words.includes(first)) words.push(first);
+  }
+  return words;
+}
+
+
+// Build the second-level list for `/cmd <partial>`.
+//
+// Two kinds of entry come out of this, mirroring how the first level mixes
+// commands and skills:
+//   * a word from the command's hint      -> completes the word
+//   * that command's own argumentHint     -> shown as a reminder when there is
+//     nothing left to complete, so typing `/auto-trim ` still tells you the shape
+function buildArgMenu(entry, rest) {
+  // `rest` is everything after "/cmd ". Split off the word being typed: a trailing
+  // space means the word is finished and we are completing the NEXT one.
+  const trailingSpace = /\s$/.test(rest);
+  const tokens = rest.trim().split(/\s+/).filter(Boolean);
+  const partial = trailingSpace ? '' : (tokens[tokens.length - 1] || '');
+  const priorTokens = trailingSpace ? tokens : tokens.slice(0, -1);
+
+  // Only the first positional slot is completed. A command like
+  // `/auto-trim threshold 50%` has a value after the sub-word, and guessing at
+  // every later slot would offer words that do not belong there.
+  const words = argCompletionsFor(entry.name);
+  if (!words.length) return [];
+
+  const matches = words.filter((w) => w.startsWith(partial.toLowerCase()));
+  // Already used earlier in this same command line: do not offer it twice.
+  const fresh = matches.filter((w) => !priorTokens.includes(w));
+
+  const items = fresh.map((w) => ({
+    name: partial ? w.slice(partial.length) : w,
+    full: w,
+    argumentHint: '',
+    desc: entry.argumentHint,
+    _argWord: true,
+    _argPrefix: partial,
+    _cmdName: entry.name,
+  }));
+  // Nothing matches a partial the user typed: keep the hint visible so the menu
+  // does not simply disappear mid-word.
+  if (!items.length && partial) {
+    items.push({
+      name: '', full: '', argumentHint: '', desc: `${entry.name} ${entry.argumentHint}`,
+      _argWord: false, _cmdName: entry.name,
+    });
+  }
+  return items;
+}
+
+// Accept the highlighted menu entry into the composer. Handles BOTH levels:
+//   * a command (level 1) -> replace the whole input with "/<name>"
+//   * an argument word    -> append only the REMAINING characters of that word to
+//     (level 2)             what is already typed, then leave a trailing space so
+//                           the next word can be started
+// Level 2 was impossible before: Tab did `input = '/' + sel.name`, which for an
+// argument entry would have wiped the command name off the line entirely.
+export function acceptMenuSelection(state) {
+  const sel = state.menuList[state.menuSel];
+  if (!sel) return;
+  if (!sel._argWord) {
+    state.input = '/' + sel.name;
+    state.caret = state.input.length;
+    return;
+  }
+  // For argument entries `name` holds only the completion SUFFIX (see buildArgMenu).
+  const before = state.input.slice(0, state.caret);
+  state.input = before + (sel.name || '') + ' ';
+  state.caret = state.input.length;
+}
+
 export function refreshMenu(state) {
   const val = state.input || '';
-  if (val === '' || !val.startsWith('/') || val.includes(' ')) {
+  if (val === '' || !val.startsWith('/')) {
     state.menuOpen = false;
     state.menuList = [];
     state.menuSel = 0;
     state.menuOffset = 0;
+    return;
+  }
+  // A space means the command name is settled and we are now in its ARGUMENTS.
+  // This used to close the menu outright, which is what made `/auto-trim ` leave
+  // the user with no reference for what to type next.
+  if (val.includes(' ')) {
+    const m = /^\/([^\s]+)\s+([\s\S]*)$/.exec(val);
+    const cmdEntry = m ? allCommands().find((c) => c.name === m[1].toLowerCase()
+      || (c.aliases || []).includes(m[1].toLowerCase())) : null;
+    const argMenu = cmdEntry ? buildArgMenu(cmdEntry, m[2]) : [];
+    // A command with no completable arguments (a free-form `<title>` or `<path>`)
+    // has nothing to offer, so the menu closes as it always did — but only there.
+    state.menuList = argMenu;
+    state.menuSel = Math.min(state.menuSel, Math.max(0, state.menuList.length - 1));
+    state.menuOpen = state.menuList.length > 0;
+    ensureMenuVisible(state);
     return;
   }
   const prefix = val.slice(1).toLowerCase();
@@ -4101,7 +4602,34 @@ export function refreshMenu(state) {
     ensureMenuVisible(state);
     return;
   }
-  state.menuList = allCommands().filter((c) => c.name.startsWith(prefix));
+  // Merge skills into the general `/` list so they are visible the moment `/` is
+  // typed, not only after `/skill:`. Each is a plain command entry whose `name`
+  // is the full `skill:<name>` token — Tab types the whole thing and Enter runs
+  // the skill via dispatch's default branch. Skills are filtered by the same
+  // prefix once the user narrows past `skill:`. (The dedicated `skill:` branch
+  // above is kept so a bare `/skill` also narrows the skill list.)
+  // Focus the skill list ONLY when the prefix has clearly committed to "skill":
+  //   - `/skill:...` (the explicit form), or
+  //   - `/skill` typed in FULL (the bare prefix itself).
+  // It used to trigger on any prefix that `'skill'.startsWith(prefix)` matched —
+  // so `/s`, `/sk`, `/ski` dropped every command (`/status`, `/search`, …) and
+  // showed only skills. A partial prefix must merge commands and skills.
+  const skillIntent = prefix === 'skill' || prefix.startsWith(SKILL_PREFIX);
+  const skillPrefix = prefix.startsWith(SKILL_PREFIX)
+    ? prefix.slice(SKILL_PREFIX.length)
+    : (prefix === 'skill' ? '' : prefix);
+  const filteredSkills = skillCompletions(skillPrefix).map((s) => ({
+    name: s.insert,
+    description: s.description || 'skill',
+    _skill: true,
+  }));
+  // When the prefix intends the skill area, only show skills. Otherwise show
+  // commands + every skill (a bare `/` lists everything, and any other prefix
+  // matches skill names directly).
+  const cmdList = skillIntent
+    ? []
+    : allCommands().filter((c) => c.name.startsWith(prefix));
+  state.menuList = [...cmdList, ...filteredSkills];
   state.menuSel = Math.min(state.menuSel, Math.max(0, state.menuList.length - 1));
   state.menuOpen = state.menuList.length > 0;
   ensureMenuVisible(state);
@@ -4128,8 +4656,16 @@ function ensureMenuVisible(state) {
 }
 
 // ---- command dispatch ----
-export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrame) {
+export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrameArg) {
   const { addChat, openPicker, openForm, notice, sendPrompt, quit, saveSession, openEditor } = h;
+  // The repaint hook: the parameter is kept for callers that pass it, but the
+  // authoritative source is `h.renderFrame` (the host always supplies one). The
+  // parameter was declared and NEVER passed by any of the four callers, so a
+  // command that repaints — /compact does — crashed with "renderFrame is not a
+  // function". A no-op fallback keeps a headless caller working.
+  const renderFrame = (typeof renderFrameArg === 'function') ? renderFrameArg
+    : (typeof h.renderFrame === 'function') ? h.renderFrame
+    : () => {};
   const entry = findCommand(cmdRaw);
   const cmd = entry ? entry.name : String(cmdRaw || '').replace(/^\//, '');
   const app = (m) => notice(m, 'info');
@@ -4137,6 +4673,24 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
   const persist = () => { try { h.persistState && h.persistState(); } catch {} };
   const appErr = (m) => notice(m, 'error');
   const say = (m) => addChat({ role: 'system', text: m });
+  // A panel whose colours are embedded in the text (grey labels, white values).
+  // Added as 'rich' so msgLines emits it verbatim instead of tinting the whole
+  // block one role colour.
+  const sayRich = (m) => addChat({ role: 'rich', text: m });
+  // A panel from plain text: the FIRST line is a white/bold heading, every other
+  // line is dim grey (indented list items, paths, dim prose). This is the shared
+  // look for `/context`-style output — used instead of `say()` (which tinted a
+  // whole block teal) for anything with structure: lists, key/value blocks, diffs.
+  const sayPanel = (text) => {
+    const parts = String(text == null ? '' : text).split('\n');
+    const out = parts.map((line, i) => {
+      const body = line.startsWith(' ') || line === '' ? line
+        : (line.startsWith('│') || line.startsWith('┌') || line.startsWith('└') ? line : '  ' + line);
+      if (i === 0 && line.trim()) return C.white + C.bold + line + C.reset;
+      return C.gray + body + C.reset;
+    });
+    addChat({ role: 'rich', text: out.join('\n') });
+  };
   const raw = (arg || '').trim();
 
   switch (cmd) {
@@ -4146,9 +4700,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       openPicker({
         title: 'Select permission mode',
         items: [
-          { label: 'Always Ask', sub: 'read-only runs automatically; other actions ask', current: state.mode === 'ask', value: 'ask' },
-          { label: 'Ask When Needed', sub: 'workspace-internal edits and commands run automatically; outside the workspace or destructive commands ask', current: state.mode === 'yolo', value: 'yolo' },
-          { label: 'Never Ask', sub: 'never interrupts; dangerous commands are still guarded', current: state.mode === 'auto', value: 'auto' },
+          { label: 'Ask', sub: 'read-only runs automatically; every other action asks first', current: state.mode === 'ask', value: 'ask' },
+          { label: 'Yolo', sub: 'nothing asks: edits and commands run automatically, inside the workspace or not', current: state.mode === 'yolo', value: 'yolo' },
+          { label: 'Auto', sub: 'nothing asks and nothing is reviewed: everything runs and is decided automatically', current: state.mode === 'auto', value: 'auto' },
         ],
         sel: ['ask', 'yolo', 'auto'].indexOf(state.mode),
         searchable: false,
@@ -4207,6 +4761,8 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           { label: 'add-dir', sub: 'add an additional workspace directory' },
           { label: 'auto-update', sub: `check npm for updates at startup + every 30 min — currently ${cfg.autoUpdate ? 'on' : 'off'}` },
           { label: 'auto-compact', sub: `summarize older history at 85% of the window — currently ${cfg.autoCompact === false ? 'off' : 'on'}` },
+          { label: 'auto-trim', sub: `elide old tool results at 50% of the window — currently ${cfg.autoTrim === false ? 'off' : 'on'}` },
+          { label: 'trim', sub: 'elide old tool results now — /trim [0.3] sets how much to keep' },
         ],
         onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
       });
@@ -4578,9 +5134,19 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
             cfg.provider = keepProvider;
             state.chat = reconstructChat(session);
             state.scroll = 0;
+            dropScrollPin(state);   // fresh transcript: re-seed the anchor on paint
             state.rounds = session.rounds || 0;
             state.steps = session.steps || 0;
             state.lastTurnMs = session.lastTurnMs || 0;
+            // The resumed session may live in another directory. `!` passthrough
+            // runs in `state.cwd || state.workspace`, so leaving the PREVIOUS
+            // session's cwd here ran the command in the wrong place.
+            if (full.workspace) {
+              state.cwd = full.workspace;
+              state.workspace = full.workspace;
+              refreshGitInfo(state, { force: true });
+            }
+
             
             // Update context gauge based on restored session messages.
             const approx = estimateMessagesTokens(session.messages, cfg);
@@ -4706,7 +5272,25 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       session.messages = msgs.slice(0, idx);
       state.chat = state.chat.slice(0, Math.max(0, state.chat.length - removed.length));
       saveSession(session);
-      app(`Undid ${count} prompt${count > 1 ? 's' : ''}.`);
+      // Rewind the FILES too. This used to only truncate the transcript and then
+      // say "Undid 1 prompt", while every Edit/Write the agent had made stayed on
+      // disk — so the user believed the work was withdrawn and then found their
+      // files still rewritten. file-history.js holds the pre-turn content of each
+      // file the agent touched, taken on the first write to it in that turn.
+      const rewound = rewindFiles(session.id, count);
+      const filesNote = describeRewind(rewound);
+      // The files on disk are now older than what the model Read, so every hash in
+      // the Read snapshot pool describes content that is no longer there. Clear it,
+      // or the model's next Edit is rejected as "changed since it was Read" against
+      // a file the user just watched being restored.
+      if (state.agent && state.agent.readPool) {
+        try { state.agent.readPool.clear(); } catch { /* best-effort */ }
+      }
+      if (rewound.failed.length) {
+        for (const f of rewound.failed) appErr(`Could not restore ${f.path}: ${f.error}`);
+      }
+      app(`Undid ${count} prompt${count > 1 ? 's' : ''}${filesNote ? ` — ${filesNote}` : ' (no files changed)'}.`);
+      renderFrame();
       return;
     }
     case 'title': {
@@ -4727,58 +5311,111 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const msgs = session.messages || [];
       if (msgs.length <= 2) { app('Nothing to compact yet.'); return; }
       const ratio = raw ? parseFloat(raw) : null; // optional slice ratio (0-1)
-
-      // AI-powered compaction: summarize the dropped portion of the conversation
-      // via the model, so context is preserved rather than simply truncated.
-      let keepCount, dropped;
-      if (ratio !== null) {
-        // Slice mode: user-specified ratio to drop (0-1). E.g. 0.2 drops the
-        // oldest 20% and keeps the most recent 80%.
-        if (!isNaN(ratio) && ratio > 0 && ratio < 1) {
-          keepCount = Math.ceil(msgs.length * (1 - ratio));
-          dropped = msgs.length - keepCount;
-        } else {
-          app('Invalid ratio; use 0-1 (e.g., 0.2 to drop 20%% of oldest messages)');
-          return;
-        }
-      } else {
-        // Default mode: keep the most recent 20% of messages, summarize the rest.
-        keepCount = Math.max(1, Math.ceil(msgs.length * 0.2));
-        dropped = msgs.length - keepCount;
+      if (ratio !== null && !(ratio > 0 && ratio < 1)) {
+        app('Invalid ratio; use 0-1 (e.g., 0.2 to drop the oldest 20% of messages)');
+        return;
       }
 
-      const droppedMsgs = msgs.slice(0, dropped);
-      const kept = msgs.slice(keepCount);
+      // Summarising is a full model round-trip. Without this, a second /compact
+      // (or a message typed while it works) would edit the same history at the
+      // same time — `state.running` is what submit() checks to queue instead.
+      if (state.running) { app('Busy — wait for the current turn to finish.'); return; }
+      state.running = true;
+      renderFrame();
 
-      // Ask the model to summarize the trimmed messages.
+      const maxCtx = cfg.maxContextTokens || state.ctxMax || 512000;
+      const plan = planCompaction(msgs, cfg, ratio, maxCtx);
+      const droppedMsgs = plan.dropped;
+      const kept = plan.kept;
+      const dropped = droppedMsgs.length;
+
+
+      // Summarize the dropped portion, so context survives the trim — that is the
+      // whole point of compaction. Rendered as the SAME live compaction block the
+      // automatic path uses (blinking bullet → "Compaction complete"), so the two
+      // look identical instead of one getting a spinner and the other a text line.
       let summary = '';
+      const liveBlock = {
+        role: 'compaction', phase: 'running', startedAt: Date.now(), instruction: '',
+      };
+      addChat(liveBlock);
+      renderFrame();
       if (droppedMsgs.length > 0) {
         const llm = new LLM(cfg);
-        app(`Summarizing ${dropped} messages for compaction…`);
+        // Let Esc abort the summary request (see the escape handler).
+        state._compactLlm = llm;
         try {
+          // Thinking off, no tools — same reasoning as the automatic path in
+          // agent.js: a reasoning model can spend the whole output budget on
+          // `reasoning_content` and return an empty summary, which turns /compact
+          // into a plain loss of history.
           summary = await llm.requestText([
             { role: 'system', content: 'You are an expert at summarizing coding-agent conversations. Summarize the conversation history below. Capture: the user\'s original request, key decisions made, files created or modified, errors encountered and how they were resolved, and the current state of any ongoing work or remaining tasks. Be concise but thorough — aim for 3-5 short paragraphs that let the model continue the task with full context. Do NOT include meta-commentary, only the facts.' },
             ...droppedMsgs,
-          ]);
+          ], { noReasoning: true, noTools: true });
         } catch (e) {
           summary = '';
         }
+        state._compactLlm = null;
+      }
+      // Interrupted (Esc): abort yields an empty summary; do NOT trim — that would
+      // drop history with nothing to replace it. Mark the block cancelled and stop.
+      if (state._compactAborted) {
+        state._compactAborted = false;
+        liveBlock.phase = 'cancelled';
+        liveBlock._cache = null;
+        state.running = false;
+        renderFrame();
+        return;
       }
 
       const compactedSummary = summary
-        ? `Context compacted: dropped ${dropped} older messages, replaced with AI summary.\n\nSummary:\n${summary}`
-        : `Context compacted (dropped ${dropped} older messages).`;
+        ? `[hncode] Earlier conversation context was compacted. ${dropped} older message(s) were replaced by this summary:\n\n${summary}`
+        : `[hncode] ${dropped} earlier message(s) were compacted without a summary. Their detail is no longer available.`;
 
-      // Update the session messages: keep the recent ones + summary.
-      session.messages = [...kept, { role: 'system', content: compactedSummary }];
-      // Mirror the change in the live chat view.
-      state.chat = [...state.chat.slice(0, state.chat.length - msgs.length), ...kept, { role: 'system', content: compactedSummary }];
+      // The summary MUST be a `user` message, NOT `system`. runAgent() skips every
+      // `system` entry in session.messages (it rebuilds the prompt from scratch),
+      // and the turn-end save filters `system` out of the persisted history — so a
+      // `system` summary was dropped at BOTH ends, leaving the model with a trimmed
+      // transcript and no record of what had been removed. Auto-compaction only
+      // gets away with it because it edits the request array directly.
+      const summaryMsg = { role: 'user', content: compactedSummary };
+
+      session.messages = [summaryMsg, ...kept];
+      // `convRowFor` returns an ARRAY (one assistant message expands into its own
+      // row plus one row per tool call). Spreading it into an object literal —
+      // `{ ...convRowFor(m), _conv: true }` — produced `{0: {...}, 1: {...},
+      // _conv: true}` instead of rows: a message with a role of `undefined`, which
+      // renders as blank. That is what made the transcript go empty after a manual
+      // /compact. Flat-map so every produced row is a row.
+      state.chat = [
+        ...state.chat.filter((m) => !m._conv),
+        { role: 'user', text: compactedSummary, _conv: true },
+        ...kept.flatMap((m) => convRowFor(m).map((r) => ({ ...r, _conv: true }))),
+      ];
 
       saveSession(session);
-      state.tokens = estimateMessagesTokens(session.messages);
-      app('OK');
+      state.tokens = estimateMessagesTokens(session.messages, cfg);
+      state.ctxTokens = state.tokens;
+      state.ctxPercent = usagePercent(state.tokens, state.ctxMax || maxCtx);
+      // The transcript was just replaced with a much shorter one. Drop the scroll
+      // anchor (as /sessions and /move do) so the next paint seeds a fresh one and
+      // the view lands on the newest rows instead of compensating for a row delta
+      // that no longer describes anything.
+      dropScrollPin(state);
+      state.scroll = 0;
+      state.running = false;
+      // Settle the live block into "Compaction complete (before → after tokens)",
+      // matching the automatic path.
+      liveBlock.phase = 'done';
+      liveBlock.tokensBefore = estimateMessagesTokens(msgs, cfg);
+      liveBlock.tokensAfter = state.tokens;
+      liveBlock.text = summary || '';
+      liveBlock._cache = null;
+      renderFrame();
       return;
     }
+
     case 'set-system-prompt': {
       // Two steps: pick a source, then edit it. Showing the editor straight away
       // (the old behaviour) left no way to start from a preset.
@@ -4936,6 +5573,223 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
 
+    case 'memory': {
+      // The AGENT's own notes (the Memory tool writes them). Same two scopes as
+      // /personal but a separate pair of files, so the user's preferences and the
+      // model's notes never overwrite each other. Bare /memory shows what is
+      // stored; `clear` wipes a scope, since a wrong note otherwise keeps being
+      // injected into every future prompt.
+      const workspace = state.workspace || cfg.workspace || process.cwd();
+      const a = raw.trim().toLowerCase();
+      const openScope = (scope) => {
+        const file = memoryFile(scope, workspace);
+        openEditor({
+          title: `Agent memory (${scope}) — ${file}`,
+          text: readMemoryRaw(scope, workspace),
+          caretRow: 0,
+          caretCol: 0,
+          onSave: (value) => {
+            try { writeMemoryRaw(scope, workspace, value); }
+            catch (e) { appErr('Could not write ' + file + ': ' + e.message); return; }
+            if (String(value).trim()) app(`Agent memory saved (${scope}) → ${file}`);
+            else app(`Agent memory cleared (${scope}); nothing will be injected.`);
+          },
+        });
+      };
+      const summary = (scope) => {
+        const t = readMemoryRaw(scope, workspace).trim();
+        if (!t) return '(empty)';
+        const n = t.split('\n').filter((l) => l.trim().startsWith('-')).length;
+        return `${n} note${n === 1 ? '' : 's'}`;
+      };
+      if (a === 'clear' || a === 'reset') {
+        openPicker({
+          title: 'Clear agent memory — choose a scope',
+          items: [
+            { label: 'project', sub: `this workspace only — ${summary('project')}` },
+            { label: 'global', sub: `all workspaces — ${summary('global')}` },
+          ],
+          onPick: (it) => {
+            const file = memoryFile(it.label, workspace);
+            try { writeMemoryRaw(it.label, workspace, ''); }
+            catch (e) { appErr('Could not clear ' + file + ': ' + e.message); return true; }
+            app(`Agent memory cleared (${it.label}) — ${file}`);
+            return true;
+          },
+        });
+        return;
+      }
+      if (a === 'global' || a === 'g' || a === 'user') { openScope('global'); return; }
+      if (a === 'project' || a === 'p' || a === 'local') { openScope('project'); return; }
+      if (a === '') {
+        openPicker({
+          title: 'Agent memory — choose a scope',
+          items: [
+            { label: 'project', sub: `this workspace only — ${summary('project')}` },
+            { label: 'global', sub: `all workspaces — ${summary('global')}` },
+          ],
+          onPick: (it) => { openScope(it.label); return true; },
+        });
+        return;
+      }
+      appErr('Usage: /memory [global|project|clear]');
+      return;
+    }
+
+    case 'permissions': {
+      // Standing allow / ask / deny rules (see permissions.js). They are read from
+      // config.toml's [permissions] table, so bare /permissions PRINTS what is in
+      // force and `edit` opens the TOML file — a free-text editor beats a wizard
+      // here because the rule syntax is the thing being edited, and the file is
+      // where the user may already have other settings.
+      const rules = cfg.permissions || {};
+      const n = (k) => (Array.isArray(rules[k]) ? rules[k].length : 0);
+      if (raw.trim().toLowerCase() === 'edit') {
+        const file = hncodeConfigFile();
+        openEditor({
+          title: `Permissions — ${file}`,
+          text: (() => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } })(),
+          caretRow: 0,
+          caretCol: 0,
+          onSave: (value) => {
+            try { fs.writeFileSync(file, String(value)); }
+            catch (e) { appErr('Could not write ' + file + ': ' + e.message); return; }
+            // Re-read so the new rules apply on the NEXT tool call, without a restart.
+            const fresh = resolveConfig();
+            cfg.permissions = fresh.permissions;
+            app(`Permissions saved. allow=${(cfg.permissions.allow || []).length} `
+              + `ask=${(cfg.permissions.ask || []).length} deny=${(cfg.permissions.deny || []).length}`
+              + ' — effective immediately.');
+          },
+        });
+        return;
+      }
+      const lines = [
+        'Standing permission rules, checked BEFORE the mode shortcuts',
+        '(so a deny cannot be bypassed with Auto, and an ask still prompts):',
+        '',
+        describeRules(rules),
+        '',
+        `Config file: ${hncodeConfigFile()}`,
+        'Edit with:   /permissions edit',
+        '',
+        'Syntax:',
+        '  Bash                    every Bash call',
+        '  Bash(npm run test)      that exact command',
+        '  Bash(npm run test *)    a command starting with `npm run test `',
+        '  Read(./src/**)          a tool whose path argument matches the glob',
+      ];
+      openPanel('Permissions', lines);
+      if (!n('allow') && !n('ask') && !n('deny')) {
+        app('No permission rules set — /permissions edit to add some.');
+      }
+      return;
+    }
+
+    case 'external': {
+      // Outside-the-workspace access. Persisted to config.toml as
+      // `tool_allow_external_paths`, so it survives a restart — the point of the
+      // switch is that a user grants (or revokes) it ONCE, instead of it being
+      // implied by whichever permission mode they happen to be in.
+      //
+      // Bare /external TOGGLES, like /plan, /focus and every other on-off mode in
+      // this CLI. `on` / `off` force a state so a script can be explicit.
+      const a = raw.trim().toLowerCase();
+      const cur = !!cfg.allowExternal;
+      let want;
+      if (a === 'on' || a === 'true' || a === 'yes' || a === '1') want = true;
+      else if (a === 'off' || a === 'false' || a === 'no' || a === '0') want = false;
+      else if (a === '') want = !cur;
+      else { appErr('Usage: /external [on|off]'); return; }
+
+      const envForced = process.env.HNCODE_ALLOW_EXTERNAL === '1';
+      try { setConfigBool('tool_allow_external_paths', want); }
+      catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+      cfg.allowExternal = want;
+      if (cfg.raw) cfg.raw.tool_allow_external_paths = want;
+      // Push it into the RUNNING agent too: it snapshotted cfg at construction, so
+      // without this the switch would only take effect on the next turn.
+      if (state.agent && state.agent.ctx) state.agent.ctx.allowExternal = want;
+      app(want
+        ? 'External paths: ON — tools may read and write outside the workspace.'
+        : 'External paths: OFF — tools are confined to the workspace.');
+      if (envForced && !want) {
+        appErr('Note: HNCODE_ALLOW_EXTERNAL=1 is set, so access stays ON until you unset it.');
+      }
+      return;
+    }
+
+    case 'web': {
+      // Publish this session to the browser through the MACHINE-WIDE web UI.
+      //
+      // There is one daemon per machine, on the fixed port from config.toml, and
+      // it is what the user opens: it lists every workspace and every session —
+      // the running ones live, the finished ones read from disk. This command
+      // brings up this session's own server and registers it there; if the daemon
+      // is already up it is REUSED rather than restarted, which is the whole point
+      // of a stable address and a stable token.
+      const a = raw.trim();
+      if (a.toLowerCase() === 'off' || a.toLowerCase() === 'stop') {
+        app(h.stopWeb() ? 'Web UI stopped (this session is no longer listed).' : 'Web UI is not running.');
+        return;
+      }
+      if (!h.startWebGlobal) { appErr('Web UI is unavailable in this build.'); return; }
+      // Optional "[bindIp] [port]" — the same shapes `--web` accepts. The old
+      // code threw these away and always bound loopback, so `/web 0.0.0.0` looked
+      // like it worked while nothing was reachable from the network.
+      let bindArg, portArg;
+      if (a) {
+        const parts = a.split(/\s+/);
+        if (/^\d+$/.test(parts[0])) portArg = Number(parts[0]);
+        else bindArg = parts[0];
+        if (parts[1] && /^\d+$/.test(parts[1])) portArg = Number(parts[1]);
+      }
+      say('Starting the web UI…');
+      h.startWebGlobal(bindArg, portArg).then(({ srv, daemon, token }) => {
+        if (!daemon) {
+          // The daemon could not be reached or started. The session's own server
+          // is still up, so report THAT rather than pretending /web failed.
+          sayPanel([
+            `Web UI (this session only): ${srv.url}`,
+            '',
+            'The machine-wide daemon is unavailable, so this session is served',
+            'directly. Open the address above; the token is below.',
+            '',
+            `    ${srv.token}`,
+          ].join('\n'));
+          notice(`Web UI on ${srv.url} (daemon unavailable)`, 'error');
+          return;
+        }
+        const lan = daemon.host && daemon.host !== '127.0.0.1' && daemon.host !== 'localhost';
+        sayPanel([
+          `Web UI:   ${daemon.rootUrl}`,
+          `Session:  ${daemon.url}`,
+          `Bind:     ${daemon.host}:${daemon.port}${lan ? '  (reachable from the network)' : '  (this machine only)'}`,
+          daemon.spawned ? 'Daemon:   started (was not running)' : 'Daemon:   reused (already running)',
+          '',
+          'The root page lists every workspace and session — running ones live,',
+          'finished ones from disk. The token below is stored in config.toml, so',
+          'it stays the same across restarts.',
+          '',
+          'Access token (paste it into the login page):',
+          '',
+          `    ${token || srv.token}`,
+          '',
+          'Anyone with this token can run commands as you. Stop this session with',
+          '/web off.',
+        ].join('\n'));
+        notice(`Web UI at ${daemon.rootUrl}`);
+      }).catch((e) => {
+        appErr(`Could not start the web UI: ${e.message}`);
+      });
+      return;
+    }
+
+
+
+
+
+
     case 'calm-mode': {
       // Terse-output mode: while ON, an instruction is injected with each request
       // telling the model not to narrate what it is about to do or why, unless
@@ -4985,7 +5839,8 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
     case 'goal': {
       const a = raw.toLowerCase();
       if (!raw || a === 'status') {
-        say(state.objective ? `Goal: ${state.objective}\nStatus: ${state.goalPaused ? 'paused' : 'active'}` : 'No goal set. Start one with /goal <objective>.');
+        if (state.objective) sayPanel(`Goal: ${state.objective}\nStatus: ${state.goalPaused ? 'paused' : 'active'}`);
+        else say('No goal set. Start one with /goal <objective>.');
         return;
       }
       if (a === 'pause') { state.goalPaused = true; app('Goal paused. Use /goal resume to continue.'); return; }
@@ -5045,20 +5900,151 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (session.title) lines.push(`Title:       ${session.title}`);
       if (state.objective) lines.push(`Goal:        ${state.objective}${state.goalPaused ? ' (paused)' : ''}`);
       lines.push(`Context:     ${state.ctxPercent}% (${fmtTokens(state.ctxTokens)}/${fmtTokens(state.ctxMax)})`);
-      say(lines.join('\n'));
+      sayPanel(lines.join('\n'));
       return;
     }
     case 'usage': {
       const msgs = session.messages || [];
       const approx = Math.round(JSON.stringify(msgs).length / 3.5);
-      say([
-        'Session usage',
-        `  messages: ${msgs.length}`,
-        `  approx tokens: ${approx}`,
+      const g = C.gray, w = C.white, b = C.bold;
+      const lines = [
+        w + b + 'Session usage' + C.reset,
+        '  ' + g + 'messages      ' + C.reset + w + msgs.length + C.reset,
+        '  ' + g + 'approx tokens ' + C.reset + w + approx + C.reset,
         '',
-        'Context window',
-        `  ${state.ctxPercent}% used (${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})`,
-      ].join('\n'));
+        w + b + 'Context window' + C.reset,
+        '  ' + g + 'used          ' + C.reset + w + `${state.ctxPercent}% `
+          + g + `(${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})` + C.reset,
+      ];
+      // Trend of the request size across this session's steps: rises as history
+      // accumulates and drops when a compaction trims it.
+      const hist = Array.isArray(state.tokenHistory) ? state.tokenHistory : [];
+      if (hist.length >= 2) {
+        const chart = sparkChart(hist, 50, 6);
+        if (chart.length) {
+          const hi = Math.max(...hist);
+          const lo = Math.min(...hist);
+          lines.push('');
+          lines.push(w + b + `Context over ${hist.length} steps` + C.reset
+            + g + `  ${fmtTokens(lo)} → ${fmtTokens(hi)}` + C.reset);
+          for (const row of chart) lines.push(g + '  ' + row + C.reset);
+          lines.push(g + '  ' + '─'.repeat(Math.min(50, hist.length))
+            + '  now: ' + fmtTokens(state.ctxTokens) + C.reset);
+        }
+      }
+      sayRich(lines.join('\n'));
+      return;
+      return;
+    }
+    case 'context': {
+      // Break the context window down by what actually occupies it, so the user
+      // can see WHERE the tokens go instead of one percentage. Mirrors Claude
+      // Code's ContextVisualization.
+      const msgs = session.messages || [];
+      const byRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
+      const countByRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
+      for (const m of msgs) {
+        const t = estimateMessagesTokens([m], cfg);
+        const r = (m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool') ? m.role : 'other';
+        byRole[r] += t;
+        countByRole[r] += 1;
+      }
+      // Tool definitions ride every request (name + schema), priced here the same
+      // way usedTokens() prices them.
+      const toolCount = Array.isArray(cfg.toolFilter) ? cfg.toolFilter.length : (toolNames().length);
+      const toolDefTokens = toolCount * 8;
+      const total = byRole.system + byRole.user + byRole.assistant + byRole.tool + byRole.other + toolDefTokens;
+      const max = state.ctxMax || cfg.maxContextTokens || 1;
+      const pct = (n) => `${(n / max * 100).toFixed(1)}%`;      // A simple bar so the biggest consumer is obvious at a glance.
+      const bar = (n) => {
+        const width = 24;
+        const filled = Math.max(0, Math.min(width, Math.round(n / Math.max(1, total) * width)));
+        return '█'.repeat(filled) + '░'.repeat(width - filled);
+      };
+      const rows = [
+        ['system prompt', byRole.system, countByRole.system],
+        ['tool definitions', toolDefTokens, toolCount],
+        ['user messages', byRole.user, countByRole.user],
+        ['assistant', byRole.assistant, countByRole.assistant],
+        ['tool results', byRole.tool, countByRole.tool],
+      ];
+      if (byRole.other) rows.push(['other', byRole.other, countByRole.other]);
+      rows.sort((a, b) => b[1] - a[1]);
+      const g = C.gray, w = C.white, b = C.bold;
+      const lines = [
+        w + b + `Context breakdown` + C.reset
+          + g + `  (${fmtTokens(total)} / ${fmtTokens(max)}  ${pct(total)})` + C.reset,
+        '',
+      ];
+      for (const [name, tok, cnt] of rows) {
+        if (!tok) continue;
+        lines.push(
+          '  ' + g + bar(tok) + C.reset
+          + w + `  ${fmtTokens(tok).padStart(7)}` + C.reset
+          + g + `  ${pct(tok).padStart(6)}  ` + C.reset
+          + w + name + C.reset
+          + (cnt ? g + ` (${cnt})` + C.reset : ''),
+        );
+      }
+      // Advice, only when there is something worth saying.
+      const tips = [];
+      if (byRole.tool > total * 0.4) tips.push('Tool results dominate — /compact or a narrower search would free the most.');
+      if (byRole.system > total * 0.3) tips.push('The system prompt is large — trim AGENTS.md / personal prompt.');
+      if (total / max > 0.8) tips.push('Over 80% — auto-compaction is close. /compact now to keep control.');
+      if (tips.length) lines.push('', ...tips.map((t) => g + '  ' + t + C.reset));
+      sayRich(lines.join('\n'));
+      return;
+      return;
+    }
+    case 'search': {
+      // Interactive project search: type to search (ripgrep via the Grep tool),
+      // Enter inserts the hit as `path:line: text` into the composer.
+      const picker = {
+        title: 'Search project',
+        hint: '↑↓ navigate · Enter insert · Esc cancel',
+        items: [],
+        sel: 0,
+        searchable: true,
+        _loading: false,
+        onQueryChange: (q) => {
+          const query = String(q || '').trim();
+          const mine = ++searchSeq;
+          if (!query) { picker.items = []; picker._loading = false; renderFrame(); return; }
+          const tool = getTool('Grep');
+          if (!tool) { picker.items = [{ label: 'Grep tool unavailable' }]; renderFrame(); return; }
+          picker._loading = true;
+          renderFrame();
+          Promise.resolve(tool.execute({ pattern: query, path: '.' }, { cwd: state.cwd, workspace: state.workspace, signal: { aborted: false } }))
+            .then((out) => {
+              if (mine !== searchSeq) return;   // a newer query superseded this one
+              picker._loading = false;
+              const text = typeof out === 'string' ? out : '';
+              const rows = text.split('\n').filter((l) => l && !/^\[?error/i.test(l)).slice(0, 200);
+              picker.items = rows.map((line) => {
+                // Path may contain a drive colon on Windows (`D:\a\b.js:12:code`),
+                // so anchor on `:<digits>:` rather than the first colon.
+                const m = /^(.*?):(\d+):(.*)$/.exec(line);
+                if (m) return { label: `${m[1]}:${m[2]}`, sub: m[3].trim().slice(0, 100), hit: { path: m[1], line: Number(m[2]) } };
+                return { label: line.slice(0, 120), sub: '', hit: null };
+              });
+              renderFrame();
+            })
+            .catch(() => { if (mine === searchSeq) { picker._loading = false; picker.items = []; renderFrame(); } });
+        },
+        onPick: (item) => {
+          const insert = item && item.hit ? `${item.hit.path}:${item.hit.line}` : (item ? item.label : '');
+          state.input = (state.input || '') + insert;
+          state.caret = state.input.length;
+          refreshMenu(state);
+          return true;
+        },
+      };
+      searchSeq += 1;
+      state.picker = picker;
+      state.pickerQuery = raw.trim();
+      state.pickerCategory = null;
+      if (state.pickerQuery) picker.onQueryChange(state.pickerQuery);
+      renderFrame();
       return;
     }
     case 'auto-update': {
@@ -5078,19 +6064,150 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
     case 'auto-compact': {
-      // Toggle /auto-compact. Persists to config.toml so it survives restarts.
-      const a = raw.toLowerCase();
+      // /auto-compact              -> toggle on/off (persisted)
+      // /auto-compact on|off       -> set explicitly
+      // /auto-compact threshold 85%  -> fire when usage reaches 85% of the window
+      // /auto-compact keep 20%       -> keep ~20% of the CURRENT usage after a trim
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      const valStr = parts.slice(1).join(' ').trim();
+      const parseRatio = (s) => {
+        const str = String(s || '').trim();
+        if (!str) return null;
+        const pct = str.endsWith('%');
+        const n = parseFloat(str);
+        if (!Number.isFinite(n)) return null;
+        const v = pct ? n / 100 : (n > 1 ? n / 100 : n);   // "85" and "85%" both = 0.85
+        if (!(v > 0 && v < 1)) return null;
+        return v;
+      };
+      if (sub === 'threshold' || sub === 'keep') {
+        const v = parseRatio(valStr);
+        if (v === null) { appErr(`Usage: /auto-compact ${sub} <0-1 | n%>  (e.g. ${sub === 'threshold' ? '0.85 or 85%' : '0.2 or 20%'})`); return; }
+        const key = sub === 'threshold' ? 'compact_threshold' : 'compact_keep_ratio';
+        try { setConfigString(key, String(v)); }
+        catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+        if (sub === 'threshold') { cfg.compactThreshold = v; cfg.raw.compact_threshold = v; }
+        else { cfg.compactKeepRatio = v; cfg.raw.compact_keep_ratio = v; }
+        app(sub === 'threshold'
+          ? `Auto-compaction now fires at ${Math.round(v * 100)}% of the context window`
+          : `Auto-compaction now keeps ~${Math.round(v * 100)}% of the current usage after trimming`);
+        return;
+      }
+      // Toggle / set on/off. Persists to config.toml so it survives restarts.
       let want;
-      if (a === 'on') want = true;
-      else if (a === 'off') want = false;
+      if (sub === 'on') want = true;
+      else if (sub === 'off') want = false;
       else want = cfg.autoCompact === false;   // flip from the current state
       try { setConfigString('auto_compact', want ? 'true' : 'false'); }
       catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
       cfg.autoCompact = want;
       cfg.raw.auto_compact = want;
+      const pct = Math.round((cfg.compactThreshold == null ? 0.85 : cfg.compactThreshold) * 100);
       app(want
-        ? 'Auto-compaction ON — older history is summarized once a request reaches 85% of the context window'
+        ? `Auto-compaction ON — older history is summarized once a request reaches ${pct}% of the context window`
         : 'Auto-compaction OFF — history is no longer trimmed automatically (use /compact manually)');
+      return;
+    }
+    case 'auto-trim': {
+      // /auto-trim                 -> toggle on/off (persisted)
+      // /auto-trim on|off          -> set explicitly
+      // /auto-trim threshold 50%   -> trim once a request reaches 50% of the window
+      // /auto-trim keep 30%        -> keep ~30% of the tool-result TEXT after a trim
+      //
+      // The mirror of /auto-compact above, deliberately: same argument shape, same
+      // persistence, same wording. Trimming is the cheap pass (replace old tool
+      // bodies with a pointer to disk), compaction is the expensive one (summarize
+      // history); the trigger here defaults far lower because doing it early avoids
+      // needing the other at all.
+      // Accepts a fraction ("0.5"), a whole-number percentage ("50"), or an
+      // explicit percentage ("50%"). A trailing `%` ALWAYS means percent. Without
+      // it, a bare value >= 1 is read as a percentage ONLY when it is a whole
+      // number: "50" is 50%, but "1.5" is rejected rather than silently read as
+      // 1.5% — a value that looks like an out-of-range fraction is far more likely
+      // a typo than a deliberate hundredth.
+      const parseRatioTrim = (s) => {
+        const str = String(s || '').trim();
+        if (!str) return null;
+        const pct = str.endsWith('%');
+        const n = parseFloat(str);
+        if (!Number.isFinite(n)) return null;
+        if (!pct && n >= 1 && !Number.isInteger(n)) return null;
+        const v = pct ? n / 100 : (n >= 1 ? n / 100 : n);
+        if (!(v > 0 && v < 1)) return null;
+        return v;
+      };
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      const valStr = parts.slice(1).join(' ').trim();
+      if (sub === 'threshold' || sub === 'keep') {
+        const v = parseRatioTrim(valStr);
+        if (v === null) {
+          appErr(`Usage: /auto-trim ${sub} <0-1 | n%>  (e.g. ${sub === 'threshold' ? '0.5 or 50%' : '0.3 or 30%'})`);
+          return;
+        }
+        const key = sub === 'threshold' ? 'trim_threshold' : 'trim_keep_ratio';
+        try { setConfigString(key, String(v)); }
+        catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+        if (sub === 'threshold') { cfg.trimThreshold = v; cfg.raw.trim_threshold = v; }
+        else { cfg.trimKeepRatio = v; cfg.raw.trim_keep_ratio = v; }
+        app(sub === 'threshold'
+          ? `Auto-trim now fires at ${Math.round(v * 100)}% of the context window`
+          : `Auto-trim now keeps ~${Math.round(v * 100)}% of the tool-result text after trimming`);
+        return;
+      }
+      let wantTrim;
+      if (sub === 'on') wantTrim = true;
+      else if (sub === 'off') wantTrim = false;
+      else wantTrim = cfg.autoTrim === false;   // flip from the current state
+      try { setConfigString('auto_trim', wantTrim ? 'true' : 'false'); }
+      catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+      cfg.autoTrim = wantTrim;
+      cfg.raw.auto_trim = wantTrim;
+      const thr = Math.round((cfg.trimThreshold == null ? 0.5 : cfg.trimThreshold) * 100);
+      const keepPct = Math.round((cfg.trimKeepRatio == null ? 0.3 : cfg.trimKeepRatio) * 100);
+      app(wantTrim
+        ? `Auto-trim ON — old tool results are elided from the request once it reaches ${thr}% of the window, keeping ~${keepPct}% of them (use /trim to do it now)`
+        : 'Auto-trim OFF — tool results are sent in full (use /trim to elide them once)');
+      return;
+    }
+case 'trim': {
+      // Manual trim, the counterpart of /auto-trim. Runs the same pass on demand,
+      // regardless of the trigger ratio — for when the user knows the history is
+      // carrying output they are done with and does not want to wait for the 50%
+      // mark.
+      //
+      // The single optional argument IS the keep ratio (`/trim 30%`), with no
+      // `keep` keyword in front of it: there is only one parameter, so naming it
+      // adds a word to type and nothing to remember.
+      //
+      // Deliberately does NOT touch the saved session: this elides what is SENT and
+      // copies the removed text to disk (see tool-result.js), so the transcript the
+      // user scrolls back through is intact.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      let keepRatio = Number.isFinite(cfg.trimKeepRatio) ? cfg.trimKeepRatio : 0.3;
+      const USAGE = 'Usage: /trim [0.3]  (a fraction, or a percent like 30%)';
+      if (parts.length > 1) { appErr(USAGE); return; }
+      if (parts.length === 1) {
+        const spec = String(parts[0]).trim();
+        const pct = spec.endsWith('%');
+        const n = parseFloat(spec);
+        // Same convention as /auto-trim: a trailing `%` always means percent, and a
+        // bare value >= 1 must be a whole-number percentage ("50" is 50%, "1.5" is
+        // rejected rather than silently read as 1.5%).
+        if (Number.isFinite(n) && !pct && n >= 1 && !Number.isInteger(n)) { appErr(USAGE); return; }
+        const v = Number.isFinite(n) ? (pct ? n / 100 : (n >= 1 ? n / 100 : n)) : NaN;
+        if (!(v > 0 && v < 1)) { appErr(USAGE); return; }
+        keepRatio = v;
+      }
+      const target = (state.agent && state.agent.messages) || (session && session.messages);
+      if (!target || !target.length) { app('Nothing to trim.'); return; }
+      const before = estimateMessagesTokens(target);
+      const res = trimToolResults(target, { sessionId: session && session.id, keepRatio });
+      if (!res || !res.elided) { app('Nothing to trim — no tool result is large enough to elide.'); return; }
+      const after = estimateMessagesTokens(target);
+      app(`Trimmed ${res.elided} tool result(s): ~${fmtTokens(res.elidedBytes / 4)} tokens of output elided, keeping ~${Math.round(keepRatio * 100)}%.`);
+      app(`Context now ~${fmtTokens(after)} (was ~${fmtTokens(before)}). The removed text is on disk — the model can Read it back.`);
       return;
     }
     case 'update': {
@@ -5136,7 +6253,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const [action, name, ...rest] = raw.split(/\s+/).filter(Boolean);
       if (!action || action === 'list') {
         const names = Object.keys(doc.mcpServers);
-        say(names.length ? `MCP servers (${mcpFile}):\n` + names.map((n) => `  ${n}`).join('\n') : `No MCP servers configured. File: ${mcpFile}`);
+        sayPanel(names.length ? `MCP servers (${mcpFile}):\n` + names.map((n) => `  ${n}`).join('\n') : `No MCP servers configured. File: ${mcpFile}`);
         return;
       }
       if (['remove', 'rm', 'delete'].includes(action)) {
@@ -5276,7 +6393,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
     case 'add-dir': {
       state.addDirs = state.addDirs || [];
       if (!raw || raw === 'list') {
-        say(state.addDirs.length ? 'Additional directories:\n' + state.addDirs.map((d) => `  ${d}`).join('\n') : 'No additional directories.');
+        sayPanel(state.addDirs.length ? 'Additional directories:\n' + state.addDirs.map((d) => `  ${d}`).join('\n') : 'No additional directories.');
         return;
       }
       const dir = path.resolve(state.cwd, raw.replace(/^~/, os.homedir()));
@@ -5339,6 +6456,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       refreshGitInfo(state, { force: true });
       state.chat = reconstructChat(session);
       state.scroll = 0;
+      dropScrollPin(state);   // fresh transcript: re-seed the anchor on paint
       state.rounds = session.rounds || 0;
       state.steps = session.steps || 0;
       saveSession(session);
@@ -5357,8 +6475,19 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           state.reasoning = !!cfg.reasoning;
           cfg.effort = state.reasoning ? state.effort : '';
           if (cfg.raw && cfg.raw.theme) { state.theme = cfg.raw.theme; setTheme(state.theme); }
+          // Refresh the context gauge from the NEW limit. `state.ctxMax` is a
+          // cached copy (see makeState) and every other reader falls back to it, so
+          // without this a changed `context_length` reloaded fine but the readout —
+          // and the percentage derived from it — kept showing the old window. That
+          // is why /reload looked like a no-op.
+          const beforeMax = state.ctxMax;
+          state.ctxMax = cfg.maxContextTokens || state.ctxMax;
+          state.ctxPercent = usagePercent(state.ctxTokens || 0, state.ctxMax);
+          const changed = beforeMax !== state.ctxMax;
+          app(changed
+            ? `Config reloaded. Context window: ${fmtTokens(beforeMax)} -> ${fmtTokens(state.ctxMax)} (now ${state.ctxPercent}% used)`
+            : 'Config reloaded.');
         }
-        app('Config reloaded.');
       } catch (e) { appErr(`Reload failed: ${e.message}`); }
       return;
     }
@@ -5476,7 +6605,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (!r.ok) { appErr(`git add failed: ${r.error}`); return; }
       const staged = gitmod.stagedFiles(cwd);
       app(paths.length ? `Staged ${paths.length} path(s).` : 'Staged all changes.');
-      say(`Index now holds ${staged.length} file(s):\n` + staged.map((f) => '  ' + f).join('\n'));
+      sayPanel(`Index now holds ${staged.length} file(s):\n` + staged.map((f) => '  ' + f).join('\n'));
       return;
     }
     case 'diff': {
@@ -5487,7 +6616,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const r = gitmod.diffText(cwd, { staged, path: path || undefined });
       if (!r.ok) { appErr(`git diff failed: ${r.error}`); return; }
       if (r.empty) { say(staged ? 'No staged changes.' : 'No uncommitted changes.'); return; }
-      say((staged ? 'Staged changes' : 'Uncommitted changes') + (path ? ` in ${path}` : '') + ':\n' + r.text);
+      sayPanel((staged ? 'Staged changes' : 'Uncommitted changes') + (path ? ` in ${path}` : '') + ':\n' + r.text);
       return;
     }
     case 'log': {
@@ -5499,7 +6628,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const r = gitmod.logText(cwd, { count, path });
       if (!r.ok) { appErr(`git log failed: ${r.error}`); return; }
       if (r.empty) { say('No commits yet.'); return; }
-      say(`Recent commits${path ? ` for ${path}` : ''}:\n` + r.text);
+      sayPanel(`Recent commits${path ? ` for ${path}` : ''}:\n` + r.text);
       return;
     }
     case 'push': {
@@ -5525,7 +6654,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           if (it.label !== 'Push') { app('Push cancelled.'); return true; }
           const r = gitmod.push(cwd, { branch: branchArg || undefined, force, setUpstream: !upstream });
           if (!r.ok) appErr(`Push failed: ${r.error}`);
-          else { app(`Pushed ${branch}.`); say(`git push output:\n${r.output}`); }
+          else { app(`Pushed ${branch}.`); sayPanel(`git push output:\n${r.output}`); }
           return true;
         },
       });
@@ -5538,20 +6667,20 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const sub = (parts[0] || '').toLowerCase();
       if (!sub || sub === 'list') {
         const list = gitmod.stashList(cwd);
-        say(list.length ? `Stashes (${list.length}):\n` + list.map((s) => '  ' + s).join('\n') : 'No stashes.');
+        sayPanel(list.length ? `Stashes (${list.length}):\n` + list.map((s) => '  ' + s).join('\n') : 'No stashes.');
         return;
       }
       if (sub === 'push' || sub === 'save') {
         const msg = parts.slice(1).join(' ') || undefined;
         const r = gitmod.stashPush(cwd, msg);
         if (!r.ok) { appErr(`git stash failed: ${r.error}`); return; }
-        app('Stashed changes.'); say(r.output || 'Changes stashed.');
+        app('Stashed changes.'); sayPanel(r.output || 'Changes stashed.');
         return;
       }
       if (sub === 'pop') {
         const r = gitmod.stashPop(cwd);
         if (!r.ok) { appErr(`git stash pop failed: ${r.error}`); return; }
-        app('Restored from stash.'); say(r.output || 'Stash popped.');
+        app('Restored from stash.'); sayPanel(r.output || 'Stash popped.');
         return;
       }
       appErr('Usage: /stash [list] | push [message] | pop');
@@ -5576,7 +6705,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           if (it.label !== 'Rebase') { app('Rebase cancelled.'); return true; }
           const r = gitmod.rebase(cwd, onto);
           if (!r.ok) appErr(`Rebase failed (resolve conflicts, then /rebase --continue or git rebase --abort): ${r.error}`);
-          else { app(`Rebased ${cur} onto ${onto}.`); say(r.output || 'Rebase complete.'); }
+          else { app(`Rebased ${cur} onto ${onto}.`); sayPanel(r.output || 'Rebase complete.'); }
           return true;
         },
       });
@@ -5612,7 +6741,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (!res.ok) { appErr(`Commit failed: ${res.error}`); return; }
       app(`Committed ${res.sha}: ${message.split('\n')[0]}`);
       const files = res.stdout.split('\n').slice(0, 8).join('\n');
-      say(`Committed ${res.sha}\n${files}`);
+      sayPanel(`Committed ${res.sha}\n${files}`);
       return;
     }
     case 'branch': {
@@ -5624,7 +6753,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         const cur = gitmod.currentBranch(cwd);
         const branches = gitmod.listBranches(cwd);
         if (!branches.length) { app(`No branches yet (current: ${cur}).`); return; }
-        say(`Branches (current: ${cur}):\n` + branches.map((b) => `  ${b === cur ? '* ' : '  '}${b}`).join('\n'));
+        sayPanel(`Branches (current: ${cur}):\n` + branches.map((b) => `  ${b === cur ? '* ' : '  '}${b}`).join('\n'));
         return;
       }
       if (sub === '-c' || sub === 'create' || sub === 'new') {
@@ -5647,7 +6776,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const url = gitmod.prUrl(cwd, base);
       if (!url) { appErr('No git remote named "origin" — cannot build a PR URL.'); return; }
       const branch = gitmod.currentBranch(cwd);
-      say(`Open a pull request for ${branch} → ${base}:\n  ${url}`);
+      sayPanel(`Open a pull request for ${branch} → ${base}:\n  ${url}`);
       app('PR link copied to the transcript (Ctrl+Shift+C to copy).');
       return;
     }
@@ -5661,7 +6790,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       cfg.promptCache = want;
       try { setConfigString('prompt_cache', want ? 'true' : 'false'); } catch { /* best-effort persist */ }
       app(`Prompt caching: ${want ? 'ON' : 'OFF'}`);
-      say(want
+      sayPanel(want
         ? 'The stable prefix (tools + system + conversation head) is marked cacheable.\n'
           + 'Providers bill cached input at a fraction of the normal rate. Effective\n'
           + 'for: anthropic (cache_control), openai-compatible (prompt_cache_key).'
@@ -5675,7 +6804,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const sub = (parts[0] || '').toLowerCase();
       if (!sub || sub === 'list') {
         const list = gitmod.listWorktrees(cwd);
-        say(`Worktrees (${list.length}):\n` + list.map((w) => `  ${w.path}  ${w.branch ? '[' + w.branch + ']' : w.detached ? '(detached)' : ''}`).join('\n'));
+        sayPanel(`Worktrees (${list.length}):\n` + list.map((w) => `  ${w.path}  ${w.branch ? '[' + w.branch + ']' : w.detached ? '(detached)' : ''}`).join('\n'));
         return;
       }
       if (sub === 'add') {
@@ -5718,15 +6847,35 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
     case 'feedback': {
-      const text = raw;
-      if (!text) { appErr('Usage: /feedback <message>'); return; }
-      const dir = path.join(os.homedir(), '.hncode', 'feedback');
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-        const f = path.join(dir, `${Date.now()}.txt`);
-        fs.writeFileSync(f, `${text}\n\nsession=${session.id}\nversion=${VERSION}\nos=${process.platform}\nmodel=${cfg.model}\n`, 'utf8');
-        app(`Feedback saved: ${f}`);
-      } catch (e) { appErr(`Feedback failed: ${e.message}`); }
+      // Build a prefilled GitHub issue URL and show it in the transcript, the way
+      // /pr shows a PR link — the user opens it and the issue form is already
+      // filled in. Nothing is written to disk or posted from here.
+      //
+      // `/feedback <title> | <body>`, with the split on a `|` when one is present so a
+// multi-word title is possible ("Crash on startup | it exits immediately").
+      // Without a `|` the FIRST word is the title and the rest is the body, which
+      // keeps the common one-liner short to type.
+      const parts = String(raw || '').trim();
+      if (!parts) { appErr('Usage: /feedback <title> | <body>'); return; }
+      const bar = parts.indexOf('|');
+      let title, body;
+      if (bar !== -1) {
+        title = parts.slice(0, bar).trim();
+        body = parts.slice(bar + 1).trim();
+      } else {
+        const sp = parts.indexOf(' ');
+        title = sp === -1 ? parts : parts.slice(0, sp);
+        body = sp === -1 ? '' : parts.slice(sp + 1).trim();
+      }
+      if (!title) { appErr('Usage: /feedback <title> | <body>'); return; }
+      // The body is EXACTLY what the user typed. Nothing is appended — a report
+      // the user did not write (an environment footer, a template) reads as noise
+      // in the issue form and has to be deleted before submitting.
+      const url = 'https://github.com/NiceHello666/hncode/issues/new'
+        + `?title=${encodeURIComponent(title)}`
+        + (body ? `&body=${encodeURIComponent(body)}` : '');
+      sayPanel(`Open a GitHub issue:\n  ${url}`);
+      app('Issue link copied to the transcript (Ctrl+Shift+C to copy).');
       return;
     }
     case 'exit': quit(); return;
@@ -5745,7 +6894,10 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         }
         const extra = String(raw || '').trim();
         const prompt = skillPrompt(sk) + (extra ? `\n\n${extra}` : '');
-        await submit(prompt);
+        // The transcript/user message stays the SHORT command; the skill body is
+        // injected as a system message so it reaches the model without ever
+        // appearing as the user's own words (mirrors kimi's activation card).
+        await sendPrompt('/' + SKILL_PREFIX + name, { skillBody: prompt });
         return;
       }
       // Check if this is a plugin-registered command.
@@ -5773,8 +6925,13 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
   }
 }
 
-const PERMISSION_LABEL = { ask: 'Always Ask', yolo: 'Ask When Needed', auto: 'Never Ask' };
+// Display names for the permission modes. One word each, matching the command
+// names, so /permission's picker, /status and the status line all read the same.
+// The old long forms ("Always Ask" / "Ask When Needed" / "Never Ask") also
+// mis-described the two auto modes once neither one asks any more.
+const PERMISSION_LABEL = { ask: 'Ask', yolo: 'Yolo', auto: 'Auto' };
 function setPermission(state, mode) { state.mode = mode; }
+
 
 // Is `p` inside the workspace (or one of the extra directories added via
 // /add-dir)? Used by YOLO mode: work inside the workspace is auto-approved, work
@@ -5824,6 +6981,47 @@ function isDestructiveCommand(cmd) {
   return DESTRUCTIVE_RE.test(String(cmd || ''));
 }
 
+// A read-only shell command: one whose FIRST word is a known query/inspection
+// tool AND that contains no shell metacharacters that could run something else
+// (pipes, redirection, command substitution, `&&`/`;`). Anything that MUTATES
+// (rm, mv, sed -i, git commit, npm install …) is not on the list, and anything
+// wrapped in a pipe/subshell is rejected outright — the wrapper could hide a
+// write. Mirrors the intent of Claude Code's readOnlyValidation, trimmed to the
+// commands that actually show up in a coding session.
+const READ_ONLY_BINS = new Set([
+  'ls', 'dir', 'pwd', 'cd', 'echo', 'cat', 'head', 'tail', 'wc', 'sort', 'uniq',
+  'grep', 'rg', 'ag', 'find', 'fd', 'which', 'where', 'whoami', 'hostname',
+  'date', 'env', 'printenv', 'stat', 'file', 'du', 'df', 'tree', 'type',
+  'jq', 'tr', 'cut', 'diff', 'man', 'help', 'true', 'test', '[',
+  'git',   // further restricted to read-only verbs below
+  // NOT here on purpose: node/python/npm/npx/make/docker/kubectl/gh — each can
+  // execute arbitrary code or mutate state via a flag (`node -e`, `python -c`,
+  // `npm install`), so allowing the bare binary would be a hole.
+]);
+// `git` is allowed only for read-only verbs. Anything that writes is excluded.
+const GIT_WRITE_SUBCMDS = new Set([
+  'push', 'reset', 'clean', 'commit', 'merge', 'rebase', 'checkout', 'switch',
+  'cherry-pick', 'revert', 'tag', 'branch', 'remote', 'stash', 'apply', 'am',
+  'init', 'clone', 'fetch', 'pull', 'submodule', 'worktree', 'config', 'gc',
+  'prune', 'rm', 'mv', 'add', 'restore', 'update-ref', 'notes',
+]);
+
+export function isReadOnlyCommand(cmd) {
+  const s = String(cmd || '').trim();
+  if (!s) return false;
+  // Reject anything that could chain or redirect into a different command.
+  if (/[|&;<>`$()]|\|\||&&|\$\(/.test(s)) return false;
+  if (/\b>\s*\S/.test(s)) return false;                 // redirection
+  const words = s.split(/\s+/);
+  const bin = words[0].replace(/^.*[\\/]/, '').replace(/\.(exe|cmd|bat|ps1)$/i, '');
+  if (!READ_ONLY_BINS.has(bin)) return false;
+  if (bin === 'git') {
+    const sub = (words[1] || '').toLowerCase();
+    if (!sub || GIT_WRITE_SUBCMDS.has(sub)) return false;
+  }
+  return true;
+}
+
 // True when every absolute / parent-relative path mentioned in the command lies
 // inside the workspace. Relative paths are resolved against the command's cwd.
 function commandPathsAreInside(state, cmd, cwd) {
@@ -5856,8 +7054,11 @@ function applyModel(state, cfg, next) {
   state.model = cfg.model; state.provider = cfg.provider;
   state.modelLabel = modelLabel(cfg) || cfg.model || '';
   state.seenThinking = false;
-  // Update context window when switching models.
+  // Switching models changes the WINDOW, so the percentage has to be recomputed
+  // against it. Updating only `ctxMax` left the old ratio in place, and a 1M-window
+  // model showed "73% — 364k/1M": two numbers that cannot both be true.
   state.ctxMax = cfg.maxContextTokens || state.ctxMax;
+  state.ctxPercent = usagePercent(state.ctxTokens || 0, state.ctxMax);
   try { if (cfg.model) rememberModel(cfg.model); } catch {}
 }
 
@@ -6097,13 +7298,354 @@ export async function startTUI(opts) {
     state.ctxPercent = usagePercent(approx, state.ctxMax);
   }
   
-  // NOW: Restore session with the correct model context
-  if (session && session.messages && session.messages.length) {
+  // NOW: Restore session with the correct model context.
+  // The shellHistory test matters as much as the messages one: `!command` output
+  // lives ONLY in shellHistory, so a session of nothing but shell commands has an
+  // empty `messages` and was restored as a blank screen.
+  if (session && ((session.messages && session.messages.length) || (session.shellHistory || []).length)) {
     state.chat = reconstructChat(session);
   }
 
+
   const stdin = process.stdin;
   const stdout = process.stdout;
+
+  // ---- web UI bridge (/web) --------------------------------------------------
+  // `web` is null until the user runs /web. `hub` is created then too, so a
+  // session that never opens the UI pays for none of this. The hub is the shared
+  // state; syncWeb pushes the transcript into it and pushes the session status,
+  // and `webActions` wires the browser's requests to the SAME functions the
+  // keyboard calls — that is what makes the two front-ends behave identically.
+  let web = null;
+  let hub = null;
+  let webSyncQueued = false;
+  // The machine-wide daemon attachment (see attachGlobalWeb). Null until /web,
+  // and its presence is what "this session is published" means.
+  let webDaemon = null;
+
+  function syncWeb() {
+    if (!web || !hub) return;
+    // Coalesce: `emit` for each changed row already marks the subscribers dirty,
+    // and syncChat is cheap, but a burst of frames would still run it repeatedly
+    // for the same state.
+    if (webSyncQueued) return;
+    webSyncQueued = true;
+    setImmediate(() => {
+      webSyncQueued = false;
+      if (!web || !hub) return;
+      try { hub.syncChat(state.chat); } catch { /* the UI must never break the TUI */ }
+      try { hub.setStatus(webStatus()); } catch { /* best-effort */ }
+    });
+  }
+
+
+  // Everything the browser's status panel and side panes show. Built fresh on each
+  // sync: it is a handful of field reads, and deriving it from live state is what
+  // keeps the two front-ends from disagreeing after a mode change.
+  function webStatus() {
+    // Files this conversation touched, counted from the transcript. The TUI has no
+    // separate index, and reading it here means a Write the model made is listed
+    // without any tool having to announce itself.
+    const files = new Map();
+    const bump = (p, op) => {
+      if (typeof p !== 'string' || !p) return;
+      let rel = p;
+      try { rel = path.relative(state.cwd || cfg.workspace || '', p) || p; } catch { /* keep as-is */ }
+      if (rel.startsWith('..')) rel = p;                 // outside the workspace: show it whole
+      const e = files.get(rel) || { path: rel, ops: new Set(), count: 0 };
+      e.ops.add(op);
+      e.count++;
+      files.set(rel, e);
+    };
+    for (const m of state.chat || []) {
+      if (m.role !== 'tool' || !m.toolArgs) continue;
+      const a = m.toolArgs;
+      const p = a.path || a.file_path;
+      bump(p, m.toolName || 'tool');
+    }
+    const fileList = [...files.values()]
+      .map((e) => ({ path: e.path, ops: [...e.ops].join(' '), count: e.count }))
+      .sort((x, y) => y.count - x.count || x.path.localeCompare(y.path))
+      .slice(0, 200);
+
+    const tasks = Object.values(state.tasks || {}).map((t) => ({
+      id: t.id || t.taskId || '',
+      kind: t.kind || 'bash',
+      status: t.status || 'running',
+      summary: t.summary || t.description || t.prompt || '',
+      // Passed through when the task carries them, so the web task card can show
+      // a start time / agent id instead of silently rendering nothing.
+      startedAt: t.startedAt || t.startAt || 0,
+      agentId: t.agentId || '',
+    }));
+
+    const next = {
+      session: session && session.id,
+      title: session && session.title,
+      model: state.modelLabel || cfg.model || '',
+      provider: cfg.provider || '',
+      mode: PERMISSION_LABEL[state.mode] || state.mode || '',
+      cwd: state.cwd || '',
+plan: !!state.plan,
+      focus: !!state.focus,
+      swarm: !!state.swarm,
+      // Live git status mirror, so the web statusline can show branch + diff
+      // counts exactly like the TUI footer. Null when git is unavailable.
+      git: state._gitInfo || null,
+      // Thinking state, mirroring the terminal footer's model suffix. The
+      // statusline appends "thinking[: effort]" from these two fields.
+      reasoning: !!state.reasoning,
+      effort: state.effort || '',
+      busy: !!state.running,
+      // The Working row's phrase and animation tick. Sent so the BROWSER shows
+      // the same word, mid-sweep, as the terminal — the browser used to pick its
+      // own random word and run its own clock, so the two screens disagreed about
+      // both the text and the colour phase.
+      workMsg: state.workMsg || '',
+      spin: state.spin || 0,
+      // The tick the current pulse BEGAN. The browser animates the tool-name
+      // sweep and the Working row off `spin`, and both must start their cycle at
+      // the tick the pulse started — using the raw spinner tick would drop them
+      // into a mid-cycle colour the instant the animation hands over, which is a
+      // different colour on screen from the terminal's.
+      pulseStart: state.pulseStart == null ? 0 : state.pulseStart,
+      ctxTokens: state.ctxTokens || 0,
+      ctxMax: state.ctxMax || 0,
+      ctxPercent: state.ctxPercent || 0,
+      rounds: state.rounds || 0,
+      steps: state.steps || 0,
+      tokRate: state.tokRate || 0,
+todos: [...(state.todos || [])],
+      queued: [...(state.queued || [])],
+      tasks,
+      files: fileList,
+      tools: toolsForWeb(),
+      commands: commandsForWeb(),
+      // The workspace tree, for `@` completion in the composer. Cached (below)
+      // because walking a real project is synchronous I/O on the render path.
+      workspaceFiles: workspaceFilesForWeb(),
+      quick: QUICK_COMMANDS,
+      // The enumerable settings the browser can CHANGE, with the current value.
+      //
+      // The terminal exposes these as pickers, which the browser cannot render —
+      // that is why /model and friends did nothing there. Sending the options
+      // with the status lets the browser draw its own control and post the choice
+      // back through `dispatch` ("/model <alias>"), which is the same path the
+      // keyboard takes.
+      options: optionsForWeb(),
+      // A blocking prompt, if one is on screen — the browser renders it as a modal
+      // and answers through the `approve` / `answerQuestion` actions.
+      pending: pendingForWeb(),
+    };
+
+    // Reuse the previous identity for any field whose CONTENT is unchanged.
+    //
+    // `setStatus` skips the broadcast when nothing changed, and it decides that by
+    // identity. Most fields above are rebuilt on every call (todos, queued, tasks
+    // and the file list all come from fresh arrays), so without this every frame
+    // would look like a change and the full status would be pushed over SSE twelve
+    // times a second for nothing. Comparing here — once, shallowly — is what makes
+    // the "did anything actually change" test meaningful.
+    const prev = (hub && hub.status) || null;
+    if (prev) {
+      for (const k of Object.keys(next)) {
+        if (next[k] === prev[k]) continue;
+        if (shallowEqualArray(next[k], prev[k])) next[k] = prev[k];
+      }
+    }
+    return next;
+  }
+
+  /** True when two arrays hold the same content (compared one level deep). */
+  function shallowEqualArray(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === b[i]) continue;
+      // Elements are usually small objects (a todo, a task); compare their own
+      // fields rather than their identity.
+      if (!shallowEqualObject(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  function shallowEqualObject(a, b) {
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) {
+      const va = a[k];
+      const vb = b[k];
+      if (va === vb) continue;
+      // A stringified compare covers the one nested level these shapes have (an
+      // ops list, a tool's args). It only runs once the references differ, so it
+      // is not on the hot path for unchanged rows.
+      if (va && vb && typeof va === 'object' && typeof vb === 'object') {
+        if (JSON.stringify(va) !== JSON.stringify(vb)) return false;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // The settings the browser can change, each with its current value and the
+  // candidates that can replace it. Every entry maps to a `dispatch` invocation,
+  // so the browser never needs a code path of its own — it posts the same command
+  // the terminal would run. That is what makes /model work in the browser.
+function optionsForWeb() {
+    const models = (cfg.raw && cfg.raw.models) || {};
+    const modelItems = Object.keys(models).map((key) => {
+      // Each model carries its OWN thinking levels. The browser draws them next
+      // to the model so switching model shows that model's valid efforts, exactly
+      // as the terminal's picker does with `effortOptions(cfg, item.label)`. A
+      // model without a Thinking control (`effortOptions` returns []) is simply
+      // absent from the list.
+      const efforts = effortOptions(cfg, key);
+      return {
+        value: key,
+        label: models[key].display_name || key,
+        sub: models[key].provider || '',
+        current: key === cfg.model,
+        efforts: efforts.map((v) => ({ value: v, label: v, current: v === (state.effort || 'off') })),
+      };
+    });
+    const efforts = effortOptions(cfg);
+return {
+      model: { value: cfg.model || '', items: modelItems },
+      effort: {
+        value: state.effort || 'off',
+        items: efforts.map((v) => ({ value: v, label: v, current: v === (state.effort || 'off') })),
+      },
+      mode: {
+        value: state.mode || 'ask',
+        items: ['ask', 'yolo', 'auto'].map((v) => ({
+          value: v, label: PERMISSION_LABEL[v] || v, current: v === (state.mode || 'ask'),
+        })),
+      },
+      plan: {
+        value: state.plan ? 'on' : 'off',
+        items: [
+          { value: 'on', label: 'on', current: !!state.plan },
+          { value: 'off', label: 'off', current: !state.plan },
+        ],
+      },
+      focus: {
+        value: state.focus ? 'on' : 'off',
+        items: [
+          { value: 'on', label: 'on', current: !!state.focus },
+          { value: 'off', label: 'off', current: !state.focus },
+        ],
+      },
+      calmMode: {
+        value: cfg.calmMode ? 'on' : 'off',
+        items: [
+          { value: 'on', label: 'on', current: !!cfg.calmMode },
+          { value: 'off', label: 'off', current: !cfg.calmMode },
+        ],
+      },
+    };
+  }
+
+  // `@` completion needs the file list, and re-walking the tree on every status
+  // push would be synchronous I/O inside the render loop. The cache is keyed by
+  // the workspace and refreshed on a TTL, matching the terminal's own @-list cache
+  // (MENTION_CACHE_MS) so the two front-ends offer the same files.
+  let wsFilesCache = { root: '', at: 0, files: null };
+  function workspaceFilesForWeb() {
+    const root = state.cwd || state.workspace || process.cwd();
+    const now = Date.now();
+    if (wsFilesCache.files && wsFilesCache.root === root && now - wsFilesCache.at < 5000) {
+      return wsFilesCache.files;
+    }
+    let files = [];
+    try { files = collectWorkspaceFiles(root, { limit: 2000, maxDepth: 6 }); } catch { files = []; }
+    wsFilesCache = { root, at: now, files };
+    return files;
+  }
+  // Built ONCE per session and reused by reference.
+  //
+  // `webStatus` runs on every frame (syncWeb is called from paintNow), so building
+  // these lists each time cost a map over ~20 tools and ~60 commands at the
+  // spinner's 80 ms cadence — and it defeated `setStatus`'s change detection,
+  // which compares by identity. The registries do not change while a session runs,
+  // so caching is both cheaper and MORE correct: an unchanged array reference is
+  // what lets the status broadcast be skipped.
+  let toolsCache = null;
+  let commandsCache = null;
+
+  function toolsForWeb() {
+    if (toolsCache) return toolsCache;
+    try {
+      toolsCache = toolNames().map((n) => {
+        const t = getTool(n);
+        return { name: n, description: (t && t.description) || '' };
+      });
+    } catch { toolsCache = []; }
+    return toolsCache;
+  }
+
+function commandsForWeb() {
+    if (commandsCache) return commandsCache;
+    try {
+      const cmds = allCommands().map((c) => ({
+        name: c.name,
+        aliases: c.aliases || [],
+        desc: c.desc || c.description || '',
+        argumentHint: c.argumentHint || '',
+      }));
+      // Merge installed skills into the `/` completion list so the web composer
+      // offers them the moment `/` is typed, mirroring the TUI menu.
+      for (const s of listSkills()) {
+        cmds.push({
+          name: SKILL_PREFIX + s.name,
+          aliases: [],
+          desc: s.description || 'skill',
+          argumentHint: '',
+        });
+      }
+      commandsCache = cmds;
+    } catch { commandsCache = []; }
+    return commandsCache;
+  }
+
+  // The approval / question currently waiting on the user, in a shape the browser
+  // can render. Only ONE of these can be open at a time (the agent blocks on it).
+  function pendingForWeb() {
+    if (state.approvalPending) {
+      const ap = state.approvalPending;
+      return {
+        kind: 'approval',
+        id: 'approval',
+        detail: [String(ap.toolName || ''), ...(ap.detail || [ap.desc || ''])].join('\n'),
+      };
+    }
+    if (state.question) {
+      const q = state.question;
+      const cur = (q.items && q.items[q.index]) || { question: '', options: [] };
+      const total = (q.items || []).length;
+      const isLast = q.index === total - 1;
+      return {
+        kind: 'question',
+        id: 'question',
+        question: cur.question || '',
+        header: cur.header || '',
+        options: (cur.options || []).map((o) => ({ label: o.label, description: o.description || '' })),
+        // Progress + mode, so the browser can render "n/total", multi-select
+        // checkboxes, and the per-question "Other" row.
+        index: q.index || 0,
+        total,
+        multiSelect: !!cur.multiSelect,
+        // The whole-request free-text note is offered after the LAST question
+        // (same as the terminal's SUPPLEMENT row).
+        hasSupplement: isLast,
+        placeholder: '',
+      };
+    }
+    return null;
+  }
+
   const addChat = (msg) => {
     state.chat.push(normalizeMsg(msg));
     // Auto-follow / re-anchor is delegated to anchorScroll() so exactly ONE place
@@ -6140,6 +7682,12 @@ export async function startTUI(opts) {
     state._hitboxes = frame.hitboxes || [];
     state._composerMeta = frame.composerMeta || [];
     if (out) stdout.write(out);
+    // Mirror the transcript to the web UI, if one is attached. Done HERE because
+    // every change reaches the screen through this one function, so it catches the
+    // rows that bypass addChat (streamed prose, tool rows, the plan bubble, an
+    // abort) without instrumenting each of those call sites. `syncChat` is a no-op
+    // until `/web` runs, and it is incremental, so an idle frame costs nothing.
+    if (web) void syncWeb();
   }
   function renderFrame() { paintNow(); }
   // Let module-level helpers (refreshGitInfo) ask for a repaint once their async
@@ -6648,21 +8196,19 @@ export async function startTUI(opts) {
     const { cols } = dims();
     const col = Math.max(0, Math.min(cols - 1, (t.col || 1) - 1));
     const screenRow = (t.row || 1) - 1;
-    // Body row 0 is drawn directly under the transcript padding (see
-    // composeFrame), so a screen row must be shifted by that padding before
-    // it is turned into a line index. Without this, clicking the blank area
-    // above a short transcript yielded a negative index that was clamped to 0
-    // ("start of session") and the drag selected everything from the top.
-    // Body row i is drawn at screen row i (0-based) and shows transcript line
-    // `_bodyTop + i`. When the transcript is shorter than the body, _bodyTop is
-    // NEGATIVE — those leading rows are the blank padding, so the padding is
-    // already accounted for here and must NOT be subtracted again.
-    const rowInBody = screenRow;
+    // Translate the SCREEN row into a row WITHIN the body, using the body's own
+    // origin on screen. `state._bodyTop` is a TRANSCRIPT row number (negative
+    // while the transcript is shorter than the viewport); the screen row is
+    // absolute. Treating one as the other offset every hit by the rows sitting
+    // above the transcript — a short session has `topPad` of them — so a drag
+    // selected the wrong lines and copied text from elsewhere, or nothing.
+    const screenTop = state._bodyScreenTop != null ? state._bodyScreenTop : 0;
+    const rowInBody = screenRow - screenTop;
     const lineIdx = (state._bodyTop != null ? state._bodyTop : 0) + rowInBody;
-    // A negative index means no transcript line sits under the pointer; report
-    // -1 so callers can ignore it (never clamp it to 0 — that is line 0, the
-    // start of the session, which made a drag select from the very top).
-    const idx = lineIdx < 0 ? -1 : lineIdx;
+    // A row outside the body (the padding above it, or the chrome below) maps to
+    // no transcript line; report -1 so callers ignore it rather than clamping to
+    // line 0, the start of the session.
+    const idx = (rowInBody < 0 || lineIdx < 0) ? -1 : lineIdx;
     // `row` is the canonical field the selection model uses (the same name the
     // head carries). Without it `anchor.row` was undefined and the paint loop
     // highlighted the whole transcript (see the selection range test).
@@ -6680,6 +8226,8 @@ export async function startTUI(opts) {
     const sb = state._sb;
     if (!sb) return;
     state.scroll = scrollFromThumbPos(sb, rowF, state.sbDragOffset || 0);
+    dropScrollPin(state);   // deliberate move: reseed the anchor on the next paint
+    renderFrame();
     renderFrame();
   }
   function hitAt(t) {
@@ -6707,6 +8255,15 @@ export async function startTUI(opts) {
         state.menuSel = hb.index;
         const cmd = state.menuList[hb.index];
         if (cmd) {
+          // A second-level ARGUMENT word is not a command: clicking it completes it
+          // into the composer. Dispatching it as a command (the old unconditional
+          // behaviour) would have run `/on` and reported "unknown command".
+          if (cmd._argWord) {
+            acceptMenuSelection(state);
+            refreshMenu(state);
+            renderFrame();
+            return true;
+          }
           state.menuOpen = false; state.menuList = []; state.menuSel = 0; state.menuOffset = 0;
           state.input = ''; state.caret = 0;
           dispatch(cmd.name, '', state, cfg, session, host, submit, stdout);
@@ -6829,11 +8386,15 @@ export async function startTUI(opts) {
       // clamping the index to 0 (as this used to) made the anchor "line 0",
       // so a later drag highlighted from the start of the session.
       state._mouseDownPos = (cell.lineIdx < 0) ? null : { row: cell.lineIdx, col: cell.col };
-      // A new press always starts a NEW selection: keeping the previous
-      // anchor made the next drag highlight everything from the FIRST press
-      // to the new pointer position. Cleared to null here and replaced on the
-      // first mousemove of this press, so a plain click selects nothing.
-      state.selection = null;
+      // NOTE: the existing selection is deliberately NOT cleared here. It used to
+      // be, on the theory that "a press starts a new selection" — but a press that
+      // is not followed by a drag is a CLICK, and cancelling the selection is the
+      // click's job. Clearing on the press meant any stray mousedown (a right-click
+      // the terminal reports as one, a stray click just before Ctrl+Shift+C)
+      // destroyed the selection silently while the user was still looking at it.
+      // Cancelling now happens on `mouseup`, once the gesture is known to be a
+      // click; a real drag overwrites the selection on its first mousemove.
+      state._selDragged = false;
       renderFrame();
       return;
     }
@@ -6899,13 +8460,19 @@ export async function startTUI(opts) {
       if (state._mouseDownPos) {
         const { col, lineIdx } = mouseToCell(t);
         if (lineIdx < 0) return;   // above the first line: nothing to anchor to
-        if (!state.selection) {
+        // The FIRST move of a drag starts a NEW selection anchored at the press
+        // point, discarding whatever was selected before. It cannot be expressed as
+        // `if (!state.selection)` any more: the press no longer clears the old
+        // selection (see the mousedown branch), so that test would keep the OLD
+        // anchor and extend from it — dragging over one line would highlight
+        // everything back to the previous selection.
+        if (!state._selDragged) {
+          state._selDragged = true;
           state.selection = { anchor: state._mouseDownPos, head: { row: lineIdx, col } };
-          renderFrame();
         } else {
-          state.selection.head = { row: lineIdx, col };
-          renderFrame();
+          state.selection = { anchor: state.selection.anchor, head: { row: lineIdx, col } };
         }
+        renderFrame();
         return;
       }
       return;
@@ -6935,14 +8502,15 @@ export async function startTUI(opts) {
         renderFrame();
         return;
       }
-      // Click on empty area: clear selection
-      if (state.selection) {
-        const a = state.selection.anchor;
-        const h = state.selection.head;
-        if (a.row === h.row && a.col === h.col) {
-          state.selection = null;
-        }
+      // A press that never turned into a drag is a CLICK, and a click cancels the
+      // selection. This is the ONLY place that cancels it now (the mousedown branch
+      // deliberately leaves it alone) — which is what keeps a stray press from
+      // destroying a selection the user is still using.
+      if (!state._selDragged) {
+        state.selection = null;
       }
+      renderFrame();
+      return;
       renderFrame();
       return;
     }
@@ -6999,12 +8567,19 @@ export async function startTUI(opts) {
     return out;
   }
   function copyToClipboard(text) {
-    if (!text) return;
+    // Empty text is NOT a success. `copyText` returns false without touching the
+    // clipboard, and the old code ignored that — it announced "Copied 0 chars"
+    // while the clipboard kept whatever was in it, which reads as "copy did not
+    // work" with no way to tell why.
+    if (!text) { notice('Nothing to copy', 'error'); return; }
     try {
-      copyText(text); // src/clipboard.js: clip.exe on Windows (~100ms, UTF-16LE)
+      const ok = copyText(text); // src/clipboard.js: clip.exe on Windows
+      if (ok === false) { notice('Clipboard unavailable', 'error'); return; }
       const n = text.split('\n').length;
       notice(`Copied ${text.length} chars (${n} line${n === 1 ? '' : 's'})`, 'info');
-    } catch { notice('Clipboard unavailable', 'error'); }
+    } catch (e) {
+      notice('Clipboard unavailable: ' + (e && e.message ? e.message : e), 'error');
+    }
   }
   // Insert pasted text into the composer, collapsing a multi-line paste into a
   // single [paste #N +L lines] marker. Shared by a bracketed paste (what
@@ -7013,11 +8588,13 @@ export async function startTUI(opts) {
   function insertComposerPaste(raw) {
     const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n');
     if (!text) return false;
-    // A paste starting with `!` into an EMPTY prompt means "run this in the
-    // shell" — enter shell mode and drop the marker, exactly like typing it. Same
-    // rule as kimi-code's editor, so a copied `!git status` behaves identically.
+// A paste starting with `!` into an EMPTY prompt means "run this in the
+    // shell" — BUT only when the `!` is clearly a command (`!git status`), not
+    // ordinary text that happens to begin with `!` (a markdown image `![..]`, a
+    // CSS `!important`). Requiring a command-like token after the bang keeps a
+    // copied `![alt](url)` from silently switching into shell mode.
     let body = text;
-    if (state.inputMode !== 'bash' && (state.input || '').length === 0 && body.startsWith('!')) {
+    if (state.inputMode !== 'bash' && (state.input || '').length === 0 && /^!+[A-Za-z0-9_\/.~-]/.test(body)) {
       state.inputMode = 'bash';
       body = body.replace(/^!+/, '');
     }
@@ -7089,6 +8666,7 @@ export async function startTUI(opts) {
     // the editor for a steered draft).
     if (draft) { state.input = ''; state.caret = 0; state.pastes.clear(); state.pasteCounter = 0; }
     state.queued = [];
+    if (web && hub) { try { hub.pubStatusField('queued', []); } catch { /* best-effort */ } }
     renderFrame();
   }
 
@@ -7098,6 +8676,7 @@ export async function startTUI(opts) {
     if (!state.queued || !state.queued.length) return false;
     const text = state.queued[state.queued.length - 1];
     state.queued = state.queued.slice(0, -1);
+    if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
     state.input = text;
     state.caret = text.length;
     // Drop the matching transcript entry: the item is back in the composer.
@@ -7164,6 +8743,7 @@ export async function startTUI(opts) {
   }
 
   function handleKey(t) {
+    // Full-screen takeovers own EVERY key while open.
     // Full-screen takeovers own EVERY key while open.
     if (state.tasksViewer) { handleTasksViewerKey(t); return; }
     if (state.tasksPanel) { handleTasksPanelKey(t); return; }
@@ -7236,56 +8816,94 @@ export async function startTUI(opts) {
       return;
     }
     if (state.question) {
-      // AskUserQuestion dialog. Owns ALL input while open — unlike the approval
-      // prompt, the user is here to answer, and the free-text "Other" row needs
-      // the character keys for itself.
+      // AskUserQuestion dialog. Owns ALL input while open.
+      //
+      // Tabs: each question is a tab, plus a trailing "Other" tab that holds the
+      // whole-request free-text note. `qs.index` is the tab: 0..items.length-1 are
+      // questions, items.length is the Other tab. Tab / Shift+Tab / Left / Right
+      // switch tabs; Up / Down move the option cursor within a question.
       const qs = state.question;
-      const cur = qs.items[qs.index] || { options: [] };
-      const isLast = qs.index === qs.items.length - 1;
-      // The list is: options, then "Other", then (last question only) the global
-      // supplement row.
-      const otherIdx = (cur.options || []).length;
-      const suppIdx = isLast ? otherIdx + 1 : -1;
-      const optCount = otherIdx + 1 + (isLast ? 1 : 0);
-      // Resolve the call. `dismissed` distinguishes "Esc out of everything" from
-      // "answered, and maybe left a note" so the tool can emit kimi's dismissal
-      // contract instead of a half-filled result.
+      const total = qs.items.length;
+      const onOtherTab = qs.index >= total;
+      const cur = onOtherTab ? { options: [] } : (qs.items[qs.index] || { options: [] });
+      const otherIdx = (cur.options || []).length;   // the per-question Other option
+      const optCount = otherIdx + 1;                 // options + Other
+      // Resolve the call. `dismissed` distinguishes "Esc out" (empty answers) from
+      // "answered, maybe with a note".
       const finish = (dismissed) => {
         const r = qs.resolve; state.question = null;
         r(dismissed ? {} : { answers: qs.answers, additional: (qs.supplement || '').trim() });
         renderFrame();
       };
-
-      // Move on after an answer was recorded.
-      //   * a further question -> ask it, cursor at the top
-      //   * the LAST question   -> drop the cursor on the supplement row so the
-      //     very next Enter opens the note editor (or Esc/Enter twice skips it).
-      //     Jumping straight to `finish` made the row unreachable: `sel` stayed on
-      //     the option just picked, so a second Enter re-picked that option.
+      // After a question is answered, move to the NEXT question; if it was the last
+      // one, jump to the Other tab (where Enter submits) — never auto-submit, so
+      // the user can leave a note.
       const advance = () => {
-        if (qs.index < qs.items.length - 1) {
+        if (qs.index < total - 1) {
           qs.index++;
           qs.sel = 0;
           qs.picked = new Set();
           renderFrame();
           return;
         }
-        qs.sel = (cur.options || []).length + 1;   // the supplement row
+        qs.index = total;   // the Other tab
+        qs.editing = 'supplement';
+        qs.editingText = qs.supplement || '';
+        qs.editingCaret = qs.editingText.length;
+        renderFrame();
+      };
+      const switchTab = (dir) => {
+        // Fold any half-typed free text into its slot before switching.
+        if (qs.editing === 'other') qs.otherText = qs.editingText || '';
+        else if (qs.editing === 'supplement') qs.supplement = qs.editingText || '';
+        qs.editing = null;
+        const n = total + 1;   // questions + the Other tab
+        qs.index = (qs.index + dir + n) % n;
+        qs.sel = 0;
+        qs.picked = new Set();
+        if (qs.index === total) {
+          // Landing on the Other tab opens its text field directly.
+          qs.editing = 'supplement';
+          qs.editingText = qs.supplement || '';
+          qs.editingCaret = qs.editingText.length;
+        }
         renderFrame();
       };
 
       if (qs.editing) {
-        // Free-text entry, shared by the per-question "Other" and the global
-        // supplement (qs.editing says which). Esc backs out WITHOUT losing what
-        // was typed, so a half-written note survives a look at the options.
+        const buf = () => String(qs.editingText || '');
+        const ec = Math.max(0, Math.min(buf().length, qs.editingCaret == null ? buf().length : qs.editingCaret));
         if (t.key === 'escape') { qs.editing = null; renderFrame(); return; }
-        if (t.key === 'backspace') { qs.editingText = (qs.editingText || '').slice(0, -1); renderFrame(); return; }
-        if (t.paste !== undefined) { qs.editingText += String(t.paste).replace(/[\r\n]+/g, ' '); renderFrame(); return; }
+        // Leaving the field without committing: Tab / Shift+Tab return to the tab
+        // bar (arrows stay inside the text field).
+        if (t.key === 'tab' || t.key === 's-tab') {
+          if (qs.editing === 'other') qs.otherText = qs.editingText || '';
+          else if (qs.editing === 'supplement') qs.supplement = qs.editingText || '';
+          qs.editing = null; switchTab(t.key === 's-tab' ? -1 : 1); return;
+        }
+        if (t.key === 'left') { qs.editingCaret = Math.max(0, ec - 1); renderFrame(); return; }
+        if (t.key === 'right') { qs.editingCaret = Math.min(buf().length, ec + 1); renderFrame(); return; }
+        if (t.key === 'home') { qs.editingCaret = 0; renderFrame(); return; }
+        if (t.key === 'end') { qs.editingCaret = buf().length; renderFrame(); return; }
+        if (t.key === 'backspace') {
+          if (ec > 0) { qs.editingText = buf().slice(0, ec - 1) + buf().slice(ec); qs.editingCaret = ec - 1; }
+          renderFrame(); return;
+        }
+        if (t.key === 'delete') {
+          if (ec < buf().length) qs.editingText = buf().slice(0, ec) + buf().slice(ec + 1);
+          renderFrame(); return;
+        }
+        if (t.paste !== undefined) {
+          const ins = String(t.paste).replace(/[\r\n]+/g, ' ');
+          qs.editingText = buf().slice(0, ec) + ins + buf().slice(ec);
+          qs.editingCaret = ec + ins.length;
+          renderFrame(); return;
+        }
         if (t.key === 'enter') {
           const answer = (qs.editingText || '').trim();
           if (qs.editing === 'supplement') {
-            // The supplement is optional: Enter commits it (empty is fine) and
-            // ends the call — it is the last row, so nothing follows it.
+            // The whole-request note is optional: Enter commits it (empty is fine)
+            // and ends the call.
             qs.supplement = answer;
             qs.editing = null;
             finish(false);
@@ -7298,11 +8916,32 @@ export async function startTUI(opts) {
           advance();
           return;
         }
-        if (t.ch) { qs.editingText = (qs.editingText || '') + t.ch; renderFrame(); return; }
+        if (t.ch) {
+          qs.editingText = buf().slice(0, ec) + t.ch + buf().slice(ec);
+          qs.editingCaret = ec + t.ch.length;
+          renderFrame(); return;
+        }
         return;
       }
 
       if (t.key === 'escape') { finish(true); return; }    // dismiss: empty answers
+      // Tab / Shift+Tab / Left / Right switch between TABS (questions + Other).
+      if ((t.key === 'tab' || t.key === 's-tab' || t.key === 'left' || t.key === 'right')
+          && total > 0) {
+        const dir = (t.key === 'left' || t.key === 's-tab') ? -1 : 1;
+        switchTab(dir);
+        return;
+      }
+      if (onOtherTab) {
+        // The Other field opens on arrival; if closed, any text/Enter reopens it.
+        if (t.ch || t.key === 'enter') {
+          qs.editing = 'supplement';
+          qs.editingText = qs.supplement || '';
+          qs.editingCaret = qs.editingText.length;
+          renderFrame(); return;
+        }
+        return;
+      }
       if (t.key === 'up') { qs.sel = (qs.sel - 1 + optCount) % optCount; renderFrame(); return; }
       if (t.key === 'down') { qs.sel = (qs.sel + 1) % optCount; renderFrame(); return; }
 
@@ -7310,19 +8949,17 @@ export async function startTUI(opts) {
       const openEditor = (which) => {
         qs.editing = which;
         qs.editingText = which === 'supplement' ? (qs.supplement || '') : (qs.otherText || '');
+        qs.editingCaret = qs.editingText.length;
         renderFrame();
       };
-
-      if (cur.multiSelect && t.key === ' ') {
-        if (qs.sel >= otherIdx) { openEditor(qs.sel === suppIdx ? 'supplement' : 'other'); return; }
+      if (cur.multiSelect && (t.key === ' ' || t.ch === ' ')) {
+        if (qs.sel >= otherIdx) { openEditor('other'); return; }
         if (qs.picked.has(qs.sel)) qs.picked.delete(qs.sel); else qs.picked.add(qs.sel);
         renderFrame(); return;
       }
       if (t.key === 'enter') {
-        if (qs.sel >= otherIdx) { openEditor(qs.sel === suppIdx ? 'supplement' : 'other'); return; }
+        if (qs.sel >= otherIdx) { openEditor('other'); return; }
         if (cur.multiSelect) {
-          // Enter CONFIRMS the multi-select; an empty selection is allowed (the
-          // user may genuinely want none of them).
           const labels = [...qs.picked].sort((a, b) => a - b).map((i) => cur.options[i].label);
           if (labels.length) qs.answers[cur.question] = labels.join(', ');
           advance();
@@ -7361,23 +8998,28 @@ export async function startTUI(opts) {
     }
 
     if (t.key === 'c-s-c') {
-      // Ctrl+Shift+C: copy the mouse selection, else the last answer — the same
-      // two actions as the right-click menu's Copy / Copy last answer. Works
-      // while the agent is streaming too. (Only terminals that can report
-      // modified keys — the kitty keyboard protocol hncode already enables —
-      // can tell Ctrl+Shift+C from Ctrl+C; a terminal that sends ^C for both
-      // cannot.)
-      const sel = (state.selection && state.selection.anchor) ? selectionText() : '';
-      if (sel) copyToClipboard(sel);
-      else {
+      // Ctrl+Shift+C copies the MOUSE SELECTION. It used to fall back to the last
+      // assistant reply when there was no selection — which silently copied the
+      // WRONG THING: a user who had selected some shell output but whose selection
+      // was not established got an AI answer on the clipboard instead, with a
+      // "Copied N chars" notice that looked like success. A key that copies
+      // something other than what is highlighted is worse than one that copies
+      // nothing, so the fallback is gone; ask for the explicit action instead.
+      // (Only terminals that can report modified keys — the kitty keyboard
+      // protocol hncode already enables — can tell Ctrl+Shift+C from Ctrl+C; one
+      // that sends ^C for both cannot.)
+      if (state.selection && state.selection.anchor && state.selection.head) {
+        const sel = selectionText();
+        if (sel) copyToClipboard(sel);
+        else notice('Nothing to copy — the selection is empty', 'error');
+      } else {
         const composerSel = state.composerSel;
         if (composerSel && composerSel.anchor !== composerSel.head) {
           const a = Math.min(composerSel.anchor, composerSel.head);
           const h = Math.max(composerSel.anchor, composerSel.head);
           copyToClipboard((state.input || '').slice(a, h));
         } else {
-          const last = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
-          if (last) copyToClipboard(last.text); else notice('Nothing to copy', 'error');
+          notice('Nothing to copy — select text first (or use the right-click menu)', 'error');
         }
       }
       renderFrame();
@@ -7389,6 +9031,16 @@ export async function startTUI(opts) {
       // that handles Ctrl+Shift+V itself sends the 200~/201~ sequence, which the
       // tokenizer turns into a {paste} token and which reads the same as this
       // shortcut from the user's point of view.
+      void pasteFromClipboard();
+      return;
+    }
+
+    if (t.key === 'c-v') {
+      // Ctrl+V: paste. Many terminals translate Ctrl+V in raw mode to the raw
+      // control byte 0x16 (not a bracketed-paste sequence), which tokenize()
+      // produces as {key:'c-v'}. That token had NO handler, so Ctrl+V silently
+      // did nothing everywhere (only Ctrl+Shift+V / bracketed paste worked).
+      // Route it through the same clipboard paste as Ctrl+Shift+V.
       void pasteFromClipboard();
       return;
     }
@@ -7454,6 +9106,10 @@ export async function startTUI(opts) {
     if (state.running && !overlayOpen) {
       if (t.key === 'escape') {
         if (state.agent) state.agent.interrupt();
+        // Manual /compact runs its own summarizer (no agent). Abort it and flag it,
+        // so the /compact handler skips the trim (abort yields an empty summary —
+        // trimming would drop history with nothing to replace it).
+        if (state._compactLlm) { state._compactAborted = true; try { state._compactLlm.abort(); } catch { /* ignore */ } }
         return;
       }
       if (t.key === 'pageup' || t.key === 'pagedown') {
@@ -7787,11 +9443,15 @@ export async function startTUI(opts) {
         if (t.key === 'backspace') {
           state.pickerQuery = (state.pickerQuery || '').slice(0, -1);
           state.picker.sel = 0;
+          const qcb = state.picker.onQueryChange;
+          if (qcb) qcb(state.pickerQuery);
           renderFrame(); return;
         }
         if (t.ch) {
           state.pickerQuery = (state.pickerQuery || '') + t.ch;
           state.picker.sel = 0;
+          const qcb = state.picker.onQueryChange;
+          if (qcb) qcb(state.pickerQuery);
           renderFrame(); return;
         }
       }
@@ -7821,11 +9481,7 @@ export async function startTUI(opts) {
     if (state.menuOpen) {
       if (t.key === 'up') { state.menuSel = (state.menuSel - 1 + state.menuList.length) % state.menuList.length; ensureMenuVisible(state); renderFrame(); return; }
       if (t.key === 'down') { state.menuSel = (state.menuSel + 1) % state.menuList.length; ensureMenuVisible(state); renderFrame(); return; }
-      if (t.key === 'tab') {
-        const sel = state.menuList[state.menuSel];
-        if (sel) { state.input = '/' + sel.name; state.caret = state.input.length; refreshMenu(state); renderFrame(); }
-        return;
-      }
+      if (t.key === 'tab') { acceptMenuSelection(state); refreshMenu(state); renderFrame(); return; }
     }
     // The inline `@file` list owns ↑↓/Tab/Enter/Esc while it is open, exactly like
     // the `/` menu above. Enter would otherwise SUBMIT the half-typed prompt.
@@ -7872,10 +9528,15 @@ export async function startTUI(opts) {
       const dir = t.key === 'down' ? 1 : -1;
       const targetRow = layout.caretRow + dir;
       if (targetRow >= 0 && targetRow < layout.rows.length) {
-        const starts = rowStartOffsets(state.input || '', layout.rows.length, insideW);
-        const colInRow = Math.max(0, layout.caretCol - 1);
-        const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
-        state.caret = Math.min((state.input || '').length, targetStart + colInRow);
+        // Keep the caret's DISPLAY column, then map it back to a character index
+        // on the target row. The old code did `targetStart + colInRow` (adding the
+        // row's start offset to the display column), which only works when every
+        // row holds the same number of characters — so on wrapped/CJK text an
+        // up/down move landed at a wrong (usually left-shifted) position.
+        // `composerTextIndexAt` walks the row by display width instead. `caretCol`
+        // includes the 1-column border, which this helper does not.
+        const colInside = Math.max(0, layout.caretCol - 1);
+        state.caret = composerTextIndexAt(layout, targetRow, colInside);
         state.composerSel = null;
         renderFrame(); return;
       }
@@ -8027,7 +9688,29 @@ export async function startTUI(opts) {
       // it must be consumed either way, or the typed "/yolo" stayed on screen
       // after the command ran (forced submission skips the composer reset).
       const fromMenu = state.menuOpen && state.menuList.length;
-      if (fromMenu) {
+      const selItem = fromMenu ? state.menuList[state.menuSel] : null;
+      // An entry from the SECOND level (arguments) is not a command name: it must
+      // never be turned into `submit('/' + name)`. That is what produced
+      // "Unknown command: /" — typing an argument that matches no completion
+      // (`/trim 0`, `/web 0.0.0.0`) left a hint-only row selected, and Enter sent
+      // the literal "/". `_cmdName` marks a row as belonging to the argument level.
+      const argLevel = !!(selItem && selItem._cmdName);
+      if (argLevel && selItem._argWord && selItem.name) {
+        // A real completion: insert the word and keep the composer, so the user
+        // can go on filling the arguments.
+        acceptMenuSelection(state);
+        refreshMenu(state);
+        renderFrame();
+      } else if (argLevel) {
+        // The hint-only row (nothing left to complete): submit exactly what the
+        // user typed, e.g. "/trim 0", so the command runs and reports its own
+        // usage — instead of a bogus "/".
+        submit();
+        state.input = ''; state.caret = 0;
+        state.pastes.clear(); state.pasteCounter = 0;
+        state.composerSel = null;
+        renderFrame();
+      } else if (fromMenu) {
         submit('/' + state.menuList[state.menuSel].name);
         state.input = ''; state.caret = 0;
         state.pastes.clear(); state.pasteCounter = 0;
@@ -8157,14 +9840,25 @@ export async function startTUI(opts) {
       + ((state.menuOpen && state.menuList.length) ? Math.min(state.menuList.length, MAX_MENU) + 1 : 0);
   }
 
+  // Whether tools may touch paths OUTSIDE the workspace. Its own switch (/external)
+  // rather than a property of the permission mode: the old code made Auto and Yolo
+  // imply it, so merely switching mode handed out filesystem-wide reach — and it
+  // MUTATED cfg, leaving the grant in place after switching back to Ask.
+  // Read live, so a /external flip applies to the very next tool call.
+  function externalAllowed() {
+    return !!cfg.allowExternal;
+  }
+
   function scrollChat(state, delta) {
     const cols = dims().cols, rows = dims().rows;
     const chat = renderChatLines(state, cols);
     const ch = Math.max(1, rows - (composerHeight(state, cols) + statusExtra(state) + STATUS_H + CTX_H));
     const maxScroll = Math.max(0, chat.length - ch);
     state.scroll = Math.min(maxScroll, Math.max(0, (state.scroll || 0) + delta));
+    // A deliberate move: the previous frame's anchor no longer describes where the
+    // user is looking, so the next paint must seed a fresh one from this value.
+    dropScrollPin(state);
   }
-
 
   async function submit(forceText) {
     // `forceText` means the text came from somewhere other than the composer
@@ -8226,6 +9920,14 @@ export async function startTUI(opts) {
       // this one finishes (the drain after agent.run()). It must NOT be handed
       // to the running turn — Ctrl-S is the explicit "inject it now" shortcut.
       renderFrame();
+      // The queue pane is a status field; make sure the web UI sees it NOW rather
+      // than whenever the next paint happens to sync. The web queue panel lagged
+      // by a minute or more because it only rode along on whatever broadcast a
+      // turn happened to trigger next. Push an independent `queued` event so the
+      // browser updates the queue pane immediately (claude-code-style granular
+      // event instead of a full-status snapshot).
+      if (web) void syncWeb();
+      if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
       return;
     }
 
@@ -8261,6 +9963,7 @@ export async function startTUI(opts) {
       session.shellHistory.push({ cmd, ts: Date.now(), ok: null, anchor: (session.messages || []).length });
     }
     state.scroll = 0;
+    dropScrollPin(state);   // jump to the tail: reseed the anchor on paint
     state.running = true;
     state.startAnim = { start: Date.now() };
     renderFrame();
@@ -8275,7 +9978,12 @@ export async function startTUI(opts) {
       } else {
         const result = await bash.execute(
           { command: cmd, description: 'shell passthrough' },
-          { ...cfg, cwd: state.cwd || state.workspace, workspace: state.workspace || state.cwd, allowExternal: true },
+          // `allowExternal` follows the /external SETTING, not a hardcoded true.
+          // A `!` passthrough bypasses the approval prompt by design (it is the
+          // user's own command), but the workspace path guard is a separate
+          // decision — hardcoding it here meant `!cat ../secrets` reached outside
+          // the workspace even with /external off.
+          { ...cfg, cwd: state.cwd || state.workspace, workspace: state.workspace || state.cwd, allowExternal: externalAllowed() },
         );
         out = String(result == null ? '' : result);
         failed = isFailureResult(out, 'Bash');
@@ -8311,13 +10019,30 @@ export async function startTUI(opts) {
   // something the user typed, so it must not appear (or persist) as their message.
   async function runAgent(text, opts = {}) {
     const asSystem = !!opts.asSystem;
-    if (!asSystem) addChat({ role: 'user', text });
+    if (!asSystem) addChat({ role: 'user', text: opts.bubbleText != null ? opts.bubbleText : text, _conv: true });
     // Fresh buffer for this turn's <plan> split (see appendAssistant).
     state._planBuf = '';
     // A message the user JUST SENT should always bring the newest content into
     // view, even if they were scrolled up reading history. (Queue/steer do NOT
     // come through here, so they keep the view exactly where the user left it.)
     state.scroll = 0;
+    dropScrollPin(state);   // jump to the tail: reseed the anchor on paint
+    // Should THIS turn produce the session title? Decided BEFORE the user message
+    // is appended to the history: the old test lived in the system-prompt builder
+    // and checked `session.messages.length === 0`, but by then the message was
+    // already in there, so the injection never fired and no session was ever
+    // auto-titled.
+    //
+    // The `state.titleAttempts` cap is what makes a FAILED naming retryable. The
+    // old test (`session.messages.length === 0`) was true on the first turn only,
+    // so one offline/aborted/empty reply left the session nameless for good — the
+    // comment on generateTitle claimed it "simply tries again" but nothing did.
+    // A few extra attempts cover a transient failure without paying for a naming
+    // request on every turn of a session the user never wanted named.
+    const TITLE_ATTEMPT_LIMIT = 3;
+    if (state.titleAttempts == null) state.titleAttempts = 0;
+    const needsTitle = !!session && !session.title && state.titleAttempts < TITLE_ATTEMPT_LIMIT;
+    state.titleAttempts++;
     state.running = true;
     // Pick the Working… wording ONCE for this turn, so it does not change while
     // the gradient loops. The next turn picks a new one.
@@ -8334,20 +10059,17 @@ export async function startTUI(opts) {
     state.pulseStart = null;
     renderFrame();
     if (session) session.rounds = state.rounds;
-    // system 固定在开头，且不持久化到 session（否则每轮都会堆一条）。
-    // 历史里的旧 system 一律跳过，统一使用当前 system prompt：
+    // The system message is pinned to the front and is NOT persisted to the
+    // session (persisting it would pile up one copy per turn). Any older system
+    // entry in the history is skipped, so the CURRENT prompt is the only one
+    // used:
     //   * a custom prompt from /set-system-prompt (config.toml `system_prompt`),
     //     falling back to the built-in SYSTEM_PROMPT;
     //   * plus the COOL-MODE instruction appended when that mode is ON, so the
     //     model stops narrating what it is about to do and why.
     const basePrompt = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
     let sysText = basePrompt;
-    
-    // Auto-generate title on first turn (if not already set)
-    if (!session.title && session.messages && session.messages.length === 0) {
-      sysText += '\n\n[IMPORTANT: Please generate a concise, descriptive title for this conversation based on the user\'s request. Return ONLY the title text, nothing else. Example: Fix color rendering issue or Implement plugin system]';
-    }
-    
+
     if (cfg.calmMode) {
       sysText += '\n\n' + CALM_MODE_INSTRUCTION;
     }
@@ -8364,6 +10086,14 @@ export async function startTUI(opts) {
     if (personal) {
       sysText += '\n\n' + personal;
     }
+    // Agent memory: notes the model wrote for itself in earlier sessions (the
+    // Memory tool). Read fresh each turn like the preferences above, so an edit
+    // lands on the next prompt. Injected AFTER the user's preferences: the user's
+    // standing instructions outrank the model's own earlier notes.
+    const memory = readMemory(state.workspace || cfg.workspace);
+    if (memory) {
+      sysText += '\n\n' + memory;
+    }
     // AGENTS.md: the PROJECT's own instructions, read fresh each turn like the
     // personal notes above, so an edit (or a fresh /init) takes effect on the next
     // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
@@ -8374,10 +10104,15 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
       sysText += '\n\n' + agents;
     }
     let messages = [{ role: 'system', content: sysText }];
+    // A skill body is injected as its OWN system message so it reaches the model
+    // but never appears (or persists) as the user's words, mirroring kimi's
+    // activation card. It is filtered out of the saved session like sysText.
+    if (opts.skillBody) messages.push({ role: 'system', content: opts.skillBody });
     if (session.messages && session.messages.length) {
       for (const m of session.messages) {
         if (m.role === 'system') continue;
-        // 丢掉既无 content、又无 toolCalls 的空 assistant 消息（旧 bug 的残留）。
+        // Drop an assistant message carrying neither content nor toolCalls — the
+        // residue of an old bug.
         if (m.role === 'assistant'
             && !(typeof m.content === 'string' && m.content.trim())
             && !(Array.isArray(m.toolCalls) && m.toolCalls.length)) {
@@ -8389,10 +10124,29 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
     // from the harness, not something the user typed, and it must not show up as a
     // user bubble or be persisted as one.
-messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: text });
-    // 只持久化对话本身，system 不进 session。转折保存交给 turn 结束处
-    // （agent.run 之后），中途不写盘以保持发消息流畅。
-    Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
+messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: opts.modelText != null ? opts.modelText : text });
+    // Only the conversation is persisted; the system message does not go into the
+    // session. Saving a turn is left to the end of the turn (after agent.run) —
+    // writing mid-turn would make sending feel sluggish.
+Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
+    // The user's message is on disk before the agent has done anything. A crash
+    // this early used to lose the entire prompt, because the first save was at
+    // turn end.
+    try { sess.saveSession(session); } catch { }
+
+    // Called at every step boundary. `messages` is the array the agent appends to,
+    // so re-filtering it into the session and writing to disk keeps the saved
+    // transcript within one step of what is on screen. Cheap: saveSession is a
+    // synchronous write of one JSON file, and a step is seconds apart.
+    function persistTurnProgress(list) {
+      if (!session || !Array.isArray(list)) return;
+      session.messages = list.filter((m) => m.role !== 'system');
+      session.rounds = state.rounds || session.rounds;
+      session.steps = state.steps || session.steps;
+      session.todos = state.todos || session.todos;
+      session.mode = state.mode || session.mode;
+      try { sess.saveSession(session); } catch { }
+    }
 
     if (state.plan) {
       cfg.toolFilter = ['Read', 'Grep', 'Glob'];
@@ -8402,44 +10156,75 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
       cfg.toolFilter = undefined;
     }
 
-    // AUTO ("Never Ask") implies unrestricted paths: the mode already auto-approves
-    // every tool, so ALSO lifting the tool-layer workspace check keeps behaviour
-    // consistent. Without this the approval callback said "yes" while
-    // resolvePath() still threw `Path outside workspace` — the mode looked broken.
+    // Outside-the-workspace access is NO LONGER implied by the permission mode.
+    // Auto and Yolo used to lift the tool-layer workspace check as a
+    // side effect of auto-approving, which meant switching mode silently granted
+    // filesystem-wide reach — and it MUTATED cfg, so one auto turn left
+    // `allowExternal` permanently true even after switching back to Ask.
     //
-    // YOLO gets the same treatment for BASH only: its approval no longer runs the
-    // workspace test (see onApproval), so the tool layer must not re-impose it.
-    // Other tools keep the check, because for them "inside the workspace" is still
-    // what decides approve-vs-ask.
+    // It is now an explicit, persisted setting: /external [on|off], stored as
+    // `tool_allow_external_paths` (or HNCODE_ALLOW_EXTERNAL=1 per session). The mode
+    // decides whether a tool needs ASKING; this decides whether the path guard at
+    // the tool layer lets the call through at all.
     const mode = state.mode || 'ask';
-    cfg.allowExternal = (mode === 'auto' || mode === 'yolo') ? true : cfg.allowExternal;
+    cfg.allowExternal = externalAllowed();
     // AskUserQuestion reads this to refuse in auto mode. Set here so the FIRST
     // tool call of the turn already sees it (onApproval re-syncs it live after).
     cfg.permissionMode = mode;
+
 
     // Approval callback: called before every tool execution
     const onApproval = async (toolName, args) => {
       // Read the mode LIVE: /permission, /yolo and /auto can change while the
       // turn runs, and the decision must follow the CURRENT setting.
       const cur = state.mode || 'ask';
-      // Keep the TOOL LAYER in step with the LIVE mode. Agent snapshots cfg into
+      // Keep the TOOL LAYER in step with the LIVE state. Agent snapshots cfg into
       // its own ctx at construction, so mutating cfg alone would not reach a turn
       // that is already running. Two things depend on this:
-      //   * allowExternal — resolvePath()'s workspace guard
+      //   * allowExternal — resolvePath()'s workspace guard. It follows the
+      //     /external SETTING alone; the permission mode must not widen it, or
+      //     switching to Auto would hand out filesystem-wide reach as a side
+      //     effect of a mode change.
       //   * permissionMode — AskUserQuestion refuses to ask while auto is on
       if (state.agent && state.agent.ctx) {
-        state.agent.ctx.allowExternal = (cur === 'auto') || !!cfg.allowExternal;
+        state.agent.ctx.allowExternal = externalAllowed();
         state.agent.ctx.permissionMode = cur;
       }
-      if (cur === 'auto') return true;
+
+
+
+      // Standing rules come FIRST, before every mode rule, so:
+      //   * a `deny` cannot be escaped by switching to Auto / Yolo;
+      //   * an explicit `ask` still prompts even in a mode that auto-approves;
+      //   * an `allow` spares the user the same prompt on every turn.
+      const rule = decideFromRules(cfg.permissions, toolName, args);
+      if (rule === 'deny') {
+        appErr(`${toolName} is blocked by a permission rule (deny).`);
+        return false;
+      }
+      if (rule === 'allow') return true;
+      // `ask` falls through to the prompt below, skipping the mode shortcuts.
+
+      if (rule !== 'ask') {
+        if (cur === 'auto') return true;
+      }
       // Read-only tools never need permission in any mode. AskUserQuestion is on
       // this list because ASKING the user is not a side effect — gating it behind
       // an approval prompt would mean answering two prompts to ask one question.
       // (In auto mode the TOOL refuses itself before any UI; see ctx.permissionMode.)
       const safeTools = ['Read', 'Grep', 'Glob', 'FetchURL', 'WebSearch', 'TaskOutput', 'TaskList', 'TaskStop', 'TaskWait', 'TodoList', 'FileLines', 'AskUserQuestion'];
-      if (safeTools.includes(toolName)) return true;
+      if (rule !== 'ask' && safeTools.includes(toolName)) return true;
+      // A read-only SHELL COMMAND (ls/git status/rg/cat …) is as safe as a
+      // read-only TOOL, so it runs without a prompt in Ask mode too — the user
+      // has no decision to make about `git log`. Only in `ask`; an explicit
+      // `ask` rule above still wins, and YOLO/AUTO never reach here anyway.
+      if (cur === 'ask' && rule !== 'ask' && toolName === 'Bash') {
+        const c = String((args && (args.command || args.cmd)) || '');
+        if (isReadOnlyCommand(c) && !isDestructiveCommand(c)) return true;
+      }
 
-      // YOLO ("Ask When Needed"): anything that stays INSIDE the workspace runs
+
+      // Yolo: anything that stays INSIDE the workspace runs
       // without asking — edits, writes and commands alike. Only work that touches
       // a path OUTSIDE the workspace (or a command whose target we cannot prove is
       // inside) needs the user.
@@ -8449,7 +10234,7 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
       // commands like `ls /tmp` and asked about them. In yolo the user has already
       // said "run routine work", so Bash runs without the workspace test — only an
       // obviously destructive command still asks.
-      if (cur === 'yolo') {
+      if (cur === 'yolo' && rule !== 'ask') {
         if (toolName === 'Bash') {
           const cmd = String((args && (args.command || args.cmd)) || '');
           if (!isDestructiveCommand(cmd)) return true;
@@ -8457,6 +10242,8 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           return true;
         }
       }
+
+
 
       return new Promise((resolve) => {
         let desc = '';
@@ -8499,6 +10286,9 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
         // values live in `otherText` / `supplement` so an Esc back-out keeps them.
         editing: null,
         editingText: '',
+        // Caret position (character index) inside the free-text buffer. Lets
+        // Left/Right move within the field instead of only appending at the end.
+        editingCaret: 0,
         otherText: '',
         supplement: '',
         resolve: (answers) => resolve(answers),
@@ -8518,10 +10308,18 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
       }
       renderFrame();
     });
+    // Open a file-history turn BEFORE the agent can write anything (file-history.js):
+    // the first write to a file in this turn snapshots its pre-turn content, which
+    // is exactly what /undo restores. Recorded even when nothing is written, so the
+    // index stays lined up one-to-one with the user prompts /undo counts.
+    if (session) beginTurn(session.id);
     const agent = new Agent({
       // maxSteps omitted: the agent loop is uncapped (see agent.js).
       // sessionId makes the prompt-cache key stable per session (see cache.js).
-      cfg: { ...cfg, sessionId: (session && session.id) || cfg.sessionId },
+      // `tasks` is handed to the agent so its ctx REUSES the same store: background
+      // bash jobs and background subagents outlive the turn that started them, and
+      // a fresh store per turn made them disappear (while still running).
+      cfg: { ...cfg, sessionId: (session && session.id) || cfg.sessionId, tasks: (state.tasks = state.tasks || {}) },
       messages, onApproval,
       // Shell hooks are re-read per turn so an edit to hooks.json (or a /hooks
       // change) takes effect on the next message without restarting.
@@ -8529,9 +10327,18 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
       onEvent: (e) => {
         // Everything the MODEL streams counts toward the tok/s meter: reasoning
         // chunks carry `text` just like answer chunks do.
+        //
+        // `_tokTimes` is (re)created here rather than assumed. It used to be
+        // initialized only by /new, so a RESTORED session (`hncode --continue`,
+        // /sessions) had it undefined and the very first streamed token threw
+        // "Cannot read properties of undefined (reading 'push')" — killing the TUI
+        // mid-answer with nothing printed, because this runs inside the agent's
+        // onEvent and the exit handler wipes the alternate screen. The tok/s timer
+        // already tolerated a missing array; the producer did not.
+        const tokTimes = state._tokTimes || (state._tokTimes = []);
         if (e.text) {
           const now = Date.now();
-          for (let k = 0, t = estimateTokens(e.text); k < t; k++) state._tokTimes.push(now);
+          for (let k = 0, t = estimateTokens(e.text); k < t; k++) tokTimes.push(now);
         }
         // Tool-call ARGUMENTS are model output too (a Write's content, a long
         // Bash command) and used to show 0 tok/s while they streamed. Only the
@@ -8539,26 +10346,62 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
         // tool_result is a later turn's input, not tokens the model produced.
         if (e.type === 'tool_args' && e.chunk) {
           const now = Date.now();
-          for (let k = 0, t = estimateTokens(e.chunk); k < t; k++) state._tokTimes.push(now);
+          for (let k = 0, t = estimateTokens(e.chunk); k < t; k++) tokTimes.push(now);
         }
         if (e.type === 'step_start') {
           state._turnSteps = (state._turnSteps || 0) + 1;
           state.steps = (state._stepsBase || 0) + state._turnSteps;
           if (session) session.steps = state.steps;
+          // Persist at every step boundary, not only at turn end. `messages` is the
+          // SAME array this Agent appends to, so copying it here captures every
+          // completed step: a crash mid-turn then loses at most the step in flight
+          // instead of the whole turn.
+          persistTurnProgress(messages);
           renderSoon();
           return;
         }
         if (e.type === 'compacting') {
-          // In-progress notice: the summary below is a full model round-trip, so
-          // show that work is happening instead of leaving the turn silent.
-          addChat({ role: 'system', text: `Context at ${fmtTokens(e.before || 0)} — auto-compacting…` });
+          // Open a LIVE compaction block (kimi's CompactionComponent): a blinking
+          // bullet while the summary round-trip runs, so the turn does not sit
+          // silent for seconds. The same row is upgraded in place on `compacted`.
+          state.compactionMsg = {
+            role: 'compaction', phase: 'running', startedAt: Date.now(),
+            instruction: e.instruction || '',
+          };
+          addChat(state.compactionMsg);
           renderSoon();
           return;
         }
         if (e.type === 'compacted') {
           state.ctxTokens = e.after || state.ctxTokens;
           state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
-          addChat({ role: 'system', text: `Context auto-compacted (${fmtTokens(e.before || 0)} → ${fmtTokens(e.after || 0)} tokens).` });
+          // Settle the live block rather than pushing a second row: the header
+          // becomes "Compaction complete (X → Y tokens)" and the summary stays
+          // hidden behind Ctrl+O.
+          const block = state.compactionMsg;
+          if (block) {
+            block.phase = 'done';
+            block.tokensBefore = e.before;
+            block.tokensAfter = e.after;
+            block.text = e.summary || '';
+            block._cache = null;
+            state.compactionMsg = null;
+          } else {
+            addChat({
+              role: 'compaction', phase: 'done',
+              tokensBefore: e.before, tokensAfter: e.after, text: e.summary || '',
+            });
+          }
+          renderSoon();
+          return;
+        }
+        if (e.type === 'compaction_cancelled') {
+          // The user interrupted an auto-compaction. Settle the live block so it
+          // stops blinking and reads as cancelled (nothing was trimmed).
+          const block = state.compactionMsg;
+          if (block) { block.phase = 'cancelled'; block._cache = null; state.compactionMsg = null; }
+          else addChat({ role: 'compaction', phase: 'cancelled' });
+          renderSoon();
           return;
         }
         if (e.type === 'incomplete') {
@@ -8578,6 +10421,18 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           state.ctxTokens = e.tokens || 0;
           state.ctxMax = e.max || state.ctxMax;
           state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
+          // Keep a bounded series of step sizes so /usage can draw the trend.
+          if (!Array.isArray(state.tokenHistory)) state.tokenHistory = [];
+          const h = state.tokenHistory;
+          if (h[h.length - 1] !== state.ctxTokens) h.push(state.ctxTokens);
+          if (h.length > 240) h.splice(0, h.length - 240);
+          // Mirror onto the session so saveSession (which persists the whole
+          // session object) captures it: a --resume restores the trend chart.
+          if (session) {
+            if (!Array.isArray(session.tokenHistory)) session.tokenHistory = [];
+            if (session.tokenHistory[session.tokenHistory.length - 1] !== state.ctxTokens) session.tokenHistory.push(state.ctxTokens);
+            if (session.tokenHistory.length > 240) session.tokenHistory.splice(0, session.tokenHistory.length - 240);
+          }
           renderSoon(); return;
         }
         if (e.type === 'think') { state.seenThinking = true; appendThinking(e.text); renderSoon(); return; }
@@ -8603,6 +10458,9 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           if (qm) qm.role = 'steer';
           const qi = state.queued.indexOf(e.text);
           if (qi >= 0) state.queued.splice(qi, 1);
+          // The steered message just left the queue: push the new list to the web
+          // queue pane immediately, or it lags until the next whole-status sync.
+          if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
           renderSoon();
           return;
         }
@@ -8616,7 +10474,7 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           if (t) t.pending = false;
           const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (!dup) {
-            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now() });
+            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now(), _conv: true });
           }
         } else if (e.type === 'tool_args') {
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
@@ -8643,7 +10501,14 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
             || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending);
           if (entry) {
-            entry.liveOutput = (entry.liveOutput || '') + e.chunk;
+            // Bounded to a TAIL. This string is mirrored into the hub row and
+            // shipped over SSE on every patch, so leaving it unbounded grew the
+            // TUI's row, the hub's row and the browser's copy together, once per
+            // chunk. Only the tail is ever displayed.
+            entry.liveOutput = tailChars(
+              (entry.liveOutput || '') + e.chunk,
+              LIVE_OUTPUT_MAX_CHARS,
+            );
             // A swarm streams `[n/m] finished` lines as subagents land: advance the
             // matching cells from queued -> completed so the grid fills in live.
             if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
@@ -8728,6 +10593,7 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           const resultMsg = normalizeMsg({
             role: 'tool_result', text: e.content, failed: failedRun,
             diff: e.name === 'Write' ? (entry && entry.diff || []) : (entry && entry.diff),
+            _conv: true,
           });
           if (entry && !isSwarm) {
             const at = state.chat.indexOf(entry);
@@ -8738,7 +10604,6 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
             while (ins < state.chat.length && state.chat[ins].role === 'tool_result') ins++;
             state.chat.splice(ins, 0, resultMsg);
             renderFrame();
-            if ((state.scroll || 0) === 0) state.scroll = 0;
           } else if (!isSwarm) {
             addChat(resultMsg);
           } else {
@@ -8748,13 +10613,30 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           // here. A message typed while the agent works is a NEW turn, so it waits
           // for this turn to finish (see the drain after `agent.run()`). Ctrl-S
           // remains the explicit "steer it into the running turn now" escape hatch.
+          // A finished tool result IS a completed step, so the transcript is
+          // persisted here too — the other half of the step-boundary save above.
+          persistTurnProgress(messages);
         } else if (e.type === 'error') addChat({ role: 'tool_result', text: (e.error && e.error.message) || String(e.error) });
-        else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; }
+        else if (e.type === 'truncation_recovery') {
+          // The answer hit the output cap mid-way and the agent asked the model to
+          // continue. Without a row here the transcript simply grew a second
+          // assistant bubble with no sign of why, which reads as a glitch.
+          addChat({ role: 'system', text: `Output limit reached — the answer continues (attempt ${e.attempt}/3).` });
+        }
+        else if (e.type === 'results_trimmed') {
+          // Old tool result bodies were replaced by a pointer to disk to shrink the
+          // request (agent.js's trim pass). Say so, including that nothing was lost:
+          // without a row the transcript quietly looks like output went missing, and
+          // the user has no way to know the text is still readable.
+          addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk.` });
+        }
+else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; if (web && hub) { try { hub.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ } } }
         renderFrame();
       },
     });
     state.agent = agent;
     if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
+    if (web && hub) { try { hub.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } }
     // A background subagent (Agent {run_in_background:true}, or an AgentSwarm)
     // finishes AFTER the turn that launched it returned. The tools call
     // `ctx._onBackgroundTaskDone`, which nothing installed, so the parent was
@@ -8776,8 +10658,17 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
     messages = agent.messages;
     if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
     state.agent = null;
+    if (web && hub) { try { hub.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } }
     const liveThink = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
     if (liveThink) liveThink.pending = false;
+    // The first turn also names the session. It runs HERE — after the answer is
+    // complete — because the old code tried to parse a title out of the streamed
+    // chunks while `state.running` was still true, so the branch never fired. It
+    // is a separate, tiny request rather than an instruction in the system prompt:
+    // a hidden instruction leaked into the answer and a heading-like first chunk
+    // was mistaken for the title.
+    if (needsTitle) await generateTitle(text);
+
 
     // ---- PLAN MODE: finalize the plan and ask to proceed --------------------
     // The plan bubble is ALREADY on screen (appendAssistant streams the text after
@@ -8808,7 +10699,7 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
           }
         }
         // ask / yolo -> the user decides; auto -> approved without asking, which
-        // is the whole point of "Never Ask". The review resolves to one of
+        // is the whole point of Auto. The review resolves to one of
         // 'approve' | 'edit' | 'keep':
         //   approve — execute the plan as written
         //   edit    — open the plan in the editor, then execute the EDITED text
@@ -8913,6 +10804,8 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
       // state.queued by the `steer` handler above.
       const next = state.queued.shift();
       if (next) { void submit(next); }
+      // Queue shrank: push the updated list to the web queue pane immediately.
+      if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
     }
     // Approved plan: Plan mode OFF (write tools come back), then re-enter the agent
     // with the plan as a SYSTEM message. Deliberately NOT via submit(): that path
@@ -8947,33 +10840,429 @@ messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', con
     try { sess.saveSession(session); } catch {}
   }
 
+  // ---- /web: serve this session to a browser ---------------------------------
+  // Started on demand. The browser talks to the SAME session: prompts it sends go
+  // through `submit` (identical to typing), slash commands through `dispatch`, and
+  // its transcript is the TUI's own `state.chat` mirrored by syncChat() on every
+  // paint. Nothing here reimplements agent behaviour — it only relays.
+  async function startWeb(bindIp, port) {
+    if (web) { notice(`Web UI already running at ${web.url}`); return web; }
+    hub = new SessionHub();
+    // Actions the browser can take. Each one calls the SAME function the keyboard
+    // calls, which is what keeps the two front-ends behaviourally identical.
+    hub.actions.submit = async (text) => {
+      if (typeof text !== 'string' || !text.trim()) throw new Error('empty message');
+      await submit(text);
+    };
+    hub.actions.dispatch = async (cmd, arg) => {
+      const name = String(cmd || '').trim();
+      if (!name.startsWith('/')) throw new Error('not a command');
+      const sp = name.indexOf(' ');
+      const c = sp === -1 ? name : name.slice(0, sp);
+      const a = sp === -1 ? String(arg || '') : name.slice(sp + 1).trim();
+      dispatch(c, a, state, cfg, session, host, submit, stdout);
+      if (state._quit) quit();
+      renderFrame();
+    };
+    hub.actions.interrupt = async () => {
+      if (!state.agent || typeof state.agent.interrupt !== 'function') throw new Error('nothing is running');
+      state.agent.interrupt();
+    };
+    hub.actions.stopTask = async (id) => {
+      const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+      stopTask(ctxLike, String(id || ''));
+    };
+    hub.actions.setMode = async (mode) => {
+      const m = String(mode || '');
+      if (!['ask', 'yolo', 'auto'].includes(m)) throw new Error('unknown mode: ' + m);
+      setPermission(state, m);
+      persistState();
+      renderFrame();
+    };
+    hub.actions.shell = async (cmd) => {
+      const c = String(cmd || '').trim();
+      if (!c) throw new Error('empty command');
+      await runShellCommand(c);
+    };
+    // The two handshakes the agent blocks on. Resolving these from the browser is
+    // what lets a phone answer an approval the terminal is showing.
+    hub.actions.approve = async (id, ok) => {
+      const ap = state.approvalPending;
+      if (!ap) throw new Error('no approval is pending');
+      state.approvalPending = null;
+      ap.resolve(!!ok);
+      renderFrame();
+    };
+    hub.actions.answerQuestion = async (id, answers, extra, note, advance) => {
+      const q = state.question;
+      if (!q) throw new Error('no question is pending');
+      const list = Array.isArray(answers) ? answers : [];
+      const cur = (q.items && q.items[q.index]) || {};
+      const key = cur.question || 'answer';
+      // The per-question answer: the picked option label(s), unless a free-text
+      // "Other" was provided (then that wins, matching the terminal).
+      const other = extra == null ? '' : String(extra).trim();
+      if (other) q.answers[key] = other;
+      else if (list.length) q.answers[key] = list.join(', ');
+      // The whole-request note is only meaningful on the last question; store it
+      // for the final resolve rather than as this question's answer.
+      if (note != null) q.supplement = String(note);
+
+      const total = (q.items || []).length;
+      const isLast = q.index >= total - 1;
+      const more = advance !== false && !isLast;
+      if (more) {
+        // Advance to the next question and let the status broadcast re-open the
+        // modal with it. Do NOT resolve yet — the agent is still blocked.
+        q.index += 1;
+        q.sel = 0;
+        q.picked = new Set();
+        try { syncWebNow(); } catch { /* best-effort */ }
+        renderFrame();
+        return { ok: true, index: q.index, total };
+      }
+      const answersOut = { ...q.answers };
+      state.question = null;
+      q.resolve({ answers: answersOut, additional: q.supplement || '' });
+      try { syncWebNow(); } catch { /* best-effort */ }
+      renderFrame();
+      return { ok: true, done: true };
+    };
+
+    // ---- session settings the browser can change ------------------------------
+    //
+    // Every one of these runs the SAME code the terminal's slash command does, and
+    // persists, so a change made in the browser survives a restart and shows up in
+    // the terminal immediately. Nothing is reimplemented here — the point is that
+    // the two front-ends are views of one session.
+
+    /** Push the transcript and status to the hub right now, not on the next paint. */
+    function syncWebNow() {
+      if (!web || !hub) return;
+      try { hub.syncChat(state.chat); } catch { /* the UI must never break the TUI */ }
+      try { hub.setStatus(webStatus()); } catch { /* best-effort */ }
+      renderFrame();
+    }
+
+    hub.actions.setTitle = async (title) => {
+      const t = String(title || '').trim();
+      if (!t) throw new Error('title required');
+      session.title = t.slice(0, 200);
+      try { sess.saveSession(session); } catch { /* the title is cosmetic */ }
+      stdout.write(`\x1b]0;${session.title}\x07`);
+      syncWebNow();
+    };
+
+
+    // Steer: inject text into the RUNNING turn instead of queueing a new one.
+    // `agent.steer()` buffers it for the next model call — nothing can be inserted
+    // into a request already in flight.
+    hub.actions.steer = async (text) => {
+      const t = String(text || '').trim();
+      if (!t) throw new Error('text required');
+      if (!state.running || !state.agent) throw new Error('nothing is running');
+      state.agent.steer(t);
+      addChat({ role: 'steer', text: t });
+    };
+
+    // Edit a QUEUED message: pull it back out of the queue so the browser can put
+    // it in the composer, exactly like the terminal's ↑-to-recall (see
+    // recallQueued). Matched by TEXT, not index — the browser's list is rebuilt on
+    // every status frame, so an index captured at click time can point at a
+    // different item by the time it arrives.
+    //
+    // Returns the removed text so the caller can seed its composer with it.
+    hub.actions.editQueued = async (text) => {
+      const t = String(text == null ? '' : text);
+      const i = state.queued.findIndex((q) => String(q) === t);
+      if (i < 0) throw new Error('that message is no longer queued');
+      state.queued.splice(i, 1);
+      // Drop the matching transcript entry too: the message is now being edited,
+      // not waiting, so leaving a `queued` row would double it.
+      for (let k = state.chat.length - 1; k >= 0; k--) {
+        if (state.chat[k].role === 'queued' && state.chat[k].text === t) { state.chat.splice(k, 1); break; }
+      }
+      if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
+      syncWebNow();
+      return { ok: true, text: t };
+    };
+
+    // Remove a queued message outright (the browser's ✕), without editing it.
+    hub.actions.dropQueued = async (text) => {
+      const t = String(text == null ? '' : text);
+      const i = state.queued.findIndex((q) => String(q) === t);
+      if (i < 0) throw new Error('that message is no longer queued');
+      state.queued.splice(i, 1);
+      for (let k = state.chat.length - 1; k >= 0; k--) {
+        if (state.chat[k].role === 'queued' && state.chat[k].text === t) { state.chat.splice(k, 1); break; }
+      }
+      if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
+      syncWebNow();
+      return { ok: true };
+    };
+
+    // The effective config, with secrets REPLACED by a set/unset flag. The browser
+    // needs to show what is in force without ever receiving a key.
+    hub.actions.getConfig = async () => effectiveSnapshot(cfg);
+
+    /**
+     * Set one root-level key in config.toml.
+     *
+     * `key` is whitelisted: this surface can be reached over the network, and
+     * "write any key" would let a caller rewrite the whole file, including the
+     * provider table and the access token.
+     */
+    hub.actions.setConfig = async (key, value) => {
+      const ALLOWED = new Set([
+        'calm_mode', 'auto_update', 'auto_compact', 'prompt_cache',
+        'tool_allow_external_paths', 'subagent_model', 'swarm_mode',
+      ]);
+      const k = String(key || '');
+      if (!ALLOWED.has(k)) throw new Error(`not a settable key: ${k}`);
+      const raw = String(value);
+      if (/^(true|false)$/i.test(raw)) setConfigBool(k, /^true$/i.test(raw));
+      else setConfigString(k, raw);
+      // Re-read so the change is live without a restart.
+      Object.assign(cfg, resolveConfig());
+      state.reasoning = !!cfg.reasoning;
+      syncWebNow();
+      return effectiveSnapshot(cfg);
+    };
+
+    // ---- providers and models -------------------------------------------------
+    // ---- providers and models -------------------------------------------------
+    //
+    // These edit config.toml through the same helpers /provider uses, then
+    // re-resolve so the change is live. The option caches are invalidated because
+    // `webStatus` reuses arrays by identity — without that the browser would keep
+    // showing a provider that has just been deleted.
+
+    function invalidateOptionCaches() {
+      toolsCache = null;
+      commandsCache = null;
+      wsFilesCache = { root: '', at: 0, files: null };
+    }
+
+    /** Every provider with its base URL and model count, for the settings UI. */
+    hub.actions.listProviders = async () => {
+      const pr = (cfg.raw && cfg.raw.providers) || {};
+      const models = (cfg.raw && cfg.raw.models) || {};
+      return Object.keys(pr).map((name) => ({
+        name,
+        baseUrl: String(pr[name].base_url || pr[name].baseUrl || ''),
+        protocol: String(pr[name].protocol || 'openai'),
+        keySet: !!(pr[name].api_key || pr[name].apiKey),
+        current: name === cfg.provider,
+        models: Object.keys(models).filter((k) => (models[k].provider || '') === name),
+      }));
+    };
+
+    hub.actions.addProvider = async (name, baseUrl, apiKey, protocol) => {
+      const n = String(name || '').trim();
+      if (!n) throw new Error('provider name required');
+      if (!/^[A-Za-z0-9_-]+$/.test(n)) throw new Error('name may contain letters, digits, - and _ only');
+      const proto = protocol === 'anthropic' ? 'anthropic' : 'openai';
+      addProvider(n, { base_url: String(baseUrl || ''), api_key: String(apiKey || ''), protocol: proto });
+      cfg.raw.providers = cfg.raw.providers || {};
+      cfg.raw.providers[n] = { base_url: String(baseUrl || ''), api_key: String(apiKey || ''), protocol: proto };
+      invalidateOptionCaches();
+      syncWebNow();
+      return hub.actions.listProviders();
+    };
+
+    hub.actions.removeProvider = async (name) => {
+      const n = String(name || '');
+      if (!n) throw new Error('provider name required');
+      const pr = (cfg.raw && cfg.raw.providers) || {};
+      if (!pr[n]) throw new Error(`no such provider: ${n}`);
+      removeProvider(n);
+      delete pr[n];
+      // Its models go too: a model keyed to a provider that no longer exists is
+      // unselectable and only clutters the picker.
+      for (const key of Object.keys(cfg.raw.models || {})) {
+        if (key.split('/')[0] === n) delete cfg.raw.models[key];
+      }
+      if (cfg.provider === n) { cfg.provider = ''; state.provider = ''; }
+      invalidateOptionCaches();
+      syncWebNow();
+      return hub.actions.listProviders();
+    };
+
+    // Read the provider's model list from its /models endpoint and register every
+    // model, so the picker fills in without the user typing ids. Best-effort: an
+    // unreachable endpoint leaves the provider added.
+    hub.actions.discoverModels = async (name) => {
+      const n = String(name || '');
+      const pr = (cfg.raw && cfg.raw.providers) || {};
+      const p = pr[n];
+      if (!p) throw new Error(`no such provider: ${n}`);
+      const baseUrl = p.base_url || p.baseUrl || '';
+      if (!baseUrl) throw new Error('provider has no base_url');
+      // `throwOnError`: the caller asked for this explicitly, so an unreachable
+      // endpoint or a rejected key must surface as an error rather than as
+      // "found 0 models", which is indistinguishable from an empty catalogue.
+      const found = await fetchModels({
+        baseUrl,
+        apiKey: p.api_key || p.apiKey || '',
+        protocol: p.protocol || 'openai',
+        throwOnError: true,
+      });
+      cfg.raw.models = cfg.raw.models || {};
+      let added = 0;
+      for (const m of found) {
+        const key = modelKey(n, m.id);
+        if (!cfg.raw.models[key]) added++;
+        addModel(n, m.id, { display_name: m.display, contextLength: m.contextLength, maxTokens: m.maxTokens });
+        cfg.raw.models[key] = {
+          provider: n, model: m.id,
+          display_name: m.display || undefined,
+          maxTokens: m.maxTokens || undefined,
+          contextLength: m.contextLength || undefined,
+          reasoning: m.reasoning || undefined,
+          efforts: m.efforts || undefined,
+        };
+      }
+      invalidateOptionCaches();
+      syncWebNow();
+      return { found: found.length, added };
+    };
+
+    // The models.dev catalogue, for "import a known provider".
+    hub.actions.listKnownProviders = async () => {
+      const catalog = await fetchCatalog();
+      if (!catalog) throw new Error('could not reach models.dev');
+      return Object.values(catalog)
+        .filter((p) => p && p.id && p.api)
+        .map((p) => ({ id: p.id, name: p.name || p.id, api: p.api }))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    };
+
+    /**
+     * Import a models.dev entry as a provider, then discover its models.
+     *
+     * The key is required from the caller: models.dev publishes endpoints, not
+     * credentials, so this cannot complete without the user supplying one.
+     */
+    hub.actions.importKnownProvider = async (catalogId, name, apiKey) => {
+      const catalog = await fetchCatalog();
+      if (!catalog) throw new Error('could not reach models.dev');
+      const entry = catalog[String(catalogId || '')];
+      if (!entry || !entry.api) throw new Error(`unknown provider: ${catalogId}`);
+      const n = String(name || entry.id || '').trim();
+      if (!n) throw new Error('provider name required');
+      const proto = /anthropic/i.test(String(entry.api)) ? 'anthropic' : 'openai';
+      addProvider(n, { base_url: entry.api, api_key: String(apiKey || ''), protocol: proto });
+      cfg.raw.providers = cfg.raw.providers || {};
+      cfg.raw.providers[n] = { base_url: entry.api, api_key: String(apiKey || ''), protocol: proto };
+      invalidateOptionCaches();
+      syncWebNow();
+      // Models are a bonus — a bad key must not undo the provider.
+      let discovered = { found: 0, added: 0 };
+      try { discovered = await hub.actions.discoverModels(n); } catch { /* best-effort */ }
+      return { name: n, baseUrl: entry.api, protocol: proto, ...discovered };
+    };
+
+
+
+    const srv = await startWebServer({
+      hub,
+      bindIp: bindIp || '127.0.0.1',
+      port: port == null ? 0 : port,
+      onNotice: (m, k) => notice(m, k),
+    });
+    web = srv;
+    // Seed the browser with what already exists, so opening the page mid-session
+    // shows the conversation rather than an empty pane.
+    try { hub.syncChat(state.chat); hub.setStatus(webStatus()); } catch { /* best-effort */ }
+    return srv;
+  }
+
+  function stopWeb() {
+    if (!web) { notice('Web UI is not running', 'error'); return false; }
+    // Tell the daemon first, so its directory stops listing this session instead
+    // of showing a link to a port that is about to disappear.
+    if (webDaemon) {
+      try { webDaemon.detach(); } catch { /* best-effort */ }
+      webDaemon = null;
+    }
+    try { web.close(); } catch { /* already gone */ }
+    web = null;
+    hub = null;
+    return true;
+  }
+
+  /**
+   * Bring up the GLOBAL web UI for this session.
+   *
+   * Two servers are involved and the distinction matters:
+   *   * `startWeb()` here — this session's OWN server, holding the transcript,
+   *     the actions and the SSE stream. It binds a random loopback port.
+   *   * the daemon — one per machine, on the FIXED port from config.toml. It
+   *     serves the directory and proxies /s/<id>/* to the session above.
+   *
+   * The user asked for a fixed address that survives restarts and lists every
+   * session, so the daemon is what they open. If one is already running this
+   * session just registers with it — that is the "reuse, do not start another"
+   * behaviour, and it is also the only option, since a second daemon could not
+   * bind the fixed port anyway.
+   */
+  async function attachGlobalWeb(bindIp, port) {
+    // The bind address: an explicit /web argument wins, else the config value,
+    // else loopback. It decides BOTH bindings — the session's own server and the
+    // daemon the browser actually opens — so `/web 0.0.0.0` is really reachable
+    // from another machine instead of silently listening on 127.0.0.1.
+    const host = String(bindIp || cfg.webHost || '127.0.0.1');
+    // The session's own server first: the daemon needs a port to proxy to.
+    const srv = await startWeb(host, port == null ? 0 : port);
+    try {
+      webDaemon = await attachToDaemon({
+        id: (session && session.id) || 'session',
+        port: srv.port,
+        token: srv.token,
+        title: (session && session.title) || '',
+        workspace: state.cwd || cfg.workspace || '',
+        host,
+      });
+    } catch (e) {
+      // The daemon is a convenience layer; the session's own server still works,
+      // so fall back to reporting that rather than failing /web outright.
+      notice(`Global web UI unavailable (${e.message}); this session is still served directly`, 'error');
+      webDaemon = null;
+    }
+    // The daemon's token is the one the user pastes into the login page. It comes
+    // from config.toml, so it is the same value every session reports — which is
+    // the point: a saved browser login keeps working.
+    return { srv, daemon: webDaemon, token: ensureWebToken() };
+  }
+
+
+
   const host = {
     addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel,
-    sendPrompt: (text) => { void runAgent(text); },
+    sendPrompt: (text, opts) => { void runAgent(text, opts || {}); },
     quit: () => { state._quit = true; },
     saveSession: (s) => sess.saveSession(s),
     reloadConfig: () => resolveConfig(),
     persistState,
+    startWeb,
+    startWebGlobal: attachGlobalWeb,
+    stopWeb,
+    webInfo: () => web,
+    // `dispatch` is module-level and was declared with a `renderFrame` parameter
+    // that NONE of its four callers ever passed. That was harmless until /compact
+    // started calling it, which threw "renderFrame is not a function". Reaching it
+    // through `host` means a future caller cannot forget it again.
+    renderFrame,
   };
 
   // Appending streamed text can also add rows (the message wraps as it grows).
-  // While the user is scrolled up, compensate so their view does not shift — the
-  // same anchoring rule addChat applies for a whole new message.
-function anchorScroll() {
-    // The arithmetic lives in anchorScrollNext() (module level, unit-tested): it
-    // takes the current chat row count and returns the new `scroll`.
-    //   * the baseline is refreshed even while the view is pinned at the bottom,
-    //     so the first append after the user scrolls up has a real delta;
-    //   * the compensation is the rows added since the previous paint.
-    //
-    // The count comes from state._chatTotal, which composeFrame() refreshes on
-    // every paint. Calling renderChatLines() here (as this used to) laid out the
-    // WHOLE transcript a second time on every streamed chunk — a full ~25k-row
-    // render per chunk on top of the windowed one, which is what made markdown
-    // output appear to stall.
-    const rows = state._chatTotal || 0;
-    state.scroll = anchorScrollNext(state, rows);
+  // No arithmetic is needed here: renderChatLines() anchors the scrolled-up window
+  // by row against the exact row count, so this only has to schedule a repaint.
+  // Kept as a named hook because the streaming path calls it in several places.
+  function anchorScroll() {
+    renderSoon();
   }
+
 
 
   // Live split of the streamed reply into prose vs. <plan> block.
@@ -9034,7 +11323,7 @@ function anchorScroll() {
       state.chat[proseIdx]._cache = null;   // replacement, not append: see fp()
       if (!trimmed.trim()) state.chat.splice(proseIdx, 1);   // nothing left: drop it
     } else if (trimmed.trim()) {
-      state.chat.unshift({ role: 'assistant', text: trimmed });
+      state.chat.unshift({ role: 'assistant', text: trimmed, _conv: true });
     }
   }
 
@@ -9054,28 +11343,86 @@ function anchorScroll() {
     if (last && last.role === 'assistant') {
       last.text += text;
     } else {
-      state.chat.push({ role: 'assistant', text: text || '' });
+      state.chat.push({ role: 'assistant', text: text || '', _conv: true });
     }
-    
-    // Check if this is the first assistant response and we need to parse title
-    if (!state.running && !session.title && state.chat.some(m => m.role === 'assistant')) {
-      // Look for title in the assistant's response
-      const assistantMsg = state.chat.find(m => m.role === 'assistant');
-      if (assistantMsg && assistantMsg.text) {
-        const text = assistantMsg.text.trim();
-        // More lenient heuristic: short text (< 80 chars), no newlines, optional ending punctuation
-        const cleanText = text.replace(/[.!?]$/, '').trim();
-        if (cleanText.length < 80 && !text.includes('\n') && cleanText.length > 2) {
-          session.title = cleanText;
-          saveSession(session);
-          stdout.write(`\x1b]0;${cleanText}\x07`);
-          app(`Auto-generated title: "${cleanText}"`);
-        }
-      }
-    }
-    
+
+
     anchorScroll();
   }
+
+
+  // Name the session from the user's FIRST message, with a dedicated one-shot
+  // request. The reply is untrusted: it can come back multi-line, prefixed
+  // ("Title: none"), or as prose, and it is scrubbed down to one short line
+  // before it is written anywhere.
+  //
+  // Three things made this fail silently before, and all three are fixed here:
+  //   * the request inherited the session's thinking effort, so a reasoning model
+  //     burnt the whole 64-token budget on `reasoning_content` and returned an
+  //     EMPTY answer (`finish_reason: "length"`). It is sent with noReasoning now.
+  //   * it carried the whole ~25 KB tool block, which no title request needs.
+  //   * it ran exactly once. `needsTitle` only held on the very first turn, so a
+  //     failure (offline, aborted, empty reply) left the session nameless forever.
+  //     state.titleAttempts now allows a few retries on later turns.
+  async function generateTitle(userText) {
+    const asked = String(userText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (!asked) return;
+    let raw = '';
+    // 64 tokens is enough once thinking is off, but a model that answers in prose
+    // can still be cut off — so escalate once rather than give up.
+    for (const budget of [64, 256]) {
+      try {
+        const titleCfg = { ...cfg, temperature: 0.2, maxOutputTokens: budget };
+        const llm = new LLM(titleCfg);
+        // NOT wired to Esc: abort() belongs to the turn's own request, and a
+        // title request shares this LLM instance.
+        const got = await llm.requestText([
+          { role: 'system', content: TITLE_PROMPT },
+          { role: 'user', content: `The entry message is:\n${asked}` },
+        ], { noReasoning: true, noTools: true });
+        if (got) { raw = got; break; }
+        // '' means "hit the output cap" — a bigger budget may still land it.
+        // null means the request itself failed; retrying the same way is pointless.
+        if (got === null) break;
+      } catch { raw = ''; break; }
+    }
+    const title = cleanTitle(raw);
+    if (!title) return;
+    session.title = title;
+    try { saveSession(session); } catch { /* the title is cosmetic; never fail a turn over it */ }
+    stdout.write(`\x1b]0;${title}\x07`);
+    notice(`Auto-generated title: "${title}"`);
+  }
+
+  // The one-shot namer. Sentence-case, 3-7 words, with worked examples — a bare
+  // "at most 50 characters" let the model echo "你好" back as a title for a
+  // greeting, which is not a name anyone can find in a list.
+  const TITLE_PROMPT = 'You name coding-agent sessions. Reply with ONLY the title: one line, 3 to 7 words, sentence case (capitalize only the first word and proper nouns), at most 50 characters. No quotes, no trailing punctuation, no "Title:" label, no explanation.\n'
+    + '\n'
+    + 'Capture the main topic or goal so the user recognises the session in a list.\n'
+    + 'Good: "Fix login button on mobile", "Add OAuth authentication", "Debug failing CI tests", "Refactor API client error handling"\n'
+    + 'Bad (too vague): "Code changes", "Greeting", "你好"\n'
+    + 'Bad (too long): "Investigate and fix the issue where the login button does not respond on mobile devices"';
+
+  // Model output -> a single short title, or '' when there is nothing usable.
+  // The old heuristic took the first streamed chunk if it was under 80 chars and
+  // on one line, which made ordinary prose ("Let me look at the file.") the title.
+  function cleanTitle(s) {
+    let t = String(s == null ? '' : s).trim();
+    if (!t) return '';
+    // A model that answers with a heading or a label instead of a bare title.
+    t = t.replace(/^\s*(?:title|标题)\s*[:：]\s*/i, '');
+    t = t.replace(/^#+\s*/, '').replace(/^["'“”‘’*_`]+|["'“”‘’*_`]+$/g, '');
+    t = t.split('\n')[0];                 // keep the first non-empty line only
+    t = t.replace(/\s+/g, ' ').trim();
+    t = t.replace(/[.。;；,，:：!?！？]+$/, '').trim();   // trailing punctuation
+    // A model that wraps its answer in JSON despite being told not to.
+    const json = t.match(/^\{.*"title"\s*:\s*"([^"]*)"/);
+    if (json) t = json[1].trim();
+    if (!t || t.length < 3) return '';
+    return t.length > 60 ? t.slice(0, 60).trim() : t;
+  }
+
 
   function appendThinking(text) {
     const last = state.chat[state.chat.length - 1];
@@ -9102,7 +11449,17 @@ function anchorScroll() {
     // Keep `card`: a background-task lifecycle card carries its phase/headline/
     // detail here (see the `bg_task` renderer). Dropping it left the row with the
     // fallback text instead of what actually happened.
-    if (m && m.card) out.card = m.card;
+    if (m && m._conv) out._conv = true;
+    // Keep the compaction block's live fields: the header is rebuilt from `phase`,
+    // the token pair and the (collapsed) summary every frame, so dropping them left
+    // the row stuck at whatever the first paint happened to show.
+    if (m && m.role === 'compaction') {
+      out.phase = m.phase || 'running';
+      out.tokensBefore = m.tokensBefore;
+      out.tokensAfter = m.tokensAfter;
+      out.startedAt = m.startedAt;
+      out.instruction = m.instruction || '';
+    }
     return out;
   }
 
@@ -9119,6 +11476,13 @@ function anchorScroll() {
     // The /tasks panel owns a flash timer; leaving it armed keeps the process
     // alive until it fires after exit.
     if (state.tasksPanel && state.tasksPanel.flashTimer) clearTimeout(state.tasksPanel.flashTimer);
+    // Leaving the daemon registered would keep this session listed as "live" in
+    // the browser until its heartbeat went stale. Deregistering now flips the page
+    // to the read-only view straight away.
+    if (webDaemon) {
+      try { webDaemon.detach(); } catch { /* best-effort */ }
+      webDaemon = null;
+    }
     try { sess.saveSession(session); } catch {}
     stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
     stdout.write(alternateScreen(false));
@@ -9134,12 +11498,101 @@ function anchorScroll() {
       stdout.write(hint);
     }
   }
-  function quit() { stop(); process.exit(0); }
+// Run the SessionEnd hook, then exit. Bounded: a hung hook must not stop the
+// process from quitting, so the whole thing races a short timer.
+function quit() {
+  stop();
+  let done = false;
+  const bye = () => { if (!done) { done = true; process.exit(0); } };
+  try {
+    const workspace = process.cwd();
+    const { hooks } = loadHooks(workspace);
+    if (hooks && hooks.SessionEnd && hooks.SessionEnd.length) {
+      setTimeout(bye, 5000).unref?.();
+      Promise.resolve(runShellHooks({ hooks }, 'SessionEnd', {}, workspace)).then(bye, bye);
+      return;
+    }
+  } catch { /* fall through to a plain exit */ }
+  bye();
+}
   process.on('SIGWINCH', () => renderFrame());
   process.on('SIGINT', () => quit());
-  process.on('exit', () => {
+  /**
+   * Record WHY the process ended, before it does.
+   *
+   * A TUI that exits on its own leaves nothing behind: the alternate screen is
+   * restored in the exit handler, so the user sees their prompt back and no error,
+   * and the reason is gone with the process. That is indistinguishable from a
+   * normal /exit — which made "it just quits mid-tool-call sometimes" impossible
+   * to diagnose from the outside.
+   *
+   * Every exit now appends one line to ~/.hncode/exit.log: the reason, whether it
+   * was requested (quit()/exit command) or the runtime deciding for us, and the
+   * active handles at the moment it happened. A tool-only exit shows up as
+   * `beforeExit`/`stdin end` with a running agent; a crash shows up as
+   * uncaughtException with a stack.
+   */
+  function noteExit(reason) {
+    try {
+      const dir = process.env.HNCODE_HOME || path.join(os.homedir(), '.hncode');
+      fs.mkdirSync(dir, { recursive: true });
+      const line = JSON.stringify({
+        at: new Date().toISOString(),
+        reason,
+        running: !!state.running,
+        busy: !!state.agent,
+        raw: wasRaw,
+        raw: wasRaw,
+        // A stop() running means the TUI already tore down its terminal state, i.e.
+        // a deliberate exit; without it this was a shutdown nobody asked for.
+        tornDown: stopped,
+        // The handles still keeping the loop alive (empty => nothing left to do,
+        // which is what lets Node exit on its own).
+        handles: process._getActiveHandles ? process._getActiveHandles().map((h) => h && h.constructor && h.constructor.name).filter(Boolean) : [],
+        session: session && session.id,
+      }) + '\n';
+      fs.appendFileSync(path.join(dir, 'exit.log'), line);
+    } catch { /* diagnostics must never be the reason an exit fails */ }
+  }
+  process.on('exit', (code) => {
+    // Save on every exit, not just the graceful path. stop() (a normal quit) saves,
+    // but a process.exit elsewhere or a crash skips it; the one place a session
+    // survives an abrupt halt is right here. sess.saveSession is synchronous fs.
+    try { sess.saveSession(session); } catch {}
+    noteExit(`exit code=${code}`);
     if (stopped) return;
     try { stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l' + alternateScreen(false) + showCursor()); } catch {}
+  });
+  // stdin reaching EOF is the one exit that is COMPLETELY silent: Node has no more
+  // readable input, the event loop drains, and the process ends without any exit
+  // handler having a reason to report. That is the shape a "TUI quit by itself"
+  // takes. Log it (and the agent state) so the next occurrence is identifiable.
+  try {
+    stdin.on('end', () => noteExit('stdin end (EOF)'));
+    stdin.on('close', () => noteExit('stdin close'));
+    stdin.on('error', (e) => noteExit(`stdin error: ${e && e.message}`));
+  } catch { /* a non-TTY stdin has no such events */ }
+  process.on('SIGHUP', () => noteExit('SIGHUP'));
+  process.on('beforeExit', () => noteExit('beforeExit'));
+  // A crash between messages used to lose the whole current turn: the only save
+  // lived at turn end (or in stop()), so anything typed or streamed before it died
+  // with the process. Save whatever arrived so far, then re-raise so the fault is
+  // still visible instead of being silently swallowed.
+  process.on('uncaughtException', (err) => {
+    try { sess.saveSession(session); } catch {}
+    noteExit(`uncaughtException: ${(err && err.message) || err}\n${(err && err.stack) || ''}`);
+    console.error('\nhncode crashed:', (err && err.stack) || err);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    try { sess.saveSession(session); } catch {}
+    // The STACK is the whole point: the message alone ("...of undefined") does not
+    // say which line. console.error() writes into the alternate screen, which the
+    // exit handler then wipes, so the user never sees it — the log is the only
+    // place the trace survives.
+    noteExit(`unhandledRejection: ${(reason && reason.message) || reason}\n${(reason && reason.stack) || ''}`);
+    console.error('\nhncode unhandled rejection:', reason);
+    process.exit(1);
   });
 
   // REMOTE CONTROL (--control): expose a local socket so a script can queue a
@@ -9171,6 +11624,39 @@ function anchorScroll() {
     }
   }
   if (control && control.server) process.on('exit', () => { try { control.close(); } catch {} });
+
+
+
+  // WEB UI (--web): same opt-in shape as --control. It starts AFTER the first
+  // paint (the UI is already up by this point), and a failure is reported in the
+  // transcript rather than killing the session — a port already in use must not
+  // stop the user from working.
+  if (opts.web && typeof opts.web === 'object') {
+    try {
+      const srv = await startWeb(opts.web.bindIp, opts.web.port);
+      const lan = !srv.loopback;
+      addChat({
+        role: 'system',
+        text: [
+          `Web UI: ${srv.url}`,
+          `Bind:   ${srv.host}:${srv.port}${lan ? '  (reachable from the network)' : '  (this machine only)'}`,
+          '',
+          'Access token (paste it into the login page):',
+          '',
+          `    ${srv.token}`,
+          '',
+          'Anyone with this token can run commands as you in this workspace.',
+          'Stop the server with /web off.',
+        ].join('\n'),
+      });
+      renderFrame();
+    } catch (e) {
+      addChat({ role: 'warn', text: `Could not start the web UI: ${e.message}` });
+      renderFrame();
+    }
+  }
+  process.on('exit', () => { try { if (web) web.close(); } catch { /* already gone */ } });
+
 
   // Keep the process alive for the whole session. startTUI is async and returns
   // as soon as the TUI is wired up; without a pending promise, main()'s await

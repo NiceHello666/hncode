@@ -16,6 +16,11 @@ export const spec = {
     required: ['path'],
   },
   async execute(args, ctx) {
+    // See read.js: a missing path reaches resolvePath(undefined), which resolves to
+    // the workspace root rather than failing.
+    if (typeof args.path !== 'string' || !args.path.trim()) {
+      return 'Error: `path` is required and must be a non-empty string.';
+    }
     let p;
     try { p = resolvePath(args.path, ctx); } catch (e) { return e.message; }
 

@@ -8,8 +8,13 @@
 //     "hooks": {
 //       "PreToolUse":  [{ "matcher": "Edit|Write", "command": "npm run lint" }],
 //       "PostToolUse": [{ "matcher": "Edit",        "command": "npx prettier --write $FILE" }],
+//       "PostToolUseFailure": [{ "matcher": "Bash", "command": "notify-fail.sh" }],
 //       "UserPromptSubmit": [{ "command": "echo submitting" }],
 //       "SessionStart": [{ "command": "git fetch --quiet" }],
+//       "SessionEnd":   [{ "command": "echo bye >> ~/sessions.log" }],
+//       "SubagentStop": [{ "command": "echo sub done" }],
+//       "PostCompact":  [{ "command": "archive-summary.sh" }],
+//       "Notification": [{ "command": "notify-send hncode" }],
 //       "Stop":         [{ "command": "echo turn done >> ~/turns.log" }]
 //     }
 //   }
@@ -39,11 +44,16 @@ import cp from 'node:child_process';
 // of silently never firing.
 export const HOOK_EVENTS = [
   'SessionStart',
+  'SessionEnd',
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'PostToolUseFailure',
   'Stop',
+  'SubagentStop',
   'PreCompact',
+  'PostCompact',
+  'Notification',
 ];
 
 // A hook that hangs must not hang the agent. 60s is generous for a formatter or
@@ -209,7 +219,7 @@ export async function runShellHooks(config, event, payload, cwd) {
   // for Edit, for BOTH PreToolUse and PostToolUse. Applying it to PreToolUse
   // alone made a PostToolUse hook run on every tool — a "format after edit" hook
   // ran after reads and searches too.
-  const isToolEvent = event === 'PreToolUse' || event === 'PostToolUse';
+  const isToolEvent = event === 'PreToolUse' || event === 'PostToolUse' || event === 'PostToolUseFailure';
   const results = [];
   for (const entry of list) {
     if (isToolEvent && !matcherApplies(entry.matcher, payload && payload.toolName)) continue;
