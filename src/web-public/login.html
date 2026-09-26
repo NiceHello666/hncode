@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>hncode</title>
+<link rel="stylesheet" href="/fonts.css">
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<main class="gate">
+  <h1 data-i18n="login.heading">hncode</h1>
+  <p class="lede" data-i18n="login.lede"></p>
+  <form id="f">
+    <label for="t" data-i18n="login.tokenLabel"></label>
+    <input id="t" name="token" type="password" autocomplete="off" spellcheck="false" autofocus>
+    <button type="submit" data-i18n="login.submit"></button>
+  </form>
+  <p id="err" class="err" role="alert" hidden></p>
+  <p class="foot" data-i18n="login.foot"></p>
+</main>
+<script type="module" src="/login.js"></script>
+</body>
+</html>

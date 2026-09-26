@@ -1,0 +1,123 @@
+/* hncode web UI — the token gate.
+   Same tokens as app.css; the point is that the sign-in page belongs to the
+   same product as the thing it unlocks. */
+
+:root {
+  color-scheme: dark;
+
+  --s0: #08090b;
+  --s1: #0d0f13;
+
+--fg:  #e6eaf2;
+  --fg1: #b6bfcf;
+  --fg2: #8f97a6;
+  --fg3: #6b7280;
+
+  --line:  #1b202a;
+  --line2: #272d3a;
+
+  --teal: #00b8db;
+  --red:  #ff6b6b;
+
+  --mono: "JetBrains Mono", "Noto Sans SC", ui-monospace, SFMono-Regular,
+          "SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace;
+--sans: var(--mono);
+
+  --radius: 3px;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+
+body {
+  background: var(--s0);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: rgba(0, 184, 219, .28); }
+:focus-visible { outline: 1px solid var(--teal); outline-offset: 2px; }
+
+.gate {
+  max-width: 380px;
+  margin: 0 auto;
+  padding: 22vh 28px 0;
+}
+
+h1 {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -.01em;
+  margin: 0 0 10px;
+  color: var(--fg);
+}
+
+.lede {
+  color: var(--fg2);
+  margin: 0 0 28px;
+  font-size: 12.5px;
+  max-width: 44ch;
+}
+
+form { display: flex; flex-direction: column; gap: 0; }
+
+label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+  margin-bottom: 6px;
+}
+
+input {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  background: var(--s1);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  width: 100%;
+  transition: border-color .12s ease;
+}
+input:focus { outline: none; border-color: var(--teal); }
+input::placeholder { color: var(--fg3); }
+
+button {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  margin-top: 12px;
+  padding: 7px 14px;
+  color: var(--fg1);
+  background: transparent;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  cursor: pointer;
+  align-self: flex-start;
+  min-width: 104px;
+  transition: border-color .12s ease, color .12s ease;
+}
+button:hover { border-color: var(--teal); color: var(--fg); }
+button:disabled { color: var(--fg3); border-color: var(--line); cursor: not-allowed; }
+
+.err {
+  color: var(--red);
+  margin: 16px 0 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.foot {
+  color: var(--fg3);
+  margin: 34px 0 0;
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+@media (max-width: 480px) {
+  .gate { padding-top: 14vh; }
+}

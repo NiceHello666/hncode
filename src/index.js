@@ -26,8 +26,8 @@ Options:
   -V, --version                 output the version number
   -S, --session [id]            Resume a session (with id) or pick interactively.
   -c, --continue                Continue the previous session for this directory.
-  -y, --yolo                    Routine edits/commands run; risky actions still ask.
-  --auto                        Never ask; everything runs automatically.
+  -y, --yolo                    Yolo mode: routine edits/commands run; risky actions still ask.
+  --auto                        Auto mode: never ask; everything runs automatically.
   -m, --model <model>           Model alias to use for this invocation.
   -p, --prompt <prompt>         Run one prompt non-interactively and print the reply.
   --output-format <format>      Prompt mode output: text (default), json, or stream-json.
@@ -35,6 +35,9 @@ Options:
                                 Exit code reflects the outcome: 0 ok, 1 failure, 2 config, 3 no answer, 4 interrupted.
   --control                     Expose a local control socket (prompt/status/interrupt) while the TUI runs.
   --control <path>              Same, at an explicit socket path.
+  --web                         Serve this session to a browser on 127.0.0.1 (random port).
+  --web [ip][:port]             Same, on a chosen address/port (e.g. --web 0.0.0.0:8080).
+  --plan                        Start in plan mode (research only, no writes).
   --plan                        Start in plan mode (research only, no writes).
   --add-dir <dir>               Add an additional workspace directory. Repeatable.
   -h, --help                    Show help.
@@ -66,7 +69,7 @@ export function parseArgs(argv) {
       if (eq >= 0) { key = a.slice(2, eq); val = a.slice(eq + 1); }
       else { key = a.slice(2); val = null; }
       if (key === 'resume') key = 'session'; // `--resume <id>` is an alias for `--session <id>`
-      if (['session', 'control'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
+      if (['session', 'control', 'web'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
 else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir') {
         if (val === null) {
           const nx = argv[i + 1];
@@ -323,8 +326,43 @@ function loadOrCreateSession(opts, cfg) {
   return session;
 }
 
+
+/**
+ * Parse the --web flag into { bindIp, port } or null.
+ *   --web                  -> loopback, OS-assigned port
+ *   --web 8080             -> loopback, that port
+ *   --web 0.0.0.0:8080     -> explicit address and port
+ *   --web 192.168.1.5      -> that address, OS-assigned port
+ * Anything unparseable returns null, so the flag is ignored rather than failing
+ * the launch — /web from inside the session still works either way.
+ */
+export function parseWebArg(v) {
+  if (v == null || v === false) return null;
+  if (v === true) return { bindIp: '127.0.0.1', port: 0 };
+  const s = String(v).trim();
+  if (!s) return { bindIp: '127.0.0.1', port: 0 };
+  let bindIp = '127.0.0.1';
+  let port = 0;
+  if (/^\d+$/.test(s)) {
+    port = Number(s);
+  } else if (s.includes(':')) {
+    // IPv6 in brackets is deliberately not handled: /web covers it, and a
+    // half-parsed address is worse than ignoring the flag.
+    const at = s.lastIndexOf(':');
+    bindIp = s.slice(0, at) || '127.0.0.1';
+    const p = s.slice(at + 1);
+    if (!/^\d+$/.test(p)) return null;
+    port = Number(p);
+  } else {
+    bindIp = s;
+  }
+  if (port < 0 || port > 65535) return null;
+  return { bindIp, port };
+}
+
 export async function main(argv) {
   const args = parseArgs(argv);
+  if (args.help) { printHelp(); return 0; }
   if (args.help) { printHelp(); return 0; }
   if (args.version) { console.log(VERSION); return 0; }
 
@@ -419,6 +457,11 @@ export async function main(argv) {
     // Remote control: expose a local socket so a script can queue a prompt or
     // query status on the running session (see ci.js).
     control: args.control === true ? '' : (typeof args.control === 'string' ? args.control : null),
+    // Web UI: start the server as soon as the TUI is up. `--web` alone binds
+    // loopback on an OS-assigned port; `--web 0.0.0.0:8080` chooses both. Parsed
+    // here so it behaves like every other flag, and the TUI still has /web to
+    // start or stop it mid-session.
+    web: parseWebArg(args.web),
     // MCP runs in the BACKGROUND once the TUI is up (see startTUI): connecting
     // can take seconds and must not delay the first paint.
     mcpConnect: connectMcp,

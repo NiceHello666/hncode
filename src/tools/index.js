@@ -17,7 +17,9 @@ import * as askUserQuestionMod from './ask-user-question.js';
 import { spec as agentSpec } from './agent.js';
 import { spec as agentSwarmSpec } from './agent-swarm.js';
 import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec } from './tasks.js';
+import * as memoryMod from './memory.js';
 import { pluginTools } from '../plugin.js';
+
 
 // Built-in tools.
 const builtinTools = [
@@ -40,7 +42,9 @@ const builtinTools = [
   TaskOutputSpec,
   TaskStopSpec,
   TaskWaitSpec,
+  memoryMod.spec,
 ];
+
 
 // Combined list: built-ins + plugin-registered tools. Plugin tools appear after
 // built-ins so their names are visible, but built-in names take precedence in

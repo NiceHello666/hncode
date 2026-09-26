@@ -47,9 +47,54 @@ function decodeBuffer(buf) {
     try { return new TextDecoder('gbk').decode(buf); } catch { return buf.toString('utf8'); }
   }
 }
-function decodeChunks(chunks) {
-  return decodeBuffer(Buffer.concat(chunks));
+
+/**
+ * Byte budget for a RUNNING command's captured output.
+ *
+ * `truncateBuf` only runs when the command FINISHES, so the whole run's output
+ * sits in memory until then — and a build or a full test suite emits hundreds of
+ * megabytes. The ring below keeps only a bounded TAIL while the command runs,
+ * which is also the part a reader wants.
+ *
+ * The HEAD is dropped rather than the tail, and the dropped count is remembered
+ * so the finished result can still report it instead of silently looking like a
+ * short run.
+ */
+const LIVE_RING_BYTES = 512 * 1024;
+
+/** Keep only the LAST `limit` bytes of an array of Buffers, in place. Returns
+    how many bytes were dropped. */
+function trimChunkRing(chunks, limit) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  if (total <= limit) return 0;
+  const dropped = total - limit;
+  let drop = dropped;
+  while (drop > 0 && chunks.length) {
+    const head = chunks[0];
+    if (head.length <= drop) { chunks.shift(); drop -= head.length; }
+    else { chunks[0] = head.subarray(drop); drop = 0; }
+  }
+  return dropped;
 }
+
+function decodeChunks(chunks) {
+  // Tolerant of a restored task: after a session round-trip the chunks are
+  // `{type:'Buffer',data:[…]}` objects (JSON has no Buffer) or absent entirely.
+  // `Buffer.concat` would throw on either, and this getter runs while the output
+  // panel is being drawn — i.e. a throw here takes the TUI down too.
+  if (chunks == null) return '';
+  const list = Array.isArray(chunks) ? chunks : [chunks];
+  if (!list.length) return '';
+  const items = list.map((c) => {
+    if (Buffer.isBuffer(c)) return c;
+    if (c && c.type === 'Buffer' && Array.isArray(c.data)) return Buffer.from(c.data);
+    return Buffer.from(String(c));
+  });
+  try { return decodeBuffer(items.length === 1 ? items[0] : Buffer.concat(items)); }
+  catch { return items.map((c) => c.toString('utf8')).join(''); }
+}
+
 
 function killTree(child) {
   try {
@@ -99,33 +144,46 @@ export const spec = {
 
     const chunks = [];
     let settled = false;
+    // Bytes shed by the live ring, reported on the finished result so a trimmed
+    // run does not look like a short one.
+    let chunksDropped = 0;
     // Live stream sink: hand decoded output to the agent (ctx.onOutput) so the UI
     // can show a running command's output in real time, exactly like the
     // finished "Used Bash" row does. Foreground runs only — a background task's
     // output is read through TaskOutput.
     //
-    // Decoding is STREAMING (a multi-byte char can be split across chunks) and
-    // sanitizing runs over the whole accumulated text, then only the NEW tail is
-    // emitted: stripping per-chunk would cut an escape sequence in half and leak
-    // the remainder into the display.
+
+    //
+    // Decoding is STREAMING (a multi-byte char can be split across chunks), and
+    // sanitizing runs over complete LINES rather than the whole accumulated text.
+    // The old form re-ran the escape regexes over everything received so far on
+    // EVERY chunk — O(n²) over the run, plus a fresh full-length string per chunk
+    // — which is what made a chatty command slow the process down and double its
+    // peak memory.
+    //
+    // Line-by-line is also what keeps an escape sequence from being cut in half:
+    // a sequence never contains a newline, so a complete line is always safe to
+    // sanitize, and the trailing partial line waits for more input.
     const sink = typeof ctx.onOutput === 'function' ? ctx.onOutput : null;
     const liveDecoder = sink ? new TextDecoder('utf-8') : null;
-    let liveAcc = '';
-    let liveSent = 0;
-    const push = (d) => {
+    let livePending = '';
+const push = (d) => {
       chunks.push(d);
+      const dropped = trimChunkRing(chunks, LIVE_RING_BYTES);
+      if (dropped) chunksDropped += dropped;
+
       if (!sink || settled) return;
       try {
-        liveAcc += liveDecoder.decode(d, { stream: true });
-        const clean = sanitizeShellOutput(liveAcc);
-        if (clean.length > liveSent) {
-          const delta = clean.slice(liveSent);
-          liveSent = clean.length;
-          sink(delta);
-        }
-      } catch {}
+        livePending += liveDecoder.decode(d, { stream: true });
+        const nl = livePending.lastIndexOf('\n');
+        if (nl < 0) return;
+        const complete = livePending.slice(0, nl + 1);
+        livePending = livePending.slice(nl + 1);
+        const clean = sanitizeShellOutput(complete);
+        if (clean) sink(clean);
+      } catch { /* display is best-effort; the result below is authoritative */ }
     };
-    if (child.stdout) child.stdout.on('data', push);
+if (child.stdout) child.stdout.on('data', push);
     if (child.stderr) child.stderr.on('data', push);
 
     let timer = null;
@@ -172,12 +230,21 @@ export const spec = {
         if (ctx) ctx._foreground = null;
         if (settled) return;
         settled = true;
+        // Flush the last partial line the live sink was holding back.
+        if (sink && livePending) {
+          try { sink(sanitizeShellOutput(livePending)); } catch { /* best-effort */ }
+          livePending = '';
+        }
         if (signal && signal.aborted) { resolve('Interrupted by user'); return; }
         let out = truncateBuf(sanitizeShellOutput(decodeChunks(chunks)));
+        // A trimmed run says so; otherwise the result would look complete while
+        // quietly missing its head.
+        if (chunksDropped) out = `...[dropped ${chunksDropped} bytes of earlier output]\n` + out;
         out += `\n[exit code: ${code === null ? 'killed' : code}]`;
         resolve(out);
       });
       child.on('error', (e) => {
+
         cleanup();
         if (ctx) ctx._foreground = null;
         if (settled) return;

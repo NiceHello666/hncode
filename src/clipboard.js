@@ -27,8 +27,11 @@ export function copyText(text) {
   if (!s) return false;
   if (win()) {
     // clip.exe takes UTF-16LE. (`cmd /c echo "…" | clip` mangled quotes, '%'
-    // and newlines; plain UTF-8 input turned non-ASCII into mojibake.)
-    cp.execSync('clip', { input: Buffer.from(s, 'utf16le'), windowsHide: true, timeout: 5000 });
+    // and newlines; plain UTF-8 input turned non-ASCII into mojibake.) Prefix the
+    // UTF-16 byte order mark (FF FE) so clip.exe is never left to guess the endian
+    // or treat input as ANSI — without it, non-ASCII on some Windows versions /
+    // code pages came out mojibake.
+    cp.execSync('clip', { input: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')]), windowsHide: true, timeout: 5000 });
     return true;
   }
   const cmd = process.platform === 'darwin' ? 'pbcopy' : 'xclip -selection clipboard';

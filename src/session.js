@@ -10,6 +10,9 @@ import crypto from 'node:crypto';
 const DEFAULT_DIR = () => path.join(os.homedir(), '.hncode', 'sessions');
 function dir(custom) { return custom || process.env.HNCODE_SESSIONS_DIR || DEFAULT_DIR(); }
 
+/** The resolved session store directory. Exported so the web daemon can read it. */
+export function sessionsDir(custom) { return dir(custom); }
+
 // ---- metadata cache --------------------------------------------------------
 // Enumerating sessions (listSessions / latestSession / --continue) re-read every
 // session file to grab its id/title/workspace/timestamps. With hundreds of
@@ -56,6 +59,34 @@ export function sessionFile(id, storeDir) {
   return path.join(dir(storeDir), `${id}.json`);
 }
 
+/**
+ * One `session.messages` entry -> the transcript ROW(s) that mirror it.
+ *
+ * Returns an ARRAY because an assistant turn with tool calls becomes the
+ * assistant row PLUS one `tool` row per call. Both the TUI transcript and the
+ * Web UI's read-only view of a finished session render from these rows, so the
+ * expansion lives here — in the session data layer — rather than in either
+ * front-end. It also keeps the Web daemon off the TUI's import graph: the daemon
+ * needs this conversion but must NOT pull in the renderer, the agent and the LLM
+ * client to get it.
+ *
+ * Callers must FLATTEN the result (`flatMap`), not spread it into an object.
+ */
+export function convRowFor(m) {
+  if (!m || typeof m !== 'object') return [];
+  const text = typeof m.content === 'string' ? m.content : '';
+  if (m.role === 'user') return [{ role: 'user', text }];
+  if (m.role === 'tool') return [{ role: 'tool_result', text }];
+  if (m.role === 'assistant') {
+    const rows = [{ role: 'assistant', text }];
+    for (const tc of (Array.isArray(m.toolCalls) ? m.toolCalls : [])) {
+      if (!tc || typeof tc !== 'object') continue;
+      rows.push({ role: 'tool', toolName: tc.name, toolArgs: tc.args || {}, pending: false });
+    }
+    return rows;
+  }
+  return [];
+}
 // FIX: build the serialized object with a FIXED key order so `updatedAt`
 // always lands BEFORE `messages`. readSessionMeta() stops scanning at the
 // `"messages"` key, so a session whose updatedAt sits after the transcript

@@ -1,0 +1,1509 @@
+/* hncode web UI — the browser's copy of the terminal transcript.
+   Palette values come from src/colors.js so the two front-ends cannot drift. */
+
+:root {
+  color-scheme: dark;
+
+  --s0: #08090b;
+  --s1: #0d0f13;
+  --s2: #12151b;
+  --s3: #1a1e26;
+
+--fg:  #e6eaf2;
+  --fg1: #b6bfcf;
+  --fg2: #8f97a6;
+  --fg3: #6b7280;
+
+  --line:  #1b202a;
+  --line2: #272d3a;
+
+  --teal:   #00b8db;
+  --cyan:   #00d7ff;
+  --blue:   #4287f5;
+  --spring: #00d7af;
+  --orange: #ff8c00;
+  --branch: #ffdb6e;
+  --shell:  #bd93f9;
+  --red:    #ff6b6b;
+  --green:  #5cff8f;
+  --yellow: #ffd93d;
+
+  --on-accent: #08090b;
+
+--mono: "JetBrains Mono", "Noto Sans SC", ui-monospace, SFMono-Regular,
+          "SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace;
+  /* This product is Chinese-first and JetBrains Mono has no CJK glyphs, so UI
+     text and code share one stack: the mono face first (paths, numbers), then
+     Noto for every Chinese character. A separate Latin sans would only cover the
+     few latin glyphs, at the cost of a second font. */
+  --sans: var(--mono);
+
+  --rail-w: 264px;
+  --radius: 3px;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+
+body {
+  background: var(--s0);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-ligatures: none;
+  font-variant-numeric: tabular-nums;
+}
+.muted { color: var(--fg2); }
+.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button { font: inherit; color: inherit; }
+
+:focus-visible { outline: 1px solid var(--teal); outline-offset: 2px; }
+
+* { scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--line2);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 5px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--fg3); background-clip: content-box; }
+::selection { background: rgba(0, 184, 219, .28); }
+
+/* ---------------------------------------------------------------- controls */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg1);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color .12s ease, color .12s ease, background-color .12s ease;
+}
+.btn:hover { border-color: var(--teal); color: var(--fg); }
+.btn:disabled { color: var(--fg3); border-color: var(--line); cursor: not-allowed; }
+
+.btn-quiet {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg2);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .12s ease, background-color .12s ease;
+}
+.btn-quiet:hover { color: var(--fg); background: var(--s3); }
+.btn-quiet:disabled { color: var(--fg3); cursor: not-allowed; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line2);
+  color: var(--fg1);
+  white-space: nowrap;
+}
+.pill-solid { background: var(--teal); color: var(--on-accent); border-color: var(--teal); }
+.pill-ok { color: var(--green); border-color: rgba(92, 255, 143, .4); }
+.pill-warn { color: var(--yellow); border-color: rgba(255, 217, 61, .4); }
+.pill-danger { color: var(--red); border-color: rgba(255, 107, 107, .4); }
+.pill-info { color: var(--teal); border-color: rgba(0, 184, 219, .4); }
+.pill-soft { background: var(--s3); border-color: transparent; color: var(--fg1); }
+
+.pill-sub { color: var(--fg2); }
+
+/* Stop is the one destructive control in the composer, so it reads as a warning
+   rather than as another Send. */
+.btn.is-stop { border-color: rgba(255, 107, 107, .5); color: var(--red); }
+.btn.is-stop:hover { border-color: var(--red); color: var(--red); background: rgba(255, 107, 107, .1); }
+
+
+.dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+  background: var(--fg3);
+}
+.dot-on { background: var(--green); }
+.dot-off { background: var(--red); }
+.dot-wait { background: var(--yellow); }
+
+/* ------------------------------------------------------------------- shell */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  height: 100%;
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------------- rail */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--s1);
+  border-right: 1px solid var(--line);
+}
+
+/* The rail is a column here, so there is nothing to open. The narrow-screen
+   rule turns this back on together with the drawer. */
+.rail-toggle { display: none; }
+.rail-scrim { display: none; }
+
+/* A square control that carries only a glyph. */
+.icon-btn {
+  appearance: none;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg2);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color .12s ease, background-color .12s ease;
+}
+.icon-btn:hover { color: var(--fg); background: var(--s3); }
+
+
+.rail-search { padding: 10px 12px 8px; flex: none; }
+.rail-search input {
+  width: 100%;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s0);
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  transition: border-color .12s ease;
+}
+.rail-search input::placeholder { color: var(--fg3); }
+.rail-search input:focus { border-color: var(--teal); outline: none; }
+
+.rail-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 0 12px 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+}
+.rail-count { color: var(--fg2); }
+.rail-sep { flex: 1; }
+.rail-conn { color: var(--fg2); }
+
+.rail-list { flex: 1; min-height: 0; overflow-y: auto; }
+
+.rail-group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px 5px;
+  background: var(--s1);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+}
+.rail-group::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+  transform: translateY(-3px);
+}
+.rail-group .ws {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg2);
+}
+.rail-group .mono { color: var(--fg3); }
+
+.rail-row {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  column-gap: 8px;
+  align-items: center;
+  padding: 7px 12px;
+  border-left: 2px solid transparent;
+  color: inherit;
+  text-decoration: none;
+  transition: background-color .1s ease;
+}
+.rail-row:hover { background: var(--s2); }
+.rail-row.is-current { border-left-color: var(--teal); background: var(--s2); }
+.rail-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--fg3); }
+.rail-dot.is-current { background: var(--teal); }
+.rail-row-top { display: contents; }
+.rail-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-when {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+  white-space: nowrap;
+}
+.rail-title {
+  grid-column: 2 / -1;
+  margin-top: 1px;
+  font-size: 12.5px;
+  color: var(--fg1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-row.is-current .rail-title { color: var(--fg); }
+.rail-empty { padding: 14px 12px; font-size: 12px; color: var(--fg3); }
+
+.rail-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+}
+.rail-link {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--fg2);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color .12s ease;
+}
+.rail-link:hover { color: var(--teal); }
+.rail-spacer { flex: 1; }
+
+.nav-lang { display: flex; gap: 2px; flex: none; }
+.nav-lang button {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--fg3);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: color .12s ease, background-color .12s ease;
+}
+.nav-lang button:hover { color: var(--fg1); }
+.nav-lang button.is-on { color: var(--teal); }
+
+/* -------------------------------------------------------------- session head */
+
+.sess-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  height: 44px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+.sess-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -.005em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sess-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg3);
+  flex: none;
+}
+.sess-spacer { flex: 1; }
+.readonly-badge {
+  flex: none;
+  margin-left: 8px;
+  padding: 0 6px;
+  border: 1px solid var(--orange);
+  border-radius: var(--radius);
+  color: var(--orange);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.sess-head .btn,
+.sess-head .pill { flex: none; }
+
+/* -------------------------------------------------------------------- tabs */
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  height: 38px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+.tab {
+  appearance: none;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  padding: 0 11px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .12s ease, background-color .12s ease;
+}
+.tab:hover { color: var(--fg); background: var(--s2); }
+.tab.is-on { color: var(--fg); background: var(--s3); }
+.tab-count { font-family: var(--mono); font-size: 10px; color: var(--fg3); }
+.tab.is-on .tab-count { color: var(--teal); }
+.tab-spacer { flex: 1; }
+.tab-sub {
+  font-size: 11.5px;
+  color: var(--fg3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 4px;
+}
+
+/* -------------------------------------------------------------------- body */
+
+.body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.view { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* -------------------------------------------------------------- transcript */
+
+
+/* The transcript scroll area. Top/bottom padding MUST match the PAD_TOP /
+   PAD_BOTTOM constants in app.js — the virtual list offsets rows from them. */
+.stream {
+  padding: 14px 16px 4px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Flow virtualisation: rows are normal blocks between two padding divs that
+   reserve the unmounted ranges. No absolute positioning, no JS-computed tops —
+   the browser lays rows out, so a wrong height estimate can shift things but
+   can never overlap them. */
+.win-spacer { width: 100%; }
+.win-pad { width: 100%; }
+.win-row { width: 100%; padding: 2px 0; }
+
+/* Rows are NOT flex containers with a marker column. The terminal builds each row
+   as `prefix + body` and lets the body's own wrap hang under the prefix, so the
+   marker is a 2-column TEXT PREFIX here too, drawn with ::before; the body's
+   `padding-left: 2ch` is the hanging indent the terminal gets for free. */
+.msg-body {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  padding-left: 2ch;
+}
+.msg-body:not([data-mark]) { padding-left: 0; }
+
+
+.win-row[data-mark] > .msg-body::before {
+  content: attr(data-mark) " ";
+  float: left;
+  margin-left: -2ch;
+  width: 2ch;
+}
+
+/* user / queued / bash — the terminal frames these in a box, whose border
+   replaces the marker column. */
+.msg-box {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--teal);
+  border-radius: var(--radius);
+  padding: 6px 11px;
+  color: var(--fg);
+  background: rgba(0, 184, 219, .045);
+}
+.msg-queued .msg-box { border-color: var(--line2); color: var(--fg2); background: transparent; }
+.msg-bash .msg-box { border-color: var(--shell); background: rgba(189, 147, 249, .05); }
+
+
+/* Marker colours, one per role, matching the terminal's `msgColorFor` */
+.msg-user > .msg-body::before { color: var(--teal); }
+.msg-queued > .msg-body::before { color: var(--fg3); }
+.msg-steer > .msg-body::before { color: var(--yellow); }
+.msg-bash > .msg-body::before { color: var(--shell); font-weight: 700; }
+.msg-warn > .msg-body::before { color: var(--orange); }
+.msg-thinking > .msg-body::before { color: var(--fg2); }
+
+.msg-assistant > .msg-body { color: var(--fg); }
+.msg-system > .msg-body { color: var(--teal); }
+.msg-warn > .msg-body { color: var(--orange); }
+.msg-error > .msg-body { color: var(--red); }
+.msg-aborted > .msg-body { color: var(--fg3); }
+
+/* Thinking: dim and italic, marker upright — the terminal closes italics with
+   SGR 23 (not a reset) precisely so the marker keeps its own style. */
+.msg-thinking > .msg-body { color: var(--fg2); font-style: italic; }
+.msg-thinking > .msg-body::before { font-style: normal; }
+.think-live { font-style: normal; color: var(--fg2); }
+
+
+/* Tool call line. The `●` marker carries the STATE (orange running, green done,
+   red failed) and the verb stays plain, exactly as the terminal colours it. */
+.msg-tool > .msg-body::before { color: var(--green); }
+.msg-tool.is-running > .msg-body::before { color: var(--orange); }
+.msg-tool.is-failed > .msg-body::before { color: var(--red); }
+.msg-tool .msg-body { color: var(--fg1); }
+.msg-tool .tool-verb { color: var(--fg1); }
+.tool-name { color: var(--teal); font-weight: 600; }
+.tool-arg { color: var(--fg2); }
+.tool-size { color: var(--fg2); }
+.tool-add { color: var(--green); }
+.tool-del { color: var(--red); }
+.tool-live { color: var(--fg2); }
+
+/* Tool output: `↳` on the first body row, everything dim, red when it failed. */
+.msg-result > .msg-body::before { color: var(--fg2); }
+.msg-result .msg-body { color: var(--fg2); }
+.msg-result.is-failed > .msg-body::before { color: var(--red); }
+.msg-result.is-failed .msg-body { color: var(--red); }
+.msg-result .diff-add { color: var(--green); }
+.msg-result .diff-del { color: var(--red); }
+.msg-result .res-more { color: var(--fg3); }
+
+/* Compaction: the marker takes the phase colour, the text stays dim. */
+.msg-compaction > .msg-body::before { color: var(--green); }
+.msg-compaction.is-running > .msg-body::before { color: var(--cyan); }
+.msg-compaction.is-cancelled > .msg-body::before { color: var(--yellow); }
+.msg-compaction .msg-body { color: var(--fg2); }
+.msg-compaction.is-done .msg-body { color: var(--green); }
+.msg-compaction.is-cancelled .msg-body { color: var(--yellow); }
+.msg-compaction.is-running .msg-body { color: var(--cyan); }
+
+/* Background-task card: marker and text share the phase colour. */
+.msg-bgtask > .msg-body::before { color: var(--green); }
+.msg-bgtask.is-started > .msg-body::before { color: var(--cyan); }
+.msg-bgtask.is-failed > .msg-body::before { color: var(--red); }
+.msg-bgtask .msg-body { color: var(--fg1); }
+.msg-bgtask.is-started .msg-body { color: var(--cyan); }
+.msg-bgtask.is-completed .msg-body { color: var(--green); }
+.msg-bgtask.is-failed .msg-body { color: var(--red); }
+
+.msg-more {
+  display: block;
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 1px 0 3px 2ch;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg3);
+  cursor: pointer;
+  text-align: left;
+  transition: color .12s ease;
+}
+.msg-more:hover { color: var(--teal); }
+
+
+/* Fenced code inside assistant prose. The TUI draws a labelled rule above the
+   block; here the label rides the top border instead, which keeps the block one
+   element instead of three. */
+.code-block {
+  margin: 7px 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--s0);
+  overflow: hidden;
+}
+.code-bar {
+  padding: 2px 10px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+  background: var(--s1);
+}
+.code-body {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--cyan);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.md-h {
+  color: var(--cyan);
+  font-weight: 600;
+}
+.md-code {
+  color: var(--cyan);
+  background: rgba(0, 215, 255, .08);
+  border-radius: 2px;
+  padding: 0 3px;
+}
+.md-b { color: var(--fg); font-weight: 600; }
+.md-link { color: var(--teal); text-decoration: underline; text-underline-offset: 2px; }
+.md-i { font-style: italic; }
+.md-s { text-decoration: line-through; color: var(--fg3); }
+.md-p { margin: 2px 0; }
+
+/* Markdown lists — bullet/ordinal in cyan, content in the default fg. */
+.md-list-ul, .md-list-ol { display: block; margin: 2px 0; }
+.md-li { display: flex; align-items: baseline; }
+.md-bullet { flex: none; width: 1.6em; color: var(--cyan); }
+.md-task { display: flex; align-items: baseline; gap: 6px; }
+.md-check { flex: none; color: var(--green); }
+
+/* Blockquote: a left bar, dimmed text — mirrors the terminal's `▍` gutter. */
+.md-quote {
+  margin: 2px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--line2);
+  color: var(--fg2);
+}
+
+/* Thematic break — a full-width hairline, like the terminal's ─ row. */
+.md-hr {
+  height: 1px;
+  margin: 6px 0;
+  background: var(--line2);
+}
+
+/* Markdown table: a CSS grid so cells align into columns. */
+.md-table {
+  display: block;
+  margin: 4px 0;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.md-tr { display: flex; }
+.md-tr + .md-tr, .md-table > .md-tr:not(:first-child) { border-top: 1px solid var(--line2); }
+.md-th, .md-td {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.md-th { font-weight: 600; color: var(--fg); }
+.md-td { color: var(--fg1); }
+.md-tr > .md-th + .md-th, .md-tr > .md-th + .md-td, .md-tr > .md-td + .md-th, .md-tr > .md-td + .md-td {
+  border-left: 1px solid var(--line2);
+}
+/* --------------------------------------------------------- side tab panels */
+
+.cards {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 14px;
+  row-gap: 2px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--s1);
+}
+.card-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.card-head .right {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg3);
+  white-space: nowrap;
+}
+
+.card-fields {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.field {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.field-label {
+  flex: none;
+  width: 68px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+}
+.field-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg1);
+  overflow-wrap: anywhere;
+}
+.field-value.dim { color: var(--fg3); }
+
+.cards-empty {
+  padding: 32px 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg3);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------- stack */
+
+.stack {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+}
+.stack-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 16px 8px;
+  background: var(--s1);
+  min-width: 0;
+}
+
+/* The panel's top edge is a RULE, and that rule is also the drag handle for
+   resizing — the terminal draws it full width above the heading and makes it
+   the grab target. It is a real element rather than a border so it can own the
+   hitbox, the hover colour and the drag cursor. */
+.stack-rule {
+  flex: none;
+  height: 6px;
+  margin: 0 -16px 1px;
+  cursor: ns-resize;
+  position: relative;
+}
+.stack-rule::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 1px;
+  background: var(--line);
+  transition: background-color .12s ease, height .12s ease;
+}
+.stack-rule:hover::after,
+.stack-rule.is-dragging::after { background: var(--teal); height: 2px; top: 1.5px; }
+
+/* The heading is CYAN and BOLD, matching the terminal's `col('  Todo', C.cyan +
+   C.bold)`. A dim grey label reads as metadata; this is a title. */
+.stack-label {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--teal);
+}
+
+
+.todos {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.todos li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg1);
+}
+.todos li .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todos li .mark { flex: none; width: 10px; text-align: center; color: var(--fg3); }
+.todos li.done { color: var(--fg3); }
+.todos li.done .t { text-decoration: line-through; }
+.todos li.done .mark { color: var(--green); }
+.todos li.now { color: var(--fg); }
+.todos li.now .t { font-weight: 600; }
+.todos li.now .mark { color: var(--teal); }
+.todos li.more { color: var(--fg3); font-size: 11px; }
+
+/* The Working row sits at the TOP of the work stack — above the todo/queue
+   panels and the composer — because it shows what the agent is doing right now,
+   the most current thing on the page. It carries no rule of its own (a border
+   here would make it read as a separate panel). `min-height` keeps the row from
+   resizing as the phrase changes. */
+.working {
+  display: flex;
+  align-items: baseline;
+  padding: 0 18px 5px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.62;
+  white-space: pre;
+  overflow: hidden;
+  min-height: 1.62em;
+}
+#working-text { display: inline-flex; align-items: baseline; white-space: pre; }
+.spin { flex: none; color: var(--orange); margin-right: 1ch; }
+
+
+/* ---------------------------------------------------------------- composer */
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 0;
+  flex: none;
+  margin: 0 16px 6px;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s1);
+  padding: 2px 4px 2px 0;
+  transition: border-color .12s ease;
+}
+.composer:focus-within { border-color: var(--teal); }
+.composer.is-shell { border-color: var(--shell); }
+
+.pmode {
+  flex: none;
+  align-self: stretch;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  width: 30px;
+  padding-top: 9px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--teal);
+  user-select: none;
+}
+.composer.is-shell .pmode { color: var(--shell); font-weight: 700; }
+
+#input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  border: 0;
+  background: transparent;
+  padding: 8px 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fg);
+  max-height: 200px;
+  overflow-y: auto;
+}
+#input:focus { outline: none; }
+#input::placeholder { color: var(--fg3); }
+
+.composer .btn { align-self: flex-end; margin-bottom: 5px; }
+
+.complete {
+  flex: none;
+  margin: 0 16px;
+  border: 1px solid var(--line2);
+  border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--s2);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.comp-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 0;
+}
+.comp-item.is-sel { background: rgba(0, 184, 219, .14); }
+.comp-name { flex: none; color: var(--fg); }
+.comp-item.is-sel .comp-name { color: var(--cyan); }
+.comp-sub { color: var(--fg3); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ------------------------------------------------------------ status line */
+
+.statusline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  padding: 8px 16px 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sl-mode {
+  flex: none;
+  color: var(--orange);
+  font-weight: 600;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.sl-badge { color: var(--teal); font-weight: 600; flex: none; }
+.sl-model {
+  flex: none;
+  color: var(--fg);
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.sl-think { color: var(--fg2); }
+.sl-tasks-bash { color: var(--teal); flex: none; }
+.sl-tasks-agent { color: var(--spring); flex: none; }
+.sl-cwd { color: var(--fg2); flex: none; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+.sl-branch { color: var(--branch); font-weight: 600; flex: none; }
+.sl-add { color: var(--green); flex: none; }
+.sl-del { color: var(--red); flex: none; }
+.sl-spacer { flex: 1; }
+.sl-usage { color: var(--fg2); flex: none; }
+.sl-ctx { color: var(--fg1); flex: none; }
+
+.sl-mode:hover, .sl-model:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---------------------------------------------------------------- popover */
+
+.popover {
+  position: fixed;
+  z-index: 70;
+  min-width: 220px;
+  max-width: min(480px, 84vw);
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s2);
+  padding: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+}
+.popover-title {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+  padding: 4px 9px 6px;
+}
+.popover-list { display: flex; flex-direction: column; gap: 1px; }
+.popover-item {
+  appearance: none;
+  border: 0;
+  background: none;
+  text-align: left;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  width: 100%;
+  padding: 5px 9px;
+  border-radius: 2px;
+  color: var(--fg1);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  min-width: 0;
+}
+.popover-item:hover,
+.popover-item.is-hover { background: var(--s3); color: var(--fg); }
+.popover-item.is-on { color: var(--cyan); }
+.popover-item.is-on::before { content: "\2713"; flex: none; }
+.popover-item:not(.is-on)::before { content: " "; flex: none; }
+.popover-item .sub {
+  margin-left: auto;
+  color: var(--fg3);
+  font-size: 10.5px;
+  flex: none;
+}
+
+/* The model + effort popover is three stacked blocks: model list, a hairline
+   divider, then a "Thinking Effort" row. The level list is NOT inline — it
+   floats out to the right of the effort row as its own panel (.popover-flyout). */
+.popover-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.popover-rule {
+  flex: none;
+  height: 1px;
+  margin: 3px 2px;
+  background: var(--line);
+}
+
+/* The "Thinking Effort" row. Hovering it (or a model above) floats the levels out
+   to the right. */
+.popover-effort {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg2);
+  cursor: default;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.popover-effort-val {
+  margin-left: auto;
+  color: var(--fg3);
+  font-size: 11px;
+}
+.popover-effort-val.has-levels {
+  color: var(--cyan);
+  cursor: default;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* The floating level list: a fixed-position panel placed beside the effort row,
+   styled like the main popover so the two read as the same mechanism. */
+.popover-flyout {
+  position: fixed;
+  z-index: 71;
+  min-width: 120px;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s2);
+  padding: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.steer-btn {
+  appearance: none;
+  margin-left: auto;
+  flex: none;
+  border: 1px solid var(--line2);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg2);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 0 6px;
+  line-height: 16px;
+  cursor: pointer;
+  transition: border-color .12s ease, color .12s ease;
+}
+/* `margin-left: auto` pushes the FIRST action to the right edge of the row. Every
+   button after it must NOT repeat that, or each one is pushed right on its own and
+   the `gap` between them stretches to fill the row. */
+.steer-btn ~ .steer-btn { margin-left: 0; }
+.steer-btn:hover { border-color: var(--teal); color: var(--teal); }
+
+/* -------------------------------------------------------------------- logs */
+
+.logs-bar {
+  display: flex;
+  justify-content: flex-end;
+  flex: none;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.logs {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 0 14px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.log-line {
+  display: grid;
+  grid-template-columns: 66px 110px minmax(0, 1fr);
+  gap: 10px;
+  padding: 1px 16px;
+  line-height: 1.55;
+}
+.log-line:hover { background: var(--s1); }
+.log-t { color: var(--fg3); }
+.log-k { color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-d { color: var(--fg1); overflow-wrap: anywhere; }
+
+/* ------------------------------------------------------- modal and overlay */
+
+.modal,
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 5, 7, .62);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+}
+.modal { z-index: 40; }
+
+.modal-box {
+  width: min(660px, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s1);
+  padding: 16px 18px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+}
+.modal-box.is-approval { border-color: var(--orange); }
+.modal-box.is-question { border-color: var(--teal); }
+
+.modal-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg3);
+  margin-bottom: 10px;
+}
+.modal-body {
+  margin: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+}
+.modal-input {
+  width: 100%;
+  margin-top: 10px;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s0);
+  color: var(--fg);
+  padding: 7px 9px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  resize: vertical;
+}
+.modal-input:focus { border-color: var(--teal); outline: none; }
+/* AskUserQuestion: progress + option rows + per-question Other + whole-request note. */
+.modal-progress {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg3);
+  margin: 2px 0 6px;
+}
+.modal-options { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.modal-opt {
+  appearance: none;
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s2);
+  color: var(--fg1);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: border-color .12s ease, background-color .12s ease, color .12s ease;
+}
+.modal-opt:hover { border-color: var(--teal); color: var(--fg); }
+.modal-opt.is-on { border-color: var(--teal); color: var(--cyan); }
+.modal-opt-label { color: inherit; }
+.modal-opt-desc { display: block; margin-top: 2px; color: var(--fg3); font-size: 11px; }
+.modal-check { display: inline-block; width: 1.4em; color: var(--fg3); }
+.modal-other { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.modal-other-toggle { color: var(--fg2); }
+.modal-input.inline { margin-top: 0; }
+.modal-note { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.modal-note-label { font-family: var(--mono); font-size: 11px; color: var(--fg3); margin-bottom: 4px; }
+
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+.overlay-box {
+  width: min(860px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s1);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+}
+.overlay-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.overlay-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.overlay-body { flex: 1; min-height: 0; overflow-y: auto; }
+
+.set-group { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.set-group:last-child { border-bottom: 0; }
+.set-group h3 {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--fg3);
+}
+.set-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-bottom: 7px; }
+.set-row label { font-size: 12px; color: var(--fg2); flex: none; }
+.set-row input[type="text"],
+.set-row input[type="password"],
+.set-row input:not([type]) {
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s0);
+  color: var(--fg);
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 150px;
+  transition: border-color .12s ease;
+}
+.set-row input:focus { border-color: var(--teal); outline: none; }
+.set-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
+
+.set-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 9px;
+  border-radius: var(--radius);
+  background: var(--s2);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.set-name { flex: none; color: var(--fg); font-weight: 600; }
+.set-tag { flex: none; font-size: 10.5px; color: var(--green); }
+.set-tag.off { color: var(--fg3); }
+.set-sub {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg3);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.set-act {
+  appearance: none;
+  flex: none;
+  border: 1px solid var(--line2);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: border-color .12s ease, color .12s ease;
+}
+.set-act:hover { border-color: var(--teal); color: var(--teal); }
+.set-act.danger:hover { border-color: var(--red); color: var(--red); }
+.set-act:disabled { color: var(--fg3); border-color: var(--line); cursor: not-allowed; }
+
+.kv {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.kv dt { color: var(--fg3); font-family: var(--mono); font-size: 11px; }
+.kv dd { margin: 0; color: var(--fg1); font-family: var(--mono); min-width: 0; }
+
+select,
+.set-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background-color: var(--s0);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%237a8290' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  color: var(--fg1);
+  padding: 4px 24px 4px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color .12s ease;
+}
+select:hover { border-color: var(--fg3); }
+select:focus { outline: none; border-color: var(--teal); }
+select option { background: var(--s1); color: var(--fg1); }
+
+/* ----------------------------------------------------------------- notice */
+
+.notice {
+  position: fixed;
+  left: 50%;
+  bottom: 96px;
+  transform: translateX(-50%);
+  z-index: 90;
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  background: var(--s2);
+  color: var(--fg);
+  padding: 6px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  max-width: 70vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+}
+.notice.is-error { border-color: var(--red); color: var(--red); }
+.notice.is-ok { border-color: var(--green); color: var(--green); }
+
+/* ----------------------------------------------------------------- drawer */
+
+.drawer { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: flex-end; }
+.drawer-scrim { position: absolute; inset: 0; background: rgba(4, 5, 7, .6); }
+.drawer-panel {
+  position: relative;
+  width: min(600px, 92vw);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--s1);
+}
+.drawer-head {
+  flex: none;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+.drawer-title { font-family: var(--mono); font-size: 11.5px; color: var(--fg2); }
+.drawer-close {
+  appearance: none;
+  border: 0;
+  background: none;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg3);
+  cursor: pointer;
+}
+.drawer-close:hover { color: var(--fg); }
+.drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 14px 18px; }
+
+/* ------------------------------------------------------------ details rows */
+
+.tool-args-btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg3);
+  padding: 0 6px;
+  margin: 3px 0 0;
+  cursor: pointer;
+  transition: border-color .12s ease, color .12s ease;
+}
+.tool-args-btn:hover, .tool-args-btn.is-on { border-color: var(--line2); color: var(--fg1); }
+.tool-args {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--s0);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 340px;
+  overflow: auto;
+  color: var(--fg1);
+}
+
+.copy-btn {
+  appearance: none;
+  border: 0;
+  background: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg3);
+  cursor: pointer;
+  padding: 0 3px;
+  margin-left: 8px;
+  transition: color .12s ease;
+}
+.copy-btn:hover { color: var(--fg1); }
+.copy-btn.is-ok { color: var(--green); }
+.copy-btn.is-err { color: var(--red); }
+
+/* ------------------------------------------------------ reduced motion / sm */
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
+
+@media (max-width: 980px) {
+  :root { --rail-w: 216px; }
+  .sl-cwd, .sl-usage { display: none; }
+  .stream { padding: 12px 12px 16px; }
+  .composer { margin: 0 12px 6px; }
+  .complete { margin: 0 12px; }
+  .working { padding: 0 14px 5px; }
+  .statusline { padding: 7px 12px 9px; gap: 9px; }
+}
+
+/* Below this width the rail stops being a column and becomes a drawer. It is NOT
+   hidden: on a phone the drawer is the only route to sessions, settings and the
+   language switch, so `display: none` removes features rather than reflowing
+   them. */
+@media (max-width: 720px) {
+  :root { --rail-w: 264px; }
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .rail-toggle { display: inline-flex; }
+
+  .rail {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--rail-w);
+    z-index: 60;
+    transform: translateX(-100%);
+    transition: transform .18s ease;
+  }
+  body.rail-open .rail { transform: translateX(0); }
+
+  .rail-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(4, 5, 7, .55);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .18s ease;
+  }
+  body.rail-open .rail-scrim { opacity: 1; pointer-events: auto; }
+/* The toggle button must stay tappable ABOVE BOTH the scrim and the drawer, or a
+     drawer that is open can never be closed from the button that opened it. The
+     rail itself sits at z-index 60, so the previous value of 56 left the button
+     UNDERNEATH the open panel — tappable only while the drawer was shut, and gone
+     exactly when it was needed. */
+  .rail-toggle { position: relative; z-index: 62; }
+
+  .tabs { padding: 0 6px; }
+  .tab { padding: 0 8px; }
+}
+
+/* Comfortable tap targets on touch, where a 26px control is a miss. */
+@media (pointer: coarse) {
+  .tab { height: 32px; }
+  .btn, .btn-quiet { padding: 6px 12px; }
+  .steer-btn { padding: 0 10px; line-height: 22px; }
+}
+

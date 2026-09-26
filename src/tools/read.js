@@ -25,6 +25,14 @@ function hashLines(lines, start, end) {
 // Public alias so edit.js (and the line-range path) share ONE implementation.
 export const hashRegion = hashLines;
 
+// Reset the Read snapshot pool after files were rewound on disk. The pool holds
+// per-file content hashes plus the line regions the model has "seen"; once /undo
+// has put an older version back, every hash in it describes content that is no
+// longer there. Keeping them made the NEXT Edit fail with a staleness rejection
+// against a file the model had just watched being restored.
+export function forgetReadPool(ctx) {
+  if (ctx && ctx.readPool && typeof ctx.readPool.clear === 'function') ctx.readPool.clear();
+}
 export const spec = {
   name: 'Read',
   description: 'Read a text file. Returns the whole file by default; use line_offset / n_lines for a range.',
@@ -42,6 +50,13 @@ export const spec = {
     required: ['path'],
   },
   async execute(args, ctx) {
+    // A missing `path` used to reach resolvePath(undefined), which resolves to the
+    // workspace ROOT — so the failure surfaced as an EISDIR from fs.readFileSync
+    // instead of "you forgot the path". Cheap to check, and it tells the model
+    // exactly what to fix.
+    if (typeof args.path !== 'string' || !args.path.trim()) {
+      return 'Error: `path` is required and must be a non-empty string.';
+    }
     let p;
     try { p = resolvePath(args.path, ctx); } catch (e) { return e.message; }
     let buf;
@@ -50,7 +65,6 @@ export const spec = {
       return `Cannot read: ${args.path} appears to be a binary file (use a tool suited for binary).`;
     }
     let st;
-    try { st = fs.statSync(p); } catch { st = null; }
     // NO truncation: the caller asked for the file, so the whole file is returned
     // (line ranges still work via line_offset / n_lines). The old 1000-line and
     // 128 KB caps silently cut the content, which also corrupted the

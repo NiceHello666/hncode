@@ -21,8 +21,8 @@ function ansi256(r, g, b) {
   return 16 + 36 * ri + 6 * gi + bi;
 }
 
-// Brand: cyan-blue (青蓝色).
-export const TEAL = rgb(0, 184, 219);     // 青蓝
+// Brand accent: cyan-blue.
+export const TEAL = rgb(0, 184, 219);
 export const CYAN = rgb(0, 215, 255);
 export const BLUE = rgb(66, 135, 245);
 export const FG = TEAL;                   // primary fg
@@ -38,10 +38,10 @@ const THEMES = {
     teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
     hover: [190, 245, 255], selBg: [0, 70, 84] 
   },
-  dark: { 
+  dark: {
     fg: [255, 255, 255], bg: [0, 18, 26], // White foreground for normal text
-    teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
-    hover: [190, 245, 255], selBg: [0, 70, 84] 
+    teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180],
+    hover: [190, 245, 255], selBg: [0, 70, 84]
   },
   light: {
     fg: [26, 26, 26], bg: [255, 255, 255],
@@ -103,6 +103,10 @@ export const C = {
   // Selection highlight (mouse text selection) and the scrollbar gutter.
   // Selection uses a dark teal background so white text stays readable.
   selBg: TRUECOLOR ? brgb(0, 70, 84) : '\x1b[48;5;23m', // Original dark cyan background
+  // Reset ONLY the background colour, keeping the current foreground. Used to end
+  // a selection highlight so text after it keeps its own colour (a bare ESC[0m
+  // would also reset the foreground, turning a cyan/white run grey).
+  bgReset: '\x1b[49m',
   scrollTrack: '\x1b[90m',          // dim gutter
   scrollThumb: TRUECOLOR ? rgb(0, 184, 219) : '\x1b[38;5;37m', // brand cyan-blue
   // Scrollbar interaction states:

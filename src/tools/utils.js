@@ -3,6 +3,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { recordBeforeWrite } from '../file-history.js';
 
 export const MAX_OUTPUT_BYTES = 128 * 1024; // cap tool results to avoid token blowup
 
@@ -52,6 +53,19 @@ export function resolvePath(input, ctx) {
 
 export function ensureDir(p) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
+}
+
+// Checkpoint `p` before a write tool modifies it, so /undo can put it back (see
+// file-history.js). The record is taken ONCE per turn, so what is captured is the
+// file as it stood before ANY of this turn's changes — the state the user would
+// expect "Undid 1 prompt" to restore.
+//
+// ctx.sessionId identifies the checkpoint store. A caller without one (a
+// subagent's own context, a test) simply gets no checkpoint rather than an error:
+// losing the safety net must never fail the actual write.
+export function checkpointBeforeWrite(p, ctx) {
+  if (!ctx || !ctx.sessionId) return false;
+  try { return recordBeforeWrite(ctx.sessionId, p); } catch { return false; }
 }
 
 // Read a file fully, returning its string. Throws if not a file.
