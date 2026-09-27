@@ -36,6 +36,7 @@ import { startWebServer } from './web.js';
 import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
+import { renderRegistryBrowser, handleRegistryBrowserKey } from './registry-browser.js';
 import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
 import { renderSwarmProgress } from './swarm-progress.js';
 import { sortedTasks, getTask, settleTask, STATUS_LABEL, backgroundTaskCard } from './agent-task.js';
@@ -74,6 +75,7 @@ export const COMMANDS = [
   { name: 'help', aliases: ['h', '?'], desc: 'Show available commands and shortcuts', priority: 80 },
   { name: 'new', aliases: ['clear'], desc: 'Start a fresh session in the current workspace', priority: 80 },
   { name: 'sessions', aliases: ['resume'], desc: 'Browse and resume sessions', priority: 80 },
+  { name: 'all-sessions', desc: 'Browse sessions from EVERY workspace', priority: 79 },
   { name: 'tasks', aliases: ['task'], desc: 'Browse background tasks (full-screen panel)', priority: 80 },
   { name: 'swarm', desc: 'Toggle swarm mode: decompose work across parallel subagents', priority: 80, argumentHint: '[on|off]' },
   { name: 'swarm-sub-agent', aliases: ['sub-agent-model'], desc: 'Choose the model subagents run on (default = this session\u2019s model)', priority: 79, argumentHint: '[model|default]' },
@@ -105,8 +107,8 @@ export const COMMANDS = [
   { name: 'add-dir', desc: 'Add or list an additional workspace directory', priority: 60, argumentHint: '[list] | <path>' },
   { name: 'move', desc: 'Move current session to another directory (must exist)', priority: 60, argumentHint: '<path>' },
   { name: 'reload', desc: 'Reload config.toml settings', priority: 60 },
-  { name: 'plugins', desc: 'List loaded plugins and their status', priority: 60 },
-  { name: 'skills', desc: 'List installed skills, or remove one', priority: 60, argumentHint: '[remove <name>]' },
+  { name: 'plugins', desc: 'Open the plugin manager (installed + available in the repo)', priority: 60, argumentHint: '[install <name> | remove <name>]' },
+  { name: 'skills', desc: 'Open the skill manager (installed + available in the repo)', priority: 60, argumentHint: '[install <name> | remove <name>]' },
   { name: 'import-skill', desc: 'Import a Markdown file as a skill (a duplicate name is overwritten)', priority: 60, argumentHint: '<file.md> [name]' },
   { name: 'hooks', desc: 'Show configured shell hooks, or test one', priority: 60, argumentHint: '[list | test <event>]' },
   { name: 'git', desc: 'Show repository status (branch, changes, remote)', priority: 62 },
@@ -247,92 +249,97 @@ export function extractPlan(text) {
 }
 
 export const TIPS = [
-  'Press Esc to interrupt the current turn at any time',
-  '!git status runs a shell command directly — no model round-trip',
-  '/init generates an AGENTS.md from your codebase for smarter agent context',
-  'Use /mcp to manage MCP servers for additional tool integration',
-  'The context line shows real-time token usage — watch it grow as the agent works',
-  '/goal starts an autonomous objective — hncode will work until done or blocked',
-  'Paste multiline content — hncode collapses it into a [paste #N +L lines] token',
-  '/usage shows detailed token, steps, and context statistics for the session',
-  'Ctrl+C aborts the current turn and returns you to the prompt',
-  'The spinner on the left cycles through status messages while the agent works',
-  '/model opens a picker — Tab switches between providers and models',
-  '/provider lets you add, remove, or switch AI providers',
-  'Tool calls show their arguments streaming live — no need to wait for completion',
-  '/think lets you add reasoning/thinking instructions inline',
-  'The todo list updates live as the agent makes progress on tasks',
-  '/focus mode gives the agent Read, Write, Edit, and Bash in your workspace',
-  'System messages appear in green — they are instructions, not conversation',
-  'Queued messages wait for the current turn to finish',
-  '/steer injects a message directly into the running turn',
+  // Kept short on purpose: a tip shares the status line with the model, cwd, git
+  // badge and tokens, and `justify()` TRUNCATES it when the two sides do not fit.
+  // A tip long enough to be cut mid-word ("Old tool results are elided from the
+  // request at 50% of the wi…") reads as a rendering bug, so every entry below
+  // states ONE idea and stays under ~60 visual columns.
+  'Press Esc to interrupt the current turn',
+  '!git status runs a shell command directly',
+  '/init writes an AGENTS.md from your codebase',
+  'Use /mcp to manage MCP servers',
+  'The context line shows live token usage',
+  '/goal starts a self-driving objective',
+  'Paste multiline content — it becomes one token',
+  '/usage shows token and context statistics',
+  'Ctrl+C aborts the current turn',
+  'The spinner cycles status messages while working',
+  '/model opens a picker — Tab switches providers',
+  '/provider lets you add or switch AI providers',
+  'Tool calls stream their arguments live',
+  '/think adds inline reasoning instructions',
+  'The todo list updates live as the agent progresses',
+  '/focus gives the agent Read, Write, Edit, and Bash',
+  'System messages are green — instructions, not chat',
+  'Queued messages wait for the turn to finish',
+  '/steer injects a message into the running turn',
   'Ctrl+R reloads the current session from disk',
   '/help shows available commands at any time',
-  '/undo rolls the transcript AND the files back to before your last prompt',
-  '/fork copies the current session so you can explore a branch without losing the original',
-  '/sessions lists every saved conversation in this workspace',
-  '/title sets a human-readable name for the current session',
-  '/compact [ratio] AI-summarizes older history and keeps the most recent 20%',
-  '/tasks lists background Bash jobs started with run_in_background',
-  '/status prints the current model, provider, endpoint, and session id',
-  '/statusline toggles which items appear in the bottom status bar',
-  '/memory shows or edits the notes the agent saved for future sessions',
-  '/personal edits your own standing preferences, injected into every prompt',
-  '/permissions shows or edits standing allow/ask/deny rules for tools',
-  '/external toggles access to paths outside the workspace (persisted)',
-  '/web serves this session to a browser — token-protected, /web off to stop',
-  '/add-dir grants the agent access to another directory for this session',
-  '/add-dir grants the agent access to another directory for this session',
-  '/reload re-reads config.toml without restarting hncode',
-  '/plugins lists the plugins loaded from ~/.hncode/plugins',
-  '/logout clears the stored API key for a provider',
+  '/undo rolls back the transcript AND the files',
+  '/fork copies the session so you can branch',
+  '/sessions lists saved conversations here',
+  '/all-sessions lists them from every workspace',
+  '/title names the current session',
+  '/compact [ratio] summarizes older history',
+  '/tasks lists background Bash jobs',
+  '/status prints model, provider, endpoint',
+  '/statusline toggles the bottom status bar items',
+  '/memory shows or edits notes for later sessions',
+  '/personal edits your standing preferences',
+  '/permissions shows allow/ask/deny rules for tools',
+  '/external toggles access outside the workspace',
+  '/web serves this session to a browser',
+  '/add-dir grants access to another directory',
+  '/reload re-reads config.toml without restarting',
+  '/skills install <name> pulls one from the repo',
+  '/logout clears the stored API key',
   '/version prints the hncode version string',
-  '/feedback <title> | <body> opens a prefilled GitHub issue in your browser',
-  '/copy puts the last assistant message on your system clipboard',
-  '/export-md writes the whole session to a Markdown file on disk',
-  '/import-session attaches a Markdown file to the next prompt without a Read call',
-  '/new starts a fresh conversation in the current workspace',
-  '/goal pause temporarily stops an autonomous objective',
-  '/goal resume continues a paused autonomous objective',
-  '/plan on turns every tool read-only so you can sketch without side effects',
-  '/focus on gives the agent only Read, Write, Edit, and Bash',
+  '/feedback opens a prefilled GitHub issue',
+  '/copy puts the last answer on the clipboard',
+  '/export-md writes the session to a Markdown file',
+  '/import-session attaches a Markdown file',
+  '/new starts a fresh conversation',
+  '/goal pause pauses the objective',
+  '/goal resume resumes the objective',
+  '/plan on makes every tool read-only',
+  '/focus on gives the agent Write tools and Bash',
   '/permission opens the picker for Ask / Yolo / Auto',
   '/settings opens the combined settings menu',
-  '/yolo auto-approves anything inside the workspace — risky paths still ask',
-  '/auto never interrupts you; everything runs and is decided automatically',
-  'Shift+Arrow selects text in the composer; Backspace or Delete removes it',
-  'Shift+Enter inserts a newline without sending the message',
+  '/yolo auto-approves anything inside the workspace',
+  '/auto never interrupts you; everything runs',
+  'Shift+Arrow selects text in the composer',
+  'Shift+Enter inserts a newline without sending',
   'Ctrl+T expands or collapses the todo panel',
-  'Ctrl+O expands or collapses tool output, thinking blocks and Edit diffs',
-  'Ctrl+B moves a long-running foreground Bash command to the background',
-  'Ctrl+Shift+V pastes the clipboard as a bracketed paste',
-  'Ctrl+Shift+C copies the mouse selection, or the last answer',
-  'Cmd/Ctrl+L clears the visible screen but keeps the session state',
-  '↑ in an empty composer recalls the newest queued message for editing',
-  '↑/↓ in an empty composer walks through your input history',
-  'PgUp / PgDn scroll the transcript without touching the composer',
-  'Mouse-wheel scrolling over the composer moves the transcript, not the caret',
-  'Drag the scrollbar thumb on the right edge to jump through the transcript',
-  'Double-click a transcript row to select the whole line for copying',
-  'Right-click a transcript row to open the copy / paste context menu',
-  'Esc closes any open picker, form, panel, or command menu',
-  'Esc during a running turn aborts the in-flight model request',
-  'Ctrl+C once asks for confirmation; Ctrl+C twice exits hncode',
-  'Ctrl+C with a dialog open closes the dialog instead of the app',
-  'The `/` menu filters as you type — keep typing to narrow the list',
-  'Enter on a `/` menu item runs the highlighted command',
-  'Tab on a `/` menu item completes the command name into the composer',
-  'The context gauge turns red as you approach the model context limit',
-  'Auto-compaction triggers at 85% of the model context, keeping ~20% of the usage (set with /auto-compact threshold|keep)',
-  'Old tool results are elided from the request at 50% of the window, keeping ~30% of them — the removed text stays on disk (/auto-trim to tune, /trim to do it now)',
-  '/compact with no argument keeps the newest 20% of the current usage and summarizes the rest',
-  'Tool results longer than the visible window collapse — Ctrl+O expands them',
-  'A red bullet next to a tool call means the command exited non-zero',
-  'A green bullet next to a tool call means it finished successfully',
-  'The `[turn took …]` line at the end of a turn shows the wall-clock duration',
-  '/provider add walks you through picking a known provider from models.dev',
-  '/model shows categories per provider — Tab cycles between them',
-  'Typing `/` at any time opens the command palette above the composer'
+  'Ctrl+O expands tool output and Edit diffs',
+  'Ctrl+B backgrounds a running Bash command',
+  'Ctrl+Shift+V pastes as a bracketed paste',
+  'Ctrl+Shift+C copies the selection or last answer',
+  'Cmd/Ctrl+L clears the screen, keeps the session',
+  '↑ recalls the newest queued message',
+  '↑/↓ walks through your input history',
+  'PgUp / PgDn scroll the transcript',
+  'Mouse-wheel over the composer scrolls the chat',
+  'Drag the right-edge scrollbar to jump',
+  'Double-click a row to select the whole line',
+  'Right-click a row for the copy / paste menu',
+  'Esc closes any open picker, form, or menu',
+  'Esc aborts the in-flight model request',
+  'Ctrl+C twice exits hncode',
+  'Ctrl+C with a dialog open closes the dialog',
+  'The `/` menu filters as you type',
+  'Enter on a `/` item runs it',
+  'Tab on a `/` item completes its name',
+  'The context gauge turns red near the limit',
+  'Auto-compaction triggers at 85% of the context',
+  'Old tool results are elided at 50% of the window',
+  '/compact summarizes older history, keeping 20%',
+  'Long tool results collapse — Ctrl+O expands them',
+  'A red bullet means the command exited non-zero',
+  'A green bullet means the tool succeeded',
+  'The `[turn took …]` line shows the turn duration',
+  '/provider add picks a provider from models.dev',
+  '/model groups models by provider — Tab cycles',
+  'Typing `/` opens the command palette'
 ];
 
 // Layout constants (kimi-code-cli style: no top chrome; the chat fills to the
@@ -1038,13 +1045,19 @@ export function tintRange(row, col0, col1) {
         || /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(s.slice(i));
       if (m) {
         const seq = m[0];
-        if (seq.endsWith('m')) { // SGR: track what the row has set for itself
+        if (seq.endsWith('m') && !isHoverSgr(seq)) { // track the row's OWN state
           const p = seq.slice(2, -1);
           if (p === '' || p.split(';').includes('0')) cur = '';
           else cur += seq;
         }
         out += seq;
-        if (tinting) out += hover; // the row's own codes must not cancel us
+        // Re-apply the highlight AFTER every SGR while tinting, so it always WINS.
+        // Applying it before the sequence was the bug behind "only the cyan part
+        // lights up": a row is built from col(...) chunks, and the label's own
+        // `\x1b[90m` (grey) came after the hover and overrode its colour, so the
+        // dim half of every `KEY label` pair stayed grey. The re-apply is skipped for
+        // the hover codes themselves, which would otherwise stack on every pass.
+        if (tinting) out += hover;
         i += seq.length;
         continue;
       }
@@ -1063,6 +1076,14 @@ export function tintRange(row, col0, col1) {
   return out;
 }
 
+// True for the sequences `C.hover` itself is made of. They must not be echoed back
+// into `cur` (they are not part of the row's own style) and must not trigger another
+// re-apply, or a single span would accumulate a copy of the style per SGR.
+function isHoverSgr(seq) {
+  return C.hover.includes(seq);
+}
+
+// Wrap the single visible cell at column `col` in reverse video: our own block
 // Wrap the single visible cell at column `col` in reverse video: our own block
 // caret. The row is already padded to the full width, so a caret past the last
 // character inverts a padding space (kimi-code renders its caret the same way).
@@ -1120,7 +1141,12 @@ export function composerLayout(state, insideW) {
       const seg = segs[si];
       const rowPre = si === 0 ? pre : cont;
       rows.push(rowPre + seg.text);
-      meta.push({ start: base + seg.start, end: base + seg.start + seg.text.length, preWidth: visualCol(rowPre) });
+      // `line` records which LOGICAL line (paragraph) the row belongs to, and
+      // `segCount`/`segIdx` which wrap segment it is within it. Vertical caret
+      // movement needs both: kimi clamps a non-last segment to `length - 1` so the
+      // caret cannot land on the first character of the NEXT row (which would make
+      // ↑/↓ appear to skip), and only the last segment may reach the line's end.
+      meta.push({ start: base + seg.start, end: base + seg.start + seg.text.length, preWidth: visualCol(rowPre), line: pi, segIdx: si, segCount: segs.length });
       const absStart = base + seg.start;
       const absEnd = absStart + seg.text.length;
       if (caret >= absStart && caret <= absEnd) {
@@ -1213,6 +1239,7 @@ function msgColorFor(role, text) {
   if (role === 'steer') return C.yellow;   // injected into the running turn
   if (role === 'tool') return C.blue;
   if (role === 'tool_result') return C.gray;
+  if (role === 'skill') return C.blue;
   // Default foreground color based on theme
   return C.fg;
 }
@@ -1621,7 +1648,15 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       const SCAN_BYTES = 64 * 1024;
       const head = msg.streamContent.length > SCAN_BYTES ? msg.streamContent.slice(0, SCAN_BYTES) : msg.streamContent;
       const lines = sanitizeText(head).replace(/\r\n/g, '\n').split('\n');
+      // A file's content almost always ends in a newline, and `split('\n')` turns
+      // that into a final EMPTY element — which rendered as a phantom numbered line
+      // ("14" with nothing after it) below the real content. Drop it, but only the
+      // one the trailing newline produced (an intentionally blank last line survives
+      // as long as the content does not end with a newline).
+      if (lines.length > 1 && lines[lines.length - 1] === '' && /\n$/.test(head)) lines.pop();
       const MAX = 20;
+      // The TRUE line count comes from the message: `lines` only covers the scanned
+      // prefix, so counting it would understate a large file's size.
       const totalLines = msg._streamLineCount || lines.length;
       const wNum = String(totalLines).length;
       lines.slice(0, MAX).forEach((ln, i) => {
@@ -1630,6 +1665,8 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       const shown = Math.min(lines.length, MAX);
       if (totalLines > shown) out.push({ text: col(`… ${totalLines - shown} more lines`, C.gray), ind: indent, raw: true });
     }
+
+    // The Edit diff is NOT drawn here: it rides on the tool_result message and is
 
     // The Edit diff is NOT drawn here: it rides on the tool_result message and is
     // rendered BELOW the `↳` receipt (see the tool_result branch). Drawing it here
@@ -1816,6 +1853,20 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     if (out.length && out[0].ind === cont && Array.isArray(msg.diff) && msg.diff.length > 0) {
       out[0] = { ...out[0], ind: pre };
     }
+    // The TOOL ROW may already have drawn this result's body — a Write streams the
+    // file's content up there ("↳ 1 line one …") — in which case the receipt below is
+    // the whole result and must NOT open a second `↳` block:
+    //     ● Used Write (a.txt) 1.3KB
+    //     ↳  1 <content>                     <- the body, marked on the tool row
+    //     ↳ File written: a.txt (1372 bytes) <- the stray second `↳`, now plain
+    // One body, one marker. `bodyOnToolRow` is set by the tool_result handler, which
+    // is the only place that knows whether the tool row had content to show.
+    if (msg.bodyOnToolRow && out.length && out[0].ind === pre) {
+      out[0] = { ...out[0], ind: cont };
+    }
+    // Nothing to show (empty output) -> render no row at all rather than a
+    // dangling "↳ ".
+    return out;
     // Nothing to show (empty output) -> render no row at all rather than a
     // dangling "↳ ".
     return out;
@@ -1918,6 +1969,11 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     // pane below, not by a different glyph.
     case 'queued': icon = '❯'; break;
     case 'steer': icon = '❯'; break;
+    // A skill activation is its own kind of row, not a user message: kimi prints
+    // `▶ Activated skill: <name>` with the user's args dim underneath, and that is
+    // what makes it clear a SKILL ran rather than the user having typed a slash
+    // command. See the `skill` branch below for the body.
+    case 'skill': icon = '▶'; break;
     case 'aborted': icon = ''; break;
     default: icon = '';
   }
@@ -1940,6 +1996,20 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       lines.push({ text: raw, ind: '', raw: true });
     }
     if (lines.length === 0) lines.push({ text: '', ind: '', raw: true });
+    return lines;
+  }
+  // A SKILL activation: kimi's card is
+  //     ▶ Activated skill: <name>
+  //       <the user's args, dim>
+  // The args line is omitted when there are none. `msg.text` is only the NAME and
+  // `msg.args` the trailing text, so the body is built here rather than wrapped.
+  if (msg.role === 'skill') {
+    lines.push({ text: prefix + 'Activated skill: ' + C.bold + String(msg.text || ''), ind: '', color: C.blue });
+    const args = String(msg.args || '').trim();
+    if (args) {
+      const w = Math.max(1, width - 2);
+      for (const seg of wrapWords(args, w)) lines.push({ text: seg, ind: '  ', color: C.gray });
+    }
     return lines;
   }
   // Only assistant/thinking output benefits from Markdown; user/system/tool
@@ -2444,6 +2514,14 @@ export function renderChatLines(state, w, viewport) {
   // Pass 1: exact row count per message (and the total). Every message's cache
   // is validated/rebuilt here so the counts are exact; only the STRING assembly
   // is limited to the visible window.
+  // Two ADJACENT bordered messages share a wall: the previous box's bottom rule
+  // doubles as this one's top rule, so it contributes ONE row less than a
+  // standalone box. Pass 2 skips that top rule when drawing, so the count here
+  // has to skip it too — counting 2 rules unconditionally made `total` one row
+  // bigger per shared wall than the rows actually pushed, so every absolute row
+  // index after the first shared wall pointed further down the transcript than
+  // the row drawn there, and a drag copied messages the user never selected.
+  let prevBordered = false;
   const rowStart = new Int32Array(n);
   const msgLen = new Int32Array(n);
   let cursor = 0;
@@ -2453,6 +2531,7 @@ export function renderChatLines(state, w, viewport) {
     const ww = border ? Math.max(1, Math.min(1, innerW - 4)) : innerW; // placeholder
     void ww;
     rowStart[mi] = cursor;
+    const rules = border ? (prevBordered ? 1 : 2) : 0;
     // Reuse/minimal layout for the row count: same width/border arithmetic as
     // the layout path below. We need boxText for bordered messages.
     const boxInner = Math.max(1, innerW - 4);
@@ -2474,7 +2553,7 @@ export function renderChatLines(state, w, viewport) {
       && cached.spinKey === spinKeyNow
       && cached.isPending === (m.pending ? 1 : 0);
     if (valid) {
-      msgLen[mi] = cached.rows.length + (border ? 2 : 0);
+      msgLen[mi] = cached.rows.length + rules;
     } else {
       const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart);
       const wrapped = rows.map(rowToLine);
@@ -2492,9 +2571,10 @@ export function renderChatLines(state, w, viewport) {
           cc.spinRows.add(i);
         }
       m._cache = cc;
-      msgLen[mi] = wrapped.length + (border ? 2 : 0);
+      msgLen[mi] = wrapped.length + rules;
     }
     cursor += msgLen[mi];
+    prevBordered = border;
   }
   const total = cursor;
   state._chatTotal = total;
@@ -2972,6 +3052,37 @@ function sliceAnsi(s, width) {
 // Frame-rate polling was the previous design and cost a git spawn per keystroke;
 // a fixed cadence is both cheaper and more predictable.
 const GIT_REFRESH_MS = 15000;
+
+// Re-resolve the hover highlight against a FRESH frame.
+//
+// `state.hoverHit` records a screen row captured the moment the mouse moved, and it
+// is only updated by the next mouse event. A repaint that moves content under a
+// stationary pointer therefore left the highlight on the WRONG text: hovering a row
+// and then letting the transcript grow (a streamed reply, an interrupt notice) kept
+// whatever slid into that row tinted. Re-running the hit test with the pointer's last
+// position against this frame's hitboxes keeps the highlight on the control the
+// pointer is actually over, and drops it when that control is gone.
+//
+// Returns the resolved span, or null when the pointer is not over anything (which is
+// what clears the tint). Falls back to null when there is no pointer data at all, so
+// a caller can decide whether to keep the stored span.
+export function resolveHoverHit(state, hitboxes) {
+  const m = state._lastMouse;
+  if (!m) return null;
+  const row = (m.row || 1) - 1;
+  const col = (m.col || 1) - 1;
+  const boxes = hitboxes || state._hitboxes || [];
+  for (let i = boxes.length - 1; i >= 0; i--) {
+    const hb = boxes[i];
+    if (hb.row !== row) continue;
+    if (col < hb.col0 || col > hb.col1) continue;
+    // The composer rows are click targets but are never tinted (see handleMouse).
+    if (hb.kind === 'composerRow') return null;
+    return { row: hb.row, col0: hb.col0, col1: hb.col1 };
+  }
+  return null;
+}
+
 export function refreshGitInfo(state, opts = {}) {
   const cwd = state.cwd || state.workspace || '';
   if (!cwd) return;
@@ -3021,6 +3132,22 @@ export function composeFrame(state, cols, rows) {
   }
   if (state.tasksPanel) {
     const lines = renderTasksBrowser(state.tasksPanel, w, h);
+    // The browser records its own click targets; the shape matches what hitAt()
+    // expects, so the generic dispatch works unchanged. The tint is resolved against
+    // the pointer's last position, exactly like the transcript's (see
+    // resolveHoverHit) — reading `state.hoverHit` directly left the highlight on
+    // whatever row slid under a stationary pointer after a refresh.
+    const hbs = (state.tasksPanel._taskHits || []).slice();
+    const hv = resolveHoverHit(state, hbs);
+    if (hv && hv.row >= 0 && hv.row < lines.length) {
+      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1 + 1);
+    }
+    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
+             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: hbs, composerMeta: [] };
+  }
+  // The /skills and /plugins manager is a full-screen takeover like the browser above.
+  if (state.registryBrowser) {
+    const lines = renderRegistryBrowser(state.registryBrowser, w, h);
     return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
              width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: [], composerMeta: [] };
   }
@@ -3807,6 +3934,9 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   }
 
   
+  const MPAD = ' ';
+  const mInner = Math.max(1, insideW - 3);
+  const menuRow = (content) => MPAD + col('│', C.border) + ' ' + fitAnsi(content, mInner) + ' ' + col('│', C.border);
   if (state.menuOpen && state.menuList.length && !dialog) {
     const totalMatches = state.menuList.length;
     const sel = state.menuSel + 1;
@@ -3827,13 +3957,13 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       const hint = cmd.argumentHint ? col(' ' + cmd.argumentHint, C.gray) : '';
       const pad = Math.max(2, 18 - visualCol(label) - visualCol(hint));
       const desc = col(cmd.desc, C.gray);
-      addHit(lines.length, 1, insideW, { kind: 'menuItem', index: off + j });
-      lines.push(col('│' + fitAnsi(mark + nameField + hint + ' '.repeat(pad) + desc, insideW) + '│', C.border));
+      addHit(lines.length, 2, mInner, { kind: 'menuItem', index: off + j });
+      lines.push(menuRow(mark + nameField + hint + ' '.repeat(pad) + desc));
     });
     const footer = isArgLevel
       ? `(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`
       : `(${sel}/${totalMatches})`;
-    lines.push(col('│' + fitAnsi(col(footer, C.gray), insideW) + '│', C.border));
+    lines.push(menuRow(col(footer, C.gray)));
   }
 
   // Inline `@file` candidate list — the same widget as the `/` menu above, so the
@@ -3862,10 +3992,10 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       // longer a split, so the row reads as one selected (or unselected) item.
       const label = col(rel, selected ? (C.cyan + C.bold) : C.gray);
       const pad = Math.max(2, 40 - visualCol(rel));
-      addHit(lines.length, 1, insideW, { kind: 'mentionItem', index: globalIndex });
-      lines.push(col('│' + fitAnsi(mark + label + ' '.repeat(pad), insideW) + '│', C.border));
+      addHit(lines.length, 2, mInner, { kind: 'mentionItem', index: globalIndex });
+      lines.push(menuRow(mark + label + ' '.repeat(pad)));
     });
-    lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray), insideW) + '│', C.border));
+    lines.push(menuRow(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray)));
   }
 
   const cwd = state.cwd || '';
@@ -3977,9 +4107,19 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   if (state._bodyScreenTop != null) state._bodyScreenTop += topPad - topTrim;
 
   if (state.hoverHit) {
-    const hv = state.hoverHit;
-    if (hv.row >= 0 && hv.row < lines.length) {
-      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1);
+    // The hover target is a SCREEN ROW captured when the mouse last moved, and it is
+    // only updated by the next mouse event — so a repaint that moves content under a
+    // stationary pointer left the highlight on whatever text slid into that row
+    // (hover a line, let a streamed reply or an interrupt notice arrive, and unrelated
+    // text kept the tint). Resolve against the LAST POINTER POSITION using THIS frame's
+    // hitboxes instead, and when there is no pointer data to resolve with, DROP the
+    // highlight: a stale screen row is never a safe thing to draw from.
+    const hv = resolveHoverHit(state, hitboxes);
+    if (hv && hv.row >= 0 && hv.row < lines.length) {
+      // `col1` is the LAST included column (see hitAt), but tintRange takes a
+      // half-open [col0, col1) range — without the +1 the final column of every
+      // hover target stayed un-tinted.
+      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1 + 1);
     }
   }
 
@@ -5100,17 +5240,27 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       saveSession(session);
       app(`Started a new session (${session.id}).`);
       return;
-    case 'sessions': {
+    case 'sessions':
+    case 'all-sessions': {
+      const everyWorkspace = cmd === 'all-sessions';
       const all = sess.listSessions();
       const cwd = path.resolve(state.cwd || state.workspace || process.cwd());
-      // Filter to only show sessions from the current workspace.
-      const list = all.filter((s) => {
+      // `/sessions` is scoped to THIS directory; `/all-sessions` deliberately is not,
+      // so a conversation started elsewhere can be resumed without cd-ing into it
+      // first. Both share ONE implementation below — a second copy of this resume
+      // logic would have to be kept in step with every fix made to it.
+      const list = everyWorkspace ? all : all.filter((s) => {
         const sessionCwd = s.workspace ? path.resolve(s.workspace) : null;
         return sessionCwd === cwd;
       });
-      if (!list.length) { app(all.length ? `No sessions in this directory (${cwd}).` : 'No saved sessions.'); return; }
+      if (!list.length) {
+        app(everyWorkspace
+          ? 'No saved sessions.'
+          : (all.length ? `No sessions in this directory (${cwd}). Try /all-sessions.` : 'No saved sessions.'));
+        return;
+      }
       openPicker({
-        title: 'Resume a session',
+        title: everyWorkspace ? 'Resume a session (all workspaces)' : 'Resume a session',
         items: list.slice(0, 50).map((s) => ({
           label: (s.title || 'untitled').slice(0, 30),
           sub: `${new Date(s.updatedAt || s.createdAt || 0).toLocaleString().slice(0, 19)} · ${(s.messages || []).length} msgs · ${s.workspace || ''}${s.lastTurnMs ? ` · last turn ${fmtDuration(s.lastTurnMs)}` : ''}`,
@@ -5138,12 +5288,23 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
             state.rounds = session.rounds || 0;
             state.steps = session.steps || 0;
             state.lastTurnMs = session.lastTurnMs || 0;
-            // The resumed session may live in another directory. `!` passthrough
-            // runs in `state.cwd || state.workspace`, so leaving the PREVIOUS
-            // session's cwd here ran the command in the wrong place.
+            // The resumed session may live in another directory, and EVERY tool path
+            // resolves against it (`resolvePath` uses `ctx.cwd || ctx.workspace`,
+            // and the agent copies `cfg` into `ctx` each turn). Updating only
+            // state.cwd moved the STATUS LINE while Edit/Read/Bash kept writing to
+            // the previous workspace — the resume looked right and hit the wrong
+            // files. `cfg` is the one the tools read, so it moves too.
             if (full.workspace) {
               state.cwd = full.workspace;
               state.workspace = full.workspace;
+              cfg.workspace = full.workspace;
+              cfg.cwd = full.workspace;
+              // An in-flight agent holds its own ctx copy; keep it in step so a
+              // resume while a turn is running cannot split the two.
+              if (state.agent && state.agent.ctx) {
+                state.agent.ctx.cwd = full.workspace;
+                state.agent.ctx.workspace = full.workspace;
+              }
               refreshGitInfo(state, { force: true });
             }
 
@@ -5865,7 +6026,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         'Skills',
         `  /${SKILL_PREFIX}<name>     run an installed skill (Tab completes the name)`,
         '  /import-skill <file.md>  add or overwrite a skill from a Markdown file',
-        '  /skills                  list installed skills',
+        '  /skills                  open the skill manager (Tab switches tabs)',
+        '  /skills install <name>   download one from the repo, without the panel',
+        '  /skills remove <name>    delete the local copy',
+        '  /plugins                 open the plugin manager',
+        '  /plugins install <name>  download one from the repo',
         '',
         'Shortcuts',
         '  Enter          send the message',
@@ -6451,8 +6616,18 @@ case 'trim': {
       // The directory changed, so the status line (path + git badge) must follow.
       // It previously kept showing the OLD path because state.cwd was never
       // updated here.
+      // `cfg` follows too, for the same reason as /sessions: the tools resolve their
+      // paths against `ctx.cwd || ctx.workspace`, which the agent copies from `cfg`
+      // each turn. Moving only the status line left Edit/Read/Bash pointed at the
+      // directory being left behind.
       state.cwd = target;
       state.workspace = target;
+      cfg.workspace = target;
+      cfg.cwd = target;
+      if (state.agent && state.agent.ctx) {
+        state.agent.ctx.cwd = target;
+        state.agent.ctx.workspace = target;
+      }
       refreshGitInfo(state, { force: true });
       state.chat = reconstructChat(session);
       state.scroll = 0;
@@ -6492,22 +6667,48 @@ case 'trim': {
       return;
     }
     case 'plugins': {
-      const { pluginCommands, API } = await import('./plugin.js');
-      // `loadedPlugins` is module-private; the public way to read it is the
-      // API.plugins getter. Importing a non-exported name yielded `undefined`
-      // and crashed on `.length`.
-      const loadedPlugins = API.plugins;
-      if (!loadedPlugins.length) { app('No plugins loaded. Check ~/.hncode/plugins/'); return; }
-      const lines = ['Loaded plugins:', ...loadedPlugins.map((p) => `  • ${p.name} v${p.version} (${p.id})`)];
-      if (pluginCommands.length) {
-        lines.push('', 'Plugin commands:', ...pluginCommands.map((c) => `  /${c.name.padEnd(14)} ${c.description || ''}`));
+      // Only the remove/install fast paths need these; `list` goes through the
+      // browser, which loads what it needs itself.
+      const remote = await import('./remote.js');
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+
+      if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        const name = parts[1];
+        if (!name) { appErr('Usage: /plugins remove <name>'); return; }
+        const ok = remote.removeLocalPlugin(name);
+        if (!ok) { appErr(`No such plugin: ${name}`); return; }
+        // Plugins are loaded once at start-up, so removing the files does not unload
+        // the code already registered in this process. Saying so avoids the impression
+        // that the removal failed.
+        app(`Plugin removed: ${name} (takes effect after restarting hncode)`);
+        return;
       }
-      h.openPanel('hncode — plugins', lines);
+      if (sub === 'install' || sub === 'add' || sub === 'i') {
+        const name = parts[1];
+        if (!name) { appErr(`Usage: /plugins install <name>  (see /plugins list)\nRepo: https://github.com/${remote.DEFAULT_REPO}/tree/${remote.DEFAULT_REF}/plugins`); return; }
+        notice(`Downloading plugin ${name}…`, 'info');
+        const res = await remote.installRemotePlugin(name);
+        if (!res.ok) { appErr(`Install failed: ${res.error}`); return; }
+        app(`Plugin ${res.replaced ? 'updated' : 'installed'}: ${res.name} (${res.files.join(', ')})`);
+        app('Restart hncode to load it.');
+        return;
+      }
+
+      // `list` (or bare) opens the interactive manager (tabs + descriptions, like
+      // kimi's panel). An unknown subcommand still errors rather than silently opening
+      // it as if the word had been understood.
+      if (sub !== 'list' && sub !== '') {
+        appErr('Usage: /plugins [list] | install <name> | remove <name>');
+        return;
+      }
+      await h.openRegistryBrowser('plugins');
       return;
     }
     case 'skills': {
       const parts = raw.split(/\s+/).filter(Boolean);
       const sub = (parts[0] || '').toLowerCase();
+      const remote = await import('./remote.js');
       if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
         const name = parts[1];
         if (!name) { appErr('Usage: /skills remove <name>'); return; }
@@ -6515,23 +6716,23 @@ case 'trim': {
         app(ok ? `Skill removed: ${normalizeSkillName(name)}` : `No such skill: ${name}`);
         return;
       }
-      if (sub === 'list' || sub === '') {
-        const items = listSkills();
-        if (!items.length) {
-          say(`No skills installed. Add one with /import-skill <file.md> (dir: ${skillsDir()}).`);
-          return;
-        }
-        h.openPanel('hncode — skills', [
-          `Installed skills (${items.length}) — activate with /${SKILL_PREFIX}<name>:`,
-          '',
-          ...items.map((s) => `  /${SKILL_PREFIX}${s.name}${s.description ? '  — ' + s.description : ''}`),
-          '',
-          `Directory: ${skillsDir()}`,
-          'Remove one with /skills remove <name>.',
-        ]);
+      if (sub === 'install' || sub === 'add' || sub === 'i') {
+        const name = parts[1];
+        if (!name) { appErr(`Usage: /skills install <name>  (see /skills list)\nRepo: https://github.com/${remote.DEFAULT_REPO}/tree/${remote.DEFAULT_REF}/skills`); return; }
+        notice(`Downloading skill ${name}…`, 'info');
+        const res = await remote.installRemoteSkill(name);
+        if (!res.ok) { appErr(`Install failed: ${res.error}`); return; }
+        app(`Skill ${res.replaced ? 'updated' : 'installed'}: ${res.name}${res.description ? ' — ' + res.description : ''}`);
+        app(`Activate it with /${SKILL_PREFIX}${res.name}`);
         return;
       }
-      appErr(`Usage: /skills [list] | remove <name>`);
+      if (sub === 'list' || sub === '') {
+        // The interactive manager (tabs + descriptions). It fetches the remote list for
+        // its Available tab itself, so nothing is fetched here.
+        await h.openRegistryBrowser('skills');
+        return;
+      }
+      appErr('Usage: /skills [list] | install <name> | remove <name>');
       return;
     }
     case 'import-skill': {
@@ -6892,12 +7093,19 @@ case 'trim': {
           appErr(`No such skill: ${name}. Use /skills to list them, or /import-skill to add one.`);
           return;
         }
+        // `raw` is whatever was typed AFTER the skill name, and it is the user's own
+        // instruction: it has to reach the model AND appear in the transcript. It was
+        // appended only to the hidden `skillBody` system message while the row showed
+        // the bare `/skill:name`, so the user's text disappeared from the conversation
+        // and the model saw it as a detached system note rather than as their words.
         const extra = String(raw || '').trim();
         const prompt = skillPrompt(sk) + (extra ? `\n\n${extra}` : '');
-        // The transcript/user message stays the SHORT command; the skill body is
-        // injected as a system message so it reaches the model without ever
-        // appearing as the user's own words (mirrors kimi's activation card).
-        await sendPrompt('/' + SKILL_PREFIX + name, { skillBody: prompt });
+        // The row is a SKILL ACTIVATION card, not a user bubble and not the literal
+        // `/skill:foo` text (which read as the user having typed a command). The body
+        // rides a system message so it never renders as the user's own speech — the
+        // distinction kimi draws, and the reason this row exists at all.
+        addChat({ role: 'skill', text: name, args: extra, _conv: true });
+        await sendPrompt('/' + SKILL_PREFIX + name, { skillBody: prompt, bubbleText: extra });
         return;
       }
       // Check if this is a plugin-registered command.
@@ -7728,6 +7936,10 @@ function commandsForWeb() {
       ? (p.category || state.picker.categories[0]) : null;
     state.form = null;
     state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    // The previous frame's hover described a DIFFERENT layout (the row the pointer
+    // was over, before this overlay replaced those rows). Keeping it tinted whatever
+    // the new overlay happened to draw on that row.
+    state.hoverHit = null;
     // A dialog usually replaces the composer, so the half-typed prompt is
     // cleared — but the right-click context menu is an overlay ON TOP of the
     // composer and must leave it (text + caret) untouched, otherwise opening it
@@ -7735,6 +7947,8 @@ function commandsForWeb() {
     if (!p.keepInput) { state.input = ''; state.caret = 0; }
     renderFrame();
   }
+
+  // ---- @ file completion ----------------------------------------------------
 
   // ---- @ file completion ----------------------------------------------------
   // Typing `@` shows an INLINE candidate list above the composer — the same widget
@@ -7939,6 +8153,9 @@ function commandsForWeb() {
     if (p.flashTimer) clearTimeout(p.flashTimer);
     if (p.pollTimer) clearInterval(p.pollTimer);
     state.tasksPanel = null;
+    // Full-screen takeover: its hitbox rows say nothing about the frame that is
+    // about to be restored, so the hover highlight goes with it.
+    state.hoverHit = null;
     renderFrame();
   }
 
@@ -7948,6 +8165,126 @@ function commandsForWeb() {
     p.flash = msg;
     if (p.flashTimer) clearTimeout(p.flashTimer);
     p.flashTimer = setTimeout(() => { p.flash = ''; renderFrame(); }, 2500);
+  }
+
+  // ---- /skills and /plugins manager (kimi's registry panel) ------------------
+  // Both commands open the SAME browser; only `kind` differs, so the two cannot drift
+  // apart the way two copies would.
+
+  /**
+   * Load what the browser shows.
+   *
+   * The LOCAL half is read synchronously from disk and published FIRST, then the remote
+   * half is fetched and merged in. The order matters: the panel opens on a local tab
+   * (Loaded / On disk / Installed), and making those wait on a network round-trip meant
+   * a slow or blocked GitHub left the user staring at "Loading…" for information that
+   * was available instantly. Only `busy` describes the fetch, and the panel now shows
+   * local rows while it is set.
+   */
+  async function loadRegistryData(kind) {
+    const remote = await import('./remote.js');
+    const b = state.registryBrowser;
+    if (!b) return;
+
+    // 1. Local data: no network, no await. Available immediately.
+    if (kind === 'skills') {
+      b.data = {
+        installed: listSkills().map((s) => ({ name: s.name, description: s.description })),
+        remote: b.data?.remote || [],
+        remoteError: '',
+      };
+    } else {
+      const { API } = await import('./plugin.js');
+      b.data = {
+        loaded: API.plugins.map((p) => ({ name: p.name, version: p.version, id: p.id })),
+        onDisk: remote.listLocalPlugins(),
+        remote: b.data?.remote || [],
+        remoteError: '',
+      };
+    }
+    b.busy = 'Fetching the repo list…';
+    renderFrame();
+
+    // 2. Remote data, best-effort. A failure is recorded per-half so each tab can say
+    //    something true about itself.
+    try {
+      const listed = kind === 'skills'
+        ? await remote.listRemoteSkillsDetailed()
+        : await remote.listRemotePlugins();
+      b.data.remote = listed.ok ? listed.items : [];
+      b.data.remoteError = listed.ok ? '' : listed.error;
+    } catch (e) {
+      b.data.remote = [];
+      b.data.remoteError = String((e && e.message) || e);
+    }
+    b.busy = null;
+    renderFrame();
+  }
+
+  async function openRegistryBrowser(kind) {
+    state.registryBrowser = {
+      kind,
+      tab: kind === 'skills' ? 'installed' : 'loaded',
+      selectedIndex: 0,
+      data: null,
+      busy: null,
+      flash: '',
+    };
+    // Close the other overlays so only one thing owns the screen.
+    state.picker = null; state.form = null; state.panel = null;
+    state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    renderFrame();
+    await loadRegistryData(kind);
+  }
+
+  function closeRegistryBrowser() {
+    state.registryBrowser = null;
+    state.hoverHit = null;
+    renderFrame();
+  }
+
+  /** Run the selected row's action, then reload so the list reflects reality. */
+  async function registryAct() {
+    const b = state.registryBrowser;
+    if (!b || !b.data) return;
+    const { rowsForTab } = await import('./registry-browser.js');
+    const remote = await import('./remote.js');
+    const rows = rowsForTab(b, b.tab);
+    const row = rows[Math.min(b.selectedIndex || 0, Math.max(0, rows.length - 1))];
+    if (!row || row.disabled || row.action === 'none') return;
+    const name = row.name;
+    b.busy = row.action.startsWith('install') ? `Installing ${name}…` : `Removing ${name}…`;
+    renderFrame();
+    try {
+      if (row.action === 'install-skill' || row.action === 'reinstall-skill') {
+        const r = await remote.installRemoteSkill(name);
+        b.flash = r.ok ? `Skill ${r.replaced ? 'updated' : 'installed'}: ${r.name}` : `Install failed: ${r.error}`;
+      } else if (row.action === 'remove-skill') {
+        const ok = remote.removeLocalSkill(name);
+        b.flash = ok ? `Skill removed: ${name}` : `Could not remove ${name}`;
+      } else if (row.action === 'install-plugin' || row.action === 'reinstall-plugin') {
+        const r = await remote.installRemotePlugin(name);
+        b.flash = r.ok ? `Plugin ${r.replaced ? 'updated' : 'installed'}: ${r.name} — restart hncode to load it` : `Install failed: ${r.error}`;
+      } else if (row.action === 'remove-plugin') {
+        const ok = remote.removeLocalPlugin(name);
+        b.flash = ok ? `Plugin removed: ${name} — restart hncode to unload it` : `Could not remove ${name}`;
+      }
+    } catch (e) {
+      b.flash = `Failed: ${String((e && e.message) || e)}`;
+    }
+    b.busy = null;
+    await loadRegistryData(b.kind);
+  }
+
+  function handleRegistryRowKey(t) {
+    const b = state.registryBrowser;
+    if (!b) return false;
+    const action = handleRegistryBrowserKey(b, t);
+    if (action === 'close') { closeRegistryBrowser(); return true; }
+    if (action === 'install' || action === 'remove') { void registryAct(); return true; }
+    if (action === 'reload') { void loadRegistryData(b.kind); return true; }
+    renderFrame();
+    return true;
   }
 
   function openTaskOutputViewer(taskId) {
@@ -7960,7 +8297,22 @@ function commandsForWeb() {
 
   function closeTaskOutputViewer() {
     state.tasksViewer = null;
+    state.hoverHit = null;
     renderFrame();
+  }
+
+  // Map a mouse token onto the tasks browser's own hitboxes. The browser works in
+  // FRAME cells (row 0 = header), the mouse reports 1-based screen cells, so the
+  // conversion happens here once instead of in every branch below.
+  function taskPanelHit(p, t) {
+    const hits = p._taskHits || [];
+    const row = (t.row || 1) - 1;
+    const col = (t.col || 1) - 1;
+    for (let i = hits.length - 1; i >= 0; i--) {
+      const hb = hits[i];
+      if (hb.row === row && col >= hb.col0 && col <= hb.col1) return hb;
+    }
+    return null;
   }
 
   // Returns true when the key was consumed by the panel / viewer.
@@ -7968,6 +8320,42 @@ function commandsForWeb() {
     const p = state.tasksPanel;
     if (!p) return false;
     const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+    // MOUSE first: the browser is a full-screen takeover, so a click on a row selects
+    // it (and a second click opens its output), a click on a footer word runs that
+    // word's action, and moving over either highlights it.
+    if (t.key === 'mousehover' || t.key === 'mousedown') {
+      const hit = taskPanelHit(p, t);
+      if (t.key === 'mousehover') {
+        const next = hit ? { row: hit.row, col0: hit.col0, col1: hit.col1 } : null;
+        const prev = state.hoverHit;
+        const changed = (!!next !== !!prev)
+          || (next && prev && (next.row !== prev.row || next.col0 !== prev.col0 || next.col1 !== prev.col1));
+        if (changed) { state.hoverHit = next; renderFrame(); }
+        // Keep the list row under the pointer highlighted too, so the tint and the
+        // per-row marker agree.
+        p.hoverIndex = hit && hit.kind === 'taskRow' ? hit.index : null;
+        return true;
+      }
+      if (!hit) return true;                       // a click on empty space: consume it
+      if (hit.kind === 'taskRow') {
+        p.selectedIndex = hit.index;
+        renderFrame();
+        return true;
+      }
+      if (hit.kind === 'taskFooter') {
+        // Re-dispatch the click as the KEY that word advertises, so a click and a
+        // keypress go through exactly the same path.
+        const asKey = { select: null, output: 'enter', stop: 's', refresh: 'r', filter: 'tab', close: 'escape' }[hit.action];
+        if (hit.action === 'confirmStop') return handleTasksPanelKey({ ch: 'y' });
+        if (hit.action === 'cancelStop') return handleTasksPanelKey({ key: 'escape' });
+        if (hit.action === null || asKey == null) return true;
+        if (asKey === 'enter') return handleTasksPanelKey({ key: 'enter' });
+        if (asKey === 'tab') return handleTasksPanelKey({ key: 'tab' });
+        if (asKey === 'escape') return handleTasksPanelKey({ key: 'escape' });
+        return handleTasksPanelKey({ ch: asKey });
+      }
+      return true;
+    }
     // Snapshot the STOP target BEFORE the key handler clears pendingStop on 'y'.
     const stopTarget = p.pendingStop;
     const action = handleTasksBrowserKey(p, t);
@@ -8202,7 +8590,17 @@ function commandsForWeb() {
     // absolute. Treating one as the other offset every hit by the rows sitting
     // above the transcript — a short session has `topPad` of them — so a drag
     // selected the wrong lines and copied text from elsewhere, or nothing.
-    const screenTop = state._bodyScreenTop != null ? state._bodyScreenTop : 0;
+    // `_bodyScreenTop === null` means the TRANSCRIPT BODY IS NOT ON SCREEN this
+    // frame — an overlay (panel / form / picker / editor) replaced it, and
+    // composeFrame clears the field so that only the body branch sets it. `_bodyTop`
+    // is then a leftover from the previous frame, so mapping through it turns a drag
+    // over the panel into a selection of transcript rows the user cannot see: the
+    // highlight is applied to the (undrawn) chat, so NOTHING looks selected, and
+    // Ctrl+Shift+C copies those hidden lines. Report "no transcript cell" instead.
+    if (state._bodyScreenTop == null) {
+      return { col, screenRow, rowInBody: -1, lineIdx: -1, row: -1 };
+    }
+    const screenTop = state._bodyScreenTop;
     const rowInBody = screenRow - screenTop;
     const lineIdx = (state._bodyTop != null ? state._bodyTop : 0) + rowInBody;
     // A row outside the body (the padding above it, or the chrome below) maps to
@@ -8239,6 +8637,28 @@ function commandsForWeb() {
       if (hb.row === row && col >= hb.col0 && col <= hb.col1) return hb;
     }
     return null;
+  }
+
+  // Close whatever OVERLAY is up, honouring its cancel callback. Shared by the
+  // click-outside path and Ctrl+C so the two cannot drift apart (Esc has its own
+  // per-overlay handling that also restores a draft in some cases).
+  // `hoverHit` is dropped too: it is a SCREEN row, and the overlay's rows are about
+  // to be replaced by the transcript. Keeping it left whatever now occupies that row
+  // tinted — the highlight visibly stuck to unrelated text until the pointer moved.
+  function dismissOverlay() {
+    state.hoverHit = null;
+    if (state.picker) {
+      const cb = state.picker.onCancel;
+      state.picker = null;
+      state.pickerQuery = '';
+      state.pickerCategory = null;
+      if (cb) cb();
+      return true;
+    }
+    if (state.form) { state.form = null; return true; }
+    if (state.panel) { state.panel = null; return true; }
+    if (state.editor) { state.editor = null; return true; }
+    return false;
   }
   function dispatchHit(hb) {
     if (!hb) return false;
@@ -8345,6 +8765,30 @@ function commandsForWeb() {
     }
     if (state.picker || state.form || state.panel || state.editor) {
       if (t.key === 'wheelup' || t.key === 'wheeldown') handleKey(t);
+      // Hover must still update, or a picker row never lights up: the early
+      // return below left `state.hoverHit` stale while an overlay was open, so the
+      // hover tint (applied in composeFrame) never reached the menu rows.
+      if (t.key === 'mousehover') {
+        const hb = hitAt(t);
+        // Same exclusion as the normal path: the composer rows are click targets
+        // (mousedown places the caret) but are never tinted — the prompt you are
+        // typing must not light up.
+        const next = (hb && hb.kind !== 'composerRow') ? { row: hb.row, col0: hb.col0, col1: hb.col1 } : null;
+        const prev = state.hoverHit;
+        const changed = (!!next !== !!prev)
+          || (next && prev && (next.row !== prev.row || next.col0 !== prev.col0 || next.col1 !== prev.col1));
+        if (changed) { state.hoverHit = next; renderFrame(); }
+        return;
+      }
+      // Clicking OUTSIDE the overlay dismisses it, the way every menu behaves.
+      // Without this the press was swallowed here (no hitbox matched, so
+      // dispatchHit returned false) and the overlay stayed open — Esc was the only
+      // way out, which is not what a right-click context menu implies.
+      if (t.key === 'mousedown' && !hitAt(t)) {
+        dismissOverlay();
+        renderFrame();
+        return;
+      }
       return;
     }
     if (t.key === 'mousedown') {
@@ -8519,10 +8963,28 @@ function commandsForWeb() {
       return;
     }
   }
-  function selectionText() {
+  // `allowHidden` is for an EXPLICIT action the user just asked for — the
+  // right-click menu's Copy. That menu is a picker overlay, so the transcript is
+  // not drawn while it is up and `_bodyScreenTop` is null; the guard below then
+  // returned '' and Copy always answered "Nothing to copy", even with text plainly
+  // selected. The guard exists to stop a drag/keystroke from silently copying rows
+  // the user cannot see, which is not what picking "Copy" means.
+  function selectionText(allowHidden = false) {
     const sel = state.selection;
     if (!sel || !sel.anchor || !sel.head) return '';
+    // A selection only means something while the TRANSCRIPT is the thing on screen.
+    // With an overlay open the body is not drawn, so the highlighted rows are not
+    // the rows the user is looking at — copying would hand back text that was never
+    // visible. `_bodyScreenTop` is null exactly then (composeFrame clears it every
+    // frame and only the body branch sets it).
+    if (!allowHidden && state._bodyScreenTop == null) return '';
     const { cols } = dims();
+    // The FULL transcript, and that is correct here: `selection.row` is an ABSOLUTE
+    // transcript row, not a screen row. mouseToCell() already converted it
+    // (`_bodyTop + rowInBody`), and composeFrame's highlight indexes the windowed
+    // array with the same absolute number — the windowed array keeps the transcript's
+    // absolute length and fills off-screen slots with '', so index N is the same row
+    // in both. Verified by printing drawn-vs-full side by side at several scrolls.
     const rawChat = renderChatLines(state, cols);
     const a = sel.anchor, h = sel.head;
     const start = (h.row < a.row || (h.row === a.row && h.col < a.col)) ? h : a;
@@ -8706,7 +9168,14 @@ function commandsForWeb() {
       keepInput: true, // the composer's text and caret must survive this menu
       hint: '↑↓ navigate · Enter run · Esc cancel',
       onPick: (it) => {
-        if (it.action === 'copy') copyToClipboard(selectionText());
+        if (it.action === 'copy') {
+          // allowHidden: the menu itself is an overlay, so the transcript is not
+          // drawn right now and selectionText()'s "the body must be on screen"
+          // guard returned '' — Copy always answered "Nothing to copy".
+          const text = selectionText(true);
+          if (text) copyToClipboard(text);
+          else notice('Nothing to copy — select text first', 'error');
+        }
         else if (it.action === 'copy-composer') {
           const sel = state.composerSel;
           const a = Math.min(sel.anchor, sel.head);
@@ -8744,9 +9213,9 @@ function commandsForWeb() {
 
   function handleKey(t) {
     // Full-screen takeovers own EVERY key while open.
-    // Full-screen takeovers own EVERY key while open.
     if (state.tasksViewer) { handleTasksViewerKey(t); return; }
     if (state.tasksPanel) { handleTasksPanelKey(t); return; }
+    if (state.registryBrowser) { handleRegistryRowKey(t); return; }
     if (t.key === 'mousedown' || t.key === 'mousemove' || t.key === 'mouseup' || t.key === 'rightclick' || t.key === 'mousehover') {
       handleMouse(t);
       return;
@@ -8795,12 +9264,13 @@ function commandsForWeb() {
       // screen), and a second Ctrl+C — often the very key the user pressed again
       // to dismiss the prompt — quit the app and discarded the draft.
       if (state.menuOpen || state.picker || state.form || state.panel || state.question || state.editor) {
-        if (state.picker) { const cb = state.picker.onCancel; state.picker = null; if (cb) cb(); }
-        if (state.form) { const cb = state.form.onCancel; state.form = null; if (cb) cb(); }
+        // One shared dismissal so Ctrl+C and a click outside cannot drift apart:
+        // this used to clear `state.form` without calling its `onCancel`, while the
+        // click path (added later) does — two ways to close one dialog with two
+        // different outcomes.
+        dismissOverlay();
         // Ctrl+C on the question dialog = dismiss, the same as Esc.
         if (state.question) { const r = state.question.resolve; state.question = null; r({}); }
-        state.panel = null;
-        state.editor = null;   // Ctrl+C cancels the editor, like Esc
         state.menuOpen = false; state.menuList = []; state.menuSel = 0; state.menuOffset = 0;
         renderFrame();
         return;
@@ -9174,10 +9644,7 @@ function commandsForWeb() {
           // key fall through to history. That is the usual shell/editor rule —
           // typing a paragraph must not have ↑ yank the draft away.
           if (cur !== '' && targetRow >= 0 && targetRow < layout.rows.length) {
-            const starts = rowStartOffsets(cur, layout.rows.length, insideW);
-            const colInRow = Math.max(0, layout.caretCol - 1);
-            const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
-            state.caret = Math.min(cur.length, targetStart + colInRow);
+            state.caret = verticalCaretIndex(state, cur, layout, targetRow);
             state.composerSel = null;
             renderFrame();
             return;
@@ -9209,7 +9676,7 @@ function commandsForWeb() {
         renderFrame();
       };
       const curLines = () => ed.text.split('\n');
-      if (t.key === 'escape') { state.editor = null; renderFrame(); return; }
+      if (t.key === 'escape') { state.editor = null; state.hoverHit = null; renderFrame(); return; }
       // Ctrl+S: save.
       if (t.key === 'c-s') {
         const cb = ed.onSave;
@@ -9286,7 +9753,7 @@ function commandsForWeb() {
 
     if (state.panel) {
       const p = state.panel;
-      if (t.key === 'escape') { state.panel = null; renderFrame(); return; }
+      if (t.key === 'escape') { state.panel = null; state.hoverHit = null; renderFrame(); return; }
       if (t.key === 'up') { p.top = Math.max(0, (p.top || 0) - 1); renderFrame(); return; }
       if (t.key === 'down') { p.top = (p.top || 0) + 1; renderFrame(); return; }
       if (t.key === 'pageup') { p.top = Math.max(0, (p.top || 0) - 10); renderFrame(); return; }
@@ -9301,7 +9768,7 @@ function commandsForWeb() {
       const nRows = f.fields.length + (f.hideType ? 0 : 1);
       const onType = !f.hideType && f.fieldIdx >= f.fields.length;
       const field = f.fields[f.fieldIdx];
-      if (t.key === 'escape') { const cb = f.onCancel; state.form = null; if (cb) cb(); renderFrame(); return; }
+      if (t.key === 'escape') { const cb = f.onCancel; state.form = null; state.hoverHit = null; if (cb) cb(); renderFrame(); return; }
       if (t.key === 'up') { f.fieldIdx = (f.fieldIdx - 1 + nRows) % nRows; renderFrame(); return; }
       if (t.key === 'down') { f.fieldIdx = (f.fieldIdx + 1) % nRows; renderFrame(); return; }
       if (t.key === 'tab') { f.fieldIdx = (f.fieldIdx + 1) % nRows; renderFrame(); return; }
@@ -9435,6 +9902,10 @@ function commandsForWeb() {
         state.picker = null;
         state.pickerQuery = '';
         state.pickerCategory = null;
+        // Drop the hover highlight: its row numbering described the MENU, and the
+        // transcript is about to take those rows back — leaving it tinted whatever
+        // ended up there until the pointer moved again.
+        state.hoverHit = null;
         if (cb) cb();
         renderFrame();
         return;
@@ -9557,7 +10028,6 @@ function commandsForWeb() {
     }
     if (t.key === 'wheelup' || t.key === 'wheeldown') {
       // With the pointer ON the scrollbar, scroll one line per notch: the bar is
-      // With the pointer ON the scrollbar, scroll one line per notch: the bar is
       // the precision control, and 3-line steps there feel jumpy on a long
       // transcript. Everywhere else keeps the usual 3-line step.
       const onBar = !!(state._lastMouse && isOnScrollbar(state._lastMouse));
@@ -9627,24 +10097,26 @@ function commandsForWeb() {
       if (dirName === 'left') {
         const mk = adjacentPasteMarker(cur, caret, -1);
         next = mk ? mk.start : Math.max(0, caret - 1);
+        state._caretPrefCol = null;
       } else if (dirName === 'right') {
         const mk = adjacentPasteMarker(cur, caret, 1);
         next = mk ? mk.end : Math.min(cur.length, caret + 1);
+        state._caretPrefCol = null;
       } else if (dirName === 'home') {
         next = 0;
+        state._caretPrefCol = null;
       } else if (dirName === 'end') {
         next = cur.length;
+        state._caretPrefCol = null;
       } else {
-        // up/down: move a visual row keeping the column, like the plain arrows,
-        // so a multi-line prompt can be selected across lines.
+        // up/down: move a visual row keeping the column, like the plain arrows, so
+        // a multi-line prompt can be selected across lines. Same sticky column as
+        // the plain ↑/↓ (see verticalCaretIndex).
         const insideW = Math.max(0, dims().cols - 2);
         const layout = composerLayout(state, insideW - 3);
         const targetRow = layout.caretRow + (dirName === 'down' ? 1 : -1);
         if (targetRow < 0 || targetRow >= layout.rows.length) { renderFrame(); return; }
-        const starts = rowStartOffsets(cur, layout.rows.length, insideW);
-        const colInRow = Math.max(0, layout.caretCol - 1);
-        const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
-        next = Math.min(cur.length, targetStart + colInRow);
+        next = verticalCaretIndex(state, cur, layout, targetRow);
       }
       state.caret = next;
       state.composerSel = (anchor === next) ? null : { anchor, head: next };
@@ -9661,6 +10133,8 @@ function commandsForWeb() {
       } else {
         state.caret = Math.min(state.input.length, (state.caret || 0) + 1);
       }
+      // A horizontal move abandons the sticky column (kimi's setCursorCol).
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
@@ -9669,6 +10143,7 @@ function commandsForWeb() {
       const layout = composerLayout(state, insideW);
       const starts = rowStartOffsets(state.input || '', layout.rows.length, insideW);
       state.caret = starts[layout.caretRow] != null ? starts[layout.caretRow] : 0;
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
@@ -9679,9 +10154,11 @@ function commandsForWeb() {
       const next = starts[layout.caretRow + 1];
       state.caret = (next != null ? next - 1 : (state.input || '').length);
       state.caret = Math.max(0, Math.min((state.input || '').length, state.caret));
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
+
     if (t.key === 'enter') {
       // Enter commits whatever is in the composer. When the `/` MENU is open it
       // selects a command, but the composer's own text is still what was typed —
@@ -9830,6 +10307,64 @@ function commandsForWeb() {
       base += p.length + 1;
     }
     return starts;
+  }
+
+  // Where the caret lands after a VERTICAL move (↑/↓, plain or Shift+).
+  //
+  // A faithful port of kimi-code's editor (packages/pi-tui/src/components/editor.ts):
+  // `moveToVisualLine()` + `computeVerticalMoveColumn()` + its sticky
+  // `preferredVisualCol`. The UNITS are what the previous attempt got wrong —
+  // everything below is a CHARACTER offset, never a display column:
+  //   * `layout.meta[i].start/.end` are character indices into the whole buffer;
+  //   * a row's length is `end - start` CHARACTERS, and the caret's column is
+  //     measured from that row's `start` (kimi: `cursorCol - vl.startCol`);
+  //   * `layout.caretCol` is NOT usable here: it is `1 + prefixWidth +
+  //     displayColumns`, so it mixes in the `❯ ` prefix and counts a double-width
+  //     glyph as two. Comparing that against a character length is what made the
+  //     caret walk left and right instead of holding its column.
+  //
+  // Decision table (P = a preference is stored, S = the caret sits mid-row,
+  // T = this row is shorter than the current column, U = this row is shorter than
+  // the preference), verbatim from kimi:
+  //   !P || S : T -> store current, go to row end   |  else -> clear, keep current
+  //   P       : T || U -> go to row end (keep pref) |  else -> use pref, clear it
+  function verticalCaretIndex(state, text, layout, targetRow) {
+    const curMeta = layout.meta[layout.caretRow];
+    const targetMeta = layout.meta[targetRow];
+    if (!curMeta || !targetMeta) return state.caret;
+
+    const rowLen = (m) => Math.max(0, m.end - m.start);
+    // Only the LAST wrap segment of a logical line may put the caret at the line's
+    // end; on any other segment the caret stops one character short, or it would sit
+    // on the first character of the next row and ↑/↓ would look like it skipped one.
+    const isLastSeg = (m) => (m.segIdx || 0) >= (m.segCount || 1) - 1;
+    const maxColOf = (m) => (isLastSeg(m) ? rowLen(m) : Math.max(0, rowLen(m) - 1));
+
+    const currentVisualCol = state.caret - curMeta.start;
+    const sourceMaxVisualCol = maxColOf(curMeta);
+    const targetMaxVisualCol = maxColOf(targetMeta);
+
+    const hasPref = state._caretPrefCol != null;                          // P
+    const cursorInMiddle = currentVisualCol < sourceMaxVisualCol;         // S
+    const targetTooShort = targetMaxVisualCol < currentVisualCol;         // T
+    const targetCantFitPref = hasPref && targetMaxVisualCol < state._caretPrefCol; // U
+
+    let moveTo;
+    if (!hasPref || cursorInMiddle) {
+      if (targetTooShort) { state._caretPrefCol = currentVisualCol; moveTo = targetMaxVisualCol; }
+      else { state._caretPrefCol = null; moveTo = currentVisualCol; }
+    } else if (targetTooShort || targetCantFitPref) {
+      moveTo = targetMaxVisualCol;
+    } else {
+      moveTo = state._caretPrefCol;
+      state._caretPrefCol = null;
+    }
+
+    // kimi clamps against the end of the LOGICAL line, so a caret pushed past the
+    // target segment still lands inside the line rather than mid-buffer.
+    const paraMeta = layout.meta.filter((m) => m.line === targetMeta.line);
+    const paraEnd = (paraMeta[paraMeta.length - 1] || targetMeta).end;
+    return Math.min(targetMeta.start + Math.max(0, moveTo), Math.max(targetMeta.start, paraEnd));
   }
 
   function statusExtra(state) {
@@ -10019,7 +10554,12 @@ function commandsForWeb() {
   // something the user typed, so it must not appear (or persist) as their message.
   async function runAgent(text, opts = {}) {
     const asSystem = !!opts.asSystem;
-    if (!asSystem) addChat({ role: 'user', text: opts.bubbleText != null ? opts.bubbleText : text, _conv: true });
+    // `bubbleText` overrides the row drawn in the transcript. A SKILL activation has
+    // already drawn its own card (see dispatch), so it passes the user's args here
+    // only to feed the MODEL — with no args that is '', and a user bubble for an
+    // empty string would show a blank `❯` row under the card.
+    const bubble = opts.bubbleText != null ? opts.bubbleText : text;
+    if (!asSystem && String(bubble).trim()) addChat({ role: 'user', text: bubble, _conv: true });
     // Fresh buffer for this turn's <plan> split (see appendAssistant).
     state._planBuf = '';
     // A message the user JUST SENT should always bring the newest content into
@@ -10124,7 +10664,20 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
     // from the harness, not something the user typed, and it must not show up as a
     // user bubble or be persisted as one.
-messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: opts.modelText != null ? opts.modelText : text });
+    //
+    // A SKILL activation's `text` is only the `/skill:<name>` marker. Sending that as
+    // the user turn told the model nothing and DROPPED the user's own instruction
+    // (`/skill:foo make it blue` lost "make it blue"). So:
+    //   * with args  -> the args ARE the user turn (the body rides a system message);
+    //   * without args -> there is no user text at all. Pushing the marker would put
+    //     the literal `/skill:foo` into the conversation, which is worse than an empty
+    //     turn: the model reads it as the user having typed a command. The skill body
+    //     is the whole instruction in that case, so no user message is added.
+    const argsText = opts.bubbleText != null ? String(opts.bubbleText).trim() : '';
+    const isSkill = opts.bubbleText != null;
+    if (asSystem) messages.push({ role: 'system', content: text });
+    else if (isSkill && !argsText) { /* body-only activation: nothing for the user turn */ }
+    else messages.push({ role: 'user', content: opts.modelText != null ? opts.modelText : (argsText || text) });
     // Only the conversation is persisted; the system message does not go into the
     // session. Saving a turn is left to the end of the turn (after agent.run) —
     // writing mid-turn would make sending feel sluggish.
@@ -10590,11 +11143,26 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           // result as the live progress block above (cells + status pip bar), so a
           // `↳ Swarm finished: …` dump underneath would print the same thing twice.
           const isSwarm = e.name === 'AgentSwarm' && entry && Array.isArray(entry.swarmMembers);
+          // No diff for Write. A write REPLACES a file rather than editing a span of
+          // it, so the "before/after" the renderer would show is the whole old
+          // content against the whole new one — a new file turns into every line
+          // being an addition, and the result row fills the screen with `+` lines
+          // that say nothing about what the model did. The receipt line ("File
+          // written: … N bytes") already reports the outcome, and the Write row
+          // itself streams the content while it arrives.
           const resultMsg = normalizeMsg({
             role: 'tool_result', text: e.content, failed: failedRun,
-            diff: e.name === 'Write' ? (entry && entry.diff || []) : (entry && entry.diff),
+            diff: e.name === 'Write' ? undefined : (entry && entry.diff),
+            // `bodyOnToolRow`: the TOOL row already drew this result's body (a Write
+            // streams the file's content there), so the receipt below it must not
+            // open a second `↳` block. Without this flag the renderer could only
+            // guess, and it guessed wrong — a Write showed
+            //     ↳  1 line one
+            //     ↳ File written: a.txt (1372 bytes)
+            // with two markers for one body.
+            bodyOnToolRow: e.name === 'Write' && !!(entry && entry.streamContent),
             _conv: true,
-          });
+});
           if (entry && !isSwarm) {
             const at = state.chat.indexOf(entry);
             // Skip any rows already sitting between the call and the transcript
@@ -11238,7 +11806,7 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 
 
   const host = {
-    addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel,
+    addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel, openRegistryBrowser,
     sendPrompt: (text, opts) => { void runAgent(text, opts || {}); },
     quit: () => { state._quit = true; },
     saveSession: (s) => sess.saveSession(s),
@@ -11252,8 +11820,27 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     // that NONE of its four callers ever passed. That was harmless until /compact
     // started calling it, which threw "renderFrame is not a function". Reaching it
     // through `host` means a future caller cannot forget it again.
-    renderFrame,
+renderFrame,
   };
+
+  // Surface what the plugins did. `loadPlugins()` already ran (index.js, before the TUI
+  // existed) and collected its notices, including any load failure — which previously went
+  // only to stderr, invisible while the TUI owns the screen. A plugin that failed to load
+  // simply did not appear, with nothing explaining why.
+  void (async () => {
+    try {
+      const { takePluginNotices } = await import('./plugin.js');
+      const notes = takePluginNotices();
+      if (!notes.length) return;
+      const icon = { error: '✗', warn: '!', info: '•' };
+      for (const n of notes) {
+        // An error reuses the `aborted` role so it renders in the failure colour without
+        // needing a new role; info/warn are ordinary system lines.
+        addChat({ role: n.level === 'error' ? 'aborted' : 'system', text: `${icon[n.level] || '•'} plugin: ${n.text}` });
+      }
+      renderFrame();
+    } catch { /* notices are best-effort; never break startup */ }
+  })();
 
   // Appending streamed text can also add rows (the message wraps as it grows).
   // No arithmetic is needed here: renderChatLines() anchors the scrolled-up window
@@ -11446,6 +12033,9 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       failed: !!(m && m.failed),
     };
     if (m && Array.isArray(m.diff)) out.diff = m.diff;
+    // `bodyOnToolRow`: the tool row above already rendered this result's body, so the
+    // receipt must not open a second `↳` marker (see the tool_result branch).
+    if (m && m.bodyOnToolRow) out.bodyOnToolRow = true;
     // Keep `card`: a background-task lifecycle card carries its phase/headline/
     // detail here (see the `bg_task` renderer). Dropping it left the row with the
     // fallback text instead of what actually happened.
@@ -11602,7 +12192,7 @@ function quit() {
   let control = null;
   if (opts.control != null) {
     try {
-      control = await startControlServer({
+        control = await startControlServer({
         prompt: async (text) => { await submit(text); },
         status: async () => ({
           busy: !!(state.running),

@@ -321,7 +321,20 @@ function setScrollTop(v) {
 // every real height, so two rows can never overlap. Only rows inside the
 // window have DOM; the ranges above/below it are reserved by two padding divs,
 // sized from measured heights (PLACEHOLDER_H until a row is first mounted).
-const WIN_OVERSCAN = 8;
+//
+// The overscan is measured in PIXELS, not rows. A row-count overscan is unusable
+// here because row heights differ by an order of magnitude — a folded tool result is
+// ~180px, a plain system line ~20px — so "8 rows" could be 160px of slack in one
+// stretch of the transcript and 1400px in another. In the thin stretch a row was
+// unmounted while it was still on screen (the reported "gone before it left the
+// viewport"), because the padding divs then took its place and the content jumped.
+// Keeping one extra viewport above and below makes the window independent of how
+// tall the rows happen to be.
+const WIN_OVERSCAN_PX = 800;
+// The row-count floor that goes with it (see renderWindow): whichever reaches further
+// wins. Estimates cannot be trusted, so this is what actually guarantees a row is not
+// unmounted while it is still visible.
+const WIN_OVERSCAN_ROWS = 12;
 const NEAR_END_PX = 24;
 // TanStack Virtual's rule for estimateSize: "estimate the LARGEST possible
 // size (within comfort)". An underestimate makes the scroll range too short,
@@ -429,35 +442,66 @@ function renderWindow() {
     return;
   }
   const viewH = stream.clientHeight || 608;
+  // Overscan is expressed in BOTH pixels and rows, and whichever reaches FURTHER
+  // wins. Row heights differ by an order of magnitude (a folded tool result ~180px,
+  // a plain line ~20px), so a row count alone left almost no margin in a thin
+  // stretch and unmounted rows that were still on screen. A pixel budget alone is not
+  // enough either: an UNMEASURED row is priced at PLACEHOLDER_H, so walking 800px of
+  // estimates can cover far less than 800px of real content and the last rows fall
+  // outside the window. The row floor is the guarantee; the pixel budget trims the
+  // overshoot on tall rows.
+  const over = Math.max(WIN_OVERSCAN_PX, viewH);
+  const MIN_MARGIN_ROWS = WIN_OVERSCAN_ROWS;
   if (win.pinned) {
-    // Fixed-size tail window (by count, not by cumulative pixels): the tail
-    // rows are the newest, and a row-count window is exact regardless of how
-    // tall the measured rows are. PLACEHOLDER_H only prices the mounts into
-    // the two pads above/below the window; the pad math handles real heights.
-    const want = Math.ceil(viewH / PLACEHOLDER_H) + WIN_OVERSCAN;
+    // Pinned to the tail: grow upward until BOTH budgets are satisfied.
     win.end = rowItems.length;
-    win.start = Math.max(0, win.end - want);
+    let used = 0;
+    let start = win.end;
+    while (start > 0 && (used < viewH + over || win.end - start < MIN_MARGIN_ROWS)) {
+      start--;
+      used += knownHeight(start);
+    }
+    win.start = start;
   } else {
+    // Walk from the top accumulating heights until the scroll position is reached.
     let acc = 0;
     let first = rowItems.length - 1;
     for (let i = 0; i < rowItems.length; i++) {
-      if (acc >= stream.scrollTop) { first = i; break; }
+      if (acc + knownHeight(i) > stream.scrollTop) { first = i; break; }
       acc += knownHeight(i);
     }
-    const start = Math.max(0, first - WIN_OVERSCAN);
-    let end = start;
-    let used = 0;
-    while (end < rowItems.length && used < viewH + WIN_OVERSCAN * PLACEHOLDER_H) {
+    // Above the viewport: the pixel budget OR the row floor, whichever is further.
+    let start = first;
+    let above = 0;
+    while (start > 0 && (above < over || first - start < MIN_MARGIN_ROWS)) {
+      start--;
+      above += knownHeight(start);
+    }
+    // Below the viewport: same rule.
+    let end = first + 1;
+    let used = knownHeight(first);
+    while (end < rowItems.length && (used < viewH + over || end - first < MIN_MARGIN_ROWS)) {
       used += knownHeight(end);
       end++;
     }
     win.start = start;
-    win.end = Math.min(rowItems.length, end + WIN_OVERSCAN);
+    win.end = Math.min(rowItems.length, end);
   }
-  const same = win.start === win._lastStart && win.end === win._lastEnd;
+  const sameRange = win.start === win._lastStart && win.end === win._lastEnd;
   win._lastStart = win.start;
   win._lastEnd = win.end;
-  if (same) return;
+  // A height change does NOT need a different window — only different paddings. The
+  // pad sizes are recomputed below on every pass, so returning early here is safe.
+  // It used to be gated on `same` (start+end), which is why `_lastStart = -1` on
+  // every height change tore the whole window down and rebuilt it: each tool call
+  // changes a row's height, so the unmount/remount cycle re-created every visible
+  // row's DOM and the tool NAMES visibly flashed — not just the call that finished.
+  if (sameRange) {
+    win.topPad.style.height = heightAbove(win.start) + "px";
+    win.bottomPad.style.height = heightBelow(win.end) + "px";
+    if (win.pinned) setScrollTop(stream.scrollHeight);
+    return;
+  }
   for (const k of [...win.els.keys()]) {
     if (k < win.start || k >= win.end) unmountRow(k);
   }
@@ -886,14 +930,16 @@ function paintToolName(rec, name, pending, tick) {
 
   if (!pending) {
     unregisterSweep(rec);
-    if (rec.namePending !== false) {
-      box.replaceChildren(document.createTextNode(name));
-      rec.namePending = false;
-      rec.nameText = name;
-    } else if (box.textContent !== name) {
-      box.textContent = name;
-      rec.nameText = name;
-    }
+    // Leave the DOM alone when it already shows the plain name. `paintBody` rebuilds
+    // a row's children on every patch, so this node is normally FRESH (empty) and the
+    // branch below is what fills it; but when the name is unchanged the existing
+    // content is already correct, and rewriting it makes the name flicker on rows
+    // that finished long ago — the flash reported for "every tool name", not just the
+    // call that just ran.
+    if (rec.namePending === false && box.textContent === name) return;
+    box.replaceChildren(document.createTextNode(name));
+    rec.namePending = false;
+    rec.nameText = name;
     return;
   }
 
@@ -1053,31 +1099,38 @@ function paintResultRow(body, r) {
   const text = String(r.text == null ? '' : r.text);
   const diff = Array.isArray(r.diff) ? r.diff.filter((d) => d.type !== 'ctx') : [];
 
-if (diff.length) {
-    if (!expandedRows.has(r.id)) {
-      body.appendChild(el('res-fold', tr('mark.result')));
-      body.appendChild(expandButton(r.id, diff.length));
-      return;
-    }
-    const width = Math.max(1, ...diff.map((d) => String(d.no || 0).length));
-    diff.forEach((d, i) => {
+  if (diff.length) {
+    // Same shape as the folded result below: show the first diff rows with the `↳`
+    // on the first, and let the fold hint trail the block. The old form drew `↳` on
+    // a line by itself with the hint on the NEXT line and no diff content at all.
+    const rows = expandedRows.has(r.id) ? diff : diff.slice(0, DIFF_MAX_ROWS);
+    const width = Math.max(1, ...rows.map((d) => String(d.no || 0).length));
+    rows.forEach((d, i) => {
       const no = String(d.no || 0).padStart(width);
       const mark = d.type === 'add' ? '+' : '-';
       const prefix = i === 0 ? tr('mark.result') + ' ' : '  ';
       body.appendChild(el(d.type === 'add' ? 'diff-add' : 'diff-del',
         prefix + no + ' ' + mark + ' ' + String(d.text) + '\n'));
     });
+    const hiddenDiff = diff.length - rows.length;
+    if (hiddenDiff > 0) body.appendChild(moreButton(r.id, hiddenDiff));
     const receipt = text.trim()
       .split('\n').filter((ln) => !/^\[exit code:/.test(ln.trim())).join('\n')
       .trim();
     if (receipt) body.appendChild(el(failed ? 'diff-del' : 'res-more', receipt));
-    body.appendChild(collapseButton(r.id));
+    if (expandedRows.has(r.id) && diff.length > DIFF_MAX_ROWS) body.appendChild(collapseButton(r.id));
     return;
   }
-
-  // A finished result is FOLDED by default (12 lines, like the terminal's
-  // ctrl+o): a whole-file Read is thousands of DOM nodes in ONE row, which
-  // stutters scrolling. The "more" button expands it in place.
+  // A finished result is FOLDED (like the terminal's ctrl+o): a whole-file Read is
+  // thousands of DOM nodes in ONE row, which stutters scrolling. The preview keeps
+  // the FIRST lines visible with the `↳` marker on the first one, and the fold hint
+  // rides the END of the block — the terminal's shape:
+  //     ↳  1 first line of the output
+  //        2 second line
+  //        … (N more lines, expand)
+  // It used to render `↳` alone on one line and the hint on the NEXT, so a folded
+  // row showed a dangling marker and no output at all, and the hint read as a
+  // separate paragraph rather than as "there is more of THIS".
   // `[exit code: N]` is bookkeeping for the model, never shown to the user.
   const lines = text.replace(/\r\n/g, '\n').split('\n')
     .filter((ln) => !/^\[exit code:/.test(ln.trim()));
@@ -1085,12 +1138,8 @@ if (diff.length) {
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
   if (!lines.length) return;
 
-  if (!expandedRows.has(r.id)) {
-    body.appendChild(el('res-fold', tr('mark.result')));
-    body.appendChild(expandButton(r.id, lines.length));
-    return;
-  }
-  const shown = lines;
+  const folded = !expandedRows.has(r.id);
+  const shown = folded ? lines.slice(0, RESULT_MAX_LINES) : lines;
   shown.forEach((ln, i) => {
     const isErr = /^\[error:/.test(ln.trim());
     const prefix = i === 0 ? tr('mark.result') + ' ' : '  ';
@@ -1098,18 +1147,9 @@ if (diff.length) {
   });
   const hidden = lines.length - shown.length;
   if (hidden > 0) body.appendChild(moreButton(r.id, hidden));
-  body.appendChild(collapseButton(r.id));
+  if (expandedRows.has(r.id) && lines.length > RESULT_MAX_LINES) body.appendChild(collapseButton(r.id));
 }
 
-
-function expandButton(id, n) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'msg-more';
-  b.textContent = tr('tool.moreLines', { n: Number(n) || 0 });
-  b.addEventListener('click', () => { expandedRows.add(id); repaintRow(id); });
-  return b;
-}
 
 function moreButton(id, n) {
   const b = document.createElement('button');
@@ -1489,8 +1529,14 @@ function renderStatusLine(s) {
   const o = s.options || {};
 
   line.appendChild(popoverButton('sl-mode', modeLabel(s.mode), 'side.mode', () => modeItems(o)));
-  const badge = s.plan ? 'Plan' : s.focus ? 'Focus' : s.swarm ? 'Swarm' : '';
-  if (badge) line.appendChild(el('sl-badge', badge));
+  // One badge, one accent — Plan/Focus/Swarm are mutually exclusive, so exactly one
+  // of these is shown. The class carries the colour (see .sl-badge-* in app.css); the
+  // three must NOT share it, or the statusline cannot say which mode is on.
+  const badge = s.plan ? { text: 'Plan', cls: 'sl-badge-plan' }
+    : s.focus ? { text: 'Focus', cls: 'sl-badge-focus' }
+      : s.swarm ? { text: 'Swarm', cls: 'sl-badge-swarm' }
+        : null;
+  if (badge) line.appendChild(el('sl-badge ' + badge.cls, badge.text));
 
   if (s.model) {
     const label = s.model + (s.reasoning

@@ -19,8 +19,8 @@
 
   --teal:   #00b8db;
   --cyan:   #00d7ff;
-  --red:    #ff6b6b;
-  --green:  #5cff8f;
+  --red:    #cd3131;
+  --green:  #0dbc79;
 
   --mono: "JetBrains Mono", "Noto Sans SC", ui-monospace, SFMono-Regular,
           "SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -100,7 +100,7 @@ h1 .dim { color: var(--fg3); }
 
 .err {
   color: var(--red);
-  border: 1px solid rgba(255, 107, 107, .4);
+  border: 1px solid color-mix(in srgb, var(--red) 40%, transparent);
   border-radius: var(--radius);
   padding: 9px 12px;
   margin: 0 0 24px;

@@ -24,9 +24,14 @@
   --orange: #ff8c00;
   --branch: #ffdb6e;
   --shell:  #bd93f9;
-  --red:    #ff6b6b;
-  --green:  #5cff8f;
-  --yellow: #ffd93d;
+  /* Semantic colours. The TUI prints 16-COLOUR codes for these on the dark theme
+     (colors.js `C.red = ESC[91m` etc.), so it inherits whatever the user's terminal
+     defines; the web has no palette to inherit and must hardcode one. These are the
+     values the standard xterm/VSCode palette renders those codes as, so the two
+     front-ends agree instead of the web looking more saturated than the terminal. */
+  --red:    #cd3131;
+  --green:  #0dbc79;
+  --yellow: #e5e510;
 
   --on-accent: #08090b;
 
@@ -127,18 +132,18 @@ button { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 .pill-solid { background: var(--teal); color: var(--on-accent); border-color: var(--teal); }
-.pill-ok { color: var(--green); border-color: rgba(92, 255, 143, .4); }
-.pill-warn { color: var(--yellow); border-color: rgba(255, 217, 61, .4); }
-.pill-danger { color: var(--red); border-color: rgba(255, 107, 107, .4); }
-.pill-info { color: var(--teal); border-color: rgba(0, 184, 219, .4); }
+.pill-ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+.pill-warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 40%, transparent); }
+.pill-danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+.pill-info { color: var(--teal); border-color: color-mix(in srgb, var(--teal) 40%, transparent); }
 .pill-soft { background: var(--s3); border-color: transparent; color: var(--fg1); }
 
 .pill-sub { color: var(--fg2); }
 
 /* Stop is the one destructive control in the composer, so it reads as a warning
    rather than as another Send. */
-.btn.is-stop { border-color: rgba(255, 107, 107, .5); color: var(--red); }
-.btn.is-stop:hover { border-color: var(--red); color: var(--red); background: rgba(255, 107, 107, .1); }
+.btn.is-stop { border-color: color-mix(in srgb, var(--red) 50%, transparent); color: var(--red); }
+.btn.is-stop:hover { border-color: var(--red); color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
 
 
 .dot {
@@ -931,7 +936,15 @@ button { font: inherit; color: inherit; }
   border: 0;
   padding: 0;
 }
+/* Plan / Focus / Swarm are MUTUALLY EXCLUSIVE modes, so at most one badge is shown —
+   and each carries its OWN accent, matching src/tui.js:
+     Plan  -> cyan   |  Focus -> blue  |  Swarm -> spring (green-tinted cyan)
+   They used to collapse into one `--teal` badge, which made three different modes
+   look like the same state. */
 .sl-badge { color: var(--teal); font-weight: 600; flex: none; }
+.sl-badge-plan { color: var(--cyan); }
+.sl-badge-focus { color: var(--blue); }
+.sl-badge-swarm { color: var(--spring); }
 .sl-model {
   flex: none;
   color: var(--fg);

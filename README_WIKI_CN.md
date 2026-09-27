@@ -30,10 +30,12 @@ hncode 的完整文档 —— 一个运行在终端用户界面（TUI）里的 A
    - [注册钩子](#注册钩子)
    - [API 完整一览](#api-完整一览)
    - [容易踩的坑](#容易踩的坑)
-14. [开发者指南](#14-开发者指南)
-15. [故障排查](#15-故障排查)
-16. [致谢](#16-致谢)
-17. [许可证](#17-许可证)
+14. [技能（Skills）](#14-技能skills)
+15. [从仓库安装技能与插件](#15-从仓库安装技能与插件)
+16. [开发者指南](#16-开发者指南)
+17. [故障排查](#17-故障排查)
+18. [致谢](#18-致谢)
+19. [许可证](#19-许可证)
 
 ---
 
@@ -303,7 +305,8 @@ hncode -p "列出 TODO" --output-format stream-json
 | `/tasks` | 浏览后台任务。 |
 | `/mcp` | 显示 MCP 服务状态。 |
 | `/mcp-config` | 配置 MCP 服务（列出 / 添加 / 移除）。 |
-| `/plugins` | 列出已加载插件及其命令。 |
+| `/plugins` | 打开插件管理器：已加载、磁盘上的文件、以及仓库里可用的。`install <名字>` / `remove <名字>` 可跳过面板。 |
+| `/skills` | 打开技能管理器（已安装 + 可用）。`install <名字>` / `remove <名字>` 可跳过面板。 |
 | `/statusline` | 配置状态行显示哪些项目。 |
 | `/settings` | 打开设置菜单（模型 / 权限 / 状态行）。 |
 | `/copy` | 复制最后一条助手消息到剪贴板。 |
@@ -562,10 +565,174 @@ off();
   而不是 install 阶段。
 - **工具的 `execute` 必须返回字符串。** 这个字符串就是模型看到的内容。如果选择抛错，
   对话里会出现 `Error running <工具名>: …`。
+- **用 `api.log`，不要用 `console`。** TUI 独占屏幕，`console.log` 写在你看不到的
+  终端里。`api.log` 会把消息放进对话区。
+- **install() 里抛错的插件不会被加载。** 它的工具没有注册，所以会被报成失败、不出现在
+  `/plugins` 的 Loaded 里，而不是「列出来了但什么都没有」。
+
+### 向用户汇报
+
+用 `api.log` 而不是 `console`。TUI 独占屏幕，插件里的 `console.log` 写进的是一个
+hncode 运行期间你看不到的终端；`api.log` 会把消息放进对话区，也就是你正在看的地方：
+
+```javascript
+export function install(api) {
+  api.log.info('registered 3 tools');
+  api.log.warn('the legacy option is ignored');
+}
+```
+
+```
+ • plugin: loaded my-plugin v1.0.0
+ • plugin: registered 3 tools
+ ! plugin: the legacy option is ignored
+```
+
+hncode 自己的插件事件也走同一套 —— 加载成功、`install()` 抛错、文件里没有 `install()`
+导出，这三种都会在对话区显示，而不是只写到 stderr。`api.log` 同时镜像到终端，所以盯着
+stderr 的插件作者也能看到。
 
 ---
 
-## 14. 开发者指南
+## 14. 技能（Skills）
+
+**技能**是一段保存好的提示词片段 —— 一个 Markdown 文件，用名字激活。和插件不同，它不含
+任何代码，只是指令，所以不需要重启，也不可能搞坏运行时。
+
+```
+/skill:review-pr 顺便确认错误分支都覆盖到了
+```
+
+输入 `/skill:` 会弹出已安装技能的补全菜单。名字后面写的文字会追加到技能正文之后，作为
+提示词发出去 —— 技能定方法，你写的是具体的要求。
+
+### 激活技能时的显示
+
+对话区显示的是一张「激活卡片」，而不是你敲的斜杠命令：
+
+```
+▶ Activated skill: review-pr
+  顺便确认错误分支都覆盖到了
+```
+
+技能正文是作为 **system** 消息注入的，所以它能影响模型的行为，但永远不会显示成「你说的话」。
+有一个后果值得知道：只写 `/skill:名字` 不带文字时，**不会发送任何用户消息** —— 技能正文
+就是全部指令。想追问什么，就把文字写在名字后面。
+
+### 技能放在哪
+
+| 位置 | 作用范围 |
+|------|----------|
+| `~/.hncode/skills/<名字>.md` | 所有工作区。 |
+| `<工作区>/.hncode/skills/<名字>.md` | 仅当前工作区。 |
+
+文件名就是技能名：`review-pr.md` 用 `/skill:review-pr` 激活。
+
+可选的 YAML front-matter 用来提供名字和 `/skills` 里显示的描述：
+
+```markdown
+---
+name: review-pr
+description: 审查 PR，只找真正会发上线的 bug
+---
+
+读 diff，然后检查……
+```
+
+正文是结尾 `---` 之后的全部内容。front-matter 是可选的 —— 没有它时整个文件都是正文，
+名字取自文件名。
+
+### 管理技能
+
+| 命令 | 说明 |
+|------|------|
+| `/skills` | 打开技能管理器（见下一节）。 |
+| `/skills install <名字>` | 从仓库下载，不打开面板。 |
+| `/skills remove <名字>` | 删除本地副本。 |
+| `/import-skill <文件.md> [名字]` | 把磁盘上的 Markdown 文件复制进技能目录。 |
+
+```
+/skills            # 管理器
+/skills install root-cause
+/import-skill ./my-notes.md release-checklist
+```
+
+---
+
+## 15. 从仓库安装技能与插件
+
+hncode 的 npm 包里**不含**任何技能和插件。它们是按需从项目仓库拉取的，这样安装包很小，
+而且更新一个技能不需要发版。
+
+仓库里每个条目一个目录：
+
+```
+skills/<名字>/SKILL.md      ->  ~/.hncode/skills/<名字>.md
+plugins/<名字>/index.js     ->  ~/.hncode/plugins/<名字>/index.js
+```
+
+### 管理器
+
+`/skills` 和 `/plugins`（不带参数，或加 `list`）会打开一个全屏管理器：
+
+```
+────────────────────────────────────────────────────────────────
+ Plugins
+ Tab switch · ↑↓ select · Enter install/remove · Esc close
+
+ [Loaded (1)]  On disk (2)   Available (3)
+
+ ❯ my-plugin/                     restart
+     not loaded — restart hncode to load it
+   secret-guard                   installed
+     Catch credentials before they are written
+
+ Enter removes the local copy of my-plugin
+────────────────────────────────────────────────────────────────
+```
+
+- **Tab** 切页；**↑/↓** 移动；**Enter** 安装或删除；**Esc** 关闭；**r** 重新拉取。
+- 每行都带**描述**，所以你知道装的是什么。
+- 插件的三个分页含义不同，所以需要三个：
+  - **Loaded** —— 本次会话已加载的插件。
+  - **On disk** —— `~/.hncode/plugins` 里的文件，不管加载没加载。在这里但不在 Loaded 的
+    条目需要**重启**。
+  - **Available** —— 仓库里提供的，若本地已有会标 `installed`。
+- 技能只有两个分页：**Installed** 和 **Available**。
+
+覆盖安装是被允许的，会报告为「更新」—— 这就是升级方式。
+
+### 各个按钮做什么
+
+| 操作 | 效果 |
+|------|------|
+| 安装（技能） | 下载 `skills/<名字>/SKILL.md` 到 `~/.hncode/skills/<名字>.md`。立刻可用。 |
+| 安装（插件） | 下载 `plugins/<名字>/*` 到 `~/.hncode/plugins/<名字>/`。**需要重启才加载。** |
+| 删除 | 删除本地副本。正在运行的插件要重启才真正卸载。 |
+
+### 注意事项
+
+- **列表是实时拉取的**，不缓存 —— 五分钟前刚合并的技能，下次打开就能看到。拉取失败时
+  只有 **Available** 分页会提示；本地分页照常工作，因为它们读的是文件系统。
+- 插件只下载可加载的文件类型（`.js`、`.mjs`、`.cjs`、`.json`、`.md`），所以插件目录里
+  混的图片不会落到你的插件目录里。
+- 技能目录**必须**包含 `SKILL.md`。没有的话会被标成无法安装，而不是生成一个没内容的技能。
+- 安装前会校验名字：含 `/`、`\` 或以 `.` 开头的一律拒绝。
+- 用 `HNCODE_REPO` / `HNCODE_REPO_REF` 指向 fork（默认 `NiceHello666/hncode` @ `main`）。
+- **关于 GitHub 限流**：列表走的是未认证的 GitHub API，每个 IP 每小时 60 次。打开一次
+  `/skills` 会消耗 1 次列目录 + 每个技能 1 次（读描述），所以技能很多时会触发限流 ——
+  面板会说明，本地分页照常可用。
+
+### 贡献一个
+
+加 `skills/<你的技能>/SKILL.md` 或 `plugins/<你的插件>/index.js`，然后提 PR。目录名就是
+安装名，所以请用普通单词。完整约定见各目录下的 `README.md`。
+
+这些文件**不会**发布到 npm —— `package.json` 的白名单里只有 `bin/`、`src/` 和顶层文档。
+
+---
+
+## 16. 开发者指南
 
 ### 项目结构
 
@@ -603,7 +770,7 @@ src/
 
 ---
 
-## 15. 故障排查
+## 17. 故障排查
 
 | 现象 | 可能原因 / 处理 |
 |------|----------------|
@@ -613,11 +780,14 @@ src/
 | 粘贴很慢 | 首次粘贴后应约为 10ms（剪贴板助手已预热）。首次极慢是 PowerShell 冷启动所致。 |
 | `Edit rejected: you have not read the lines…` | 先 `Read` 文件（相关行），再 `Edit`。 |
 | 上下文计量接近 100% | 运行 `/compact`，或等 85% 时自动压缩触发。 |
-| 自己写的插件没加载 | 原因打在 **stderr** 上，不在对话里 —— TUI 占着整个屏幕。启动 hncode 再退出，读终端输出。一个文件一个插件，且名字必须唯一。 |
+| 自己写的插件没加载 | 现在原因会出现在**对话区**（`✗ plugin: …`），同时仍写到 stderr。名字必须唯一；目录式插件需要有 `index.js`。 |
+| `/plugins` 提示列表拉取失败 | GitHub 不可达，或触发了未认证 API 的限流（每小时 60 次）。**Loaded** 和 **On disk** 不受影响，它们读的是文件系统。 |
+| 装好的插件在 **On disk** 但不在 **Loaded** | 插件只在启动时加载，重启 hncode。 |
+| `/skills install` 报没有 `SKILL.md` | 仓库里那个条目有问题：每个技能目录都必须包含 `SKILL.md`。 |
 
 ---
 
-## 16. 致谢
+## 18. 致谢
 
 hncode 建立在这几个开源项目的理念之上：
 
@@ -627,7 +797,7 @@ hncode 建立在这几个开源项目的理念之上：
 
 ---
 
-## 17. 许可证
+## 19. 许可证
 
 [PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE)。
 

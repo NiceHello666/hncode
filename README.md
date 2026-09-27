@@ -16,7 +16,8 @@ A cyan-blue terminal user interface (TUI) coding agent inspired by [Kimi Code](h
 - **Prompt Caching**: Explicit cache breakpoints for the stable prefix (`/cache`)
 - **MCP-style Toolbelt**: Read, Write, Edit, Bash, Glob, Grep, TodoList, WebSearch, etc.
 - **MCP Client**: Connect real Model Context Protocol servers (stdio + HTTP) and use their tools
-- **Skills**: Package reusable prompts as Markdown (`/import-skill`, `/skill:<name>` with tab-completion)
+- **Skills**: Package reusable prompts as Markdown (`/import-skill`, `/skill:<name>` with tab-completion, plus a manager that installs them from the repo)
+- **Skills & plugins manager**: `/skills` and `/plugins` browse what is installed *and* what the repo offers, with descriptions, and install/remove in place
 - **Shell Hooks**: Run your own commands at lifecycle events (`PreToolUse`, `PostToolUse`, …)
 - **Git Workflow**: `/git`, `/commit`, `/branch`, `/worktree`, `/pr` plus a `Git` tool for the agent
 - **Plan Review**: Review what a plan will touch, edit it, then approve before any file changes

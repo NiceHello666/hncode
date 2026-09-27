@@ -30,10 +30,12 @@ Complete documentation for hncode — an AI coding agent that runs as a terminal
    - [Registering a hook](#registering-a-hook)
    - [The full API surface](#the-full-api-surface)
    - [Things that trip people up](#things-that-trip-people-up)
-14. [For developers](#14-for-developers)
-15. [Troubleshooting](#15-troubleshooting)
-16. [Acknowledgments](#16-acknowledgments)
-17. [License](#17-license)
+14. [Skills](#14-skills)
+15. [Installing skills and plugins from the repo](#15-installing-skills-and-plugins-from-the-repo)
+16. [For developers](#16-for-developers)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Acknowledgments](#18-acknowledgments)
+19. [License](#19-license)
 
 ---
 
@@ -203,6 +205,9 @@ Every value below **overrides** its `config.toml` counterpart — handy for CI o
 | `HNCODE_CONFIG` | Path to an alternate config file (used by `doctor config`). |
 | `HNCODE_SESSIONS_DIR` | Alternate directory for saved sessions. |
 | `HNCODE_PLUGINS` | Alternate plugin directory. |
+| `HNCODE_SKILLS_DIR` | Alternate skill directory. |
+| `HNCODE_REPO` | Repository for `/skills install` and `/plugins install` (`owner/name`, default `NiceHello666/hncode`). |
+| `HNCODE_REPO_REF` | Branch or tag to pull from (default `main`). |
 
 ---
 
@@ -302,7 +307,8 @@ Type `/` in the composer to open the command menu; **Tab** completes, **Enter** 
 | `/tasks` | Browse background tasks. |
 | `/mcp` | Show MCP server status. |
 | `/mcp-config` | Configure MCP servers (list / add / remove). |
-| `/plugins` | List loaded plugins and their commands. |
+| `/plugins` | Open the plugin manager: loaded plugins, files on disk, and what the repo offers. `install <name>` / `remove <name>` skip the panel. |
+| `/skills` | Open the skill manager (installed + available). `install <name>` / `remove <name>` skip the panel. |
 | `/statusline` | Configure which items appear in the status line. |
 | `/settings` | Open the settings menu (model / permission / statusline). |
 | `/copy` | Copy the last assistant message to the clipboard. |
@@ -368,6 +374,9 @@ The model can call these built-in tools. Each returns a string; failures are sho
 | `ReadMediaFile` | Read an image/media file. |
 | `FileLines` | Count (or inspect) the lines of a file. |
 | `AskUserQuestion` | Ask the user 1-4 multiple-choice questions mid-turn and wait for the answer. Every question also gets a free-text "Other" option, plus an optional notes row after the last one. If the user presses Esc the turn continues with no answer. |
+
+Plugins can register more. A plugin installed from the repo does not register its tools
+until the next start — see [Installing skills and plugins](#15-installing-skills-and-plugins-from-the-repo).
 
 ### The Edit safety model
 
@@ -545,6 +554,7 @@ always wins.
 | `api.registerConfig(defaults)` | fn | Merge default config values. |
 | `api.ctx` | getter | The live agent context. Only meaningful inside a hook. |
 | `api.tools` / `api.commands` / `api.hooks` / `api.config` / `api.plugins` | getter | Copies, for introspection. |
+| `api.log` | obj | Report to the **chat**: `info`, `warn`, `error`, plus a `log` alias. |
 
 All three `register*` functions return a function that undoes the registration, so a
 plugin can unload itself:
@@ -555,20 +565,199 @@ const off = api.registerTool({ /* … */ });
 off();
 ```
 
+### Reporting to the user
+
+Use `api.log`, not `console`. The TUI owns the screen, so a `console.log` from a plugin
+is written to a terminal the user cannot see while hncode is running. `api.log` puts the
+message in the transcript, where they are already looking:
+
+```javascript
+export function install(api) {
+  api.log.info('registered 3 tools');
+  api.log.warn('the legacy option is ignored');
+}
+```
+
+```
+ • plugin: loaded my-plugin v1.0.0
+ • plugin: registered 3 tools
+ ! plugin: the legacy option is ignored
+```
+
+hncode reports its own plugin events the same way — a successful load, a plugin whose
+`install()` threw, and a file with no `install()` export all appear as lines in the chat,
+instead of only going to stderr. `api.log` still mirrors to the terminal, so a plugin
+author watching stderr sees it too.
+
 ### Things that trip people up
 
 - **Names must be unique across all plugins.** Registering `Echo` twice throws; two
   plugins cannot both claim the same tool or command name.
 - **Plugins load once, at startup.** Editing a plugin file needs a restart.
   `/reload` reloads `config.toml`, not plugin code.
+- **Use `api.log`, not `console`.** See above — the console is invisible while the TUI
+  runs.
 - **`api.ctx` is null outside a hook.** It is injected when the agent runs, so read it
   inside a hook callback rather than at install time.
 - **A tool's `execute` must return a string.** That string is what the model sees.
   Throw instead, and the transcript shows `Error running <tool>: …`.
+- **A plugin that throws during `install()` is NOT loaded.** Its tools never register, so
+  it is reported as a failure and left out of `/plugins`, rather than being listed as
+  loaded with nothing behind it.
 
 ---
 
-## 14. For developers
+## 14. Skills
+
+A **skill** is a saved prompt fragment — a Markdown file you activate by name. Unlike a
+plugin it contains no code: it is instructions, so it needs no restart and cannot break
+the runtime.
+
+```
+/skill:review-pr make sure the error paths are covered
+```
+
+Typing `/skill:` opens a completion menu of installed skills. Whatever follows the name
+is appended to the skill body and sent as the prompt, so the skill sets the approach and
+your text is the specific ask.
+
+### Activating a skill
+
+The transcript shows an activation card, not your slash command:
+
+```
+▶ Activated skill: review-pr
+  make sure the error paths are covered
+```
+
+The skill body is injected as a **system** message, so it shapes the model's behaviour
+without ever appearing as something you said. One consequence worth knowing: a bare
+`/skill:name` with no text sends **no user message at all** — the skill body is the whole
+instruction. If you want to ask something specific, type it after the name.
+
+### Where skills live
+
+| Location | Scope |
+|----------|-------|
+| `~/.hncode/skills/<name>.md` | Every workspace. |
+| `<workspace>/.hncode/skills/<name>.md` | This workspace only. |
+
+The file name is the skill name: `review-pr.md` is activated as `/skill:review-pr`.
+
+Optional YAML front-matter supplies the name and the description shown in `/skills`:
+
+```markdown
+---
+name: review-pr
+description: Review a pull request for the bugs that actually ship
+---
+
+Read the diff, then check…
+```
+
+The body is everything after the closing `---`. Front-matter is optional — without it the
+whole file is the body and the name comes from the file name.
+
+### Managing skills
+
+| Command | Description |
+|---------|-------------|
+| `/skills` | Open the skill manager (see the next section). |
+| `/skills install <name>` | Download one from the repo, without opening the panel. |
+| `/skills remove <name>` | Delete the local copy. |
+| `/import-skill <file.md> [name]` | Copy a Markdown file from disk into the skills directory. |
+
+```
+/skills            # the manager
+/skills install root-cause
+/import-skill ./my-notes.md release-checklist
+```
+
+---
+
+## 15. Installing skills and plugins from the repo
+
+hncode ships **no** skills or plugins in the npm package. They are fetched on demand from
+the project repository, which keeps the installed package small and lets a skill be
+updated without a release.
+
+The repository holds one directory per item:
+
+```
+skills/<name>/SKILL.md      ->  ~/.hncode/skills/<name>.md
+plugins/<name>/index.js     ->  ~/.hncode/plugins/<name>/index.js
+```
+
+### The manager
+
+`/skills` and `/plugins` (bare, or with `list`) open a full-screen manager:
+
+```
+────────────────────────────────────────────────────────────────
+ Plugins
+ Tab switch · ↑↓ select · Enter install/remove · Esc close
+
+ [Loaded (1)]  On disk (2)   Available (3)
+
+ ❯ my-plugin/                     restart
+     not loaded — restart hncode to load it
+   secret-guard                   installed
+     Catch credentials before they are written
+
+ Enter removes the local copy of my-plugin
+────────────────────────────────────────────────────────────────
+```
+
+- **Tab** switches tabs; **↑/↓** move; **Enter** installs or removes; **Esc** closes;
+  **r** refetches.
+- Every row carries a **description** so you can tell what you are installing.
+- The tabs mean different things, which is why there are three for plugins:
+  - **Loaded** — plugins running in this session.
+  - **On disk** — files in `~/.hncode/plugins`, loaded or not. An entry here that is not
+    in Loaded needs a **restart**.
+  - **Available** — what the repo offers, badged `installed` when you already have it.
+- Skills have two tabs: **Installed** and **Available**.
+
+Installing over an existing entry is allowed and reported as an *update* — that is how you
+pick up a newer version.
+
+### What the buttons do
+
+| Action | Effect |
+|--------|--------|
+| Install (skill) | Downloads `skills/<name>/SKILL.md` to `~/.hncode/skills/<name>.md`. Usable immediately. |
+| Install (plugin) | Downloads `plugins/<name>/*` to `~/.hncode/plugins/<name>/`. **Restart to load.** |
+| Remove | Deletes the local copy. A running plugin stays loaded until you restart. |
+
+### Notes
+
+- **The list is fetched live**, with no cache, so a skill merged five minutes ago appears
+  on the next open. If the fetch fails, only the **Available** tab says so — the local
+  tabs keep working, because they read the filesystem.
+- Only loadable files are downloaded for a plugin (`.js`, `.mjs`, `.cjs`, `.json`, `.md`),
+  so a stray asset in a plugin directory cannot land in your plugin folder.
+- A skill directory **must** contain `SKILL.md`. Without it the entry is listed as
+  uninstallable rather than producing a nameless skill.
+- Installing verifies the name first: anything with `/`, `\`, or a leading `.` is refused.
+- Set `HNCODE_REPO` / `HNCODE_REPO_REF` to point at a fork (defaults:
+  `NiceHello666/hncode` @ `main`).
+- **On GitHub rate limits**: the listing uses the unauthenticated GitHub API, which allows
+  60 requests/hour per IP. Opening `/skills` costs one request plus one per skill (to read
+  each description), so a very large repo can hit the limit — the panel then says so and
+  the local tabs keep working.
+
+### Contributing one
+
+Add `skills/<your-skill>/SKILL.md` or `plugins/<your-plugin>/index.js` and open a PR. The
+directory name becomes the install name, so keep it to plain words. See the `README.md` in
+each directory for the full convention.
+
+These files are **not** published to npm — `package.json` whitelists only `bin/`, `src/`
+and the top-level docs.
+
+---
+
+## 16. For developers
 
 ### Project layout
 
@@ -606,7 +795,7 @@ There is no test runner wired up; keep `node --check <file>` clean and exercise 
 
 ---
 
-## 15. Troubleshooting
+## 17. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
@@ -616,12 +805,14 @@ There is no test runner wired up; keep `node --check <file>` clean and exercise 
 | Paste feels slow | It should be ~10 ms after the first paste (the clipboard helper is pre-warmed). A very slow first paste is the PowerShell cold start. |
 | `Edit rejected: you have not read the lines…` | `Read` the file (the relevant lines) first, then `Edit`. |
 | Context gauge near 100% | Run `/compact`, or let auto-compaction trigger at 85%. |
-| Context gauge near 100% | Run `/compact`, or let auto-compaction trigger at 85%. |
-| A plugin I wrote does not load | The reason is on **stderr**, not in the chat — the TUI owns the screen. Run hncode, quit, and read the terminal output. One file per plugin, and the name must be unique. |
+| A plugin I wrote does not load | The reason is on **stderr**, not in the chat — the TUI owns the screen. Run hncode, quit, and read the terminal output. The name must be unique, and a directory plugin needs an `index.js`. |
+| `/plugins` says the list could not be fetched | GitHub was unreachable, or you hit the unauthenticated API rate limit (60/hour). The **Loaded** and **On disk** tabs are unaffected — they read the filesystem. |
+| An installed plugin is in **On disk** but not **Loaded** | Plugins load at startup only. Restart hncode. |
+| `/skills install` says there is no `SKILL.md` | The repo entry is malformed: every skill directory must contain `SKILL.md`. |
 
 ---
 
-## 16. Acknowledgments
+## 18. Acknowledgments
 
 hncode is built on the ideas of several open-source projects:
 
@@ -631,7 +822,7 @@ hncode is built on the ideas of several open-source projects:
 
 ---
 
-## 17. License
+## 19. License
 
 [PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE).
 
