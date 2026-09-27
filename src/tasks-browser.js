@@ -136,20 +136,47 @@ export function renderTasksBrowser(state, cols, rows) {
 
   const key = (s) => C.cyan + C.bold + s + C.reset;
   const dim = (s) => C.gray + s + C.reset;
+  // The footer doubles as a TOOLBAR: each `KEY label` pair is clickable, so the
+  // whole pair is recorded as one span. `cursor` tracks the column so the spans stay
+  // correct as the parts are concatenated by `join('  ')`.
+  const footerHits = [];
   let footer;
   if (state.pendingStop) {
-    footer = fitExactly(' ' + C.orange + C.bold + 'Stop' + C.reset + ' ' + C.white + state.pendingStop + C.reset + '? '
-      + key('Y') + ' ' + dim('confirm') + '  ' + key('N') + dim('/') + key('esc') + ' ' + dim('cancel') + ' ', cols);
+    // The confirm prompt is a toolbar too: Y / N / Esc each do something, so each
+    // gets a clickable span. `c` tracks the column so the spans land exactly on the
+    // rendered words — the original drew `N/esc cancel` as one run, so the two keys
+    // share the single "cancel" label and are measured as one span.
+    const prefix = ' ' + C.orange + C.bold + 'Stop' + C.reset + ' ' + C.white + state.pendingStop + C.reset + '? ';
+    let c = visWidth(prefix);
+    const yPart = key('Y') + ' ' + dim('confirm');
+    footerHits.push({ keyWord: 'Y', label: 'confirm', action: 'confirmStop', col0: c, col1: c + visWidth(yPart) - 1 });
+    c += visWidth(yPart) + 2;
+    const nPart = key('N') + dim('/') + key('esc') + ' ' + dim('cancel');
+    footerHits.push({ keyWord: 'N/esc', label: 'cancel', action: 'cancelStop', col0: c, col1: c + visWidth(nPart) - 1 });
+    footer = fitExactly(prefix + yPart + '  ' + nPart + ' ', cols);
   } else {
-    const parts = [
-      ' ' + key('\u2191\u2193') + ' ' + dim('select'),
-      key('Enter/O') + ' ' + dim('output'),
-      key('S') + ' ' + dim('stop'),
-      key('R') + ' ' + dim('refresh'),
-      key('Tab') + ' ' + dim('filter'),
-      key('Q/Esc') + ' ' + dim('close') + ' ',
+    const specs = [
+      ['\u2191\u2193', 'select', 'select'],
+      ['Enter/O', 'output', 'openOutput'],
+      ['S', 'stop', 'requestStop'],
+      ['R', 'refresh', 'refresh'],
+      ['Tab', 'filter', 'toggleFilter'],
+      ['Q/Esc', 'close', 'close'],
     ];
-    const left = parts.join('  ');
+    const parts = [];
+    let cursor = 1;
+    for (const [kw, label, action] of specs) {
+      const piece = key(kw) + ' ' + dim(label);
+      const w = visWidth(piece);
+      // `col1` is the LAST included column (hitboxes use an inclusive range, see
+      // hitAt), so a piece starting at `cursor` spanning `w` cells ends at
+      // `cursor + w - 1`. Using `cursor + w` made the span one column too wide, so a
+      // hover tinted the following space as well.
+      footerHits.push({ keyWord: kw, label, action, col0: cursor, col1: cursor + w - 1 });
+      cursor += w + 2;             // the `parts.join('  ')` separator
+      parts.push(piece);
+    }
+    const left = ' ' + parts.join('  ');
     const flash = state.flash ? C.orange + ' ' + state.flash + ' ' + C.reset : '';
     const total = visWidth(left) + visWidth(flash);
     footer = total <= cols ? left + ' '.repeat(cols - total) + flash : fitExactly(left, cols);
@@ -168,7 +195,11 @@ export function renderTasksBrowser(state, cols, rows) {
   } else {
     listLines = visible.map((t, i) => {
       const selected = i === state.selectedIndex;
-      const ptr = selected ? C.cyan + '\u276f ' + C.reset : '  ';
+      // Hover highlight, mirroring the rest of the TUI: the row under the pointer is
+      // tinted by the generic hover pass in tui.js (composeFrame), which needs a
+      // hitbox to aim at — those are recorded in state._taskHits below.
+      const hot = state.hoverIndex === i;
+      const ptr = selected ? C.cyan + '\u276f ' + C.reset : (hot ? C.hover + '\u276f ' + C.reset : '  ');
       const idCol = t.kind === 'agent' ? C.green : t.kind === 'question' ? C.orange : C.blue;
       const idText = selected ? idCol + C.bold + t.taskId + C.reset : idCol + t.taskId + C.reset;
       const pad = ' '.repeat(Math.max(0, 20 - visWidth(t.taskId)));
@@ -179,6 +210,18 @@ export function renderTasksBrowser(state, cols, rows) {
       const desc = singleLine(t.description) || singleLine(t.command) || '(no description)';
       return fitExactly(prefix + ' ' + C.white + truncateToWidth(desc, budget) + C.reset, listInnerW);
     });
+  }
+  // Click targets. Coordinates are FRAME cells: line 0 is the header, line 1 is the
+  // list box's TOP RULE, so the first content row is line 2 — using `1 + i` put the
+  // hitboxes one row high, which highlighted the border instead of the task and made
+  // a click select the wrong row. Columns match the box interior (`│` + 1 cell of
+  // padding), and `col1` is the LAST included column.
+  state._taskHits = [];
+  for (let i = 0; i < Math.min(visible.length, listInnerH); i++) {
+    state._taskHits.push({ row: 2 + i, col0: 1, col1: listInnerW, kind: 'taskRow', index: i });
+  }
+  for (const h of footerHits) {
+    state._taskHits.push({ row: rows - 1, col0: h.col0, col1: h.col1, kind: 'taskFooter', action: h.action });
   }
   while (listLines.length < listInnerH) listLines.push('');
   const listFrame = renderFrame('Tasks [' + state.filter + ']', listLines.slice(0, listInnerH), listW, bodyH);

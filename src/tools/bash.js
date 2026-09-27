@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import cp from 'node:child_process';
 import { resolvePath, truncateBuf } from './utils.js';
 import { createTask, appendTaskOutput, settleTask } from '../agent-task.js';
+import { shellSpawnArgs } from './shell.js';
 
 // kimi-code's timeout policy (agent-core-v2/agent/tools/os/bash/bash.ts).
 export const DEFAULT_TIMEOUT_S = 60;
@@ -137,10 +138,19 @@ export const spec = {
     const cap = bg ? MAX_BACKGROUND_TIMEOUT_S : MAX_TIMEOUT_S;
     const def = bg ? DEFAULT_BACKGROUND_TIMEOUT_S : DEFAULT_TIMEOUT_S;
     const timeoutMs = args.disable_timeout ? undefined : Math.min(args.timeout ?? def, cap) * 1000;
-    const command = args.command;
+const command = args.command;
     // stdin is 'ignore' (NUL / /dev/null): leaving it as an open pipe made any
     // command that reads stdin (`cat`, `npm init`, …) block until the timeout.
-    const child = cp.spawn('pwsh', ['-Command', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    //
+    // The shell is RESOLVED, not hardcoded: `spawn('pwsh', …)` failed outright on a
+    // box with only the built-in Windows PowerShell (see tools/shell.js). `env` is
+    // passed explicitly rather than relying on Node's implicit inheritance, which is
+    // what made the tool depend on pwsh having been added to PATH by hand.
+    let shell;
+    try { shell = shellSpawnArgs(command); } catch (e) { return `Error: ${e.message}`; }
+    const child = cp.spawn(shell.bin, shell.args, {
+      cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+    });
 
     const chunks = [];
     let settled = false;
@@ -288,7 +298,11 @@ function spawnBackground(args, cwd, ctx) {
   // task's output file instead, so the process survives and TaskOutput can
   // still read it. (In the TUI the parent rarely exits, but headless -p mode
   // does, and a background job should outlive the prompt.)
-  const child = cp.spawn('pwsh', ['-Command', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+let shell;
+  try { shell = shellSpawnArgs(command); } catch (e) { return `Error: ${e.message}`; }
+  const child = cp.spawn(shell.bin, shell.args, {
+    cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+  });
   const task = createTask(ctx, 'process', {
     description: args.description || args.command,
     command: args.command,
