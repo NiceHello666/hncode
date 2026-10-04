@@ -18,31 +18,68 @@ import fs from 'node:fs';
 import os from 'node:os';
 import cp from 'node:child_process';
 import {
-  C, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, THEME_NAMES, lerpColor,
+  C, TRUECOLOR, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, THEME_NAMES, THEME_LABELS, isLightTheme, hasTheme, lerpColor, bgRgb,
 } from './colors.js';
-import { copyText, readText, warmClipboard, readClipboardContentAsync } from './clipboard.js';
-import { visualWidth, estimateTokens, estimateMessagesTokens, expandTabs } from './term.js';
-import { Agent, SYSTEM_PROMPT } from './agent.js';
+import { copyText, readText, warmClipboard, readClipboardContentAsync, cleanupPastedImages } from './clipboard.js';
+import { visualWidth, estimateTokens, estimateMessagesTokens, estimateMessageTokens, messageTokens, expandTabs } from './term.js';
+// The picker is composited onto the frame as a cell layer rather than assigned over
+// it (see src/cell-buffer.js), so the transcript BESIDE the card survives.
+import { parseCells, renderCells, drawFrameBuffer } from './cell-buffer.js';
+// Streaming text is paced through a backlog so a coalescing provider (Anthropic) looks
+// as smooth as a token-level one (OpenAI); see src/stream-buffer.js.
+import { StreamBuffer, StreamOp } from './stream-buffer.js';
+// What the terminal can actually do, ASKED rather than guessed (synchronized output,
+// the Kitty keyboard protocol, a readable theme for the detected background).
+import { probeTerminal, terminalCaps, syncOutputUsable, kittyKeysUsable, isLightBg, stripProbeReplies } from './term-caps.js';
+// Makes "the terminal has that frame" observable, so the geometry consumers stop assuming
+// it. See src/flush-tick.js.
+import { noteTerminalFlush, getTerminalFlushTick } from './flush-tick.js';
+import { forkOf } from './fork.js';
+// Rendered rows live in a shared, bounded store rather than on the message objects.
+// See src/row-cache.js for why the bound is by USE, not by position, and why the key
+// is content: a key that missed one layout input would serve rows drawn for a
+// different frame, which is a mis-drawn screen rather than a stale cache.
+import { makeRowKey, rowCacheGet, rowCacheSet } from './row-cache.js';
+import { renderContextBar, segmentCaption } from './context-bar.js';
+import { runDoctor, formatDoctor } from './doctor.js';
+import { loadKeybindings, resolveKey, describeKeybindings, readOrEmpty, writeKeybindings, normalizeKey } from './keybindings.js';
+import { describeRuns, listRuns, sendToRun, interruptRun, interruptAll, closeRun } from './subagent-control.js';
+import { buildTree, visibleRows, allDirs, renderTree, moveSel } from './file-tree.js';
+import { walkFiles } from './tools/ignore.js';
+
+
+import { Agent, SYSTEM_PROMPT, addUsage } from './agent.js';
 import { LLM } from './llm.js';
 import * as sess from './session.js';
 import { convRowFor } from './session.js';
-import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, effortOptions, effortWire, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, setConfigBool, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor, readMemory, readMemoryRaw, writeMemoryRaw, memoryFile, ensureWebToken, effectiveSnapshot } from './config.js';
-import { pluginCommands } from './plugin.js';
+import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, upsertModel, replaceProviderModels, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, effortOptions, effortWire, effortsFromReasoning, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, setConfigBool, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor, readMemory, readMemoryRaw, writeMemoryRaw, memoryFile, ensureWebToken, effectiveSnapshot, costFromCatalog, modelCost, usageCost } from './config.js';
+import { pluginCommands, renderWidgets, runHooks, runPatch, runPatchSync, runKeybindsSync, pluginKeybinds } from './plugin.js';
 import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
 import { getTool, toolNames } from './tools/index.js';
-import { decideFromRules, describeRules } from './permissions.js';
+import { decideFromRules, describeRules, selfTestRules, describeSelfTest } from './permissions.js';
+import { isDestructiveCommand as shellIsDestructiveCommand, isReadOnlyCommand as shellIsReadOnlyCommand } from './shell-safety.js';
+import { usdRate, syncRate, convert, normalizeCurrency, SUPPORTED_CURRENCIES } from './fx.js';
+import { approvalKey, sessionApprovalLabel, isApprovedForSession, rememberApproval, describeSessionApprovals } from './session-approvals.js';
+import { listStyles, findStyle, styleReminder, writeStyleTemplate, styleDirs, nameFromFile } from './output-styles.js';
+import { EXPERIMENTS, experimentState, enabledExperiments, mergeExperiments, pruneUnknown, describeExperiments, isExperiment } from './experiments.js';
+import { forkMessages, SideThread, recapMessages, digestStats, SIDE_RO_TOOLS, SIDE_TOOL_REFUSAL, sideToolAllowed } from './side-thread.js';
+import { listSchedules, dueSchedules, markRun, describeSchedules, validateEntry, dueWithHistory, readHistory as readScheduleHistory, writeHistory as writeScheduleHistory } from './schedule.js';
+import { packSession, serializeTeleport, parseTeleport, unpackInto, teleportFileName, describeTeleport } from './teleport.js';
+import { buildSteps, renderStep, replaySummary, stateAtStep } from './rollout.js';
+import { renderBtwPanel, btwPanelHeight } from './btw-panel.js';
 import { SessionHub } from './session-hub.js';
 import { startWebServer } from './web.js';
 import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
+import { renderRegistryBrowser, handleRegistryBrowserKey } from './registry-browser.js';
 import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
 import { renderSwarmProgress } from './swarm-progress.js';
 import { sortedTasks, getTask, settleTask, STATUS_LABEL, backgroundTaskCard } from './agent-task.js';
 import { localVersion } from './version.js';
 import { listSkills, readSkill, importSkill, deleteSkill, skillPrompt, skillCompletions, normalizeSkillName, SKILL_PREFIX, skillsDir } from './skills.js';
 import { loadHooks, describeHooks, runShellHooks, HOOK_EVENTS } from './hooks.js';
-import { beginTurn, rewind as rewindFiles, describeRewind } from './file-history.js';
+import { beginTurn, rewind as rewindFiles, describeRewind, listCheckpoints, restoreCheckpoint, describeCheckpoints, checkpointDelta } from './file-history.js';
 import { trimToolResults } from './tool-result.js';
 import * as gitmod from './git.js';
 import { reviewLines, savePlan, filesReferenced, planStats, listPlans, plansDir } from './plan.js';
@@ -52,6 +89,64 @@ import { attachToDaemon } from './web-daemon-client.js';
 
 const ESC = '\x1b';
 const VERSION = localVersion();
+
+// Well-known base URLs for catalog providers that do not publish an `api` field
+// (notably the first-party anthropic / openai entries in models.dev — they are
+// addressed by SDK, not by URL). Keyed by models.dev provider id.
+const CATALOG_DEFAULT_URLS = {
+  anthropic: 'https://api.anthropic.com/v1',
+  openai: 'https://api.openai.com/v1',
+  google: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  'google-vertex': 'https://aiplatform.googleapis.com/v1',
+  groq: 'https://api.groq.com/openai/v1',
+  mistral: 'https://api.mistral.ai/v1',
+  deepseek: 'https://api.deepseek.com/v1',
+  xai: 'https://api.x.ai/v1',
+  openrouter: 'https://openrouter.ai/api/v1',
+  together: 'https://api.together.xyz/v1',
+  cerebras: 'https://api.cerebras.ai/v1',
+  perplexity: 'https://api.perplexity.ai/v1',
+  deepinfra: 'https://api.deepinfra.com/v1/openai',
+};
+function catalogDefaultUrl(id) {
+  return CATALOG_DEFAULT_URLS[String(id || '').toLowerCase()] || '';
+}
+
+// The Type field's label <-> the wire protocol. Three protocols: chat/completions
+// ("OpenAI Compatible" — dozens of non-OpenAI vendors implement it), the Responses
+// API ("OpenAI Responses"), and Anthropic ("Anthropic"). The label list lives in
+// ONE place so the form, its default, and the keyboard cycle cannot drift.
+const PROTOCOL_TYPES = ['OpenAI Compatible', 'OpenAI Responses', 'Anthropic'];
+function typeToProtocol(type) {
+  const t = String(type || '').toLowerCase();
+  if (t === 'anthropic') return 'anthropic';
+  if (t.includes('responses')) return 'responses';
+  return 'openai';
+}
+function protocolToType(protocol) {
+  if (protocol === 'anthropic') return 'Anthropic';
+  if (protocol === 'responses') return 'OpenAI Responses';
+  return 'OpenAI Compatible';
+}
+
+function cfgCnyPerUsd(cfg) {
+  const raw = cfg && ((cfg.raw && cfg.raw.cny_per_usd) ?? cfg.cnyPerUsd);
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+// A model entry's pricing fields, ready to spread into `cfg.raw.models[key]`.
+// config.js owns the TOML key names; this keeps the in-memory shape and the
+// written shape from drifting apart.
+function costEntry(cost) {
+  if (!cost) return {};
+  return {
+    cost_input: cost.input,
+    cost_output: cost.output,
+    cost_cache_read: cost.cacheRead,
+    cost_cache_write: cost.cacheWrite,
+  };
+}
 
 // ---- Slash command registry ----
 // Mirrors kimi-code-cli's BUILTIN_SLASH_COMMANDS (registry.ts): name, aliases,
@@ -69,29 +164,53 @@ export const COMMANDS = [
   { name: 'auto', desc: 'Auto mode: never interrupts you; everything runs and is decided automatically.', priority: 99 },
   { name: 'ask', aliases: ['manual'], desc: 'Ask mode: read-only runs automatically; every other action asks first.', priority: 99 },
   { name: 'model', desc: 'Switch LLM model', priority: 100 },
-  { name: 'effort', aliases: ['thinking'], desc: 'Switch thinking effort', priority: 95, argumentHint: '[off|on|high|medium|low]' },
+  // The argument hint is a PLACEHOLDER, not the level list: the real levels come
+  // from the current model (models.dev), so they are completed live by
+  // setArgCompletionProvider rather than hardcoded here.
+  { name: 'effort', aliases: ['thinking'], desc: 'Switch thinking effort', priority: 95, argumentHint: '[level]' },
   { name: 'provider', aliases: ['providers'], desc: 'Manage AI providers (add / delete)', priority: 95 },
   { name: 'help', aliases: ['h', '?'], desc: 'Show available commands and shortcuts', priority: 80 },
   { name: 'new', aliases: ['clear'], desc: 'Start a fresh session in the current workspace', priority: 80 },
   { name: 'sessions', aliases: ['resume'], desc: 'Browse and resume sessions', priority: 80 },
+  { name: 'all-sessions', desc: 'Browse sessions from EVERY workspace', priority: 79 },
   { name: 'tasks', aliases: ['task'], desc: 'Browse background tasks (full-screen panel)', priority: 80 },
   { name: 'swarm', desc: 'Toggle swarm mode: decompose work across parallel subagents', priority: 80, argumentHint: '[on|off]' },
   { name: 'swarm-sub-agent', aliases: ['sub-agent-model'], desc: 'Choose the model subagents run on (default = this session\u2019s model)', priority: 79, argumentHint: '[model|default]' },
   { name: 'compact', desc: 'Compact the conversation context (AI summary + keep last 20%)', priority: 80, argumentHint: '[ratio]' },
-  { name: 'goal', aliases: ['objective'], desc: 'Start or manage an autonomous goal', priority: 80, argumentHint: '[status|pause|resume|cancel] | <objective>' },
+  { name: 'goal', aliases: ['objective'], desc: 'Start or manage an autonomous goal', priority: 80, argumentHint: '[status|pause|resume|cancel|replace <text>] | <objective>' },
   { name: 'init', desc: 'Generate or update AGENTS.md from the codebase', priority: 70, argumentHint: '[instructions]' },
   { name: 'fork', desc: 'Fork the current session into a copy without switching to it', priority: 80 },
   { name: 'undo', desc: 'Withdraw the last prompt: transcript + files it changed', priority: 80, argumentHint: '[count]' },
-  { name: 'trim', desc: 'Trim old tool results now, down to the keep ratio (manual)', priority: 40, argumentHint: '[0.3]' },
+  { name: 'trim', desc: 'Trim old tool results now, down to the keep ratio (manual)', priority: 40, argumentHint: '[keep-ratio]' },
   { name: 'auto-trim', aliases: ['autotrim'], desc: 'Auto tool-result trimming: toggle, or set the trigger/keep ratios', priority: 40, argumentHint: '[on|off | threshold <n> | keep <n>]' },
   { name: 'title', aliases: ['rename'], desc: 'Set or show session title (also sets window title)', priority: 60, argumentHint: '<title>' },
   { name: 'status', desc: 'Show current session and runtime status', priority: 60 },
-  { name: 'usage', desc: 'Show session tokens + context window', priority: 60 },
+  { name: 'doctor', desc: 'Diagnose the environment: config, store, MCP, hooks, terminal', priority: 60, argumentHint: '[--all]' },
+  { name: 'usage', desc: 'Show real token totals (provider-reported) + context window', priority: 60 },
+  { name: 'cost', desc: 'Show what this session has spent, in USD or CNY', priority: 60, argumentHint: '[usd|cny]' },
   { name: 'context', aliases: ['ctx'], desc: 'Break down what fills the context window', priority: 60 },
+  { name: 'raw', desc: 'Show assistant replies verbatim: no Markdown, no wrapping', priority:50, argumentHint: '[on|off]' },
+  { name: 'reduced-motion', desc: 'Replace all animation with a slow-breathing indicator', priority: 50, argumentHint: '[on|off]' },
+  { name: 'shimmer-edge', desc: 'Sweep edge: cosine (soft both sides) or linear (hard leading edge)', priority: 40, argumentHint: '[cosine|linear]' },
+  { name: 'output-style', aliases: ['style'], desc: 'Apply an output style loaded from ~/.hncode/output-styles/*.md', priority: 50, argumentHint: '[name | off | new <name> | edit]' },
+  { name: 'experiments', desc: 'List or toggle unfinished features', priority: 50, argumentHint: '[name on|off]' },
+  { name: 'btw', aliases: ['aside'], desc: 'Ask a question in a side thread that does not enter the conversation', priority: 55, argumentHint: '[question]' },
+  { name: 'recap', desc: 'Say where this session got to, without changing it', priority: 55 },
+  { name: 'secondary-model', aliases: ['small-model'], desc: 'Pick the model used for side questions and recaps', priority: 45, argumentHint: '[model | off]' },
+  { name: 'replay', aliases: ['rollout'], desc: 'Step back through this session: what the model saw at each step', priority: 45, argumentHint: '[step | next | prev | last]' },
+  { name: 'schedule', desc: 'Recurring prompts queued on a running session', priority: 45, argumentHint: '[list | run <id>]' },
+  { name: 'teleport', desc: 'Export or import this session for another machine or checkout', priority: 45, argumentHint: '[export [path] | import <file>]' },
   { name: 'search', aliases: ['grep'], desc: 'Search the project and insert the hit into the composer', priority: 60, argumentHint: '[query]' },
-  { name: 'mcp', desc: 'Show MCP server status', priority: 60 },
-  { name: 'mcp-config', desc: 'Configure MCP servers (list / add / remove)', priority: 60 },
+  { name: 'mcp', desc: 'Show MCP server status', priority: 60, argumentHint: '[tools]' },
+  { name: 'mcp-config', desc: 'Manage MCP servers (interactive, or list / add / remove)', priority: 60, argumentHint: '[list] | add <name> <command|url> [args…] | remove <name>' },
   { name: 'statusline', desc: 'Configure which items appear in the status line', priority: 60 },
+  { name: 'theme', desc: 'Switch the colour theme', priority: 60, argumentHint: `[${THEME_NAMES.join('|')}]` },
+  { name: 'keybindings', aliases: ['keys'], desc: 'Remap a key to another key or to a slash command', priority: 55, argumentHint: '[list | add <key> <key|/command> | remove <key> | edit]' },
+  { name: 'agents', aliases: ['subagents'], desc: 'List running subagents, and message, interrupt or close them', priority: 55, argumentHint: '[list | message <id> <text> | interrupt [id|all] | close <id>]' },
+  { name: 'files', aliases: ['tree'], desc: 'Browse the workspace as a tree; Enter inserts the path', priority: 60, argumentHint: '[path-filter]' },
+  { name: 'checkpoints', aliases: ['cp'], desc: 'List per-file checkpoints and restore one file on its own', priority: 55, argumentHint: '[list | restore <n> | diff <n>]' },
+  { name: 'save-history', desc: 'Keep the display-only transcript (notices, warnings, compaction, plan cards, reasoning) in the saved session', priority: 60, argumentHint: '[on|off|thinking|nothinking]' },
+  { name: 'save-history', desc: 'Keep the display-only transcript (notices, warnings, compaction, plan cards, reasoning) in the saved session', priority: 60, argumentHint: '[on|off|thinking|nothinking]' },
   
   { name: 'export-md', aliases: ['export'], desc: 'Export current session as a Markdown file', priority: 40, argumentHint: '[output-path]' },
   { name: 'import-session', aliases: ['import'], desc: 'Attach a Markdown file to the prompt so the AI reads it without a tool call', priority: 40, argumentHint: '<file.md>' },
@@ -104,18 +223,19 @@ export const COMMANDS = [
   { name: 'calm-mode', desc: 'Terse replies: stop the model narrating what it will do and why unless asked', priority: 60, argumentHint: '[on|off]' },
   { name: 'add-dir', desc: 'Add or list an additional workspace directory', priority: 60, argumentHint: '[list] | <path>' },
   { name: 'move', desc: 'Move current session to another directory (must exist)', priority: 60, argumentHint: '<path>' },
-  { name: 'reload', desc: 'Reload config.toml settings', priority: 60 },
-  { name: 'plugins', desc: 'List loaded plugins and their status', priority: 60 },
-  { name: 'skills', desc: 'List installed skills, or remove one', priority: 60, argumentHint: '[remove <name>]' },
+  { name: 'reload', desc: 'Reload config and plugins without restart', priority: 60 },
+  { name: 'reload-config', desc: 'Reload config.toml settings only', priority: 60 },
+  { name: 'plugins', desc: 'Open the plugin manager (installed + available in the repo)', priority: 60, argumentHint: '[install <name> | remove <name> | reload]' },
+  { name: 'skills', desc: 'Open the skill manager (installed + available in the repo)', priority: 60, argumentHint: '[install <name> | remove <name>]' },
   { name: 'import-skill', desc: 'Import a Markdown file as a skill (a duplicate name is overwritten)', priority: 60, argumentHint: '<file.md> [name]' },
   { name: 'hooks', desc: 'Show configured shell hooks, or test one', priority: 60, argumentHint: '[list | test <event>]' },
   { name: 'git', desc: 'Show repository status (branch, changes, remote)', priority: 62 },
   { name: 'commit', desc: 'Stage and commit with a message (or let the agent draft one)', priority: 62, argumentHint: '[message]' },
   { name: 'branch', desc: 'List, create, or switch git branches', priority: 62, argumentHint: '[list | <name> | -c <name>]' },
-  { name: 'worktree', desc: 'List, add, or remove git worktrees for parallel work', priority: 60, argumentHint: '[list | add <dir> [branch] | remove <dir>]' },
+  { name: 'worktree', desc: 'List, create, or remove git worktrees for parallel work', priority: 60, argumentHint: '[list | new [name] [--branch] | add <dir> [branch] | remove <dir>]' },
   { name: 'pr', desc: 'Show the URL to open a pull request for the current branch', priority: 60, argumentHint: '[base]' },
   { name: 'add', aliases: ['stage'], desc: 'Stage changes (all by default, or given paths)', priority: 62, argumentHint: '[<path> ...]' },
-  { name: 'diff', desc: 'Show uncommitted changes', priority: 62, argumentHint: '[--staged] [<path>]' },
+  { name: 'diff', desc: 'Show uncommitted changes', priority: 62, argumentHint: '[--staged|--cached] [<path>]' },
   { name: 'log', desc: 'Show recent commits', priority: 62, argumentHint: '[count] [<path>]' },
   { name: 'push', desc: 'Push the current branch (asks first)', priority: 62, argumentHint: '[branch] [-f]' },
   { name: 'stash', desc: 'Stash changes: list / push / pop', priority: 60, argumentHint: '[list | push [msg] | pop]' },
@@ -151,7 +271,7 @@ export const QUICK_COMMANDS = [
 // loaded before the TUI starts, so this reflects any registered commands.
 function allCommands() {
   return [...COMMANDS, ...pluginCommands.map((c) => ({
-    name: c.name, description: c.description, aliases: c.aliases,
+    name: c.name, description: c.description, desc: c.description, aliases: c.aliases,
     argumentHint: c.argumentHint, priority: c.priority || 50,
     _plugin: true, run: c.run,
   }))].sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.name.localeCompare(b.name));
@@ -204,9 +324,9 @@ export const PLAN_MODE_INSTRUCTION =
   + '- The write tools (Write, Edit, Bash, ...) are NOT available. Investigate with\n'
   + '  the read-only tools you do have, then produce a PLAN.\n'
   + '- Do NOT try to make the changes. Your job this turn is the plan, not the code.\n'
-  + '- End your reply with the plan wrapped in <plan> and </plan> tags, on their own\n'
-  + '  lines. Everything between them is shown to the user verbatim and is what they\n'
-  + '  approve. Only the LAST such block is used.\n'
+  + '- End your reply with the plan wrapped in <|plan|> and </|plan|> tags, on their\n'
+  + '  own lines. Everything between them is shown to the user verbatim and is what\n'
+  + '  they approve. Only the LAST such block is used.\n'
   + '- Inside the block, use short Markdown: a heading per step, and bullets for the\n'
   + '  files to touch and why. Be concrete enough that the plan can be executed as\n'
   + '  written — name files, functions and commands.\n'
@@ -215,13 +335,13 @@ export const PLAN_MODE_INSTRUCTION =
   + '  the plan must stand on its own.\n'
   + '\n'
   + 'Example shape:\n'
-  + '<plan>\n'
+  + '<|plan|>\n'
   + '## Add the /personal command\n'
   + '- `src/config.js`: add readPersonalPrompt() merging global + project files.\n'
   + '- `src/tui.js`: register /personal, inject the text each turn.\n'
   + '## Verify\n'
   + '- Write a temp workspace, check both scopes merge in order.\n'
-  + '</plan>';
+  + '</|plan|>';
 
 // Sent back to the model once the user approves a plan. Plan mode is off by then,
 // so it has the write tools; this frames the approved text as an instruction
@@ -232,125 +352,266 @@ export const PLAN_EXECUTE_PREFIX =
   + 'for approval; if a step turns out to be impossible, do the rest and report\n'
   + 'plainly what you could not do.\n\n';
 
-// Pull the LAST <plan>…</plan> block out of an assistant reply. Returns null when
+// The plan block's delimiters. Pipe-delimited on purpose: `<plan>` is a bare word in
+// angle brackets, so a reply that merely mentions the word "plan" in prose — or shows
+// HTML — could match it, and a tag the model writes inside a code fence is
+// indistinguishable from one that delimits the block. The extra bars make an accidental
+// match effectively impossible while staying plain text in every model's output.
+export const PLAN_OPEN_TAG = '<|plan|>';
+export const PLAN_CLOSE_TAG = '</|plan|>';
+
+// Pull the LAST <|plan|>…</|plan|> block out of an assistant reply. Returns null when
 // there is none, so callers can tell "no plan offered" from "empty plan".
 export function extractPlan(text) {
   const s = String(text || '');
-  const open = /<plan>\s*/gi;
+  const open = /<\|plan\|>\s*/gi;
   let match = null, m;
   while ((m = open.exec(s)) !== null) match = m;
   if (!match) return null;
   const start = match.index + match[0].length;
-  const close = s.indexOf('</plan>', start);
-  const body = (close === -1 ? s.slice(start) : s.slice(start, close)).trim();
+  // The CLOSE is matched case-insensitively too: a model that capitalises the opening
+  // tag capitalises the closing one, and a case-sensitive search for the close then
+  // runs past it to the end of the reply — so the whole tail, closing tag included,
+  // became the "plan".
+  const close = /<\/\|plan\|>/i.exec(s.slice(start));
+  const body = (close ? s.slice(start, start + close.index) : s.slice(start)).trim();
   return body || null;
 }
 
 export const TIPS = [
-  'Press Esc to interrupt the current turn at any time',
-  '!git status runs a shell command directly — no model round-trip',
-  '/init generates an AGENTS.md from your codebase for smarter agent context',
-  'Use /mcp to manage MCP servers for additional tool integration',
-  'The context line shows real-time token usage — watch it grow as the agent works',
-  '/goal starts an autonomous objective — hncode will work until done or blocked',
-  'Paste multiline content — hncode collapses it into a [paste #N +L lines] token',
-  '/usage shows detailed token, steps, and context statistics for the session',
-  'Ctrl+C aborts the current turn and returns you to the prompt',
-  'The spinner on the left cycles through status messages while the agent works',
-  '/model opens a picker — Tab switches between providers and models',
-  '/provider lets you add, remove, or switch AI providers',
-  'Tool calls show their arguments streaming live — no need to wait for completion',
-  '/think lets you add reasoning/thinking instructions inline',
-  'The todo list updates live as the agent makes progress on tasks',
-  '/focus mode gives the agent Read, Write, Edit, and Bash in your workspace',
-  'System messages appear in green — they are instructions, not conversation',
-  'Queued messages wait for the current turn to finish',
-  '/steer injects a message directly into the running turn',
+  // Kept short on purpose: a tip shares the status line with the model, cwd, git
+  // badge and tokens, and `justify()` TRUNCATES it when the two sides do not fit.
+  // A tip long enough to be cut mid-word ("Old tool results are elided from the
+  // request at 50% of the wi…") reads as a rendering bug, so every entry below
+  // states ONE idea and stays under ~60 visual columns.
+  'Press Esc to interrupt the current turn',
+  '!git status runs a shell command directly',
+  '/init writes an AGENTS.md from your codebase',
+  'Use /mcp to manage MCP servers',
+  'The context line shows live token usage',
+  '/goal starts a self-driving objective',
+  'Paste multiline content — it becomes one token',
+  '/usage shows token and context statistics',
+  'Ctrl+C aborts the current turn',
+  'The spinner cycles status messages while working',
+  '/model opens a picker — Tab switches providers',
+  '/provider lets you add or switch AI providers',
+  'Tool calls stream their arguments live',
+  '/think adds inline reasoning instructions',
+  'The todo list updates live as the agent progresses',
+  '/focus gives the agent Read, Write, Edit, and Bash',
+  'System messages are green — instructions, not chat',
+  'Queued messages wait for the turn to finish',
+  '/steer injects a message into the running turn',
   'Ctrl+R reloads the current session from disk',
   '/help shows available commands at any time',
-  '/undo rolls the transcript AND the files back to before your last prompt',
-  '/fork copies the current session so you can explore a branch without losing the original',
-  '/sessions lists every saved conversation in this workspace',
-  '/title sets a human-readable name for the current session',
-  '/compact [ratio] AI-summarizes older history and keeps the most recent 20%',
-  '/tasks lists background Bash jobs started with run_in_background',
-  '/status prints the current model, provider, endpoint, and session id',
-  '/statusline toggles which items appear in the bottom status bar',
-  '/memory shows or edits the notes the agent saved for future sessions',
-  '/personal edits your own standing preferences, injected into every prompt',
-  '/permissions shows or edits standing allow/ask/deny rules for tools',
-  '/external toggles access to paths outside the workspace (persisted)',
-  '/web serves this session to a browser — token-protected, /web off to stop',
-  '/add-dir grants the agent access to another directory for this session',
-  '/add-dir grants the agent access to another directory for this session',
-  '/reload re-reads config.toml without restarting hncode',
-  '/plugins lists the plugins loaded from ~/.hncode/plugins',
-  '/logout clears the stored API key for a provider',
+  '/undo rolls back the transcript AND the files',
+  '/fork copies the session so you can branch',
+  '/sessions lists saved conversations here',
+  '/all-sessions lists them from every workspace',
+  '/title names the current session',
+  '/compact [ratio] summarizes older history',
+  '/tasks lists background Bash jobs',
+  '/status prints model, provider, endpoint',
+  '/statusline toggles the bottom status bar items',
+  '/memory shows or edits notes for later sessions',
+  '/personal edits your standing preferences',
+  '/permissions shows allow/ask/deny rules for tools',
+  '/external toggles access outside the workspace',
+  '/web serves this session to a browser',
+  '/add-dir grants access to another directory',
+  '/reload re-reads config.toml without restarting',
+  '/skills install <name> pulls one from the repo',
+  '/logout clears the stored API key',
   '/version prints the hncode version string',
-  '/feedback <title> | <body> opens a prefilled GitHub issue in your browser',
-  '/copy puts the last assistant message on your system clipboard',
-  '/export-md writes the whole session to a Markdown file on disk',
-  '/import-session attaches a Markdown file to the next prompt without a Read call',
-  '/new starts a fresh conversation in the current workspace',
-  '/goal pause temporarily stops an autonomous objective',
-  '/goal resume continues a paused autonomous objective',
-  '/plan on turns every tool read-only so you can sketch without side effects',
-  '/focus on gives the agent only Read, Write, Edit, and Bash',
+  '/feedback opens a prefilled GitHub issue',
+  '/copy puts the last answer on the clipboard',
+  '/export-md writes the session to a Markdown file',
+  '/import-session attaches a Markdown file',
+  '/new starts a fresh conversation',
+  '/goal pause pauses the objective',
+  '/goal resume resumes the objective',
+  '/plan on makes every tool read-only',
+  '/focus on gives the agent Write tools and Bash',
   '/permission opens the picker for Ask / Yolo / Auto',
   '/settings opens the combined settings menu',
-  '/yolo auto-approves anything inside the workspace — risky paths still ask',
-  '/auto never interrupts you; everything runs and is decided automatically',
-  'Shift+Arrow selects text in the composer; Backspace or Delete removes it',
-  'Shift+Enter inserts a newline without sending the message',
+  '/yolo auto-approves anything inside the workspace',
+  '/auto never interrupts you; everything runs',
+  '/usage shows the real token totals, not an estimate',
+  '/cost [usd|cny] shows what this session has spent',
+  'The session cost appears in the status row once prices are known',
+  'Shift+Arrow selects text in the composer',
+  'Shift+Enter inserts a newline without sending',
   'Ctrl+T expands or collapses the todo panel',
-  'Ctrl+O expands or collapses tool output, thinking blocks and Edit diffs',
-  'Ctrl+B moves a long-running foreground Bash command to the background',
-  'Ctrl+Shift+V pastes the clipboard as a bracketed paste',
-  'Ctrl+Shift+C copies the mouse selection, or the last answer',
-  'Cmd/Ctrl+L clears the visible screen but keeps the session state',
-  '↑ in an empty composer recalls the newest queued message for editing',
-  '↑/↓ in an empty composer walks through your input history',
-  'PgUp / PgDn scroll the transcript without touching the composer',
-  'Mouse-wheel scrolling over the composer moves the transcript, not the caret',
-  'Drag the scrollbar thumb on the right edge to jump through the transcript',
-  'Double-click a transcript row to select the whole line for copying',
-  'Right-click a transcript row to open the copy / paste context menu',
-  'Esc closes any open picker, form, panel, or command menu',
-  'Esc during a running turn aborts the in-flight model request',
-  'Ctrl+C once asks for confirmation; Ctrl+C twice exits hncode',
-  'Ctrl+C with a dialog open closes the dialog instead of the app',
-  'The `/` menu filters as you type — keep typing to narrow the list',
-  'Enter on a `/` menu item runs the highlighted command',
-  'Tab on a `/` menu item completes the command name into the composer',
-  'The context gauge turns red as you approach the model context limit',
-  'Auto-compaction triggers at 85% of the model context, keeping ~20% of the usage (set with /auto-compact threshold|keep)',
-  'Old tool results are elided from the request at 50% of the window, keeping ~30% of them — the removed text stays on disk (/auto-trim to tune, /trim to do it now)',
-  '/compact with no argument keeps the newest 20% of the current usage and summarizes the rest',
-  'Tool results longer than the visible window collapse — Ctrl+O expands them',
-  'A red bullet next to a tool call means the command exited non-zero',
-  'A green bullet next to a tool call means it finished successfully',
-  'The `[turn took …]` line at the end of a turn shows the wall-clock duration',
-  '/provider add walks you through picking a known provider from models.dev',
-  '/model shows categories per provider — Tab cycles between them',
-  'Typing `/` at any time opens the command palette above the composer'
+  'Ctrl+P opens the command palette',
+  'Ctrl+O expands tool output and Edit diffs',
+  'Ctrl+B backgrounds a running Bash command',
+  'Ctrl+Shift+V pastes as a bracketed paste',
+  'Ctrl+Shift+C copies the selection or last answer',
+  'Ctrl+L expands or collapses the plugin load log',
+  'Ctrl+Up / Ctrl+Down scroll the AI output area',
+  '↑ recalls the newest queued message',
+  '↑/↓ walks through your input history',
+  'PgUp / PgDn scroll the transcript',
+  'Mouse-wheel over the composer scrolls the chat',
+  'Drag the right-edge scrollbar to jump',
+  'Double-click a row to select the whole line',
+  'Right-click a row for the copy / paste menu',
+  'Esc closes any open picker, form, or menu',
+  'Esc aborts the in-flight model request',
+  'Ctrl+C twice exits hncode',
+  'Ctrl+C with a dialog open closes the dialog',
+  'The `/` menu filters as you type',
+  'Enter on a `/` item runs it',
+  'Tab on a `/` item completes its name',
+  'The context gauge turns red near the limit',
+  'Auto-compaction triggers at 85% of the context',
+  'Old tool results are elided at 50% of the window',
+  '/compact summarizes older history, keeping 20%',
+  'Long tool results collapse — Ctrl+O expands them',
+  'A red bullet means the command exited non-zero',
+  'A green bullet means the tool succeeded',
+  'The `[turn took …]` line shows the turn duration',
+  '/provider add picks a provider from models.dev',
+  '/model groups models by provider — Tab cycles',
+  'Typing `/` opens the command palette'
 ];
 
 // Layout constants (kimi-code-cli style: no top chrome; the chat fills to the
 // top, and the bottom stack is: input box (bottom) / menu / status line /
 // context line — the context line is the very last row of the screen).
-const CTX_H = 1;                 // context line (screen bottom row)
-const STATUS_H = 1;              // status line (above context)
+// Below the composer, top to bottom: status line, the context bar, then the notice/tip
+// row. `CTX_H` covers the last TWO of those: the bar and the row under it.
+const CTX_H = 2;                 // context bar + the notice/tip row beneath it
+const STATUS_H = 1;              // status line (above the context bar)
 const INPUT_BASE_H = 3;          // input box: top border + input line + bottom border
 const MAX_MENU = 6;              // menu rows shown (matches the ~6 you see)
 const MAX_PICKER = 12;            // max picker list rows shown at once
+// How many of the MOST RECENT messages keep their wrapped-row cache. The cache
+// makes a re-render cheap, but it holds a full copy of the message's rows and used
+// to live forever (see the eviction in renderChatLines): 8000 messages held 42000
+// cached rows (~20 MB of heap) and only grew. Keeping the tail covers everything
+// the viewport shows; older messages re-render on demand when scrolled back to,
+// which costs one layout pass instead of permanent memory.
+const CACHE_KEEP = 300;
 const TIP_INTERVAL = 15000;
 // Braille spinner frames for the "Working" indicator (orange).
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// The REDUCED-MOTION spinner: a single dot that breathes on a slow cycle, rather
+// than a rotating glyph. Claude Code does this (`REDUCED_MOTION_CYCLE_MS = 2000`,
+// "1s visible, 1s dim") and the reasoning is worth keeping: a fully static glyph
+// reads as "hung", so the slow brightness change is what says "still working"
+// without any motion. Two seconds is slow enough not to draw the eye.
+const REDUCED_MOTION_DOT = '●';
+const REDUCED_MOTION_CYCLE_MS = 2000;
 // Stand-in for the LIVE spinner glyph inside a CACHED row. A pending thinking
 // block must not be re-wrapped by the 80ms spin tick (see renderChatLines), so
 // its preview is cached with this sentinel and the real frame is substituted in
 // afterwards. It occupies 0 columns, so the swap never disturbs the layout.
 const SPIN_PLACEHOLDER = '\u0000';
+
+/** Is reduced motion on for this session? Read from config, or the env override. */
+export function reducedMotionOn(state) {
+  if (!state) return false;
+  if (state.reducedMotion !== undefined) return !!state.reducedMotion;
+  const env = process.env.HNCODE_REDUCED_MOTION;
+  if (env !== undefined) return /^(1|true|yes|on)$/i.test(env);
+  return !!(state.cfg && state.cfg.reducedMotion);
+}
+
+/**
+ * The frames a SPINNER-style animation shows: { glyph, dim }.
+ *
+ * In normal mode the glyph rotates and is never dim. In reduced motion the glyph is
+ * a constant dot whose brightness flips once per second — the same 2-second cycle
+ * Claude uses. Returning both pieces means every caller (the Working row, a pending
+ * tool, a thinking preview) gets the same treatment from one place.
+ */
+export function spinnerFrame(state, tick) {
+  if (reducedMotionOn(state)) {
+    const t = tick !== undefined ? tick : (state && state.spin) || 0;
+    return { glyph: REDUCED_MOTION_DOT, dim: Math.floor(t / (REDUCED_MOTION_CYCLE_MS / 80)) % 2 === 1 };
+  }
+  const n = SPINNER.length;
+  const i = ((tick !== undefined ? tick : (state && state.spin) || 0) % n + n) % n;
+  return { glyph: SPINNER[i], dim: false };
+}
+
+/**
+ * A sweep that SETTLES: a character the band has passed stays at 1.
+ *
+ * This is the shape the Working row's colour phase needs, and the two previous
+ * attempts both got it wrong by reusing a travelling PULSE:
+ *
+ *   * the original `(head - charAt) / BAND` ramps DOWN as the head passes, so a
+ *     character lit up and then went DARK again — the phrase never became orange;
+ *   * the cosine `0.5 * (1 + cos(PI * d / half))` is a bell centred on the band, so
+ *     every character dimmed again once the band left it. Measured over one colour
+ *     phase it animated `[ ] -> [ :#@#: ] -> [ :#] -> [ ]`: a light sweeping across
+ *     and leaving nothing behind.
+ *
+ * The convention that fixes it, stated once here:
+ *
+ *   `dist >= 0`          the band is past this character -> 1 (settled)
+ *   `-half < dist < 0`   the band is on it -> ramp 0 -> 1
+ *   `dist <= -half`      not reached yet -> 0
+ *
+ * `dist` is `head - position`, so a LARGER `dist` means "further behind the head".
+ * `edge` shapes only the transition band:
+ *   `cosine` — a raised cosine, so both ends of the ramp are gentle;
+ *   `linear` — a straight ramp, sharpest at the settle point.
+ */
+export function sweepSettle(dist, half, edge = 'cosine') {
+  const h = Math.max(1e-6, half);
+  if (dist >= 0) return 1;              // passed: stays lit
+  if (dist <= -h) return 0;             // not yet reached
+  const x = (dist + h) / h;             // 0 at the far edge, 1 at the settle point
+  return edge === 'linear' ? x : 0.5 * (1 - Math.cos(Math.PI * x));
+}
+
+// ---------------------------------------------------------------------------
+// Sweep parameters — ONE set of numbers for every animated row
+// ---------------------------------------------------------------------------
+// The parameter that decides whether a sweep reads as a GRADIENT or as a SNAP is
+// frames-per-character: how many 80ms ticks a character spends crossing the band.
+//
+//     framesPerChar = BAND * ticks / travel        (BAND = bandChars / n)
+//
+// With the old `travel = 1 + 2*BAND` this approached `ticks / 2` as the band grew, so
+// the half-sweep's tick count ALONE capped the smoothness: the previous values (band
+// 3.3 chars, 6 ticks) gave 1.20 frames per character, meaning each character changed
+// colour inside a single frame — a snap, not a fade. The comment claiming "a 3-char
+// band gives each char ~3 frames" was simply wrong.
+//
+// The geometry also wasted margin at both ends: the head only has to run from the far
+// edge of the band to the settle point, i.e. `travel = 1 + BAND`, not `1 + 2*BAND`.
+// Correcting that buys ~25% more frames for free, because the extra was spent sweeping
+// through empty space before and after the row.
+export const SWEEP_TICKS = 10;          // ticks per half-sweep (0.8s, so a 3.2s cycle)
+const SWEEP_TRAVEL_PAD = 1;             // head runs from -BAND to 1
+
+/**
+ * Band width in characters, scaled to the row so every row is equally smooth.
+ *
+ * HALF THE ROW, with a floor of 3 characters. Because the band is then always `n/2`,
+ * `BAND = 0.5` for every row of 6+ characters, so frames-per-character — and therefore
+ * the visual smoothness — is the SAME for a 6-char tool name and a 60-char phrase.
+ *
+ * An earlier version capped the band at 6 characters, which made BAND shrink as the row
+ * grew: a 30-char row got 1.67 frames per character and snapped, so the cap defeated the
+ * very scaling it was part of. The floor matters for very short rows, where half the row
+ * would be a 2-char band — a flash rather than a sweep.
+ */
+export function bandCharsFor(n) {
+  return Math.max(3, n / 2);
+}
+
+/** Frames each character spends inside the band — the smoothness measure. */
+export function framesPerChar(n, ticks = SWEEP_TICKS) {
+  const BAND = bandCharsFor(n) / n;
+  return (BAND * ticks) / (1 + BAND * SWEEP_TRAVEL_PAD);
+}
+
 // How long a foreground Bash command runs before its card advertises Ctrl+B, and
 // the hint text itself. Mirrors kimi-code's tool-call card (DETACH_HINT_*).
 const DETACH_HINT_DELAY_MS = 10_000;
@@ -706,6 +967,20 @@ export function tailChars(s, max) {
 function visualCol(s) { return visualWidth(stripAnsi(String(s))); }
 function col(text, c) { return c + String(text) + C.reset; }
 
+// A message the USER actually typed, as opposed to one the harness injected with
+// role 'user'. `beginTurn` (file-history) runs once per real prompt, and /undo's
+// picker lists them, so both must agree on what counts. Harness notes are marked
+// with `_harness` at the source (the truncation-recovery nudge and the compaction
+// handoff in agent.js). Older sessions predate the flag, so the <system-reminder>
+// wrapper they used is still recognised as a fallback.
+export function isRealUserPrompt(m) {
+  if (!m || m.role !== 'user') return false;
+  if (m._harness) return false;
+  const text = typeof m.content === 'string' ? m.content : '';
+  if (/^<system-reminder>/.test(text.trim())) return false;
+  return true;
+}
+
 function fitAnsi(s, w) {
   const str = String(s);
   const v = visualCol(str);
@@ -949,15 +1224,23 @@ export function composerInput(state) {
   return { text: state.input || '', caret: state.caret || 0, prefix: shell ? '! ' : '❯ ' };
 }
 
-// Marker text for a collapsed multi-line paste, e.g. `[paste #1 +12 lines]`.
-// Only multi-line pastes collapse; a single-line paste is inserted verbatim.
-export function pasteMarker(id, lineCount) {
+// Marker text for a collapsed paste. Only a multi-line TEXT paste collapses; an
+// IMAGE always collapses (its payload is a temp file path, which should never be
+// shown as if the user typed it).
+//   text, multi-line : [paste #1 +12 lines]
+//   text, one line   : [paste #1 1 lines]
+//   image            : [paste #1 image]
+// The `image` form keeps the same `paste #N` prefix on purpose: expandPastes,
+// highlightPasteMarkers and adjacentPasteMarker all key off it, so images get the
+// chip styling and atomic caret/delete behaviour for free.
+export function pasteMarker(id, lineCount, kind = 'paste') {
+  if (kind === 'image') return `[paste #${id} image]`;
   return lineCount > 1 ? `[paste #${id} +${lineCount} lines]` : `[paste #${id} ${lineCount} lines]`;
 }
-// Matches a collapsed-paste marker anywhere in a string.
-const PASTE_MARKER_RE = /\[paste #(\d+) \+\d+ lines\]/g;
+// The tail of any collapsed-paste marker: `+L lines`, `L lines`, or `image`.
+const PASTE_MARKER_RE = /\[paste #(\d+) (?:\+\d+ lines|\d+ lines|image)\]/g;
 
-// Expand every `[paste #N +L lines]` marker in `text` back to its real content.
+// Expand every `[paste #N …]` marker in `text` back to its real content.
 export function expandPastes(text, pastes) {
   if (!pastes || !text || !text.includes('[paste #')) return text;
   return text.replace(PASTE_MARKER_RE, (whole, id) => {
@@ -966,13 +1249,13 @@ export function expandPastes(text, pastes) {
   });
 }
 
-// Wrap each `[paste #N +L lines]` marker in the composer row with a selection
-// background so it renders as one block chip (foreground preserved). Returns
-// the row with ANSI inserted; non-marker text is left untouched.
+// Wrap each collapsed-paste marker in the composer row with a selection background
+// so it renders as one block chip (foreground preserved). Non-marker text is left
+// untouched.
 export function highlightPasteMarkers(row) {
   const s = String(row);
   if (!s.includes('[paste #')) return s;
-  return s.replace(/\[paste #\d+ \+\d+ lines\]/g, (m) => C.selBg + m + C.reset);
+  return s.replace(PASTE_MARKER_RE, (m) => C.selBg + m + C.reset);
 }
 
 // Apply selection background to the text portion of a composer row.
@@ -1001,16 +1284,19 @@ export function highlightSelection(text, textStart, selAnchor, selHead) {
 }
 
 // The composer treats a collapsed-paste marker as ONE atomic unit: moving the
-// caret across it jumps over the whole `[paste #N +L lines]`, and deleting it
-// removes the entire marker. `dir` = -1 (look left of the caret) or +1 (right).
+// caret across it jumps over the whole marker, and deleting it removes the entire
+// marker. `dir` = -1 (look left of the caret) or +1 (right). Covers both the text
+// (`+L lines`) and image (`image`) forms.
+const MARKER_LEFT_RE = /\[paste #(\d+) (?:\+\d+ lines|\d+ lines|image)\]$/;
+const MARKER_RIGHT_RE = /^\[paste #(\d+) (?:\+\d+ lines|\d+ lines|image)\]/;
 export function adjacentPasteMarker(text, caret, dir) {
   const s = String(text || '');
   const c = Math.max(0, Math.min(s.length, caret));
   if (dir < 0) {
-    const m = /\[paste #(\d+) \+\d+ lines\]$/.exec(s.slice(0, c));
+    const m = MARKER_LEFT_RE.exec(s.slice(0, c));
     if (m) return { start: c - m[0].length, end: c, id: Number(m[1]) };
   } else {
-    const m = /^\[paste #(\d+) \+\d+ lines\]/.exec(s.slice(c));
+    const m = MARKER_RIGHT_RE.exec(s.slice(c));
     if (m) return { start: c, end: c + m[0].length, id: Number(m[1]) };
   }
   return null;
@@ -1038,13 +1324,19 @@ export function tintRange(row, col0, col1) {
         || /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(s.slice(i));
       if (m) {
         const seq = m[0];
-        if (seq.endsWith('m')) { // SGR: track what the row has set for itself
+        if (seq.endsWith('m') && !isHoverSgr(seq)) { // track the row's OWN state
           const p = seq.slice(2, -1);
           if (p === '' || p.split(';').includes('0')) cur = '';
           else cur += seq;
         }
         out += seq;
-        if (tinting) out += hover; // the row's own codes must not cancel us
+        // Re-apply the highlight AFTER every SGR while tinting, so it always WINS.
+        // Applying it before the sequence was the bug behind "only the cyan part
+        // lights up": a row is built from col(...) chunks, and the label's own
+        // `\x1b[90m` (grey) came after the hover and overrode its colour, so the
+        // dim half of every `KEY label` pair stayed grey. The re-apply is skipped for
+        // the hover codes themselves, which would otherwise stack on every pass.
+        if (tinting) out += hover;
         i += seq.length;
         continue;
       }
@@ -1061,6 +1353,13 @@ export function tintRange(row, col0, col1) {
   }
   if (tinting) out += C.reset + cur;
   return out;
+}
+
+// True for the sequences `C.hover` itself is made of. They must not be echoed back
+// into `cur` (they are not part of the row's own style) and must not trigger another
+// re-apply, or a single span would accumulate a copy of the style per SGR.
+function isHoverSgr(seq) {
+  return C.hover.includes(seq);
 }
 
 // Wrap the single visible cell at column `col` in reverse video: our own block
@@ -1120,7 +1419,12 @@ export function composerLayout(state, insideW) {
       const seg = segs[si];
       const rowPre = si === 0 ? pre : cont;
       rows.push(rowPre + seg.text);
-      meta.push({ start: base + seg.start, end: base + seg.start + seg.text.length, preWidth: visualCol(rowPre) });
+      // `line` records which LOGICAL line (paragraph) the row belongs to, and
+      // `segCount`/`segIdx` which wrap segment it is within it. Vertical caret
+      // movement needs both: kimi clamps a non-last segment to `length - 1` so the
+      // caret cannot land on the first character of the NEXT row (which would make
+      // ↑/↓ appear to skip), and only the last segment may reach the line's end.
+      meta.push({ start: base + seg.start, end: base + seg.start + seg.text.length, preWidth: visualCol(rowPre), line: pi, segIdx: si, segCount: segs.length });
       const absStart = base + seg.start;
       const absEnd = absStart + seg.text.length;
       if (caret >= absStart && caret <= absEnd) {
@@ -1136,6 +1440,25 @@ export function composerLayout(state, insideW) {
 
 // Map a click inside the composer content (colInside = 0-based column within the
 // text area, after the left border) on display row `rowIdx` back to a text index.
+// Map a VISUAL column (0-based, as the terminal counts it) to a CHARACTER index in
+// `line`. The two differ whenever the text holds wide glyphs (CJK, emoji) — a
+// Chinese character is ONE index but TWO columns — so treating a click column as a
+// string index put the caret to the RIGHT of the click on any non-ASCII line.
+// The walk is over the ORIGINAL string (what `caretCol` indexes); each character's
+// column width comes from its tab-EXPANDED form (what the renderer draws).
+function charIndexForVisualCol(line, col) {
+  const raw = String(line == null ? '' : line);
+  let w = 0;
+  let idx = 0;
+  for (const ch of raw) {
+    const cw = visualWidth(expandTabs(ch));
+    if (w + cw > col) break;
+    w += cw;
+    idx += 1;
+  }
+  return idx;
+}
+
 export function composerTextIndexAt(layout, rowIdx, colInside) {
   const m = layout.meta[rowIdx];
   if (!m) return 0;
@@ -1213,6 +1536,8 @@ function msgColorFor(role, text) {
   if (role === 'steer') return C.yellow;   // injected into the running turn
   if (role === 'tool') return C.blue;
   if (role === 'tool_result') return C.gray;
+  if (role === 'skill') return C.blue;
+  if (role === 'image') return C.gray;   // the row names a file, it is not prose
   // Default foreground color based on theme
   return C.fg;
 }
@@ -1263,10 +1588,7 @@ function keyArgument(name, args, workspace) {
   }
   return '';
 }
-// "● Using Read (src/tui.js)" while running, "● Used Read (src/tui.js)" when done.
-// The verb is plain (white) / green once finished; the tool NAME is always the
-// theme (cyan) colour; the key argument is dim/gray.
-export function formatToolLine(msg, workspace, spin, pulseStart) {
+export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge) {
   const name = msg.toolName || '';
   const arg = keyArgument(name, msg.toolArgs, workspace);
   const verb = msg.pending ? 'Using' : 'Used';
@@ -1275,18 +1597,22 @@ export function formatToolLine(msg, workspace, spin, pulseStart) {
   let nameDisplay;
   if (msg.pending) {
     // Multi-stage sweep animation for tool names (like the "Working..." line):
-    //   0.5s l→c sweep (pale cyan → cyan),       0.5s c→l fade back
-    //   0.5s c→b sweep (cyan → cyan-blue),       0.5s b→c fade back
-    // → loops straight back to l→c. ~2s per full cycle.
-    const SWEEP = 6;                 // 0.5s
-    const HALF  = SWEEP + SWEEP;     // 12 ticks per colour pair (sweep + sweep back)
-    const CYCLE = HALF * 2;          // 24 ticks for the full loop (~2s)
-    // Phase is measured from the tick the pulse BEGAN (state.pulseStart), not
-    // from 0: the spinner has been running since turn start, so a raw
-    // `spin % CYCLE` dropped the pulse into a mid-cycle colour (often the red
-    // half) the instant the start animation handed over.
-    const inCycle = ((spin - (pulseStart || spin)) % CYCLE + CYCLE) % CYCLE;
-    const inHalf  = inCycle % HALF;       // 0..23 within this colour pair's half
+    //   out to pale cyan, back; out to cyan-blue, back — one cycle.
+    // The tick counts come from SWEEP_TICKS so this row and the Working row share
+    // one smoothness budget (see the SWEEP_* block near the top of the file).
+    const SWEEP = SWEEP_TICKS;       // ticks per half-sweep
+    const HALF  = SWEEP + SWEEP;     // ticks per colour pair (sweep + sweep back)
+    const CYCLE = HALF * 2;          // ticks for the full loop
+    // Phase is measured from the tick the pulse BEGAN, so a spinner that has already
+    // been running does not drop the sweep into a mid-cycle colour.
+    //
+    // `??`, NOT `||`: `pulseStart` is legitimately 0 at the START of a turn (that is
+    // where the spinner begins), and `0 || spin` evaluates to `spin`, making
+    // `spin - spin === 0` forever — the name then held ONE flat colour and never
+    // animated at all. Only `null`/`undefined` mean "no anchor yet".
+    const anchor = pulseStart ?? spin;
+    const inCycle = ((spin - anchor) % CYCLE + CYCLE) % CYCLE;
+    const inHalf  = inCycle % HALF;       // position within this colour pair's half
     const phase   = inCycle < HALF ? 0 : 1; // 0 = l↔c, 1 = c↔b
 
     // Colours as plain RGB triples (mirroring Working's orange→yellow/red pattern).
@@ -1308,9 +1634,9 @@ export function formatToolLine(msg, workspace, spin, pulseStart) {
     const chars = name;
     const n = chars.length;
 
-    // A character fades over a band this many characters wide.
-    const BAND_CHARS = Math.max(2, Math.min(4, n / 3));
-    const BAND = BAND_CHARS / n;
+    // A character fades over a band this many characters wide. Same sizing rule as
+    // the Working row, so the two sweeps have the same feel.
+    const BAND = bandCharsFor(n) / n;
 
     // Interpolate base ↔ target by `t` (0 = base, 1 = target).
     const mix = (t) => {
@@ -1327,18 +1653,27 @@ export function formatToolLine(msg, workspace, spin, pulseStart) {
     };
 
     const out = [];
+    // The band SHAPE is shared with the Working row, and this sweep SETTLES: a
+    // character the head has passed stays at its target colour, which is what makes
+    // the name read as "filling in" left to right rather than a light passing over.
+    // The edge arrives as a PARAMETER, threaded from `state` by the render chain:
+    // formatToolLine is module-level and `state` lives in startTUI's closure, so
+    // reading `state.shimmerEdge` here threw "state is not defined" on the first
+    // pending tool row — the ReferenceError surfaced as an unhandledRejection and
+    // the process handler exited the TUI the moment a tool call started.
+    const edge = shimmerEdge || 'cosine';
     for (let i = 0; i < n; i++) {
       const charAt = n > 0 ? i / n : 0;
       let t; // 0 = base, 1 = target
-      if (inHalf < SWEEP) {
-        // Sweep in: base → target, left to right.
-        const head = (inHalf + 1) / SWEEP;   // 1/SWEEP … 1
-        t = (head - charAt) / BAND;
-      } else {
-        // Sweep back: target → base, left to right.
-        const head = (inHalf - SWEEP + 1) / SWEEP;  // 1/SWEEP … 1
-        t = 1 - (head - charAt) / BAND;
-      }
+      // Same geometry as the Working row's pulse: the head runs from BEHIND the name
+      // to past its end within each half, so the first frame of a half is the resting
+      // colour and the last frame is fully settled. Starting at `1/SWEEP` (already
+      // past the first character) made the name jump on the very first frame.
+      //   / (SWEEP - 1) so the FIRST frame is progress 0 and the LAST is 1.
+      const progress = (inHalf < SWEEP ? inHalf : inHalf - SWEEP) / (SWEEP - 1);
+      const head = -BAND + progress * (1 + BAND * SWEEP_TRAVEL_PAD);
+      const settled = sweepSettle(head - charAt, BAND, edge);
+      t = inHalf < SWEEP ? settled : 1 - settled;
       out.push(col(chars[i], mix(t)));
     }
     nameDisplay = out.join('');
@@ -1443,7 +1778,9 @@ function renderTodoPanel(state, w, hoverTop, dragTop) {
     for (const t of todos) if (!rows.includes(t)) counts[t.status] = (counts[t.status] || 0) + 1;
     const dist = [['done', 'done'], ['in_progress', 'in progress'], ['pending', 'pending']]
       .filter(([k]) => counts[k] > 0).map(([k, label]) => `${counts[k]} ${label}`).join(', ');
-    out.push(col(`  … +${hidden} more${dist ? ` (${dist})` : ''} · drag the top rule to resize`, C.gray));
+    // The hint appears exactly when rows are hidden — which is exactly when Ctrl+T
+    // is useful — so this is where the key has to be discoverable.
+    out.push(col(`  … +${hidden} more${dist ? ` (${dist})` : ''} · ctrl+t to expand · drag the top rule to resize`, C.gray));
   }
   return out;
 }
@@ -1539,11 +1876,25 @@ export function todoPanelHeight(state) {
 
 // Render one chat message into display lines.
 // Returns { lines: [{text, ind, color}] } (ind = indent string for continuation).
-function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
+//
+// `rawMode` (/raw) shows the model's text VERBATIM: no Markdown rendering, no
+// wrapping, no ANSI interpretation. It exists to answer "what did the model
+// actually send" when a rendering bug makes a reply look wrong — with the renderer
+// in the way there is no way to tell a bad reply from a bad render.
+function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode, shimmerEdge) {
+  if (rawMode && (msg.role === 'assistant' || msg.role === 'thinking')) {
+    const src = String(msg.text == null ? '' : msg.text);
+    // escape the ANSI bytes so a stray `\x1b[31m` in the model's output cannot
+    // repaint the terminal — the point is to SEE it, not to obey it.
+    const out = src.replace(/\x1b/g, '^[').split('\n').map((t, i) => ({
+      text: t, ind: i === 0 ? '' : '', color: C.gray,
+    }));
+    return out.length ? out : [{ text: '', ind: '', color: C.gray }];
+  }
   // Tool calls render as a single "● Using/Used Name (arg)" line (kimi style).
   // The body already carries its own ANSI colours, so mark it pre-colored.
   if (msg.role === 'tool') {
-    const body = formatToolLine(msg, workspace, spin, pulseStart);
+    const body = formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge);
     // Red bullet for a failed call (a Bash non-zero exit / [error: …]).
     const failed = msg.failed === true || (msg.role === 'tool' && msg.failed === true);
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
@@ -1621,7 +1972,15 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       const SCAN_BYTES = 64 * 1024;
       const head = msg.streamContent.length > SCAN_BYTES ? msg.streamContent.slice(0, SCAN_BYTES) : msg.streamContent;
       const lines = sanitizeText(head).replace(/\r\n/g, '\n').split('\n');
+      // A file's content almost always ends in a newline, and `split('\n')` turns
+      // that into a final EMPTY element — which rendered as a phantom numbered line
+      // ("14" with nothing after it) below the real content. Drop it, but only the
+      // one the trailing newline produced (an intentionally blank last line survives
+      // as long as the content does not end with a newline).
+      if (lines.length > 1 && lines[lines.length - 1] === '' && /\n$/.test(head)) lines.pop();
       const MAX = 20;
+      // The TRUE line count comes from the message: `lines` only covers the scanned
+      // prefix, so counting it would understate a large file's size.
       const totalLines = msg._streamLineCount || lines.length;
       const wNum = String(totalLines).length;
       lines.slice(0, MAX).forEach((ln, i) => {
@@ -1632,11 +1991,13 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     }
 
     // The Edit diff is NOT drawn here: it rides on the tool_result message and is
+
+    // The Edit diff is NOT drawn here: it rides on the tool_result message and is
     // rendered BELOW the `↳` receipt (see the tool_result branch). Drawing it here
     // put it between the `● Used Edit` status bullet and the receipt.
     return out;
   }
-  // A PLAN block (Plan mode): the model's <plan>…</plan> body, rendered as a
+  // A PLAN block (Plan mode): the model's <|plan|>…</|plan|> body, rendered as a
   // single-column TABLE — the same ╭─┬─╮ / ├─┼─┤ / ╰─┴─╯ vocabulary the Markdown
   // table renderer uses, so a plan reads as structured data rather than as prose
   // or as a second composer box.
@@ -1644,18 +2005,18 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     // `width` is the transcript's inner width (the caller already removed the
     // one-column margin); the wrapped user boxes land at `width - 2`.
     const tableW = Math.max(12, width - 2);
-    const inner = Math.max(1, tableW - 2);          // between the two │
-    // NOTE: rows must be {text, ind, raw} OBJECTS — messageLines' contract.
-    // Pushing plain strings here made rowToLine read `undefined` and the whole
-    // block rendered as blank lines.
+// Body rows.
+    // NOTE: rows must be {text, ind, raw} OBJECTS — messageLines' contract. Pushing
+    // plain strings here made rowToLine read `undefined` and the whole block rendered as
+    // blank lines.
     const out = [];
     const bar = (ch) => col(ch, C.border);
+    const inner = Math.max(1, tableW - 2);
     const full = (l, r) => bar(l + '─'.repeat(inner) + r);
     // Header: the table's single column is captioned "Plan".
     out.push({ text: full('╭', '╮'), ind: '', raw: true });
     out.push({ text: bar('│') + fitAnsi(col(' Plan', C.cyan + C.bold), inner) + bar('│'), ind: '', raw: true });
     out.push({ text: bar('├' + '─'.repeat(inner) + '┤'), ind: '', raw: true });
-    // Body rows.
     const lines = String(msg.text || '').replace(/\r\n/g, '\n').split('\n');
     while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
     const textW = Math.max(1, inner - 2);
@@ -1816,6 +2177,20 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     if (out.length && out[0].ind === cont && Array.isArray(msg.diff) && msg.diff.length > 0) {
       out[0] = { ...out[0], ind: pre };
     }
+    // The TOOL ROW may already have drawn this result's body — a Write streams the
+    // file's content up there ("↳ 1 line one …") — in which case the receipt below is
+    // the whole result and must NOT open a second `↳` block:
+    //     ● Used Write (a.txt) 1.3KB
+    //     ↳  1 <content>                     <- the body, marked on the tool row
+    //     ↳ File written: a.txt (1372 bytes) <- the stray second `↳`, now plain
+    // One body, one marker. `bodyOnToolRow` is set by the tool_result handler, which
+    // is the only place that knows whether the tool row had content to show.
+    if (msg.bodyOnToolRow && out.length && out[0].ind === pre) {
+      out[0] = { ...out[0], ind: cont };
+    }
+    // Nothing to show (empty output) -> render no row at all rather than a
+    // dangling "↳ ".
+    return out;
     // Nothing to show (empty output) -> render no row at all rather than a
     // dangling "↳ ".
     return out;
@@ -1880,6 +2255,19 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       if (ln === '') { contentLines.push(''); continue; }
       for (const w of wrapWords(ln, bodyW)) contentLines.push(w);
     }
+    // AN EMPTY REASONING BLOCK DRAWS NOTHING.
+    //
+    // A model may emit a `think` event with no text, and the block that spans a tool
+    // call can be left with nothing in it — the tool boundary finalises the block, so
+    // when the model reasons again it opens a NEW one. Either way the old code drew a
+    // bare `●` row (or a lone "thinking…" spinner), which reads as a rendering bug:
+    // there is no thought to show.
+    //
+    // Only the RENDERING is suppressed. The block stays in `state.chat`, so the next
+    // `think` event APPENDS to it rather than opening another one — the state machine
+    // (and the row cache that keys on it) is unchanged, and a block that later
+    // receives text appears with its full content.
+    if (!contentLines.some((l) => l.trim() !== '')) return [];
     const PREVIEW = expanded ? Infinity : 2;
     // The reasoning BODY is italic; the "thinking…" label and the "N more lines"
     // hint are NOT. Closed with endItalic rather than reset, so the row keeps the
@@ -1901,10 +2289,10 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
       if (contentLines.length > PREVIEW) {
         out.push({ text: `… (${contentLines.length - PREVIEW} more lines, ctrl+o to expand)`, ind: INDENT, color: C.gray });
       }
-      if (shown.length === 0) out.push({ text: '', ind: '● ', color: C.gray });
     }
     return out;
   }
+
 
 
   let icon = '';
@@ -1918,6 +2306,14 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     // pane below, not by a different glyph.
     case 'queued': icon = '❯'; break;
     case 'steer': icon = '❯'; break;
+    // A skill activation is its own kind of row, not a user message: kimi prints
+    // `▶ Activated skill: <name>` with the user's args dim underneath, and that is
+    // what makes it clear a SKILL ran rather than the user having typed a slash
+    // command. See the `skill` branch below for the body.
+    case 'skill': icon = '▶'; break;
+    // A pasted image is its own row type: the marker says what was pasted, and the
+    // picture (when the terminal can draw one) follows it.
+    case 'image': icon = '▣'; break;
     case 'aborted': icon = ''; break;
     default: icon = '';
   }
@@ -1942,14 +2338,69 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
     if (lines.length === 0) lines.push({ text: '', ind: '', raw: true });
     return lines;
   }
+  // A SKILL activation: kimi's card is
+  //     ▶ Activated skill: <name>
+  //       <the user's args, dim>
+  // The args line is omitted when there are none. `msg.text` is only the NAME and
+  // `msg.args` the trailing text, so the body is built here rather than wrapped.
+  if (msg.role === 'skill') {
+    lines.push({ text: prefix + 'Activated skill: ' + C.bold + String(msg.text || ''), ind: '', color: C.blue });
+    const args = String(msg.args || '').trim();
+    if (args) {
+      const w = Math.max(1, width - 2);
+      for (const seg of wrapWords(args, w)) lines.push({ text: seg, ind: '  ', color: C.gray });
+    }
+    return lines;
+  }
+  // A pasted IMAGE. The row NAMES the file: that is the receipt for what the model received,
+  // and it is the only thing shown, because the terminal is not asked to draw a picture.
+  if (msg.role === 'image') {
+    const file = String(msg.image || msg.text || '');
+    const label = file ? file.split(/[\\/]/).pop() : 'image';
+    lines.push({ text: prefix + label, ind: '', color: fg });
+    return lines;
+  }
+  // A collapsible PLUGIN LOG: collapsed shows the single summary line already in
+  // `msg.text`; expanded shows `msg.allLines` (one per notice). Ctrl+L flips
+  // `msg.expanded`. Rendered as plain lines with a continuation indent, so an
+  // expanded block still reads as one message.
+  if (msg.pluginLog) {
+    const src = msg.expanded && Array.isArray(msg.allLines) ? msg.allLines : [String(msg.text || '')];
+    src.forEach((line) => {
+      for (const ln of wrapWords(expandTabs(String(line)), bodyW)) {
+        // Marker on the first row only; every later line gets the continuation pad.
+        const firstRow = lines.length === 0;
+        lines.push({ text: ln, ind: firstRow ? prefix : contPad, color: firstRow ? bodyFg : C.gray });
+      }
+    });
+    if (!lines.length) lines.push({ text: '', ind: prefix, color: bodyFg });
+    return lines;
+  }
   // Only assistant/thinking output benefits from Markdown; user/system/tool
   // stay plain so their text is never mangled. Assistant text should be WHITE by default.
   const useMd = msg.role === 'assistant';
   if (useMd) {
-    const mdRows = renderMdText(String(msg.text || ''), bodyW, fg, codeFg);
-    mdRows.forEach((ml, i) => {
-      lines.push({ text: ml, ind: i === 0 ? prefix : contPad, raw: true });
+    // Split into the STABLE head (already-complete blocks) and the growing tail.
+    // The head's wrapped lines are cached on the message, so a streaming frame only
+    // wraps the tail block instead of the entire reply. Without this the whole
+    // accumulated text was re-wrapped every frame (measured ~10ms at 40 KB, which
+    // stalls the 80ms animation tick).
+    const { headRows, tailRows, headCut } = renderMdIncremental(msg, String(msg.text || ''), bodyW, fg, codeFg);
+    const c = msg._mdCache;
+    let headWrapped = c && c.headWrapped;
+    if (!headWrapped || c.headWrappedCut !== headCut) {
+      // ONLY the first row of the whole message carries the `❯` marker; every later
+      // row uses the continuation pad. Using `prefix` for every head row put a `❯`
+      // on each line of the message.
+      headWrapped = headRows.map((ml, i) => ({ text: ml, ind: i === 0 ? prefix : contPad, raw: true }));
+      if (c) { c.headWrapped = headWrapped; c.headWrappedCut = headCut; }
+    }
+    for (const w of headWrapped) lines.push(w);
+    const tailBase = lines.length;
+    tailRows.forEach((ml, i) => {
+      lines.push({ text: ml, ind: (tailBase === 0 && i === 0) ? prefix : contPad, raw: true });
     });
+    if (!lines.length) lines.push({ text: '', ind: prefix, color: fg });
   } else {
     let code = false;
     for (const raw of expandTabs(String(msg.text || '')).split('\n')) {
@@ -1972,10 +2423,83 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart) {
 
 // Block-level Markdown renderer. Produces pre-styled rows (each carries its own
 // ANSI). Supports: headings, thematic breaks, blockquotes, unordered/ordered and
-// task lists, indented/nested lists, tables, fenced code blocks (with the
-// language captured so a future highlighter can use it), paragraphs, and inline
-// styles (bold/italic/strike/code/links/autolinks).
-function renderMdText(text, width, fg, codeFg) {
+// INCREMENTAL markdown for a STREAMING assistant message.
+//
+// While a reply streams, `msg.text` grows every frame, and re-parsing the WHOLE
+// accumulated text each time measured 5ms/frame at 10 KB and ~20ms at 50 KB — a
+// visible stall at the 80ms tick ("the spinner freezes while it types").
+//
+// The unit of reuse is a top-level BLOCK: a run of lines up to the next blank line
+// that is not inside a code fence, with the blank lines attached to the FOLLOWING
+// block. Rendering block-by-block and concatenating produces byte-identical output
+// to rendering the whole document (verified across headings, lists, fenced code,
+// multiple fences, and consecutive blank lines), which is what makes the cache
+// safe. Only the LAST block can still be growing, so only it is re-rendered.
+//
+// (An earlier attempt cut the text at a blank line and rendered head/tail
+// separately. That is NOT equivalent — a trailing blank line contributes a row on
+// its own but acts as a separator inside the whole document — so the two renders
+// disagreed by a row. Blocks avoid the problem entirely.)
+export function renderMdIncremental(msg, text, width, fg, codeFg) {
+  const src = text.replace(/\r\n/g, '\n');
+  let c = msg._mdCache;
+  // Layout identity: same width/colours and the same text. Comparing the text (not
+  // just its length) is required — a same-length replacement must re-render.
+  if (c && c.width === width && c.fg === fg && c.codeFg === codeFg && c.text === src) {
+    return { headRows: c.headRows, tailRows: c.tailRows, headCut: c.headCut };
+  }
+  if (!c || c.width !== width || c.fg !== fg || c.codeFg !== codeFg) {
+    c = msg._mdCache = { width, fg, codeFg };
+  }
+
+  const parts = splitBlocks(src);
+  // A block is final once a LATER block exists; the last one is still growing.
+  const headCount = Math.max(0, parts.length - 1);
+  const canReuse = Array.isArray(c.blocks)
+    && Array.isArray(c.blockTexts)
+    && c.blockTexts.length >= headCount
+    && parts.length >= headCount
+    && c.blockTexts.slice(0, headCount).every((t, i) => t === parts[i]);
+
+  const blocks = canReuse ? c.blocks.slice(0, headCount) : parts.slice(0, headCount).map((b) => renderMdText(b, width, fg, codeFg));
+  const headRows = [];
+  for (const b of blocks) for (const r of b) headRows.push(r);
+  const tailRows = renderMdText(parts.length ? parts[parts.length - 1] : '', width, fg, codeFg);
+  const headCut = parts.length > 1 ? parts.slice(0, headCount).join('\n').length : 0;
+
+  msg._mdCache = {
+    text: src, width, fg, codeFg,
+    blocks, blockTexts: parts.slice(0, headCount),
+    headRows, tailRows, headCut,
+  };
+  return { headRows, tailRows, headCut };
+}
+
+// Split at blank lines OUTSIDE a fence. The blank line(s) begin the NEXT block, so
+// every block renders the same whether or not later blocks exist — that is the
+// property the incremental cache depends on.
+export function splitBlocks(src) {
+  if (src === '') return [''];
+  const lines = src.split('\n');
+  const out = [];
+  let cur = [];
+  let fence = false;
+  for (const ln of lines) {
+    const isFence = /^\s*(```+|~~~+)/.test(ln);
+    const blank = ln.trim() === '';
+    if (blank && !fence) {
+      if (cur.length) { out.push(cur); cur = []; }
+      cur.push(ln);
+      continue;
+    }
+    if (isFence) fence = !fence;
+    cur.push(ln);
+  }
+  if (cur.length) out.push(cur);
+  return out.map((b) => b.join('\n'));
+}
+
+export function renderMdText(text, width, fg, codeFg) {
   const src = String(text).replace(/\r\n/g, '\n');
   const para = src.split('\n');
   const out = [];
@@ -2431,28 +2955,87 @@ function fpArgs(args) {
   return out;
 }
 
+/**
+ * The shared-store key for a rendered message.
+ *
+ * Built from the SAME predicates the cache-validity check below uses, because the two
+ * have to agree: the key decides whether a store entry may be reused, and a disagreement
+ * between them shows up as rows drawn for a different width or a different toggle — a
+ * mis-drawn frame, not a stale one.
+ *
+ * The message TEXT is included, and compared by value, because a streamed reply replaces
+ * `text` on every delta; a reference check would miss every reuse after the first frame.
+ * The live-output fields are included for the same reason: tool arguments and partial
+ * results change without `text` changing.
+ *
+ * `id` is the message identity rather than its index, so inserting or removing a message
+ * (which compaction and /undo both do) does not shift every later key onto a different
+ * entry. The row COUNT memo stays index-based on purpose — that is a different lifetime.
+ */
+function lruKeyFor(m, rowWidth, expanded, spinKey, state) {
+  return makeRowKey({
+    id: `${m.role}:${m.toolName || ''}` + (m.toolCallId ? `:${m.toolCallId}` : ''),
+    text: [m.text, m.streamContent, m.liveOutput, m.diff, m._diffCounts,
+      m.toolArgs ? fpArgs(m.toolArgs) : ''].map((v) => String(v == null ? '' : v)).join('\u0000'),
+    w: rowWidth,
+    fg: m.role,
+    codeFg: state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge) || 0,
+    expanded: m.pluginLog ? !!m.expanded : expanded,
+    raw: !!state.rawMode,
+    pending: !!m.pending,
+    failed: !!m.failed,
+spin: spinKey,
+  });
+}
+
 export function renderChatLines(state, w, viewport) {
   const out = [];
   const expanded = !!state.expanded;
   const PAD = ' ';
   const padW = visualCol(PAD);
   const innerW = Math.max(1, w - padW);
-  const spinFrame = SPINNER[(state.spin || 0) % SPINNER.length];
+  // Reduced motion swaps the rotating glyph for a breathing dot, so this is the one
+  // place the substitution is decided for the whole transcript.
+  const spinFrame = spinnerFrame(state).glyph;
   const chat = state.chat;
   const n = chat.length;
 
   // Pass 1: exact row count per message (and the total). Every message's cache
   // is validated/rebuilt here so the counts are exact; only the STRING assembly
   // is limited to the visible window.
-  const rowStart = new Int32Array(n);
-  const msgLen = new Int32Array(n);
+  // Two ADJACENT bordered messages share a wall: the previous box's bottom rule
+  // doubles as this one's top rule, so it contributes ONE row less than a
+  // standalone box. Pass 2 skips that top rule when drawing, so the count here
+  // has to skip it too — counting 2 rules unconditionally made `total` one row
+  // bigger per shared wall than the rows actually pushed, so every absolute row
+  // index after the first shared wall pointed further down the transcript than
+  // the row drawn there, and a drag copied messages the user never selected.
+  let prevBordered = false;
+  let rowStart;
+  let msgLen;
   let cursor = 0;
+  // Reuse the previous paint's metrics when the transcript and layout are
+  // unchanged. Scrolling changes NEITHER, so a scroll frame can skip the O(n)
+  // walk entirely — pass 1 exists to learn each message's row count, and that
+  // cannot change just because the viewport moved.
+  const mem = state._metrics;
+  const sig = (mem && mem.w === w && mem.expanded === expanded && mem.innerW === innerW)
+    ? metricsSignature(state, n, w, expanded, innerW) : 0;
+  if (mem && sig && mem.sig === sig) {
+    rowStart = mem.rowStart;
+    msgLen = mem.msgLen;
+    cursor = mem.total;
+    prevBordered = mem.prevBordered;
+  } else {
+  rowStart = new Int32Array(n);
+  msgLen = new Int32Array(n);
   for (let mi = 0; mi < n; mi++) {
     const m = chat[mi];
     const border = m.role === 'user' || m.role === 'queued' || m.role === 'bash';
     const ww = border ? Math.max(1, Math.min(1, innerW - 4)) : innerW; // placeholder
     void ww;
     rowStart[mi] = cursor;
+    const rules = border ? (prevBordered ? 1 : 2) : 0;
     // Reuse/minimal layout for the row count: same width/border arithmetic as
     // the layout path below. We need boxText for bordered messages.
     const boxInner = Math.max(1, innerW - 4);
@@ -2472,38 +3055,111 @@ export function renderChatLines(state, w, viewport) {
       && cached.diffRef === m.diff && cached.countsRef === m._diffCounts
       && cached.keyArgs === (m.toolArgs ? fpArgs(m.toolArgs) : '0')
       && cached.spinKey === spinKeyNow
-      && cached.isPending === (m.pending ? 1 : 0);
+      // The collapsible plugin log renders from `m.expanded` + `m.allLines`, which
+      // the cache key must include: otherwise Ctrl+L only flipped the flag and the
+      // cached (collapsed) rows were reused, so nothing visibly changed.
+      && cached.pluginExpanded === (m.pluginLog ? !!m.expanded : null)
+      && cached.isPending === (m.pending ? 1 : 0)
+      // /raw changes how an assistant row is built, so the cache must be invalidated
+      // when it flips — otherwise the old Markdown rows are reused and the toggle
+      // appears to do nothing.
+      && cached.raw === !!state.rawMode;
+    // An evicted message keeps only `m._count`. When its layout key still matches,
+    // the row count is known, so the message is counted WITHOUT re-rendering it —
+    // which is the whole point of keeping the count separate from the rows (an idle
+    // 2000-message transcript was re-rendering ~7700 messages per frame otherwise).
+    // The key is a NUMBER, not a string. Building `rowWidth + '|' + ...` for every
+    // message on every frame allocated one string per message, which profiled at
+    // ~1.15ms/frame on an 8000-message transcript — 6x the arithmetic below, and
+    // pure garbage for the collector.
+    const countKey = rowWidth * 8 + (expanded ? 1 : 0) + (m.pending ? 2 : 0) + (m.pluginLog && m.expanded ? 4 : 0)
+      + (state.rawMode ? 16 : 0);
+    if (!valid && !cached && m._count && m._count.key === countKey) {
+      msgLen[mi] = m._count.len + rules;
+      cursor += msgLen[mi];
+      prevBordered = border;
+      continue;
+    }
     if (valid) {
-      msgLen[mi] = cached.rows.length + (border ? 2 : 0);
+      msgLen[mi] = cached.rows.length + rules;
     } else {
-      const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart);
-      const wrapped = rows.map(rowToLine);
-      const isPending2 = m.pending ? 1 : 0;
-      const cc = {
-        rowW: rowWidth, expanded, spinKey: spinKeyNow, isPending: isPending2,
-        textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
-        failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
-        keyArgs: m.toolArgs ? fpArgs(m.toolArgs) : '0',
-        rows: wrapped, spinRows: null,
-      };
-      for (let i = 0; i < wrapped.length; i++)
-        if (wrapped[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
-          if (!cc.spinRows) cc.spinRows = new Set();
-          cc.spinRows.add(i);
-        }
-      m._cache = cc;
-      msgLen[mi] = wrapped.length + (border ? 2 : 0);
+      // Before re-rendering, ask the SHARED store. This is the path that makes the
+      // store worth having: a message whose local cache was dropped, or one rebuilt by a
+      // session switch, lands here with no local entry and used to re-wrap its rows from
+      // scratch. Now it costs one Map lookup.
+      const shared = rowCacheGet(lruKeyFor(m, rowWidth, expanded, spinKeyNow, state));
+      if (shared && shared.rowW === rowWidth && shared.expanded === expanded
+        && shared.spinKey === spinKeyNow && shared.isPending === (m.pending ? 1 : 0)
+        && shared.raw === !!state.rawMode
+        // The content fields are compared by REFERENCE here, exactly as in the local
+        // check above: they are only equal if nothing rewrote them, and the key already
+        // covered the value-level ones. Anything the key does not name is checked here, so
+        // the two together cover every input the render reads.
+        && shared.textRef === m.text && shared.streamRef === m.streamContent
+        && shared.liveRef === m.liveOutput && shared.diffRef === m.diff
+        && shared.countsRef === m._diffCounts
+        && shared.keyArgs === (m.toolArgs ? fpArgs(m.toolArgs) : '0')
+        && shared.pluginExpanded === (m.pluginLog ? !!m.expanded : null)) {
+        m._cache = shared;
+        msgLen[mi] = shared.rows.length + rules;
+      } else {
+        const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart, state.rawMode,
+          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge));
+        const wrapped = rows.map(rowToLine);
+        const isPending2 = m.pending ? 1 : 0;
+        const cc = {
+          rowW: rowWidth, expanded, spinKey: spinKeyNow, isPending: isPending2,
+          textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
+          failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
+          keyArgs: m.toolArgs ? fpArgs(m.toolArgs) : '0',
+          pluginExpanded: m.pluginLog ? !!m.expanded : null,
+          raw: !!state.rawMode,
+          rows: wrapped, spinRows: null,
+        };
+        for (let i = 0; i < wrapped.length; i++)
+          if (wrapped[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
+            if (!cc.spinRows) cc.spinRows = new Set();
+            cc.spinRows.add(i);
+          }
+        m._cache = cc;
+        // The ROW COUNT is all the scroll maths needs, and it is stable for a given
+        // layout key. Record it separately so an evicted message (below) still has a
+        // count and never has to be re-rendered just to be counted — that re-render
+        // is what made an idle 2000-message transcript cost 78ms per frame.
+        m._count = { key: countKey, len: wrapped.length };
+        msgLen[mi] = wrapped.length + rules;
+      }
+    }
+    // Drop the local copy for anything far from the tail, and hand its rows to the
+    // shared store first so a later pass can reuse them. Storing here rather than on the
+    // way IN matters: storing on the way in and then looking the key up in the same loop
+    // made the FIRST paint do the work twice for every message it had just rendered.
+    if (mi < n - CACHE_KEEP && m._cache) {
+      rowCacheSet(lruKeyFor(m, rowWidth, expanded, spinKeyNow, state), m._cache);
+      m._cache = null;
     }
     cursor += msgLen[mi];
+    prevBordered = border;
+  }
   }
   const total = cursor;
   state._chatTotal = total;
+  state._chatTotal = total;
+  // Memo for the count-only caller (scrollChat). These metrics do NOT depend on
+  // `scroll`, only on the transcript and the layout, so they stay valid until one
+  // of those changes. scrollChat used to call the FULL renderer — with no viewport
+  // that renders every message's rows — just to learn the total, which is what made
+  // every wheel tick stall on a long transcript.
+  state._metrics = {
+    sig: sig || metricsSignature(state, n, w, expanded, innerW),
+    w, expanded, innerW, total, rowStart, msgLen, prevBordered,
+  };
 
   // Visible window: [total - bodyH - scroll, total - scroll), with a small
   // margin above so a message crossing the boundary renders whole. When no
   // viewport is given, render everything (full render).
   let visibleFrom = 0, visibleTo = -1;
-if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
+  if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
     const bodyH = viewport.bodyH;
     const maxScroll = Math.max(0, total - bodyH);
     const asked = Math.max(0, viewport.scroll || 0);
@@ -2546,20 +3202,36 @@ if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
   // Pass 2: assemble final strings, but only for messages that overlap the
   // visible range (or the whole transcript when no viewport).
   cursor = 0;
+  // The two rule strings depend ONLY on `innerW` and the box colour, and there are just
+  // two colours, so each is built at most twice per frame. They used to be built for
+  // EVERY bordered message BEFORE the visibility test — 2 x `'─'.repeat(114)` plus two
+  // `col()` calls for all ~2000 bordered messages of an 8000-message transcript, when at
+  // most a couple of dozen are ever on screen. That measured ~0.5ms/frame of allocation
+  // discarded unused, and pure garbage for the collector: the same class of waste the
+  // numeric `countKey` in pass 1 removed.
+  const ruleCache = { top: new Map(), bot: new Map() };
+  const ruleText = Math.max(1, innerW - 4);
+  const rule = (top, color) => {
+    const m = top ? ruleCache.top : ruleCache.bot;
+    let got = m.get(color);
+    if (got === undefined) {
+      got = PAD + col((top ? '╭' : '╰') + '─'.repeat(ruleText) + (top ? '╮' : '╯'), color);
+      m.set(color, got);
+    }
+    return got;
+  };
+
   for (let mi = 0; mi < n; mi++) {
     const msg = chat[mi];
     const bordered = msg.role === 'user' || msg.role === 'queued' || msg.role === 'bash';
     const boxColor = msg.role === 'bash' ? C.shellMode : C.border;
-    let topRule = null, botRule = null, boxPad = 1, boxText = innerW;
+    let boxPad = 1, boxText = innerW;
     if (bordered) {
       const boxW = innerW - 2;
       const boxInner = Math.max(1, boxW - 2);
       boxPad = Math.min(1, Math.max(0, boxInner - 1));
       boxText = Math.max(1, boxInner - boxPad * 2);
-      topRule = PAD + col('╭' + '─'.repeat(boxInner) + '╮', boxColor);
-      botRule = PAD + col('╰' + '─'.repeat(boxInner) + '╯', boxColor);
     }
-    const cc = msg._cache || { rows: [] };
     // Shared wall with the previous bordered message (its bottom rule is ours).
     let shared = false;
     if (bordered && mi > 0) {
@@ -2570,24 +3242,84 @@ if (viewport && Number.isFinite(viewport.bodyH) && viewport.bodyH > 0) {
     const len = msgLen[mi];
     const visible = visibleTo < 0 || (cursor + len > visibleFrom && cursor < visibleTo);
     if (visible) {
-      const spinRows = cc.spinRows;
+      // Pass 1 may have skipped building the rows for a message far from the
+      // viewport (it only needed the row COUNT, so it used `_count`). Now that the
+      // message IS visible, build them here — otherwise an evicted message rendered
+      // as blank rows, which is what made scrolled-back history look like it had
+      // "not loaded". The row width must match what pass 1 counted with.
+      let ccc = msg._cache;
+      if (!ccc || !ccc.rows || ccc.rows.length !== len - (bordered ? (shared ? 1 : 2) : 0)) {
+        const bw = bordered ? boxText : innerW;
+        const built = messageLines(msg, bw, state.cwd, expanded, state.spin, state.pulseStart, state.rawMode,
+          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge)).map(rowToLine);
+        ccc = { rows: built, spinRows: null };
+        for (let i = 0; i < built.length; i++) {
+          if (built[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
+            if (!ccc.spinRows) ccc.spinRows = new Set();
+            ccc.spinRows.add(i);
+          }
+        }
+        msg._cache = ccc;
+      }
+      const spinRows = ccc.spinRows;
       const liveAt = (r, i) => (spinRows && spinRows.has(i) ? r.split(SPIN_PLACEHOLDER).join(spinFrame) : r);
-      if (bordered && !shared) out.push(topRule);
+      if (bordered && !shared) out.push(rule(true, boxColor));
       if (bordered) {
         const pad = ' '.repeat(boxPad);
         const wall = col('│', boxColor);
-        for (let i = 0; i < cc.rows.length; i++)
-          out.push(PAD + wall + pad + fitAnsi(liveAt(cc.rows[i], i), boxText) + pad + wall);
+        for (let i = 0; i < ccc.rows.length; i++)
+          out.push(PAD + wall + pad + fitAnsi(liveAt(ccc.rows[i], i), boxText) + pad + wall);
       } else {
-        for (let i = 0; i < cc.rows.length; i++) out.push(PAD + liveAt(cc.rows[i], i));
+        for (let i = 0; i < ccc.rows.length; i++) out.push(PAD + liveAt(ccc.rows[i], i));
       }
-      if (bordered) out.push(botRule);
+      if (bordered) out.push(rule(false, boxColor));
     } else {
       for (let i = 0; i < len; i++) out.push('');
     }
     cursor += len;
   }
   return out;
+}
+
+// A cheap signature of everything pass 1 depends on. Values are only compared
+// (never stringified per message), so this stays O(n) arithmetic with no
+// allocation per message — the same reason countKey is numeric.
+export function metricsSignature(state, n, w, expanded, innerW) {
+  let h = 2166136261 >>> 0;
+  const mix = (v) => { h ^= (v | 0); h = Math.imul(h, 16777619) >>> 0; };
+  mix(n); mix(w); mix(innerW); mix(expanded ? 1 : 0); mix(state.spin || 0);
+  // rawMode changes every assistant row's shape, so it is part of the layout
+  // identity: without this, toggling /raw left the cached rows on screen.
+  mix(state.rawMode ? 1 : 0);
+  const chat = state.chat;
+  for (let i = 0; i < n; i++) {
+    const m = chat[i];
+    // Text length + identity of the mutable fields. A same-length edit is caught by
+    // `m._cache` being nulled at the edit sites, so length is enough here.
+    mix(i);
+    mix(typeof m.text === 'string' ? m.text.length : 0);
+    mix(typeof m.streamContent === 'string' ? m.streamContent.length : 0);
+    mix(m.pending ? 1 : 0);
+    mix(m.pluginLog && m.expanded ? 1 : 0);
+    mix(m._cache ? 1 : 0);
+    mix(m._count ? 1 : 0);
+  }
+  return h;
+}
+
+/**
+ * Total transcript rows WITHOUT building a single rendered string. Reuses the
+ * memo from the last renderChatLines when the transcript and layout are unchanged
+ * (the scrolling case). Returns the row count.
+ */
+export function chatRowTotal(state, w) {
+  const mem = state._metrics;
+  const expanded = !!state.expanded;
+  const innerW = Math.max(1, w - 1);
+  const sig = metricsSignature(state, state.chat.length, w, expanded, innerW);
+  if (mem && mem.sig === sig) return mem.total;
+  renderChatLines(state, w);           // fills state._metrics
+  return state._chatTotal || 0;
 }
 
 // ---- scroll anchoring --------------------------------------------------------
@@ -2647,7 +3379,44 @@ function fmtTokens(n) {
     return (k >= 100 ? Math.round(k) : trimDecimal(k)) + 'k';
   }
   return String(n);
-  return String(n);
+}
+
+// Thousands separators for a plain count. fmtTokens rounds to k/M, which is right
+// for a context gauge but wrong for a token BILL: "1.5M input tokens" hides
+// whether that is 1.45M or 1.54M, and the cost readout next to it is precise.
+function fmtCount(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '0';
+  return Math.round(v).toLocaleString('en-US');
+}
+
+// A money amount, at a precision that stays readable across five orders of
+// magnitude: a single cheap request is fractions of a cent, a long session is
+// dollars. A bare `0.00` for a real cost is the failure to avoid, so anything
+// non-zero under a cent keeps its decimals rather than rounding away. The symbol
+// is the caller's business — the status row puts it AFTER the number.
+function moneyAmount(v, currency = 'USD') {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 'n/a';
+  // CNY is about 7x USD, so the same amount crosses these thresholds one step
+  // sooner; scaling the comparison keeps both currencies at the same precision.
+  const scale = currency === 'CNY' ? 7 : 1;
+  if (n === 0) return '0.00';
+  if (n * scale < 0.01) return n.toFixed(5);
+  if (n * scale < 1) return n.toFixed(4);
+  return n.toFixed(2);
+}
+
+/**
+
+/**
+ * `$12.34` / `¥86.51` — the amount with its symbol in front, for a panel line
+ * where there is room to spell the currency out too.
+ */
+function formatCost(amount, currency = 'USD') {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return 'unknown';
+  return `${currency === 'CNY' ? '¥' : '$'}${moneyAmount(n, currency)}`;
 }
 
 // A tiny ASCII line chart for a numeric series (context growth over steps).
@@ -2689,6 +3458,47 @@ function sparkChart(values, width, height) {
 function usagePercent(used, max) {
   if (!Number.isFinite(max) || max <= 0) return 0;
   return Math.min(100, Math.max(0, Math.ceil((used / max) * 100)));
+}
+
+// The session's spend, cached on `state` for the status bar. Called wherever its
+// inputs change — a usage event, a model switch, a resume, /new, a currency
+// switch — and never from the render path, which has no config in scope and must
+// stay cheap.
+//
+// Three cached fields, because the render path can only READ:
+//   _costKnown   prices exist for this model at all
+//   _costUsd     the amount in USD (the native unit; /cost always reports it)
+//   _costText    the amount as it should be PRINTED, in the display currency
+// `_costText` is null when the currency needs a rate that is not available yet;
+// the row then falls back to the USD text rather than a converted guess.
+export function refreshCost(state, cfg) {
+  const cost = modelCost(cfg);
+  const usage = state.usage || {};
+  const hasUsage = !!usage.calls;
+  const usd = (hasUsage && cost) ? usageCost(usage, cost) : null;
+  const currency = costCurrency(cfg);
+  state._costKnown = !!cost;
+  state._costUsd = usd;
+  state._costCurrency = currency;
+  // A sync lookup only: the rate has to have been warmed already (startup, or the
+  // /cost that switched the currency). Converting here would need an await.
+  const fx = usd === null ? null : syncRate(currency, { override: cfgCnyPerUsd(cfg) });
+  const amount = (usd === null || !fx) ? null : convert(usd, currency, fx.rate);
+  state._costRate = fx ? fx.rate : null;
+  // The symbol leads, the same way formatCost writes it in /cost: `$0.0523`, not
+  // `0.0523$`. One spelling for the number across both readouts.
+  if (amount === null) state._costText = usd === null ? null : formatCost(usd);
+  else state._costText = formatCost(amount, currency);
+}
+
+// The currency the cost readouts use, from config.toml (`cost_currency`), the
+// environment, or USD. Persisted by `/cost usd|cny`, so the switch survives a
+// restart and the status row follows it.
+export function costCurrency(cfg) {
+  const fromEnv = normalizeCurrency(process.env.HNCODE_COST_CURRENCY);
+  if (fromEnv) return fromEnv;
+  const raw = cfg && ((cfg.raw && cfg.raw.cost_currency) ?? cfg.costCurrency);
+  return normalizeCurrency(raw) || 'USD';
 }
 
 // Human-readable elapsed duration, omitting zero leading units:
@@ -2791,16 +3601,55 @@ export function questionBoxClampedHeight(state, insideW, h, chromeH) {
 export function scrollbarGeometry({ total, bodyH, scroll }) {
   const maxScroll = Math.max(0, total - bodyH);
   const pos = Math.min(maxScroll, Math.max(0, scroll || 0));
-  // Thumb length proportional to the visible fraction, at least 1 row.
-  const thumbLenF = Math.max(1, bodyH * (bodyH / Math.max(1, total)));
-  const thumb = Math.max(1, Math.round(thumbLenF));
-  // 0 = bottom (pinned), maxScroll = top. Row 0 is the TOP of the body.
+  // OpenTUI works on a 2x virtual grid so the thumb has HALF-ROW resolution: each
+  // real row is two virtual units, and a thumb boundary landing inside a cell is
+  // drawn as `▀` (top half) or `▄` (bottom half). That is what makes a short
+  // scrollbar look smooth instead of jumping a whole row at a time. See OpenTUI
+  // Slider.ts: getVirtualThumbSize / getVirtualThumbStart / renderVertical.
+  const virtualTrack = bodyH * 2;
+  // Thumb size = viewport / (content + viewport) of the track, min one virtual unit.
+  const contentSize = maxScroll + bodyH;
+  const virtualThumbSize = bodyH >= total
+    ? virtualTrack
+    : Math.max(1, Math.min(
+      Math.floor(virtualTrack * (bodyH / Math.max(1, contentSize))),
+      virtualTrack,
+    ));
+  // 0 = bottom (pinned), maxScroll = top. Row 0 is the TOP of the body, so the
+  // virtual start counts from the top (OpenTUI's value grows downward; ours
+  // grows upward from the newest line, hence the inversion).
   const fromTop = maxScroll === 0 ? 0 : (maxScroll - pos) / maxScroll;
+  const maxVirtualStart = Math.max(0, virtualTrack - virtualThumbSize);
+  const virtualThumbStart = Math.round(fromTop * maxVirtualStart);
+
+  // Row-range + fractional forms, kept for the drag maths and the hit-test, which
+  // reason in whole rows. Derived from the virtual values so paint and drag agree.
+  const thumbLenF = Math.max(1, virtualThumbSize / 2);
+  const thumbStart = Math.floor(virtualThumbStart / 2);
+  const thumb = Math.max(1, Math.ceil((virtualThumbStart + virtualThumbSize) / 2) - thumbStart);
   const maxThumbStartF = Math.max(0, bodyH - thumbLenF);
-  // Round once, at the end. Using `bodyH - thumb` (rounded) here made the last
-  // row unreachable when the thumb was 1 row and bodyH was even.
-  const thumbStart = Math.round(fromTop * maxThumbStartF);
-  return { thumbStart, thumbLen: thumb, thumbLenF, maxThumbStartF, bodyH, total, maxScroll };
+
+  return {
+    thumbStart, thumbLen: thumb, thumbLenF, maxThumbStartF,
+    virtualThumbStart, virtualThumbSize, virtualTrack,
+    bodyH, total, maxScroll,
+  };
+}
+
+// The glyph for one body row, exactly OpenTUI's per-cell rule (Slider.ts
+// renderVertical): full coverage -> `█`; a half-covered cell -> `▀` when the thumb
+// starts in the upper half of that cell, `▄` when it starts in the lower half;
+// no coverage -> ` ` (the track shows through as its background colour).
+export function scrollbarGlyph(g, row) {
+  if (!g) return ' ';
+  const cellStart = row * 2;
+  const cellEnd = cellStart + 2;
+  const start = Math.max(g.virtualThumbStart, cellStart);
+  const end = Math.min(g.virtualThumbStart + g.virtualThumbSize, cellEnd);
+  const coverage = end - start;
+  if (coverage >= 2) return '█';
+  if (coverage > 0) return (start - cellStart) === 0 ? '▀' : '▄';
+  return ' ';
 }
 
 // Map a position on the track to a transcript scroll offset. `rowF` is the mouse
@@ -2961,6 +3810,229 @@ function sliceAnsi(s, width) {
   return out + (out.includes('\x1b') ? C.reset : '');
 }
 
+/**
+ * Add FAINT to the visible columns [from, to) of an ANSI row, leaving every cell's
+ * own colours untouched.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The popup is a modal, and a modal is made by the SURROUNDINGS receding while the
+ * card stays at full contrast. Dimming the card's own interior would mute the thing
+ * the user has to read and act on, so the backdrop is dimmed first and the card is
+ * painted opaquely over it afterwards.
+ *
+ * WHY THE CELL KEEPS ITS OWN COLOUR
+ * ---------------------------------
+ * A retained-mode TUI (OpenTUI, which cline's dialogs run on) dims by setting one
+ * attribute on the cell and the renderer blends it — the cell keeps its own
+ * foreground. hncode paints finished ANSI strings instead, so "dim" has to be
+ * written into the string. Overwriting each cell with a fixed grey would throw away
+ * the colour the transcript deliberately uses (cyan user markers, green diff
+ * counts, red errors) and flatten the whole screen to one shade; `C.dim` is an
+ * attribute, so it can simply be prepended and the cell's own SGR still applies.
+ * That is the ANSI equivalent of what the retained renderer does for free.
+ *
+ * WHY IT GOES THROUGH parseCells INSTEAD OF WRITING `C.dim + ch + C.reset`
+ * ----------------------------------------------------------------------
+ * The first version emitted that per cell, and it silently DESTROYED colour: the
+ * `C.reset` closed each cell, so every cell after the first was painted with no
+ * foreground at all. It looked correct with the escapes stripped — which is exactly
+ * how it was being checked — and wrong on a real terminal, where a row of cyan user
+ * markers went grey after the first character. Dimming a cell means adding an
+ * attribute to the style that cell ALREADY carries, which is what the cell buffer
+ * knows and a raw string walk does not.
+ */
+/**
+ * The background colour a cell carries, as `[r, g, b]`, or null when the cell has no
+ * explicit background (which includes a cell whose background was already reset).
+ *
+ * THE LAST `48;…` IS THE ONE IN FORCE. `parseCells` accumulates SGR codes into a cell's
+ * style and never drops the ones a later background overrides, so a cell inside the
+ * context bar carries every fill up to its own column — `48;…system`, `48;…prompt`,
+ * `48;…assistant`, `48;…thinking`. Matching the FIRST one reported the same colour for
+ * every cell in the row, and the backdrop dimming then rewrote all five fills to that one
+ * colour: the bar came back as a single flat band, which on a terminal whose page is not
+ * black is indistinguishable from the page — the bar looked simply gone.
+ */
+function cellBg(cells, c) {
+  const cell = cells[c];
+  if (!cell) return null;
+  let m = null;
+  for (const hit of cell.style.matchAll(/48;(?:2;(\d+);(\d+);(\d+)|5;(\d+))/g)) m = hit;
+  if (!m) return null;
+  if (m[1] !== undefined) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  // 256-colour index -> rgb. Only the two families a palette can plausibly use here: the
+  // 6x6x6 cube (16..231) and the grey ramp (232..255). Anything else is left alone rather
+  // than converted wrongly, because a wrong colour is worse than an undimmed cell.
+  const n = Number(m[4]);
+  if (n >= 232 && n <= 255) {
+    const v = 8 + (n - 232) * 10;
+    return [v, v, v];
+  }
+  if (n >= 16 && n <= 231) {
+    const c6 = (n - 16) / 36 | 0;
+    const g6 = ((n - 16) % 36) / 6 | 0;
+    const b6 = (n - 16) % 6;
+    const step = (v) => (v === 0 ? 0 : 55 + v * 40);
+    return [step(c6), step(g6), step(b6)];
+  }
+  return null;
+}
+
+function dimRange(row, from, to) {
+  if (to <= from) return row;
+  const cells = parseCells(row);
+  for (let c = from; c < to && c < cells.length; c++) {
+    // Prefix the cell's own style, so it keeps its colour and merely gains faint.
+    const cell = cells[c];
+    if (cell.style.includes(C.dim)) continue;
+    // `ESC[2m` fades the FOREGROUND only. A cell painted with a BACKGROUND — the context
+    // bar's segments, the scrollbar thumb, any filled chip — therefore stayed at full
+    // brightness while every glyph around it receded, so an open picker left the bar
+    // blazing under the dimmed page. The bar is read as a row of colour with no text at
+    // all, so this was the only part of the screen that did not dim.
+    //
+    // Terminals have no "dim this background", so the background is darkened explicitly:
+    // a cell that carries one gets a proportionally darker `48;2;…` in place of the
+    // `48;5;n` it had, keeping the hue and losing the brightness. Which is the same
+    // operation a real compositor does, and it composes with `C.dim` on the glyph.
+    // Terminals have no "dim this background", so the background is darkened explicitly:
+    // a cell that carries one gets a proportionally darker `48;2;…` in place of the
+    // `48;5;n` it had, keeping the hue and losing the brightness. Which is the same
+    // operation a real compositor does, and it composes with `C.dim` on the glyph.
+    //
+    // Nothing is exempt. The scrollbar's thumb was going to be, on the reasoning that its
+    // colour is what distinguishes idle from hovered from dragged — but an overlay being
+    // open means the pointer is on the card, so the thumb cannot be hovered or dragged at
+    // that moment and there is no state to lose. It dims with everything else, which is also
+    // what the scrollbar test has always asked for ("nothing on the bar keeps full
+    // brightness").
+    const bg = cellBg(cells, c);
+    const faded = bg ? dimmedBg(bg) : '';
+    // ORDER MATTERS, and getting it wrong is invisible in a stripped-text check.
+    //
+    // `ESC[2m` (faint) is an INTENSITY attribute, not a glyph attribute: a terminal that
+    // implements it as a global dimming applies it to the background as well. Emitting
+    // `ESC[0m ESC[2m ESC[48;5;24m` leaves faint active while the fill is being set, and
+    // Windows Terminal's response to "a faint background" is to drop the background outright —
+    // the bar came back with its glyphs and nothing behind them, which reads as "the bar
+    // vanished" rather than as a terminal quirk.
+    //
+    // So the fill goes FIRST and the faint after it: the intensity attribute is then applied
+    // to a fill the terminal has already resolved, and nothing downstream can unset it.
+    //
+    // The two branches differ because they are two different corrections, and only one of
+    // them replaces the fill: `dimmedBg` returns '' at 256 colours (where no darker shade
+    // keeps the segments apart), and there the original `48;…` has to be put BACK rather
+    // than dropped, or the fill is lost entirely.
+    // The WHOLE escape has to go, not just its parameters: stripping `48;2;…` from
+    // `ESC[48;2;…m` leaves a bare `ESC[m`, and a bare `ESC[m` is itself a full reset —
+    // it cancelled the faded fill that had just been emitted and every attribute before
+    // it, so on a truecolor terminal the bar came out with no background at all.
+    const withoutFill = cell.style.replace(/\x1b\[48;(?:5;\d+|2;\d+;\d+;\d+)m/g, '');
+    const style = faded ? faded + C.dim + withoutFill : cell.style + C.dim;
+    cells[c] = { ...cell, style };
+  }
+  return renderCells(cells);
+}
+
+/** How far a background is pulled toward the page when the page dims.
+
+/** How far a background is pulled toward the page when the page dims.
+ *
+ *  NOT a plain multiply. Two things made that wrong:
+ *
+ *  * On a 256-colour terminal the bar's fills are ALREADY dark — the free segment is
+ *    rgb(48,48,48), index 236 — and halving one lands on rgb(17,17,17), which quantises
+ *    into the 6x6x6 cube's lowest step and comes out indistinguishable from the page. The
+ *    picture did not dim, it disappeared, leaving only its glyphs.
+ *
+ *  * Dimming a backdrop is a loss of CONTRAST, not of light. What makes a surface recede is
+ *    its distance from the page colour shrinking, so the fill moves TOWARD the background
+ *    rather than toward black. That keeps every fill distinguishable from the page while
+ *    making it plainly quieter, which is the whole point of a backdrop.
+ *
+ *  The floor exists for the same reason: a fill already at the page's own brightness has
+ *  nowhere to go, and forcing it lower only makes it read as a hole.
+ */
+const DIM_BACKGROUND_SCALE = 0.72;
+const DIM_BACKGROUND_FLOOR = 28;
+
+/**
+ * The dimmed form of a background, or '' to leave it alone.
+ *
+ * WHY IT IS A NO-OP AT 256 COLOURS
+ * -------------------------------
+ * The obvious implementation — scale the triple toward the page — does not survive
+ * quantisation. The 6x6x6 cube has six steps per channel and the bar's blues live in its
+ * lowest two (`ctxSystem` lands on index 23, `ctxAssistant` on 61). Pulling them down by even
+ * 15% collapses them: measured across the six fills, 0.85x keeps five distinct and 0.72x
+ * keeps four, and the segments that merge are precisely the ones the bar exists to tell
+ * apart. What came out on a 256-colour terminal was a row of one flat colour — dimmed, but
+ * no longer a bar.
+ *
+ * So the fill is only rewritten where an exact triple can be stated. `ESC[2m` still dims the
+ * glyphs at every depth, and at 256 colours that is what the terminal can express faithfully;
+ * the alternative is a bar that has quietly lost two of its five segments.
+ *
+ * `bgRgb` rather than a raw `48;2;…`, for the same reason it exists: an escape the terminal
+ * does not implement is dropped silently, which looks exactly like "the fill vanished" — and
+ * that is what happened before this was noticed.
+ */
+function dimmedBg([r, g, b]) {
+  if (!TRUECOLOR) return '';
+  const k = (v) => Math.max(DIM_BACKGROUND_FLOOR, Math.min(255, Math.round(v * DIM_BACKGROUND_SCALE)));
+  const out = [k(r), k(g), k(b)];
+  // Unchanged means the fill was already at the floor: darkening further would only make it
+  // read as a hole punched in the page.
+  if (out[0] === r && out[1] === g && out[2] === b) return '';
+  return bgRgb(out[0], out[1], out[2]);
+}
+
+/**
+ * Replace the visible columns [from, to) of an ANSI row with blank cells, keeping every
+ * other cell exactly as it was.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * A floating card composites over the frame, and the columns it occupies are its own.
+ * What it must NOT do is leave the transcript's glyphs pressed against its edge: a
+ * panel is a surface with a margin, and text that runs right up to (or under) the last
+ * column of the panel reads as clipped, not as a layer. The card reserves one column
+ * each side as a gutter, and this is what clears those columns.
+ *
+ * WHY NOT `row.slice(0, a) + ' '.repeat(n) + row.slice(b)`
+ * --------------------------------------------------------
+ * String indices are not display columns. A row containing a CJK glyph has fewer
+ * characters than columns, so a slice at a column index cuts the row in the wrong place
+ * — the same desynchronisation `parseCells` exists to prevent. Working on cells keeps
+ * index == column.
+ */
+function blankRange(row, from, to) {
+  if (to <= from) return row;
+  const cells = parseCells(row);
+  // A WIDE glyph is one cell plus a continuation cell, and `renderCells` emits the
+  // continuation as NOTHING — the glyph before it already covers both columns. So
+  // blanking only one half of a pair is what shifted the whole row: the half left behind
+  // stopped being emitted while the blanked half emitted a single space, and the row
+  // came out one column short. Everything after it slid left, which moved the
+  // scrollbar column inward on exactly the rows where a wide glyph straddled the
+  // range boundary. The pair is therefore blanked as a UNIT: if the range touches
+  // either half, both halves become ordinary spaces, so the columns are still there.
+  for (let c = from; c < to && c < cells.length; c++) {
+    let start = c;
+    if (cells[c].cont) start = c - 1;
+    if (start < 0) continue;
+    cells[start] = { ch: ' ', style: '', blank: false };
+    // The glyph's second column is inside the range, or it is not — either way it has
+    // to go with the first, or the pair no longer accounts for two columns.
+    if (cells[start + 1] && cells[start + 1].cont) {
+      cells[start + 1] = { ch: ' ', style: '', blank: false };
+    }
+  }
+  return renderCells(cells);
+}
+
 // ---- git status for the status line ----------------------------------------
 // The badge shows the branch and the uncommitted diff totals. Computing that
 // costs a handful of git subprocesses, so it is NEVER done from the render path:
@@ -2972,8 +4044,54 @@ function sliceAnsi(s, width) {
 // Frame-rate polling was the previous design and cost a git spawn per keystroke;
 // a fixed cadence is both cheaper and more predictable.
 const GIT_REFRESH_MS = 15000;
+
+// Re-resolve the hover highlight against a FRESH frame.
+//
+// `state.hoverHit` records a screen row captured the moment the mouse moved, and it
+// is only updated by the next mouse event. A repaint that moves content under a
+// stationary pointer therefore left the highlight on the WRONG text: hovering a row
+// and then letting the transcript grow (a streamed reply, an interrupt notice) kept
+// whatever slid into that row tinted. Re-running the hit test with the pointer's last
+// position against this frame's hitboxes keeps the highlight on the control the
+// pointer is actually over, and drops it when that control is gone.
+//
+// Returns the resolved span, or null when the pointer is not over anything (which is
+// what clears the tint). Falls back to null when there is no pointer data at all, so
+// a caller can decide whether to keep the stored span.
+// Click targets that must NOT be tinted on hover. They are text-entry or
+// text-body areas: tinting a line of editable text reads as a SELECTION, which it
+// is not, and it repaints on every mouse move for no benefit.
+//   composerRow — the input line (existing behaviour)
+//   editor      — the modal editor's text body (e.g. /set-system-prompt, /personal)
+//   panelBody   — an info panel's rows (nothing on them is clickable; the hitbox
+//                 only exists so a click inside does not dismiss the panel)
+//   pickerBody  — the picker popup's box rows (same absorb-only role; the rows
+//                 that DO have an action carry pickerItem/pickerCategory/… and
+//                 are registered after it, so backward iteration finds those first)
+const NO_HOVER_TINT = new Set(['composerRow', 'editor', 'panelBody', 'pickerBody']);
+
+export function resolveHoverHit(state, hitboxes) {
+  const m = state._lastMouse;
+  if (!m) return null;
+  const row = (m.row || 1) - 1;
+  const col = (m.col || 1) - 1;
+  const boxes = hitboxes || state._hitboxes || [];
+  for (let i = boxes.length - 1; i >= 0; i--) {
+    const hb = boxes[i];
+    if (hb.row !== row) continue;
+    if (col < hb.col0 || col > hb.col1) continue;
+    if (NO_HOVER_TINT.has(hb.kind)) return null;
+    // `kind` travels with the hit: the hover tint only needs the span, but a hit that has
+    // something TO SAY — the context bar naming the segment under the pointer — needs to
+    // know which one, and the span alone cannot tell a segment from a status-line field.
+    return { row: hb.row, col0: hb.col0, col1: hb.col1, kind: hb.kind, data: hb.data };
+  }
+  return null;
+}
+
 export function refreshGitInfo(state, opts = {}) {
   const cwd = state.cwd || state.workspace || '';
+  if (!cwd) return;
   if (!cwd) return;
   const now = Date.now();
   const force = opts.force === true;
@@ -3000,6 +4118,98 @@ export function refreshGitInfo(state, opts = {}) {
       if (typeof state._requestRender === 'function') state._requestRender();
     });
 }
+/**
+ * Tokens per content type, and how many messages of each kind there are.
+ *
+ * Shared by `/context` (which prints the table) and by the status bar's bar (which draws
+ * it), so the two can never disagree about what is being counted.
+ */
+export function contextBreakdown(session, cfg) {
+  // `cfg` is optional because the render path reaches this through `state.cfg`, and a state
+  // built directly (several tests do) has no `cfg` at all. An absent config must not take
+  // the frame down; it only means the tool-definition count falls back to the full list.
+  const conf = cfg || {};
+  const byRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
+  const countByRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
+  for (const m of ((session && session.messages) || [])) {
+    // Per-message estimator, memoised: `estimateMessagesTokens([m])` re-ran the whole message
+    // Per-message estimator, memoised: `estimateMessagesTokens([m])` re-ran the whole message
+    // loop for a single-element array, which on a long transcript made /context O(n²). The
+    // memo means re-opening /context — or opening it after the bar already priced these
+    // messages — is a WeakMap hit per message instead of a fresh walk of every tool body.
+    const t = messageTokens(m, conf);
+    const r = (m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool') ? m.role : 'other';
+    byRole[r] += t;
+    countByRole[r] += 1;
+  }
+  // Tool definitions ride every request (name + schema), priced here the same way
+  // usedTokens() prices them.
+  const toolCount = Array.isArray(conf.toolFilter) ? conf.toolFilter.length : (toolNames().length);
+  return { byRole, countByRole, toolDefTokens: toolCount * 8, toolCount };
+}
+
+/**
+ * The same breakdown in the shape the bar draws it, CACHED.
+ *
+ * The cache is not an optimisation detail, it is what makes the bar affordable: the walk
+ * is O(messages) with a token estimate for each, which on a long transcript is the most
+ * expensive thing a frame could do — and a frame happens several times a second while text
+ * streams. The numbers only move when the conversation does, so the key is the message COUNT
+ * plus the token total: a count change means something was added or removed, and the total
+ * catches an in-place edit to an existing message.
+ *
+ * `state._ctxSegs` holds `{ key, segments }`.
+ */
+export function contextSegments(state, cfg) {
+  const msgs = (state.session && state.session.messages) || [];
+  // The system prompt is assembled fresh each turn and deliberately kept OUT of
+  // `session.messages`: a system entry there would be persisted and replayed, so both
+  // turn start and every step boundary write the array back with `role !== 'system'`
+  // filtered out. The render path reads exactly that array, so during a turn there was
+  // no system message to count and the `system prompt` segment got zero columns and
+  // vanished — then reappeared at turn end, when the full request is assigned back.
+  // `turnSystemPrompt` carries the assembled text for the duration of the turn so the
+  // segment can be priced the whole time it is actually being sent.
+  const hasSystemMsg = msgs.some((m) => m && m.role === 'system');
+  const sysText = (!hasSystemMsg && typeof state.turnSystemPrompt === 'string') ? state.turnSystemPrompt : '';
+  const priced = sysText ? [{ role: 'system', content: sysText }, ...msgs] : msgs;
+  const total = state.ctxTokens || 0;
+  const key = `${msgs.length}:${total}:${state.rounds || 0}:${sysText.length}`;
+  const hit = state._ctxSegs;
+  if (hit && hit.key === key) return hit.segments;
+
+  const { byRole } = contextBreakdown({ messages: priced }, cfg);
+  // Reasoning is not a session message — `agent.js` keeps it out of `messages` because it
+  // must not be sent back to the model — so it has no per-message source. It is whatever
+  // the gauge counts that the conversation does not, and only once the model has produced
+  // some, so a model that never thinks gets no phantom segment.
+  const counted = byRole.system + byRole.user + byRole.assistant + byRole.tool + byRole.other;
+  // The gauge's total and the sum of the per-message estimates are NOT the same number, and
+  // the difference is not small: `ctxTokens` is what the provider REPORTED for the request, so
+  // it carries the system prompt, every tool definition, and the framing around each message
+  // — none of which appear in `session.messages` as countable text. Drawing the estimate as
+  // the bar made a 5%-full session render as a bar that was 95% empty, which contradicts the
+  // percentage printed on the same row.
+  //
+  // So the estimate is scaled up to the reported total. Every segment's RELATIVE share is
+  // preserved — and the share is the only thing a colour can honestly encode — while the
+  // filled part of the bar now agrees with the number beside it. Reasoning is left out of the
+  // scaling: it is not a session message at all, and it is measured separately as whatever
+  // the gauge counts that the conversation does not.
+  const scale = counted > 0 && total > counted ? total / counted : 1;
+  const share = (n) => Math.round(n * scale);
+  const conversation = share(byRole.system) + share(byRole.user) + share(byRole.assistant)
+    + share(byRole.tool) + share(byRole.other);
+  const segments = {
+    system: share(byRole.system),
+    prompt: share(byRole.user),
+    assistant: share(byRole.assistant),
+    thinking: state.seenThinking ? Math.max(0, total - conversation) : 0,
+    tools: share(byRole.tool) + share(byRole.other),
+  };
+  state._ctxSegs = { key, segments };
+  return segments;
+}
 
 // ---- pure frame composer (no TTY side effects) ----
 // kimi-code-cli layout: NO top chrome. Top-to-bottom it is:
@@ -3011,18 +4221,56 @@ export function composeFrame(state, cols, rows) {
   const h = Math.max(12, rows | 0);
   // NOTE: no git call here. The render path only READS state._gitInfo; refreshing
   // it is driven by a 15s timer and by turn-end (see refreshGitInfo).
-  // Full-screen takeovers (kimi's screen-takeover): the /tasks browser and its
-  // output viewer own the ENTIRE screen, so they short-circuit the normal
-  // layout ? no chat, no composer, no status bar.
+  // A full-screen takeover (kimi's screen-takeover) owns the ENTIRE screen: no
+  // chat, no composer, no status bar. Those surfaces return BEFORE the generic
+  // hover pass near the end of this function, so the tint has to be applied here
+  // — that is exactly what `takeoverFrame` does, in one place. A takeover that
+  // forgets it (as the registry browser did) ends up clickable with NO hover,
+  // which reads as broken. Passing the recorded hitboxes makes hover automatic:
+  // if something is a click target, it is a hover target.
+  const takeoverFrame = (lines, hbs) => {
+    // Resolve from the POINTER, not from `state.hoverHit`: each takeover records
+    // `_lastMouse` in its own handler, and gating on hoverHit (which some surfaces
+    // never set) is what left the registry rows untinted. `resolveHoverHit` returns
+    // null when there is no pointer data, so an untouched screen stays plain.
+    const hv = resolveHoverHit(state, hbs);
+    if (hv && hv.row >= 0 && hv.row < lines.length) {
+      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1 + 1);
+    }
+    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
+             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(),
+             hitboxes: hbs, composerMeta: [] };
+  };
   if (state.tasksViewer) {
     const lines = renderTaskOutputViewer(state.tasksViewer, w, h);
-    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
-             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: [], composerMeta: [] };
+    return takeoverFrame(lines, []);
   }
   if (state.tasksPanel) {
     const lines = renderTasksBrowser(state.tasksPanel, w, h);
-    return { ansi: '', lines, cursor: { row: 0, col: 0 }, cursorVisible: false,
-             width: w, height: h, cursorRow: 0, cursorCol: 0, cursorShape: hideCursor(), hitboxes: [], composerMeta: [] };
+    // The browser records its own click targets; the shape matches what hitAt()
+    // expects, so the generic dispatch works unchanged.
+    return takeoverFrame(lines, (state.tasksPanel._taskHits || []).slice());
+  }
+  // The /skills and /plugins manager is a full-screen takeover like the browser above.
+  if (state.registryBrowser) {
+    const lines = renderRegistryBrowser(state.registryBrowser, w, h);
+    return takeoverFrame(lines, (state.registryBrowser._regHits || []).slice());
+  }
+  // The file tree browser (/files) is another takeover. It re-renders from ITS OWN state
+  // every frame, so a directory opened with the arrows is reflected immediately.
+  if (state.fileTree) {
+    const ctx = state.fileTree;
+    const rows = visibleRows(ctx.root, ctx.expanded);
+    const view = renderTree({
+      root: ctx.root, rows, sel: ctx.sel, scroll: ctx.scroll,
+      width: w, height: h, filter: ctx.filter, expandedSet: ctx.expanded,
+    });
+    // Remember what was drawn: the key handler needs the same `rows` this frame used, or
+    // an arrow or a click would act on a list the user is not looking at.
+    ctx._rows = rows;
+    ctx.sel = view.sel;
+    ctx.scroll = view.scroll;
+    return takeoverFrame(view.lines, []);
   }
   const insideW = Math.max(0, w - 2);
 
@@ -3034,19 +4282,41 @@ export function composeFrame(state, cols, rows) {
   // composer, so the transcript stays visible (see the `state.question` block).
   const dialog = state.editor || state.picker || state.form || state.panel || null;
 
+// TRUE TAKEOVER: an overlay that owns the whole body and REPLACES the composer.
+// The picker is deliberately excluded — it is a floating popup composited over the
+// transcript (see the picker popup step), so the composer, the todo panel and the
+// tail of the conversation must stay on screen underneath it. Hiding the composer
+// for a menu is what made the picker read as a full-screen takeover: the input box
+// you were about to type into vanished, and the rows the box floats over were
+// overwritten with spaces, erasing whatever was behind them.
+//
+// `dialog` stays as-is (truthy for every overlay) wherever the question is "is
+// SOMETHING modal open" — key routing, absorbing stray clicks, the caret — because
+// a picker IS modal even though it is not a takeover. Only the LAYOUT decisions,
+// which ask "does this overlay own the body", use this one.
+const takeover = state.editor || state.panel || null;
+
   // ---- geometry ----
   const composer = composerLayout(state, insideW - 3); // bodyW = (insideW-3)-2 = 53, matches fitAnsi(textW-2) = cInner-4 = 53
-  const composerBoxH = dialog ? 0 : composer.rows.length + 2;
-  const menuItems = (state.menuOpen && state.menuList.length && !dialog)
+  const composerBoxH = takeover ? 0 : composer.rows.length + 2;
+  const menuItems = (state.menuOpen && state.menuList.length && !takeover)
     ? Math.min(state.menuList.length, MAX_MENU) + 1
     : 0;
   // The notice no longer reserves a row: it is drawn ON the context row (see the
   // bottom of this function), so `noticeH` only selects the colour there.
   const noticeH = state.notice ? 1 : 0;
   const confirmH = state.confirmExit ? 1 : 0;
-  const workingH = (!dialog && state.running) ? 1 : 0;
-  const todoH = dialog ? 0 : todoPanelHeight(state);
-  const queueH = dialog ? 0 : queuePanelHeight(state);
+  const workingH = (!takeover && state.running) ? 1 : 0;
+  // The todo and queue panels sit directly above the composer, so they stay visible
+// under a picker for the same reason the composer does — a popup covers the
+// transcript, not the controls.
+const todoH = takeover ? 0 : todoPanelHeight(state);
+const queueH = takeover ? 0 : queuePanelHeight(state);
+  // The side-thread box takes its rows OUT of the transcript, the same way the queue
+  // panel does — otherwise it would overlap the chat.
+  const btwH = (!takeover && state.btwPanel && state.btwPanel.turns && state.btwPanel.turns.length)
+    ? btwPanelHeight(state, h, insideW)
+    : 0;
   // The question box is chrome above the composer, so its rows must come OUT of
   // the transcript area — otherwise the box would overlap the chat.
   //
@@ -3058,14 +4328,14 @@ export function composeFrame(state, cols, rows) {
   // The `@file` list occupies the same rows as the `/` menu, so it counts against
   // the same budget — otherwise the frame overflows and the top trim eats the
   // transcript. Only one of the two can be open at a time (see refreshMention).
-  const mentionItems = (state.mentionOpen && state.mentionList.length && !dialog)
+  const mentionItems = (state.mentionOpen && state.mentionList.length && !takeover)
     ? Math.min(state.mentionList.length, MAX_MENU) + 1
     : 0;
-  const chromeH = todoH + queueH + workingH + composerBoxH + menuItems + mentionItems + STATUS_H + confirmH + CTX_H;
+  const chromeH = todoH + queueH + btwH + workingH + composerBoxH + menuItems + mentionItems + STATUS_H + confirmH + CTX_H;
   // NOTE the extra `- 1`: `bodyH` below is clamped to a MINIMUM of 1 row, so that
   // row has to be reserved here too. Without it the total came out one over and
   // the top trim ate the box's `╭` border.
-  const questionH = (!dialog && state.question)
+  const questionH = (!takeover && state.question)
     ? Math.min(questionBoxHeight(state, insideW), Math.max(1, h - chromeH - 1))
     : 0;
   const bottomH = chromeH + questionH;
@@ -3078,6 +4348,24 @@ export function composeFrame(state, cols, rows) {
   let questionCaret = null;
   const hits = [];
   const addHit = (row, col0, col1, hit) => hits.push({ row, col0, col1, ...hit });
+  // Built by the picker branch below and PAINTED after the chat body, so the
+  // picker floats over the transcript instead of replacing it (see the picker
+  // popup step). Rows/columns stay body-relative until that step positions it.
+  let pickerOverlay = null;
+  // Where the picker card landed, so the whole frame can be dimmed once every row
+  // exists (the status line and context row are pushed after the card is drawn).
+  let pickerCard = null;
+  // The card's first and last BODY-relative rows, set when the overlay is placed
+  // (`[start, end]`, inclusive). Used at the hitbox assembly step to drop the controls
+  // UNDERNEATH an open overlay, so the pointer cannot tint or operate what the card
+  // covers. Stays null when no overlay is drawn.
+  let overlayCardRows = null;
+  // The FORM's card spec, when one is open. /provider and /model editing open a form,
+  // and it is drawn through the SAME popup path as the picker (see the popup card step),
+  // so editing no longer blanks the screen.
+  let popupCard = null;
+  // Composition-time row where the chat body starts, set when it is drawn.
+  let chatOrigin = null;
   // Cleared every frame: the body records its origin only when it is actually
   // drawn, and the `+= topPad - topTrim` correction at the end of this function
   // must not run twice against a stale value (a dialog frame leaves the body
@@ -3091,10 +4379,17 @@ export function composeFrame(state, cols, rows) {
     const ed = state.editor;
     const rule = col('─'.repeat(w), C.border);
     const textLines = ed.text.split('\n');
-    lines.push(col(ed.title || 'Edit', C.cyan + C.bold));
+    // The title is CLAMPED to one row. An overlong title (e.g. /personal's, which
+    // embeds the full file path) used to be emitted unwrapped: the terminal then
+    // wrapped it onto a second visual row while the `lines` array still had ONE,
+    // so every row below — the text body included — sat one row lower on screen
+    // than the code assumed. Clicks and the caret landed one line off.
+    lines.push(col(fitAnsi(ed.title || 'Edit', w), C.cyan + C.bold));
     lines.push(rule);
     const hint = ed.hint || 'Ctrl+S save · Esc cancel · Enter newline';
-    lines.push(col(hint, C.gray));
+    // Clamped like the title: an overlong hint would wrap on screen and shift the
+    // body the same way.
+    lines.push(col(fitAnsi(hint, w), C.gray));
     lines.push('');
     // Viewport height for the editor body. The editor's own rows are:
     //   title + rule + hint + blank            (4, pushed above)
@@ -3114,8 +4409,12 @@ export function composeFrame(state, cols, rows) {
       const idx = top + i;
       const txt = idx < textLines.length ? expandTabs(textLines[idx]) : '';
       lines.push(col(fitAnsi(txt, w), C.white));
-      // Mouse click on this body row moves the caret to that line.
-      addHit(lines.length - 1, 0, w - 1, { kind: 'editor', row: idx });
+      // Mouse click on this body row moves the caret to that line. The payload is
+      // `line`, NOT `row`: `row` is the hitbox's SCREEN row and composeFrame
+      // overwrites it with the topPad/topTrim correction, which turned the text
+      // index into `idx + topPad - topTrim` — clicking near the top jumped the
+      // caret far down the file.
+      addHit(lines.length - 1, 0, w - 1, { kind: 'editor', line: idx });
     }
     lines.push(col(fitAnsi(`  line ${ed.caretRow + 1}/${textLines.length} · ${textLines.length} lines`, w), C.gray));
     if (ed.notice) lines.push(col(fitAnsi('  ' + ed.notice, w), ed.noticeKind === 'error' ? C.red : C.green));
@@ -3137,6 +4436,7 @@ export function composeFrame(state, cols, rows) {
     const viewH = Math.max(1, bodyH - 5);
     const maxTop = Math.max(0, bodyLines.length - viewH);
     const top = Math.min(maxTop, Math.max(0, p.top || 0));
+    const panelTop = lines.length;   // first row of the panel (its title)
     lines.push(col(p.title || '', C.cyan + C.bold));
     lines.push(rule);
     for (let i = 0; i < viewH; i++) {
@@ -3148,12 +4448,21 @@ export function composeFrame(state, cols, rows) {
     lines.push(col(fitAnsi(`  ${up} ${down}`, w), C.gray));
     lines.push(col('Esc close · ↑/↓ scroll', C.gray));
     lines.push(rule);
+    // A hitbox for EVERY rendered row of the panel. A click INSIDE the panel must
+    // NOT dismiss it: without these the mousedown fell through to the "click outside
+    // an overlay closes it" path, so any click — even one meant to scroll or select
+    // the text — closed the panel. `addHit` is single-row, so one per row is needed
+    // (a single hit on the title row would still leave every content row closable).
+    for (let r = panelTop; r < lines.length; r++) addHit(r, 0, w - 1, { kind: 'panelBody' });
     while (lines.length < bodyH) lines.push(' '.repeat(w));
   } else if (state.form) {
     const f = state.form;
-    const rule = col('─'.repeat(w), C.border);
+    // A rule row starts as a SENTINEL, exactly as in the picker: the popup box is
+    // narrower than the terminal, so a full-width rule computed here would not fit. The
+    // overlay step turns it into the box's inner width once that is known.
+    const RULE = { __rule: true };
     const fields = f.fields || [];
-    const body = [col(f.title || '', C.cyan + C.bold), rule, ''];
+    const body = [col(f.title || '', C.cyan + C.bold), RULE, ''];
     const fieldBodyRows = [];
     fields.forEach((field, i) => {
       const active = i === f.fieldIdx;
@@ -3167,7 +4476,10 @@ export function composeFrame(state, cols, rows) {
     let typeOpts = [];
     if (!f.hideType) {
       body.push('');
-      const types = ['OpenAI', 'Anthropic'];
+      // "OpenAI Responses" sits right after "OpenAI" and maps to the Responses API
+      // protocol (a distinct wire format from chat/completions). Use the form's own
+      // list when present so the drawn options and the keyboard cycle cannot drift.
+      const types = (f.types && f.types.length) ? f.types : PROTOCOL_TYPES;
       const typeActive = f.fieldIdx === fields.length;
       const labelW = visualCol('Type:'.padEnd(f.labelW + 1));
       let colCursor = labelW;
@@ -3188,43 +4500,51 @@ export function composeFrame(state, cols, rows) {
     }
     body.push('');
     body.push(col(f.hint || 'Tab next field · Enter submit · Esc cancel', C.gray));
-    body.push(rule);
-    const padTop = Math.max(0, Math.floor((bodyH - body.length) / 2));
-    fieldBodyRows.forEach((bi, i) => addHit(padTop + bi, 0, w - 1, { kind: 'formField', index: i }));
-    if (typeBodyRow >= 0) {
-      typeOpts.forEach((rec) => addHit(padTop + typeBodyRow, rec.colStart, rec.colEnd, { kind: 'formType', option: rec.opt }));
-    }
-    for (let i = 0; i < padTop; i++) lines.push(' '.repeat(w));
-    for (const b of body) lines.push(b);
-    while (lines.length < bodyH) lines.push(' '.repeat(w));
-    if (dialogCaret) dialogCaret.row += padTop;
+    body.push(RULE);
+    // The form is a POPUP, like the picker — it used to be a full-screen takeover,
+    // which meant /provider and /model editing blanked the whole screen and hid the
+    // composer, the status line and the list you were picking from. The body is stashed
+    // and the popup step boxes and centres it over the dimmed transcript; the caret and
+    // the field hitboxes stay BODY-relative until then.
+    popupCard = { body, fieldBodyRows, typeBodyRow, typeOpts, anchor: null };
   }
   if (state.picker) {
     const pick = state.picker;
     const query = state.pickerQuery || '';
     const list = pickerFiltered(state);
     const selIdx = Math.max(0, Math.min(list.length - 1, pick.sel || 0));
-    const rule = col('─'.repeat(w), C.border);
+    // A rule row starts as a SENTINEL: the popup box is narrower than the
+    // terminal, so a full-width rule computed here would not fit. The overlay
+    // step turns it into the box's inner width once that is known.
+    const RULE = { __rule: true };
     const titleSuffix = pick.searchable === false ? '' : ' (type to search)';
     const hintText = pick.hint || '↑↓ navigate · Enter select · Esc cancel';
     const body = [
       col(pick.title || '', C.cyan + C.bold) + col(titleSuffix, C.gray),
-      rule,
+      RULE,
       col(hintText, C.gray),
       '',
     ];
+    // The caret stays BODY-RELATIVE here; the overlay step converts it to an
+    // absolute frame position once the box is placed.
+    let pickCaret = null;
     if (pick.searchable !== false) {
       body.push(col('Search: ', C.gray) + col(query, C.white));
       if (query) {
-        dialogCaret = { row: body.length - 1, col: visualCol('Search: ') + visualCol(query) };
+        pickCaret = { row: body.length - 1, col: visualCol('Search: ') + visualCol(query) };
       }
     }
     // Category tabs (if the picker defines them): "All" + provider categories.
+    // Each tab records its COLUMN RANGE so a click can select that category and a
+    // hover can highlight it (previously the row was pure text: no hitbox at all).
+    let catBodyRow = -1;
+    const catTabs = [];
     if (pick.categories && pick.categories.length > 1) {
       const cats = pick.categories;
       const active = state.pickerCategory || cats[0];
       const allItems = state.picker.items || [];
       let catLine = col('Categories: ', C.gray);
+      let catCursor = visualCol('Categories: ');
       for (let ci = 0; ci < cats.length; ci++) {
         const label = cats[ci];
         const active_ = label === active;
@@ -3235,17 +4555,23 @@ export function composeFrame(state, cols, rows) {
         } else {
           cnt = allItems.filter((it) => it.category === label).length;
         }
-        const seg = active_
-          ? col(`[${label} (${cnt})]`, C.cyan + C.bold)
-          : col(` ${label} (${cnt}) `, C.gray);
+        const text = active_ ? `[${label} (${cnt})]` : ` ${label} (${cnt}) `;
+        const seg = active_ ? col(text, C.cyan + C.bold) : col(text, C.gray);
+        catTabs.push({ label, colStart: catCursor, colEnd: catCursor + visualCol(text) - 1 });
+        catCursor += visualCol(text);
         catLine += seg;
       }
       body.push(catLine);
+      catBodyRow = body.length - 1;
     }
-    // Overhead: header rows (body.length) + trailing empty + rule + optional "more" line + optional footer (empty + footer row).
+    // Overhead: header rows (body.length) + optional footer (empty + footer row).
     const footerRows = pick.footer ? 2 : 0;
-    const overhead = body.length + footerRows + 2; // +2 for trailing empty line and rule
-    const maxItems = Math.max(1, Math.min(MAX_PICKER, bodyH - overhead - 1)); // -1 reserved for potential "more" line
+    const overhead = body.length + footerRows + 2; // +2 for the trailing blank and a "more" line
+    // The picker is a floating BOX, not the whole body: cap its height so the
+    // transcript stays visible around it and the box can never outgrow the
+    // screen. The overlay clips defensively anyway.
+    const popBudget = Math.max(4, Math.min(bodyH - 2, 30));
+    const maxItems = Math.max(1, Math.min(MAX_PICKER, popBudget - overhead - 1)); // -1 reserved for potential "more" line
     let first = Math.max(0, selIdx - Math.floor((maxItems - 1) / 2));
     if (first + maxItems > list.length) first = Math.max(0, list.length - maxItems);
     const shown = list.slice(first, first + maxItems);
@@ -3261,9 +4587,11 @@ export function composeFrame(state, cols, rows) {
       const ptr = isSel ? col('❯ ', C.cyan) : '  ';
       const label = col(String(item.label), isSel ? (C.cyan + C.bold) : C.white);
       const sub = item.sub != null && item.sub !== '' ? col('  ' + String(item.sub), C.gray) : '';
-      const cur = item.current ? col('  ← current', C.green) : '';
+      // The "current" marker sits right after the name (not right-aligned at the far
+      // edge), with a wider gap so it does not crowd the label.
+      const cur = item.current ? col('   ← current', C.green) : '';
       itemBodyRows.push(body.length);
-      body.push(col(fitAnsi(ptr + label + sub, w - visualCol(cur)), C.white) + cur);
+      body.push(col(ptr + label + sub + cur, C.white));
     });
     if (list.length > maxItems) body.push(col(`▼ ${list.length - (first + shown.length)} more`, C.gray));
     let footerBodyRow = -1;
@@ -3287,31 +4615,28 @@ export function composeFrame(state, cols, rows) {
       body.push(row);
       footerBodyRow = body.length - 1;
       if (f.focused) {
-        dialogCaret = { row: body.length - 1, col: visualCol(label) + 1 };
+        pickCaret = { row: body.length - 1, col: visualCol(label) + 1 };
       }
     }
     body.push('');
-    body.push(rule);
-    const padTop = Math.max(0, Math.floor((bodyH - body.length) / 2));
-    itemBodyRows.forEach((bi, j) => {
-      addHit(padTop + bi, 0, w - 1, { kind: 'pickerItem', index: first + j });
-    });
-    if (footerBodyRow >= 0) {
-      footerOpts.forEach((rec) => {
-        addHit(padTop + footerBodyRow, rec.colStart, rec.colEnd, { kind: 'pickerFooterOpt', option: rec.opt });
-      });
-    }
-    for (let i = 0; i < padTop; i++) lines.push(' '.repeat(w));
-    for (const b of body) lines.push(b);
-    while (lines.length < bodyH) lines.push(' '.repeat(w));
-    if (dialogCaret) dialogCaret.row += padTop;
+    // Do NOT paint here. The picker is a POPUP drawn over the transcript: the
+    // chat body renders first, then the overlay step (right after the chat
+    // branch) boxes this content and paints it centered. Everything the paint
+    // needs is stashed with rows/columns still BODY-relative.
+    pickerOverlay = {
+      body, itemBodyRows, catBodyRow, catTabs, footerBodyRow, footerOpts,
+      caret: pickCaret, first, anchor: pick.anchor || null,
+    };
   }
   // The chat body is the LAST fallback for an open overlay. It used to be the
   // bare `else` of the PICKER branch, so opening the editor (picker == null) ran
   // this too and appended a whole extra viewport of rows ON TOP of the editor.
   // The frame then overflowed, the top trim ate the editor's own title and text,
   // and /personal & /set-system-prompt showed nothing but a stray caret.
-if (!state.editor && !state.panel && !state.form && !state.picker) {
+  // The PICKER no longer suppresses the chat: it is a popup OVER the transcript
+  // (see the picker popup step below), so the conversation stays visible behind
+  // the dialog instead of the whole body going blank for a menu.
+  if (!state.editor && !state.panel) {
     // Windowed: renderChatLines computes the visible tail from bodyH+scroll and
     // fills the rest with padding. `chat` still has the full row count (holes
     // are blank strings), so `chat.length` remains the true total and the
@@ -3356,6 +4681,7 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     // body, so `lines.length` here IS the body's origin; deriving it afterwards as
     // `lines.length - bodyH` assumes nothing came before it, which is false.
     const bodyScreenTop = lines.length;
+    chatOrigin = bodyScreenTop;
     for (let i = 0; i < bodyH; i++) {
       const idx = start + i;
       let row = '';
@@ -3363,12 +4689,35 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
         row = chat[idx] || '';
       }
       if (sb) {
-        const inThumb = i >= sb.thumbStart && i < sb.thumbStart + sb.thumbLen;
-        let thumbColor = C.scrollThumb;
-        if (state.sbDrag) thumbColor = C.scrollThumbActive;
-        else if (state.sbHover) thumbColor = C.scrollThumbHover;
-        const glyph = inThumb ? col('┃', thumbColor) : col('│', C.scrollTrack);
-        row = fitAnsi(row, w - 1) + glyph;
+        // The scrollbar cell is drawn EXACTLY the way OpenTUI's SliderRenderable draws
+        // it (packages/core/src/renderables/Slider.ts, `renderVertical`):
+        //
+        //   setCellWithAlphaBlending(x, y, char, foregroundColor, backgroundColor)
+        //
+        // with foregroundColor = the THUMB colour and backgroundColor = the TRACK
+        // colour. That pairing is what a half block needs: `▄` paints its lower half
+        // with the foreground and leaves the upper half on the background, so a
+        // half-covered row reads as "half thumb, half track".
+        //
+        // It used to set BOTH to the thumb colour, on the theory that a block glyph
+        // fills its cell so only its background shows. That is true of `█` but NOT of
+        // `▀`/`▄`: the exposed half kept the thumb colour, so a half-covered row grew a
+        // second square. It also broke the modal backdrop — `dimRange` adds faint
+        // (`ESC[2m`), which fades the FOREGROUND only, so an open picker left the
+        // thumb's background half at full brightness while the rest of the screen
+        // receded.
+        const glyphChar = scrollbarGlyph(sb, i);
+        const onThumb = glyphChar !== ' ';
+        let fg;
+        if (onThumb) {
+          if (state.sbDrag) fg = C.scrollThumbActiveFg;
+          else if (state.sbHover) fg = C.scrollThumbHoverFg;
+          else fg = C.scrollThumbFg;
+        } else {
+          fg = C.scrollTrackFg;
+        }
+        const bg = C.scrollTrackBg;
+        row = fitAnsi(row, w - 1) + fg + bg + glyphChar + C.reset;
       }
       lines.push(row);
     }
@@ -3389,6 +4738,184 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     state._bodyPadTop = Math.max(0, -start);
   }
 
+  // ---- popup card ------------------------------------------------------------
+  // Both the picker and the form float over the transcript. They used to differ: the
+  // picker was a centred box but the form was a full-screen takeover, so /provider and
+  // /model editing blanked the screen and hid the list you were picking from. They now
+  // share ONE box builder, so the two can never drift apart again.
+  //
+  // `card` is `{ body, anchor }`. Row/column numbers produced here are composition-time
+  // indices, corrected by the same `+ topPad - topTrim` the hitboxes get at the end.
+  const cardSpec = pickerOverlay || popupCard;
+  if (cardSpec) {
+    const ov = cardSpec;
+    // Measure the content first: the box hugs it instead of spanning the screen.
+    let contentW = 1;
+    for (const b of ov.body) if (typeof b === 'string') contentW = Math.max(contentW, visualCol(b));
+    // +2 for one space of padding each side of the content — the same breathing
+    // The panel hugs its content, but never so wide that it stops reading as a floating
+    // surface: at `w - 2` the margins go to zero and it spans the terminal, which looks
+    // like a takeover. Two columns of breathing room each side keeps it visibly centred
+    // no matter how long a row is — the row is clipped to fit instead of the panel growing.
+    const inner = Math.max(8, Math.min(w - 6, contentW + 2));
+    const boxW = inner + 2;
+    // An ANCHORED box opens at the given screen position (the right-click context
+    // menu follows the pointer) instead of centred — and is then nudged back INSIDE
+    // the frame, because a menu that opens at the pointer near the right or bottom
+    // edge would otherwise be clipped in half by its own screen.
+    //
+    // Both axes are clamped against the frame, because the anchor is an absolute
+    // screen position and the card must never be painted off the edge of it.
+    let padLeft = Math.max(0, Math.floor((w - boxW) / 2));
+    let padTop = null;   // null = centred vertically
+    if (ov.anchor) {
+      padLeft = Math.max(0, Math.min(w - boxW, Math.round(ov.anchor.col)));
+      padTop = Math.max(0, Math.min(h - 1, Math.round(ov.anchor.row)));
+    }
+    // The card is a FILLED PANEL, not a bordered box: no frame, no side walls, no
+    // inner rule. The panel background IS the boundary — a solid block of colour that
+    // the transcript cannot show through — which is how Cline's dialog reads (it sets
+    // a `backgroundColor` on the panel and nothing else; see
+    // apps/cli/src/tui/components/dialog-theme-sync.tsx).
+    //
+    // WHY THE FRAME HAD TO GO, beyond taste: every box-drawing character it used
+    // (`╭ ╮ ╰ ╯ ─ │`) is East Asian AMBIGUOUS — 1 column in our width model, 2 on a CJK
+    // terminal — so each frame row was drawn twice as wide as we thought and the wall
+    // landed far right of the panel. A filled surface has no such character: the block
+    // ends where its background ends, whatever the terminal's width rules are.
+    //
+    // Padding: one column each side, and one blank row above and below, so the text has
+    // room to breathe and the first/last item does not touch the edge.
+    //
+    // EVERY row goes through `padRow`, including the blanks. A bare `''` parses to ZERO
+    // cells, so it contributed no layer cells at all and those rows had NO background —
+    // the greyed transcript showed straight through two lines of the panel. Padding each
+    // row to the full panel width is what makes the background continuous.
+    const PANEL_BG = C.bgPanel;
+    const padRow = (content) => ' ' + fitAnsi(content, Math.max(1, boxW - 2)) + ' ';
+    const box = [padRow('')];
+    for (const b of ov.body) {
+      // Rule sentinels become a blank spacer row now that there is no frame to rule off.
+      if (b && b.__rule) { box.push(padRow('')); continue; }
+      box.push(padRow(b));
+    }
+    box.push(padRow(''));
+    const fit = box.slice(0, h);
+    // An anchored box keeps the row it was given (clamped above); a normal one is
+    // centred on the TERMINAL, not on the transcript area.
+    //
+    // It used to centre within `origin + room` — the region left over after the
+    // composer, todo panel and status line took their rows. That is not the middle
+    // of the screen: the card sat visibly high, above the vertical centre, because
+    // every one of those chrome rows counts as space the card refused to use. The
+    // frame height `h` is the real screen, so that is what it is centred on.
+    const top = padTop != null
+      ? padTop
+      : Math.max(0, Math.floor((h - fit.length) / 2));
+    // Clamp against the FRAME height, not `lines.length`: `lines` is still short at this
+    // point — the topPad/topTrim pass that pads it to `h` has not run yet — so
+    // clamping to it pulled the card upwards on any frame with a short transcript,
+    // which is exactly the tall-terminal case it was supposed to centre on.
+    const at = Math.max(0, Math.min(h - fit.length, top));
+    // The card is a floating LAYER, composited cell-by-cell onto the row.
+    //
+    // It used to be `lines[r] = fit[i]`, a whole-string replacement, which also erased
+    // the transcript BESIDE the card: a row of `11111111111111` came out as
+    // `        |111111|`. Compositing keeps both flanks and replaces only the card's own
+    // columns, which is the whole point of drawing it as a layer.
+    //
+    // EVERY cell in the card is opaque: it carries PANEL_BG in addition to its own
+    // style, so the terminal fills that column and nothing behind can show through.
+    // This is what makes the bleed-through impossible even when our measured widths
+    // and the terminal's disagree (see the note above `PANEL_BG`).
+    const layer = fit.map((row) => {
+      const cells = parseCells(row);
+      for (let i = 0; i < cells.length; i++) {
+        cells[i] = { ...cells[i], style: PANEL_BG + cells[i].style };
+      }
+      return cells;
+    });
+    pickerCard = { at, padLeft, boxW, height: fit.length, layer };
+    // The card's rows, BODY-relative here and corrected with the same topPad/topTrim
+    // as every other hitbox below. Recorded so the hitbox assembly step can drop the
+    // controls UNDERNEATH the card: an overlay is modal, so a pointer inside it must
+    // not tint or operate the transcript/composer behind it.
+    overlayCardRows = [at, at + fit.length - 1];
+    // Panel-relative row/column of the CONTENT. `body` index 0 is the panel's blank
+    // top pad row, and the rows are `' ' + text + ' '`, so the text starts one column in:
+    //   row   at + 1 + bodyRow   (the +1 skips the blank pad row pushed above)
+    //   col   padLeft + 1        (the +1 skips the leading pad space)
+    // There is no border any more, so the old `+2` for the wall glyph is gone: using it
+    // would have shifted every hover tint and click one column to the right.
+    const rowOf = (bodyRow) => at + 1 + bodyRow;
+    const col0 = padLeft;
+    const col1 = padLeft + boxW - 1;
+    const contentCol0 = padLeft + 1;
+    const contentCol1 = padLeft + boxW - 2;
+    // Row-wide panel hit FIRST: a click on the title/hint/padding is INSIDE the panel
+    // (absorbed, no action) — only a click outside it dismisses.
+    // Both hitAt and resolveHoverHit iterate BACKWARD (last registered wins),
+    // so the precise item/tab/footer hits go AFTER this one and win where they
+    // overlap — otherwise every inner click would be swallowed by the panel hit
+    // and picking an item with the mouse would stop working.
+    //
+    // Everything registered BEFORE this point belongs to the transcript behind the
+    // card; those hits are dropped once every row is known (see the hitbox assembly
+    // step at the end of this function, which is where `overlayTop` is applied).
+    for (let i = 0; i < fit.length; i++) addHit(at + i, col0, col1, { kind: 'pickerBody' });
+    // Row-wide box hit FIRST: a click on the title/hint/border is INSIDE the
+    // dialog (absorbed, no action) — only a click outside the box dismisses.
+    // Both hitAt and resolveHoverHit iterate BACKWARD (last registered wins),
+    // so the precise item/tab/footer hits go AFTER this one and win where they
+    // overlap — otherwise every inner click would be swallowed by the box hit
+    // and picking an item with the mouse would stop working.
+    //
+    // Everything registered BEFORE this point belongs to the transcript behind the
+    // card; those hits are dropped once every row is known (see the hitbox assembly
+    // step at the end of this function, which is where `overlayTop` is applied).
+    for (let i = 0; i < fit.length; i++) addHit(at + i, col0, col1, { kind: 'pickerBody' });
+    if (ov.itemBodyRows) {
+      ov.itemBodyRows.forEach((bi, j) => addHit(rowOf(bi), contentCol0, contentCol1, { kind: 'pickerItem', index: ov.first + j }));
+    }
+    if (ov.catBodyRow >= 0) {
+      ov.catTabs.forEach((tab) => {
+        // +1 = the leading padding space before the content (no border any more).
+        addHit(rowOf(ov.catBodyRow), padLeft + 1 + tab.colStart, padLeft + 1 + tab.colEnd,
+          { kind: 'pickerCategory', label: tab.label });
+      });
+    }
+    if (ov.footerBodyRow >= 0) {
+      ov.footerOpts.forEach((rec) => {
+        addHit(rowOf(ov.footerBodyRow), padLeft + 1 + rec.colStart, padLeft + 1 + rec.colEnd,
+          { kind: 'pickerFooterOpt', option: rec.opt });
+      });
+    }
+    // The form's own hits: a field row spans the card's CONTENT (not its walls, for
+    // the reason given above `contentCol0`), and a Type option is a precise clickable
+    // range within its row. These are what make clicking a field focus it now that the
+    // form is a centred card rather than a full-width screen.
+    if (ov.fieldBodyRows) {
+      ov.fieldBodyRows.forEach((bi, i) => addHit(rowOf(bi), contentCol0, contentCol1, { kind: 'formField', index: i }));
+    }
+    if (ov.typeBodyRow >= 0) {
+      ov.typeOpts.forEach((rec) => {
+        addHit(rowOf(ov.typeBodyRow), padLeft + 1 + rec.colStart, padLeft + 1 + rec.colEnd,
+          { kind: 'formType', option: rec.opt });
+      });
+    }
+    // The form's caret is BODY-relative, like the picker's — it is converted here,
+    // where the card's position is finally known.
+    if (popupCard && dialogCaret) {
+      dialogCaret = { row: rowOf(dialogCaret.row), col: padLeft + 1 + dialogCaret.col };
+    }
+    if (ov.caret) {
+      // Absolute frame row/col; the cursor step adds the same `+ topPad` the
+      // other dialog carets get (dialogs are padded below, never trimmed). +1 =
+      // the leading padding space before the content (no border any more).
+      dialogCaret = { row: rowOf(ov.caret.row), col: padLeft + 1 + ov.caret.col };
+    }
+  }
+
   // AskUserQuestion prompt: a box sitting directly above the composer (not a
   // full-screen dialog) so the transcript the question refers to stays visible.
   //
@@ -3400,7 +4927,7 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   //     Other
   //   ↑↓ 移动 · Enter 选择 · Esc 取消
   // Single-select marker is `> `; multi-select uses an empty/filled square.
-  if (state.question && !dialog) {
+  if (state.question && !takeover) {
     const qs = state.question;
     const cur = qs.items[qs.index] || { question: '', options: [] };
     const promptW = insideW;
@@ -3443,53 +4970,53 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       box.push(boxRow(col(label, C.gray) + col(text, C.white)));
       box.push(boxRow(col('Enter submit · Tab/arrows switch', C.gray)));
     } else {
-    // ---- the question text, wrapped by DISPLAY width (CJK-safe) ----
-    for (const seg of wrapWords(cur.question, innerW - 2)) {
-      box.push(boxRow(col('  ' + seg, C.white)));
-    }
-    // Options: the model's options, then our per-question "Other" (free answer).
-    const opts = cur.options.map((o) => ({ label: o.label, description: o.description, kind: 'option' }));
-    opts.push({ label: OTHER_LABEL, description: '', kind: 'other' });
-    const boxBudget = (questionH || Infinity) - 2 - box.length;
-    const showHint = boxBudget >= opts.length + 1;
-    const bodyBudget = Math.max(0, boxBudget - (showHint ? 1 : 0));
-    let firstOpt = 0;
-    if (opts.length > bodyBudget && bodyBudget > 0) {
-      firstOpt = Math.min(Math.max(0, qs.sel - bodyBudget + 1), opts.length - bodyBudget);
-    }
-    const shownOpts = opts.slice(firstOpt, firstOpt + (bodyBudget || opts.length));
-    shownOpts.forEach((o, k) => {
-      const j = firstOpt + k;
-      const isSel = j === qs.sel;
-      const chosen = qs.picked.has(j);
-      // Marker: single-select draws `> ` on the current row; multi-select shows an
-      // empty/filled square (filled = picked). Plain block glyphs, never emoji.
-      let marker;
-      if (cur.multiSelect) marker = chosen ? '\u25a0 ' : '\u25a1 ';
-      else marker = isSel ? '> ' : '  ';
-      // The current row is marked by `> ` (single) / the filled square (multi); no
-      // background highlight.
-      const markerPaint = isSel ? C.cyan : (chosen ? C.cyan : C.gray);
-      const labelPaint = isSel ? (C.cyan + C.bold) : (chosen ? C.cyan : C.white);
-      const typed = (o.kind === 'other' && qs.otherText) ? `: ${qs.otherText}` : '';
-      const head = col(marker, markerPaint) + col(String(o.label) + typed, labelPaint);
-      const desc = o.description ? col('  ' + o.description, C.gray) : '';
-      itemRows.push({ boxIdx: box.length, index: j });
-      box.push(boxRow(fitAnsi(head + desc, innerW - 2)));
-    });
-    if (qs.editing === 'other' && showHint) {
-      const label = OTHER_LABEL + ': ';
-      const text = String(qs.editingText || '');
-      const ec = Math.max(0, Math.min(text.length, qs.editingCaret == null ? text.length : qs.editingCaret));
-      caretInBox = box.length;
-      caretColInBox = visualCol(label) + visualCol(text.slice(0, ec));
-      box.push(boxRow(col(label, C.gray) + col(text, C.white)));
-    } else if (showHint) {
-      const hint = cur.multiSelect
-        ? '↑↓ move · Space toggle · Enter confirm · Esc dismiss'
-        : '↑↓ move · Enter select · Esc dismiss';
-      box.push(boxRow(col(hint, C.gray)));
-    }
+          // ---- the question text, wrapped by DISPLAY width (CJK-safe) ----
+          for (const seg of wrapWords(cur.question, innerW - 2)) {
+            box.push(boxRow(col('  ' + seg, C.white)));
+          }
+          // Options: the model's options, then our per-question "Other" (free answer).
+          const opts = cur.options.map((o) => ({ label: o.label, description: o.description, kind: 'option' }));
+          opts.push({ label: OTHER_LABEL, description: '', kind: 'other' });
+          const boxBudget = (questionH || Infinity) - 2 - box.length;
+          const showHint = boxBudget >= opts.length + 1;
+          const bodyBudget = Math.max(0, boxBudget - (showHint ? 1 : 0));
+          let firstOpt = 0;
+          if (opts.length > bodyBudget && bodyBudget > 0) {
+            firstOpt = Math.min(Math.max(0, qs.sel - bodyBudget + 1), opts.length - bodyBudget);
+          }
+          const shownOpts = opts.slice(firstOpt, firstOpt + (bodyBudget || opts.length));
+          shownOpts.forEach((o, k) => {
+            const j = firstOpt + k;
+            const isSel = j === qs.sel;
+            const chosen = qs.picked.has(j);
+            // Marker: single-select draws `> ` on the current row; multi-select shows an
+            // empty/filled square (filled = picked). Plain block glyphs, never emoji.
+            let marker;
+            if (cur.multiSelect) marker = chosen ? '\u25a0 ' : '\u25a1 ';
+            else marker = isSel ? '> ' : '  ';
+            // The current row is marked by `> ` (single) / the filled square (multi); no
+            // background highlight.
+            const markerPaint = isSel ? C.cyan : (chosen ? C.cyan : C.gray);
+            const labelPaint = isSel ? (C.cyan + C.bold) : (chosen ? C.cyan : C.white);
+            const typed = (o.kind === 'other' && qs.otherText) ? `: ${qs.otherText}` : '';
+            const head = col(marker, markerPaint) + col(String(o.label) + typed, labelPaint);
+            const desc = o.description ? col('  ' + o.description, C.gray) : '';
+            itemRows.push({ boxIdx: box.length, index: j });
+            box.push(boxRow(fitAnsi(head + desc, innerW - 2)));
+          });
+          if (qs.editing === 'other' && showHint) {
+            const label = OTHER_LABEL + ': ';
+            const text = String(qs.editingText || '');
+            const ec = Math.max(0, Math.min(text.length, qs.editingCaret == null ? text.length : qs.editingCaret));
+            caretInBox = box.length;
+            caretColInBox = visualCol(label) + visualCol(text.slice(0, ec));
+            box.push(boxRow(col(label, C.gray) + col(text, C.white)));
+          } else if (showHint) {
+            const hint = cur.multiSelect
+              ? '↑↓ move · Space toggle · Enter confirm · Esc dismiss'
+              : '↑↓ move · Enter select · Esc dismiss';
+            box.push(boxRow(col(hint, C.gray)));
+          }
     }
     const boxTop = lines.length;
     for (const b of box) lines.push(b);
@@ -3505,7 +5032,12 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   }
 
   if (workingH) {
-    const frame = SPINNER[(state.spin || 0) % SPINNER.length];
+    const frameInfo = spinnerFrame(state);
+    const frame = frameInfo.glyph;
+    // Reduced motion turns the whole row into its resting form: no type-on, no
+    // sweep, no pulse. The row still exists (the user must be able to see that a
+    // turn is running) but nothing moves except the dot's slow brightness.
+    const still = reducedMotionOn(state);
     // ---- shared palette for the whole Working row -------------------------
     // Everything on this row (spinner glyph, typed chars, elapsed tail, sweep)
     // must come from ONE set of RGB values, rendered through the SAME lerpColor
@@ -3522,11 +5054,23 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     const workMsg = state.workMsg || WORKING_MESSAGES[0];
     const spin = state.spin || 0;
 
+    // ---- reduced motion: the resting row ----
+    // Nothing types on, sweeps or pulses. The phrase, the elapsed tail and a dot that
+    // slowly changes brightness are all that is drawn. Handled FIRST so the animated
+    // branches below cannot run at all.
+    if (still) {
+      const dim = frameInfo.dim;
+      const dotEsc = dim ? greyEsc : orangeEsc;
+      lines.push(
+        (dim ? C.dim : '') + col(frame, dotEsc) + ' '
+        + col(workMsg, greyEsc) + elapsed + (dim ? C.reset : ''),
+      );
+    }
     // ---- turn-start animation ----
     // 0.5s: type out "Working..." in grey (chars appear left→right)
     // 0.5s: fill with orange (chars change colour left→right)
     // After 1s total: start the normal pulse animation (yellow/red cycle)
-    if (state.startAnim) {
+    else if (state.startAnim) {
       // 1s total: 0.5s types `Working... [0s]` out in grey, then 0.5s sweeps the
       // PHRASE grey → orange. The `[0s]` tail types out WITH the phrase but is
       // EXCLUDED from the colour sweep — it stays grey the whole time.
@@ -3555,15 +5099,20 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       } else {
         // Colour sweep: only the PHRASE goes grey → orange. The tail stays grey
         // (it is appended as the colored `elapsed` chunk after `out`).
-        const BAND_CHARS = Math.max(2, Math.min(4, phrase.length / 3));
-        const BAND = BAND_CHARS / phrase.length;
-        // head sweeps from just left of the phrase (0) to just right of it (1),
-        // extended by BAND on both ends so every char crosses the band smoothly.
-        const head = -BAND + phaseT * (1 + 2 * BAND);
+        const BAND = bandCharsFor(phrase.length) / phrase.length;
+        // head sweeps from the far edge of the band to the settle point, so the first
+        // frame is untouched and the last has every character settled. See the
+        // SWEEP_* block above for why the travel is `1 + BAND` and not `1 + 2*BAND`.
+        const head = -BAND + phaseT * (1 + BAND * SWEEP_TRAVEL_PAD);
+        // SETTLE, not pulse: a character the head has passed stays orange, so the
+        // phrase FILLS IN left to right and ends fully orange. A travelling pulse here
+        // was the bug — a pulse dims a character again after the band leaves it, so
+        // the phase ended with the phrase DARK instead of orange (measured:
+        // [ ] -> [ :#@#: ] -> [ :#] -> [ ]).
+        const edge = state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge) || 'cosine';
         for (let i = 0; i < phrase.length; i++) {
           const charAt = i / phrase.length;
-          let tChar = (head - charAt) / BAND;
-          tChar = Math.max(0, Math.min(1, tChar));
+          const tChar = sweepSettle(head - charAt, BAND, edge);
           const r = Math.round(GREY_RGB[0] + (ORANGE_RGB[0] - GREY_RGB[0]) * tChar);
           const g = Math.round(GREY_RGB[1] + (ORANGE_RGB[1] - GREY_RGB[1]) * tChar);
           const b = Math.round(GREY_RGB[2] + (ORANGE_RGB[2] - GREY_RGB[2]) * tChar);
@@ -3613,21 +5162,21 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       lines.push(col(frame, animColor) + ' ' + col('[', animColor) + col(word, animColor) + col(tail, greyEsc));
     } else {
 
-      // Timing (spinner ticks every 80ms, so 0.5s ≈ 6 ticks):
-    //   0.5s yellow sweep (each char fades orange → yellow, left to right)
-    //   0.5s fade back   (each char fades yellow → orange, left to right)
-    //   0.5s red sweep   (each char fades orange → red, left to right)
-    //   0.5s fade back   (each char fades red → orange, left to right)
-    // → loops straight back to the yellow sweep. ~2s per full cycle.
-    const SWEEP = 6;                 // 0.5s
-    const HALF  = SWEEP + SWEEP;     // 12 ticks per colour (sweep + sweep back)
-    const CYCLE = HALF * 2;          // 24 ticks for the full loop (~2s)
+      // Timing: SWEEP ticks per half-sweep, four halves per cycle (out to yellow,
+    // back, out to red, back). The tick count lives in SWEEP_TICKS so every animated
+    // row shares one smoothness budget — see the SWEEP_* block near the top.
+    const SWEEP = SWEEP_TICKS;       // ticks per half-sweep
+    const HALF  = SWEEP + SWEEP;     // ticks per colour (out + back)
+    const CYCLE = HALF * 2;          // ticks for the full loop
     // Phase is measured from the tick the pulse BEGAN (state.pulseStart), not
     // from 0: the spinner has been running since turn start, so a raw
     // `spin % CYCLE` dropped the pulse into a mid-cycle colour (often the red
     // half) the instant the start animation handed over.
-    const inCycle = ((spin - (state.pulseStart || spin)) % CYCLE + CYCLE) % CYCLE;
-    const inHalf  = inCycle % HALF;       // 0..23 within this colour's half
+    // `??`, NOT `||` — the same trap as the tool-name sweep: a `pulseStart` of 0 is a
+    // real anchor (the turn's first tick), and `0 || spin` collapses the cycle to 0, so
+    // the row would sit on one colour forever instead of pulsing.
+    const inCycle = ((spin - (state.pulseStart ?? spin)) % CYCLE + CYCLE) % CYCLE;
+    const inHalf  = inCycle % HALF;       // position within this colour's half
     const phase   = inCycle < HALF ? 0 : 1; // 0 = yellow, 1 = red
 
     // Colours as plain RGB triples (never ANSI strings). ORANGE is the shared
@@ -3638,13 +5187,9 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
 
     const chars = workMsg;
     const n = chars.length;
-
-    // A character fades over a band this many characters wide. BAND = 1/n made
-    // the band exactly one char, so at this sweep speed (n/6 chars per tick) a
-    // char crossed it inside a single frame — i.e. it snapped instead of fading.
-    // A 3-char band gives each char ~3 frames of visible gradient.
-    const BAND_CHARS = Math.max(2, Math.min(4, n / 3));
-    const BAND = BAND_CHARS / n;
+    // The band is sized once for this row; `framesPerChar(n)` is the resulting
+    // smoothness, and 3+ frames is where a fade stops looking like a snap.
+    const BAND = bandCharsFor(n) / n;
 
     // Interpolate orange ↔ target by `t` (0 = orange, 1 = target).
     const mix = (t) => {
@@ -3661,27 +5206,38 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     };
 
     const out = [];
+    // The pulse is TWO settles, not a ramp: the first takes every character from
+    // orange to the phase's target (yellow or red), the second takes it back to
+    // orange. Each runs its head from the far edge of the band to the settle point,
+    // so:
+    //
+    //   first frame of a phase -> head is behind everything -> nothing swept yet
+    //   last frame             -> head is past everything   -> every char settled
+    //
+    // That geometry is what makes the boundary seamless. The previous version started
+    // the head at `1/SWEEP`, already PAST the first character, so the very first pulse
+    // frame painted char 0 at 50% of the target right after the row had been fully
+    // ORANGE — a visible jump on every handoff, and again at each half-cycle.
+    // `/ (SWEEP - 1)`, not `/ SWEEP`: the first frame of a half must be progress 0
+    // and its LAST frame progress 1, so every half starts untouched and ends fully
+    // settled. Dividing by SWEEP left the final frame at (SWEEP-1)/SWEEP = 0.9, so the
+    // sweep never quite completed and the row carried a 2% residue into the next half.
+    const progress = (inHalf < SWEEP ? inHalf : inHalf - SWEEP) / (SWEEP - 1);
+    const head = -BAND + progress * (1 + BAND * SWEEP_TRAVEL_PAD);
+    const pulseEdge = state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge) || 'cosine';
     for (let i = 0; i < n; i++) {
       const charAt = n > 0 ? i / n : 0;
-      let t; // 0 = orange, 1 = target colour
-      if (inHalf < SWEEP) {
-        // Sweep in: orange → target colour, left to right.
-        // `head` must reach 1 (not (SWEEP-1)/SWEEP) or the last char,
-        // at (n-1)/n, is never swept.
-        const head = (inHalf + 1) / SWEEP;   // 1/SWEEP … 1
-        t = (head - charAt) / BAND;
-      } else {
-        // Sweep back: target colour → orange, left to right.
-        const head = (inHalf - SWEEP + 1) / SWEEP;  // 1/SWEEP … 1
-        t = 1 - (head - charAt) / BAND;
-      }
+      // Settled amount toward the target; the back-sweep is the same shape mirrored,
+      // so it un-settles toward orange in the same left-to-right order.
+      const settled = sweepSettle(head - charAt, BAND, pulseEdge);
+      const t = inHalf < SWEEP ? settled : 1 - settled;
       out.push(col(chars[i], mix(t)));
     }
-      lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
+    lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
     }
   }
 
-  if (!dialog && state.todos && state.todos.length) {
+  if (!takeover && state.todos && state.todos.length) {
     // The panel's top rule is a DRAG HANDLE. Record its screen row as a hitbox so
     // the mouse handler can hover/press it; the row offset is corrected to final
     // screen coordinates by composeFrame's hitbox pass (like every other hit).
@@ -3692,13 +5248,22 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
 
   // Queued (not yet sent) messages, directly above the composer: these are what
   // Ctrl-S steers into the running turn. See renderQueuePanel.
-  if (!dialog && state.queued && state.queued.length) {
+  if (!takeover && state.queued && state.queued.length) {
     // The panel's top rule is a DRAG HANDLE. Record its screen row as a hitbox so
     // the mouse handler can hover/press it.
     const queueTopRow = lines.length;
     addHit(queueTopRow, 0, w - 1, { kind: 'queueResize' });
     for (const l of renderQueuePanel(state, w, state.queueResizeHover, state.queueResizeDrag)) lines.push(l);
   }
+
+  // Side-thread box (/btw), docked directly above the composer — the placement kimi
+  // uses (its panelContainer sits over the editor with `connectedAbove = true`), so
+  // the conversation being asked about stays visible while you keep typing.
+  if (!takeover && state.btwPanel && state.btwPanel.turns && state.btwPanel.turns.length) {
+    for (const l of renderBtwPanel(state, w, { terminalRows: h })) lines.push(l);
+  }
+
+
 
     // Approval pending overlay - same width as the composer, placed above it.
   // The border characters are coloured INDIVIDUALLY and each content row is
@@ -3729,11 +5294,11 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     } else if (ap.desc) {
       for (const seg of wrapWords(ap.desc, innerW)) lines.push(boxRow(col(seg, C.gray)));
     }
-    lines.push(boxRow(col('Enter to approve | Esc to reject', C.gray)));
+    lines.push(boxRow(col('Enter approve | Ctrl+A approve for session | Esc reject', C.gray)));
     lines.push(bar('╰' + '─'.repeat(promptW) + '╯'));
   }
 
-  // Plan review: shown once the model hands over a <plan> in Plan mode. Same box
+  // Plan review: shown once the model hands over a <|plan|> in Plan mode. Same box
   // shape as the tool approval above so the two read as the same kind of prompt.
   // It shows WHAT the plan will touch (step/file counts and the files named), so
   // approving is an informed decision rather than a guess from prose.
@@ -3752,7 +5317,7 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   }
   
   let composerFirstRow = -1;
-  if (!dialog) {
+  if (!takeover) {
     composerFirstRow = lines.length + 1;
     // The composer carries the same 1-column left margin as the transcript, so its
     // walls line up exactly with a sent user/queue message's box.
@@ -3807,7 +5372,10 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   }
 
   
-  if (state.menuOpen && state.menuList.length && !dialog) {
+  const MPAD = ' ';
+  const mInner = Math.max(1, insideW - 3);
+  const menuRow = (content) => MPAD + col('│', C.border) + ' ' + fitAnsi(content, mInner) + ' ' + col('│', C.border);
+  if (state.menuOpen && state.menuList.length && !takeover) {
     const totalMatches = state.menuList.length;
     const sel = state.menuSel + 1;
     const off = state.menuOffset || 0;
@@ -3827,19 +5395,19 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       const hint = cmd.argumentHint ? col(' ' + cmd.argumentHint, C.gray) : '';
       const pad = Math.max(2, 18 - visualCol(label) - visualCol(hint));
       const desc = col(cmd.desc, C.gray);
-      addHit(lines.length, 1, insideW, { kind: 'menuItem', index: off + j });
-      lines.push(col('│' + fitAnsi(mark + nameField + hint + ' '.repeat(pad) + desc, insideW) + '│', C.border));
+      addHit(lines.length, 2, mInner, { kind: 'menuItem', index: off + j });
+      lines.push(menuRow(mark + nameField + hint + ' '.repeat(pad) + desc));
     });
     const footer = isArgLevel
       ? `(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`
       : `(${sel}/${totalMatches})`;
-    lines.push(col('│' + fitAnsi(col(footer, C.gray), insideW) + '│', C.border));
+    lines.push(menuRow(col(footer, C.gray)));
   }
 
   // Inline `@file` candidate list — the same widget as the `/` menu above, so the
   // two read as one mechanism. Shows the path, dims the directory prefix of a
   // nested entry so the BASENAME is what your eye lands on.
-  if (state.mentionOpen && state.mentionList.length && !dialog && !state.menuOpen) {
+  if (state.mentionOpen && state.mentionList.length && !takeover && !state.menuOpen) {
     const totalMatches = state.mentionList.length;
     const sel = state.mentionSel + 1;
     // Render the VISIBLE WINDOW, but decide "is this row the selected one" by the
@@ -3862,15 +5430,20 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
       // longer a split, so the row reads as one selected (or unselected) item.
       const label = col(rel, selected ? (C.cyan + C.bold) : C.gray);
       const pad = Math.max(2, 40 - visualCol(rel));
-      addHit(lines.length, 1, insideW, { kind: 'mentionItem', index: globalIndex });
-      lines.push(col('│' + fitAnsi(mark + label + ' '.repeat(pad), insideW) + '│', C.border));
+      addHit(lines.length, 2, mInner, { kind: 'mentionItem', index: globalIndex });
+      lines.push(menuRow(mark + label + ' '.repeat(pad)));
     });
-    lines.push(col('│' + fitAnsi(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray), insideW) + '│', C.border));
+    lines.push(menuRow(col(`(${sel}/${totalMatches})  Enter or Tab to insert · Esc to dismiss`, C.gray)));
   }
 
   const cwd = state.cwd || '';
+  // Thinking suffix: "<model> thinking <level>". The level is shown whenever one
+  // is set (including 'on', which used to be elided and made the footer unable to
+  // tell "on" apart from "no level selected"). A model whose thinking is supported
+  // but has no chosen level still reads just "thinking".
+  const thinkLevel = state.effort && state.effort !== 'off' ? String(state.effort) : '';
   const thinking = state.reasoning
-    ? (state.effort && state.effort !== 'on' ? ` thinking: ${state.effort}` : ' thinking')
+    ? (thinkLevel ? ` thinking ${thinkLevel}` : ' thinking')
     : state.seenThinking ? ' thinking' : '';
   const label = state.modelLabel || state.model || '';
   // Plan / Focus / Swarm are mutually exclusive modes, so at most one badge is
@@ -3881,6 +5454,18 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     : state.swarm ? col('Swarm', C.spring + C.bold)
     : '';
   const parts = [];
+  // Track the column range of the two fields made CLICKABLE (mode group and model),
+  // so this row can register hitboxes for them. Everything else stays decoration.
+  const statusRow = lines.length;        // the status line's frame row
+  const slHits = [];                     // { col0, col1, kind }
+  let slCol = 0;                         // running visual column
+  const pushPart = (text, hit) => {
+    if (parts.length) slCol += 2;        // parts are joined with two spaces
+    const cw = visualCol(text);
+    if (hit) slHits.push({ ...hit, col0: slCol, col1: slCol + cw - 1 });
+    slCol += cw;
+    parts.push(text);
+  };
   // The permission mode and the Plan/Focus badge are both "what mode am I in",
   // so they read as ONE group: separated by a single space. Everything after the
   // group gets the normal two-space divider, so a name that already contains a
@@ -3888,10 +5473,10 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
   //   Auto Plan  workbuddy/deepseek-v4.1-flash  D:\hncode
   let modeGroup = state.slMode !== false ? col(modeLabel(state.mode), C.orange + C.bold) : '';
   if (modeBadge) modeGroup = modeGroup ? modeGroup + ' ' + modeBadge : modeBadge;
-  if (modeGroup) parts.push(modeGroup);
+  if (modeGroup) pushPart(modeGroup, { kind: 'statusMode' });
   if (state.slModel !== false && label) {
     const think = state.slEffort !== false ? thinking : '';
-    parts.push(col(`${label}${think}`, C.white));
+    pushPart(col(`${label}${think}`, C.white), { kind: 'statusModel' });
   }
   if (state.slTasks !== false) {
     // Two SEPARATE badges, mirroring kimi-code's footer: `bashTasks` counts
@@ -3928,60 +5513,132 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
         if (gi.deletions) bits.push(col(`-${gi.deletions}`, C.red));
         badge += ' ' + bits.join(' ');
       }
+      // Push it, or the whole git segment — branch AND `+N -N` — is computed and
+      // thrown away: the badge silently vanished from the statusline when the
+      // pushPart refactor dropped this line.
       parts.push(badge);
     }
   }
   const statusLeft = parts.join('  ');
-  const statusRight = (state.slTips !== false && state.tip) ? col(state.tip, C.gray) : '';
+  // The session tallies — cost, turns, steps, tokens/sec — ride the RIGHT of this row. They
+  // used to trail the context row as one string, which crowded the composition numbers
+  // together with the context gauge; here they sit with the other session figures and the
+  // tip moves down to the last row, beside the notice.
+  //
+  // The cost segment is conditional for two reasons: the provider must have reported tokens
+  // AND the model must have prices (its own entry or the models.dev catalog). Either one
+  // missing would mean inventing the number, so it is omitted rather than shown as `0$`,
+  // which reads as "this was free".
+  const costSeg = state._costText ? `${state._costText} cost | ` : '';
+  const countsRight = col(`${costSeg}${state.rounds} turn${state.rounds === 1 ? '' : 's'} | ${state.steps} step${state.steps === 1 ? '' : 's'} | ${Math.round(state.tokRate)} tok/s`, C.white);
+  const statusRight = countsRight;
+  // Plugin TUI widgets render into the status bar's right side.
+  try { const wid = renderWidgets(); if (wid) statusRight && (statusRight += '   '); if (wid) statusRight = (statusRight || '') + wid; } catch {}
   lines.push(justify(statusLeft, statusRight, w));
+  // Clickable status fields: the mode group opens /permissions, the model name
+  // opens /model. Registered on the row just pushed; hover comes free from the
+  // generic hover tint (any hitbox is tinted unless it is a composerRow).
+  for (const h of slHits) addHit(statusRow, h.col0, h.col1, { kind: h.kind });
 
   if (confirmH) lines.push(col(fitAnsi('Press Ctrl+C again to exit the hncode', w), C.yellow));
 
-  const ctxRight = `${state.rounds} turn${state.rounds === 1 ? '' : 's'} | ${state.steps} step${state.steps === 1 ? '' : 's'} | ${Math.round(state.tokRate)} tok/s | context: ${state.ctxPercent}% (${fmtTokens(state.ctxTokens || 0)}/${fmtTokens(state.ctxMax || 1)})`;
-  // The short-lived notice ("Expanded tool output", "Copied 1.2k chars", …)
-  // shares the context row, LEFT-aligned, instead of reserving a row of its own
-  // — a whole blank line appeared and disappeared above the context bar on every
-  // Ctrl+O. The gauge keeps its full width (it must never be the part that gets
-  // cut), so the notice is truncated into whatever space is left over. NOTE:
-  // measure the RAW string — fitAnsi() pads to the full width, so using its
-  // result here made the available room always 0 and the notice invisible.
-  const ctxW = visualCol(ctxRight);
-  if (noticeH) {
-    const nc = state.noticeKind === 'error' ? C.red : C.gray;
-    // The notice yields first: it gets whatever is left after the gauge keeps
-    // its natural width plus a 1-column gap, and is truncated into it.
-    const room = Math.max(0, w - Math.min(ctxW, w) - 1);
-    const left = room > 0 ? col(fitAnsi(state.notice, room), nc) : '';
-    const lw = visualCol(left);
-    const gap = lw > 0 ? 1 : 0;
-    // The gauge takes the remaining columns exactly, so the row is always
-    // EXACTLY `w` wide (never 1 over, which wrapped the last column onto the
-    // next screen row) and stays visible even on a narrow terminal.
-    const gauge = col(fitAnsi(ctxRight, Math.max(0, w - lw - gap)), C.white);
-    lines.push(left + ' '.repeat(gap) + gauge);
-  } else {
-    lines.push(' '.repeat(Math.max(0, w - ctxW)) + col(fitAnsi(ctxRight, Math.min(ctxW, w)), C.white));
+  // The context row is now a BAR: the window's composition as colour, with the same
+  // `context: 12% (11.7k/97.7k)` text set into the free segment's right edge. The wording
+  // is unchanged from the string this replaces — only its carrier changed from a line of
+  // text to the tail of a bar, so nothing that was readable stops being readable.
+  //
+  // `contextSegments` is the cached per-content-type breakdown. It is a cache rather than a
+  // per-frame walk because the walk is O(messages) with a token estimate each, which on a
+  // long transcript is the single most expensive thing the frame could do — and the
+  // numbers only move when the conversation does.
+  //
+  // No bar when the window is unknown: a bar claiming to be full is worse than no bar, and
+  // `ctxMax` is 0 until the first usage report lands.
+  const ctxText = `context: ${state.ctxPercent}% (${fmtTokens(state.ctxTokens || 0)}/${fmtTokens(state.ctxMax || 1)})`;
+  const ctxSegs = contextSegments(state, state.cfg);
+  const barRow = lines.length;
+  const bar = state.ctxMax > 0
+    ? renderContextBar(ctxSegs, state.ctxTokens || 0, state.ctxMax, w, ctxText)
+    : { text: '', hits: [] };
+  lines.push(bar.text || ' '.repeat(w));
+  // Every segment is a hover target, INCLUDING one too narrow to carry a label: pointing at
+  // it is then the only way to read what it is, which is why `renderContextBar` returns the
+  // spans rather than the bar alone.
+  for (const hit of bar.hits) {
+    addHit(barRow, hit.col0, hit.col1, { kind: 'ctxSegment', data: hit.data });
   }
 
+  // The last row: a hovered segment's caption, else the short-lived notice, on the left; the
+  // tip on the right. The caption takes precedence because it answers what the pointer is
+  // asking, and it stays for as long as the pointer rests on that segment.
+  //
+  // The hover is resolved HERE, at paint time, so the caption and the highlight on the bar
+  // can never disagree — the two come out of the same hit list in the same pass.
+  // Read from THIS pass's own hit list, not `state._hitboxes`: the bar's segments are
+  // registered a few lines above, so the hit being resolved is one this frame just created.
+  // Reading the previous frame's list made the caption lag the pointer by a repaint.
+  const barHover = resolveHoverHit(state, hits);
+  const segCaption = (barHover && barHover.kind === 'ctxSegment' && barHover.row === barRow)
+    ? segmentCaption(barHover.data, ctxSegs[barHover.data] || 0)
+    : '';
+  const tipText = (state.slTips !== false && state.tip) ? col(state.tip, C.gray) : '';
+  const leftText = segCaption
+    ? col(segCaption, C.white)
+    : (noticeH ? col(state.notice, state.noticeKind === 'error' ? C.red : C.gray) : '');
+  lines.push(justify(leftText, tipText, w));
+
+
+  // Normalize EVERY row to exactly `w` columns BEFORE anything composites onto it.
+  //
+  // The transcript's blank filler rows are EMPTY strings, not runs of spaces, and the
+  // frame is only padded to full width by the `fitAnsi` pass at the very END of this
+  // function. Any pass that works in COLUMNS therefore saw fewer columns than the
+  // screen does: the picker's backdrop dimming, its gutter blanking and the hover tint
+  // all run before that final pad, so on a SHORT transcript — a fresh session, where
+  // most of the body is filler — their column ranges fell past the end of the row and
+  // silently did nothing. The visible symptom was the modal backdrop coming out
+  // un-dimmed around the card, which is the very thing that makes a popup read as
+  // focused.
+  //
+  // Padding here fixes dim/blank/tint together and makes the invariant explicit: from
+  // this point on, column N of a row IS screen column N. The final `fitAnsi` pass then
+  // has nothing left to do for width (an `w`-wide row is returned unchanged).
+
+  for (let i = 0; i < lines.length; i++) lines[i] = fitAnsi(lines[i] == null ? '' : lines[i], w);
   let topPad = 0;
   if (lines.length < h) { topPad = h - lines.length; }
   while (lines.length < h) lines.unshift(' '.repeat(w));
   let topTrim = 0;
   if (lines.length > h) { topTrim = lines.length - h; lines.splice(0, topTrim); }
+  // An OPEN OVERLAY ABSORBS THE POINTER. Every control the frame registered while the
+  // transcript / composer / status line was drawn belongs UNDER the card, and leaving
+  // those hitboxes in place left holes in it:
+  //
+  //   * a pointer inside the card at a row that lines up with the composer or the
+  //     status line resolved to THAT control, so the tint was applied to text BEHIND
+  //     the popup and showed through it;
+  //   * a CLICK there ran the control behind the card — clicking a menu row could put
+  //     the caret in the composer instead.
+  //
+  // The card's own targets are registered last, so keeping only the hits that overlap
+  // the card's row span leaves exactly what a modal dialog should expose. The
+  // scrollbar, todo and queue resize handles (also registered earlier) go with it.
+  const overlayRows = overlayCardRows
+    ? { from: overlayCardRows[0] + topPad - topTrim, to: overlayCardRows[1] + topPad - topTrim }
+    : null;
   const hitboxes = hits
     .map((hb) => ({ ...hb, row: hb.row + topPad - topTrim }))
-    .filter((hb) => hb.row >= 0 && hb.row < h);
+    .filter((hb) => hb.row >= 0 && hb.row < h)
+    .filter((hb) => !overlayRows || (hb.row >= overlayRows.from && hb.row <= overlayRows.to));
   // The body's screen origin needs the SAME correction the hitboxes just got:
   // rows pushed above it (topPad) and any trimmed off the top both move it. It is
   // adjusted here because only at this point is the final geometry known.
   if (state._bodyScreenTop != null) state._bodyScreenTop += topPad - topTrim;
 
-  if (state.hoverHit) {
-    const hv = state.hoverHit;
-    if (hv.row >= 0 && hv.row < lines.length) {
-      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1);
-    }
-  }
+  // NOTE: the hover tint is applied AFTER the picker's cell layer, further down. It used
+  // to run here, and the picker repainted the card over the row it had just tinted — the
+  // card is opaque now, so every hover highlight inside it was erased again in the same
+  // frame, which is why hovering a picker item stopped showing anything.
 
   let cursor;
   let cursorVisible;
@@ -4028,7 +5685,72 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
     cursorVisible = true;
   }
 
-  const padded = lines.map((l) => fitAnsi(l, w));
+  // Modal backdrop + the card's cell layer. Both run LAST, once every row of the frame
+  // exists — the composer, the status line and the context row are pushed onto `lines`
+  // well after the card was measured, so painting the card here put it past the end of
+  // the array and had those rows painted over it (the card appeared clipped on tall
+  // terminals), and dimming here is the only way to reach those rows at all.
+  //
+  // Order matters and mirrors OpenTUI's two-pass model: dim the scene, THEN composite
+  // the card over it. Dimming after the card went on would fade the card's own text.
+  if (pickerCard) {
+    // The frame geometry is only final here: `topPad` rows were pushed above and
+    // `topTrim` were trimmed off, so the card's recorded row takes the same correction
+    // the hitboxes do.
+    const at = pickerCard.at + topPad - topTrim;
+    // The card's columns, plus the one-column gutter on each side. The card's own
+    // padding lives inside `boxW`, so without this the transcript's last glyph before
+    // the card lands in the column DIRECTLY against the panel edge and reads as clipped
+    // by it. Clearing that column turns the edge into a margin, which is how a floating
+    // surface is meant to look: the text stops, then the panel starts.
+    const gutterL = pickerCard.padLeft - 1;
+    const gutterR = pickerCard.padLeft + pickerCard.boxW;
+    // Pass 1 — recede the backdrop. The card's own cells are left alone; only the
+    // columns AROUND it are dimmed, so it reads as a hole punched in a dimmed screen.
+    for (let r = 0; r < lines.length; r++) {
+      if (lines[r] == null) continue;
+      const inCard = r >= at && r < at + pickerCard.height;
+      if (!inCard) { lines[r] = dimRange(lines[r], 0, w); continue; }
+      lines[r] = dimRange(dimRange(lines[r], 0, pickerCard.padLeft), pickerCard.padLeft + pickerCard.boxW, w);
+      // The gutters are cleared AFTER the dimming, never before: blanking resets a
+      // cell's style, so a blank written first would simply be dimmed again.
+      if (gutterL >= 0) lines[r] = blankRange(lines[r], gutterL, gutterL + 1);
+      if (gutterR < w) lines[r] = blankRange(lines[r], gutterR, gutterR + 1);
+    }
+    // Pass 2 — composite the card's cell layer over the dimmed backdrop. Every cell of
+    // the card is opaque, so it fully covers its own columns; the flanks the layer does
+    // not reach keep the dimmed transcript.
+    for (let i = 0; i < pickerCard.layer.length; i++) {
+      const r = at + i;
+      if (r < 0 || r >= lines.length) continue;
+      lines[r] = drawFrameBuffer(lines[r] == null ? ' '.repeat(w) : lines[r], pickerCard.layer[i], pickerCard.padLeft);
+    }
+  }
+
+  if (state.hoverHit) {
+    // The hover target is a SCREEN ROW captured when the mouse last moved, and it is
+    // only updated by the next mouse event — so a repaint that moves content under a
+    // stationary pointer left the highlight on whatever text slid into that row
+    // (hover a line, let a streamed reply or an interrupt notice arrive, and unrelated
+    // text kept the tint). Resolve against the LAST POINTER POSITION using THIS frame's
+    // hitboxes instead, and when there is no pointer data to resolve with, DROP the
+    // highlight: a stale screen row is never a safe thing to draw from.
+    //
+    // It runs after the picker layer on purpose: the card is opaque, so tinting first
+    // and painting the card over it hid the highlight completely.
+    const hv = resolveHoverHit(state, hitboxes);
+    if (hv && hv.row >= 0 && hv.row < lines.length) {
+      // `col1` is the LAST included column (see hitAt), but tintRange takes a
+      // half-open [col0, col1) range — without the +1 the final column of every
+      // hover target stayed un-tinted.
+      lines[hv.row] = tintRange(lines[hv.row], hv.col0, hv.col1 + 1);
+    }
+  }
+
+  let padded = lines.map((l) => fitAnsi(l, w));
+  // Mixin seam: beforeRender - plugins may rewrite the painted lines. Runs before the
+  // ANSI string is built so the change actually reaches the screen.
+  try { const out = runPatchSync('beforeRender', { lines: padded, state, cols: w, rows: h }, (c) => c); if (out && Array.isArray(out.lines)) padded = out.lines; } catch (e) {}
   // Draw the block caret ourselves (composer OR dialog field / search box) and
   // keep the hardware cursor hidden for the whole session: the differential
   // painter writes full-width rows while scrolling, and the terminal parks its
@@ -4041,24 +5763,57 @@ if (!state.editor && !state.panel && !state.form && !state.picker) {
 
   const ansi = `\x1b[H` + padded.join('\n')
     + `\x1b[${cursor.row + 1};${cursor.col + 1}H` + cursorShape;
-  return { ansi, lines: padded, cursor, cursorVisible, width: w, height: h,
+  let _frame = { ansi, lines: padded, cursor, cursorVisible, width: w, height: h,
            cursorRow: cursor.row, cursorCol: cursor.col, cursorShape, hitboxes, composerMeta: composer.meta };
+  // Mixin seam: afterRender - plugins may modify the final frame (overlay, banner).
+  try { const out = runPatchSync('afterRender', { frame: _frame, state }, (c) => c); if (out && out.frame) _frame = out.frame; } catch (e) {}
+  return _frame;
 }
 
 // Differential paint: emit cursor-positioning + content for ONLY the rows whose
 // content changed since `prev`. This is what keeps redraws flicker-free and
 // cheap (kimi-code's pi-tui does the same). A full repaint happens on first
 // paint and whenever the terminal size changes.
+//
+// WHY EVERY ROW ENDS WITH A CARRIAGE RETURN
+// -----------------------------------------
+// A terminal sets its "pending wrap" flag when a printed character fills the LAST
+// column, and the next printable character then wraps to the following line. Every row
+// composeFrame produces is exactly `cols` columns wide on purpose (the frame is padded),
+// so writing one fills that column EVERY time. POSIX says the next cursor movement
+// cancels the flag, and xterm and Windows Terminal honour that — but not all emulators
+// do, and the failure is nasty: the next row's first character wraps, everything after
+// it shifts down a line, and because this painter compares against the frame it BELIEVES
+// it painted, the mess is never repaired. It surfaces as a few characters of the last
+// reply stranded on screen (sometimes a lone wide glyph like `通`, sometimes a stray
+// `a` or `7`) that disappear only when something forces a full repaint — re-entering the
+// session, or a resize.
+//
+// `\r` is the one cursor move every terminal implements, and clearing the flag on CR is
+// what xterm's own `do_cr` does. It costs one byte per written row and cannot move
+// anything that matters, because each row is preceded by its own absolute address.
+const CR = '\r';
+// Synchronized output: the terminal holds the frame until END, so a repaint that
+// rewrites 30 rows lands as one update instead of 30 visible steps.
+const SYNC_BEGIN = '\x1b[?2026h';
+const SYNC_END = '\x1b[?2026l';
 export function diffFrame(prev, next) {
   let shape = '';
   if (!prev || prev.cursorShape !== next.cursorShape) shape = next.cursorShape;
   const pos = `\x1b[${next.cursorRow + 1};${next.cursorCol + 1}H`;
 
+  // Synchronized output (DEC 2026) is wrapped around every write only when the
+  // terminal said it knows the mode (see terminalCaps): a terminal that does not
+  // implement it is supposed to ignore the private mode, but on a frame of ~30 rows
+  // that is two sequences written per repaint on nothing more than a promise.
+  const before = syncOutputUsable() ? SYNC_BEGIN : '';
+  const after = syncOutputUsable() ? SYNC_END : '';
+
   const sizeChanged = !prev || prev.width !== next.width || prev.height !== next.height;
   if (sizeChanged) {
-    let out = '\x1b[?2026h';
-    for (let i = 0; i < next.lines.length; i++) out += `\x1b[${i + 1};1H\x1b[2K` + next.lines[i];
-    out += '\x1b[?2026l' + pos + shape;
+    let out = before;
+    for (let i = 0; i < next.lines.length; i++) out += `\x1b[${i + 1};1H\x1b[2K` + next.lines[i] + CR;
+    out += after + pos + shape;
     return out;
   }
 
@@ -4073,7 +5828,7 @@ export function diffFrame(prev, next) {
     return pos + shape;
   }
 
-  let out = '\x1b[?2026h';
+  let out = before;
   // Only [first, last] changed; rewriting to the bottom of the screen made a
   // single appended line repaint the whole viewport every frame.
   //
@@ -4086,17 +5841,16 @@ export function diffFrame(prev, next) {
   // top border — "Working… gets written on the next line and overwrites the
   // input box". Absolute addressing cannot scroll, so the span is now safe.
   const reach = Math.min(next.lines.length, last + 1);
-  for (let i = first; i < reach; i++) {
-    out += `\x1b[${i + 1};1H\x1b[2K` + next.lines[i];
-  }
+  for (let i = first; i < reach; i++) out += `\x1b[${i + 1};1H\x1b[2K` + next.lines[i] + CR;
   // No "clear the trailing rows" pass is needed: composeFrame always returns
   // EXACTLY `rows` lines (both frames here share the same height, otherwise the
   // sizeChanged path above would have run), so a shrinking viewport is already
   // handled by `last` moving up and the freed rows being rewritten as blanks.
-  out += '\x1b[?2026l';
+  out += after;
   out += pos + shape;
   return out;
 }
+
 
 function renderFieldValue(field, active) {
   const val = field.value || '';
@@ -4156,14 +5910,43 @@ export function saveHistory(list) {
 // ---- state factory ----
 export function makeState({ cfg, session, opts }) {
   const cwd = session.workspace || cfg.workspace || process.cwd();
+  // The session's thinking level. Restored from the session (so a resume keeps the
+  // level the user picked), else the config's, else the plain on/off implied by
+  // `reasoning`. `state.reasoning` is DERIVED from it rather than read off
+  // `cfg.reasoning` alone: a resumed session whose effort is 'on' left
+  // `reasoning` false, so the status line omitted "thinking on" until the model
+  // was re-picked (setEffort is the only other writer, and it sets both).
+  const effort = (session && session.effort) || cfg.effort || (cfg.reasoning ? 'on' : 'off');
   return {
     workspace: cwd,
+    cfg,
+    // The SAME session local this function already reads for `effort`, kept on the state
+    // so the module-level renderers can reach the conversation: `composeFrame` receives
+    // only `(state, cols, rows)` and has no closure over startTUI's locals.
+    session: session || null,
+    provider: cfg.provider || '',
     provider: cfg.provider || '',
     model: cfg.model || '',
+    // REDUCED MOTION and the sweep-edge shape are copied onto the STATE, not read
+    // from `cfg` at render time: `composeFrame(state, …)` only receives the state,
+    // and `cfg` is a closure variable inside startTUI. Everything else that the
+    // renderer needs from configuration does the same (see `state.experiments`).
+    reducedMotion: !!cfg.reducedMotion,
+    shimmerEdge: cfg.shimmerEdge || 'cosine',
+    // How much of the display-only transcript is written to disk. These rows — a notice, a
+    // warning, a compaction result, a reasoning block — have no home in `session.messages`,
+    // because that array is what gets SENT to the model; a `/save-history off` session
+    // simply does not keep them. `undefined` on the session means the default (on), so an
+    // older file is not read as "off".
+    saveHistory: !(session && session.saveHistory === false),
+    // Reasoning is split out because it is the bulk of the cost: a long session's file
+    // grows by more than its own answers. `/save-history nothinking` keeps the notices and
+    // drops the chains.
+    saveThinking: !(session && session.saveThinking === false),
     modelLabel: modelLabel(cfg) || cfg.model || '',
     // CLI flags win; otherwise resume whatever the session was left in.
     mode: opts.auto ? 'auto' : opts.yolo ? 'yolo' : ((session && session.mode) || 'ask'),
-    reasoning: !!cfg.reasoning,
+    reasoning: effort !== 'off',
     seenThinking: false,
     expanded: false,
     todos: (session && Array.isArray(session.todos)) ? session.todos : [],
@@ -4253,7 +6036,7 @@ export function makeState({ cfg, session, opts }) {
     // restored here and written by persistState(). Reading only config.toml left
     // it off after /sessions resume, /fork and a plain restart.
     swarm: !!(session && session.swarm),
-    effort: (session && session.effort) || cfg.effort || (cfg.reasoning ? 'on' : 'off'),
+    effort,
     // Theme removed - forced dark only
     addDirs: [],
     tasks: {},
@@ -4270,7 +6053,7 @@ export function makeState({ cfg, session, opts }) {
     // AskUserQuestion dialog: { items, index, sel, picked:Set, multiSelect-going
     // state, editing, text, resolve }. Non-null while the user is answering.
     question: null,
-    // Plan approval: { plan, resolve } while the user reviews a <plan> in Plan
+    // Plan approval: { plan, resolve } while the user reviews a <|plan|> in Plan
     // mode. Mirrors approvalPending, but for the whole plan rather than one tool.
     planPending: null,
     // /tasks full-screen browser: { tasks, filter, selectedIndex, listScroll,
@@ -4288,6 +6071,20 @@ export function makeState({ cfg, session, opts }) {
     history: loadHistory(),   // restored from disk so ↑ works across restarts
     historyIdx: -1,
     _tipIndex: 0,
+    // Provider-reported token totals for the whole session (see the `usage`
+    // event). Restored from the session so --resume keeps counting from what was
+    // already spent instead of restarting the cost readout at zero.
+    usage: (session && session.usage) || {},
+    // The most recent single request's report, for a per-request readout.
+    lastUsage: null,
+    // Spend cache for the status bar (see refreshCost). Declared here with the rest
+    // of the state — a field only refreshCost creates is a crash the first time the
+    // RENDERER runs before it, which is exactly what happens on a restored session.
+    _costUsd: null,
+    _costKnown: false,
+    _costText: null,        // the amount as printed, in the display currency
+    _costCurrency: 'USD',
+    _costRate: null,        // the rate used, or null when the figure is USD
   };
 }
 
@@ -4334,7 +6131,16 @@ export function planCompaction(msgs, cfg, ratio, maxCtx) {
     ? Math.max(1, Math.floor(used * (1 - ratio)))
     : Math.max(1, Math.floor((used || (maxCtx || 512000) * 0.85) * keepRatio));
 
-  const tokOf = (m) => estimateMessagesTokens([m], cfg) - estimateMessagesTokens([], cfg);
+  // Price each message ONCE, and memoise it. `tokOf(m)` used to call
+  // estimateMessagesTokens twice per message (once for [m], once for []), and the loop
+  // visits every message, so a 4000-message transcript re-scanned ~8000 whole-array
+  // estimates. The empty array contributes nothing anyway —
+  // estimateMessagesTokens([]) is 0 by definition.
+  //
+  // `messageTokens` additionally caches each message's own figure, so a SECOND run of
+  // this planner over the same transcript (/compact, then the automatic path) costs a
+  // WeakMap lookup per message instead of re-walking every tool result body.
+  const tokOf = (m) => messageTokens(m, cfg);
   let keepFrom = list.length;
   let keptTokens = 0;
   while (keepFrom > 0) {
@@ -4388,6 +6194,27 @@ export function reconstructChat(s) {
     }
   };
 
+  // Rows that live ONLY on screen, from an earlier session. `session.messages` holds what
+  // the model sees, so a notice, a warning, a compaction result and a reasoning block have
+  // no home there — writing them in would spend context on prose the model already acted
+  // on. They are recorded in `session.transcript` instead, each with the same kind of
+  // `anchor` shellHistory uses (how many real messages preceded it), so a resume puts them
+  // back in the slot they were shown in rather than at the tail.
+  const transcriptByAnchor = new Map();
+  for (const ev of ((s && s.transcript) || [])) {
+    if (!ev || typeof ev !== 'object' || !ev.row) continue;
+    const a = Number(ev.anchor != null ? ev.anchor : 0);
+    if (!transcriptByAnchor.has(a)) transcriptByAnchor.set(a, []);
+    transcriptByAnchor.get(a).push(ev.row);
+  }
+  const emitTranscript = (out, a) => {
+    for (const row of transcriptByAnchor.get(a) || []) {
+      if (!row || typeof row !== 'object') continue;
+      // `pending` is live state — a spinner that ended before the session was closed must
+      // not start spinning again on resume — so it is settled on the way back in.
+      out.push(row.pending ? { ...row, pending: false } : { ...row });
+    }
+  };
 
   const out = [];
   const msgs = (s && s.messages) || [];
@@ -4398,6 +6225,7 @@ export function reconstructChat(s) {
     // malformed message at index `mi` used to `continue` past the emit, so a
     // shell command anchored at that index was dropped from the resume entirely.
     emitShells(out, mi);
+    emitTranscript(out, mi);
     // Skip junk entries. A session file can carry a null (older writer, hand
     // edit, truncated write); reading `m.role` off it threw and the whole resume
     // died with an unhandled TypeError instead of showing the rest of the
@@ -4413,8 +6241,9 @@ export function reconstructChat(s) {
     for (const row of convRowFor(m)) out.push({ ...row, _conv: true });
   }
 
-  // Any shell commands anchored at/past the end land at the very tail.
+  // Any shell commands and transcript rows anchored at/past the end land at the very tail.
   emitShells(out, msgs.length);
+  emitTranscript(out, msgs.length);
   return out;
 }
 
@@ -4424,15 +6253,16 @@ export function pickerFiltered(state) {
   const q = (state.pickerQuery || '').trim().toLowerCase();
   let filtered = items;
   if (q) {
-    const hit = items.filter((it) => String(it.label).toLowerCase().includes(q));
-    filtered = hit.length ? hit : items;
+    // A query that matches nothing must yield an EMPTY list, so the renderer can
+    // show "No matches". Falling back to the full list hid the miss entirely and
+    // made a typo look like "everything still matches".
+    filtered = items.filter((it) => String(it.label).toLowerCase().includes(q));
   }
-  // Category filter: when "All" is active (cat is null or "All"), show everything.
-  // For a specific provider category, only show items whose category matches.
+  // Category filter: only narrow when the selected category actually has items.
+  // ("All", or no category, keeps everything.)
   const cat = state.pickerCategory;
   if (cat && cat !== 'All') {
-    const catFiltered = filtered.filter((it) => it.category === cat);
-    filtered = catFiltered.length ? catFiltered : filtered;
+    filtered = filtered.filter((it) => it.category === cat);
   }
   return filtered;
 }
@@ -4450,7 +6280,17 @@ export function pickerFiltered(state) {
 // just insert a placeholder; those are skipped.
 
 
-export function argCompletionsFor(name) {
+export function argCompletionsFor(name, dynamicFor) {
+  // A command may supply its completions from live state instead of a static hint
+  // (e.g. /effort's levels come from the current model's models.dev data, which the
+  // hardcoded hint could never track). When a provider returns a non-empty list it
+  // wins outright; the hint parser below is only the fallback.
+  if (typeof dynamicFor === 'function') {
+    try {
+      const dyn = dynamicFor(String(name || '').toLowerCase());
+      if (Array.isArray(dyn) && dyn.length) return dyn;
+    } catch { /* fall through to the static hint */ }
+  }
   const entry = allCommands().find((c) => c.name === name);
   if (!entry || !entry.argumentHint) return [];
   // The hint is a small grammar: `|` separates alternatives, `[...]` wraps an
@@ -4465,7 +6305,7 @@ export function argCompletionsFor(name) {
   const words = [];
   const chunks = String(entry.argumentHint).split('|');
   for (let i = 0; i < chunks.length; i++) {
-    let chunk = chunks[i].trim();
+    const chunk = chunks[i].trim();
     if (!chunk) continue;
     // Strip an optional-group bracket, but only from THIS chunk: `[on|off` splits
     // into `[on` and `off]`, and a `]` closing the group must not be treated as
@@ -4502,7 +6342,7 @@ export function argCompletionsFor(name) {
 //   * a word from the command's hint      -> completes the word
 //   * that command's own argumentHint     -> shown as a reminder when there is
 //     nothing left to complete, so typing `/auto-trim ` still tells you the shape
-function buildArgMenu(entry, rest) {
+function buildArgMenu(entry, rest, dynamicFor) {
   // `rest` is everything after "/cmd ". Split off the word being typed: a trailing
   // space means the word is finished and we are completing the NEXT one.
   const trailingSpace = /\s$/.test(rest);
@@ -4513,7 +6353,7 @@ function buildArgMenu(entry, rest) {
   // Only the first positional slot is completed. A command like
   // `/auto-trim threshold 50%` has a value after the sub-word, and guessing at
   // every later slot would offer words that do not belong there.
-  const words = argCompletionsFor(entry.name);
+  const words = argCompletionsFor(entry.name, dynamicFor);
   if (!words.length) return [];
 
   const matches = words.filter((w) => w.startsWith(partial.toLowerCase()));
@@ -4561,6 +6401,14 @@ export function acceptMenuSelection(state) {
   state.caret = state.input.length;
 }
 
+// Live argument completions. A few commands complete from RUNTIME state rather
+// than a fixed hint string: /effort's levels come from the current model's
+// models.dev data (effortOptions), which a hardcoded hint cannot track. `startTUI`
+// installs the provider (it is the only place with `cfg`/`state` in scope);
+// refreshMenu only knows `state`, so the provider is held here.
+let argCompletionProvider = null;
+export function setArgCompletionProvider(fn) { argCompletionProvider = typeof fn === 'function' ? fn : null; }
+
 export function refreshMenu(state) {
   const val = state.input || '';
   if (val === '' || !val.startsWith('/')) {
@@ -4577,7 +6425,7 @@ export function refreshMenu(state) {
     const m = /^\/([^\s]+)\s+([\s\S]*)$/.exec(val);
     const cmdEntry = m ? allCommands().find((c) => c.name === m[1].toLowerCase()
       || (c.aliases || []).includes(m[1].toLowerCase())) : null;
-    const argMenu = cmdEntry ? buildArgMenu(cmdEntry, m[2]) : [];
+    const argMenu = cmdEntry ? buildArgMenu(cmdEntry, m[2], argCompletionProvider) : [];
     // A command with no completable arguments (a free-form `<title>` or `<path>`)
     // has nothing to offer, so the menu closes as it always did — but only there.
     state.menuList = argMenu;
@@ -4658,6 +6506,30 @@ function ensureMenuVisible(state) {
 // ---- command dispatch ----
 export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdout, renderFrameArg) {
   const { addChat, openPicker, openForm, notice, sendPrompt, quit, saveSession, openEditor } = h;
+
+  // ---- command alias expansion ----
+  // A user-defined alias (set via the alias/global-alias plugin commands) is
+  // expanded BEFORE any built-in or plugin command is resolved, so an alias
+  // behaves exactly like typing the full command. Aliases are stored in
+  // cfg.command_aliases as a map: { short: { to, scope, workspace } }. A `global`
+  // scope matches in every workspace; a `project` scope only in its workspace.
+  {
+    const full = String(cmdRaw || '').replace(/^\/+/, '');
+    const rawName = full.split(/\s+/)[0].toLowerCase();
+    const aliases = (cfg && cfg.command_aliases) || {};
+    const here = aliases[rawName];
+    const ws = (state && (state.cwd || state.workspace)) || process.cwd();
+    if (here && (here.scope === 'global' || here.workspace === ws)) {
+      const rest = full.slice(rawName.length).replace(/^\s+/, '');
+      const expanded = `${here.to} ${rest}`.trim();
+      cmdRaw = expanded;
+      // arg is recomputed from the expanded command so the rest of dispatch sees
+      // the resolved name and its trailing args consistently.
+      const sp = expanded.indexOf(' ');
+      arg = sp === -1 ? '' : expanded.slice(sp + 1).trim();
+    }
+  }
+
   // The repaint hook: the parameter is kept for callers that pass it, but the
   // authoritative source is `h.renderFrame` (the host always supplies one). The
   // parameter was declared and NEVER passed by any of the four callers, so a
@@ -4760,9 +6632,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           { label: 'statusline', sub: 'configure status line items' },
           { label: 'add-dir', sub: 'add an additional workspace directory' },
           { label: 'auto-update', sub: `check npm for updates at startup + every 30 min — currently ${cfg.autoUpdate ? 'on' : 'off'}` },
-          { label: 'auto-compact', sub: `summarize older history at 85% of the window — currently ${cfg.autoCompact === false ? 'off' : 'on'}` },
-          { label: 'auto-trim', sub: `elide old tool results at 50% of the window — currently ${cfg.autoTrim === false ? 'off' : 'on'}` },
-          { label: 'trim', sub: 'elide old tool results now — /trim [0.3] sets how much to keep' },
+          // The thresholds are CONFIGURABLE (/auto-compact threshold <n>), so show the
+          // live value rather than a hardcoded "85%"/"50%" that lied after an edit.
+          { label: 'auto-compact', sub: `summarize older history at ${Math.round((cfg.compactThreshold ?? 0.85) * 100)}% of the window — currently ${cfg.autoCompact === false ? 'off' : 'on'}` },
+          { label: 'auto-trim', sub: `elide old tool results at ${Math.round((cfg.trimThreshold ?? 0.5) * 100)}% of the window — currently ${cfg.autoTrim === false ? 'off' : 'on'}` },
+          { label: 'trim', sub: `elide old tool results now — /trim [${cfg.trimKeepRatio ?? 0.3}] sets how much to keep` },
         ],
         onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
       });
@@ -4807,14 +6681,74 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           ],
           categories: _catLabels,
           category: null,  // start on "All"
-          hint: '↑↓ navigate · Tab switch category · Enter select · Esc cancel',
+          // Trimmed to fit the row, which is clipped (not wrapped) at the terminal
+          // width: `Esc cancel` and the long "switch category" phrasing are the
+          // guessable parts, and dropping them keeps `Ctrl+E edit` on screen at the
+          // narrowest width the dialog targets.
+          hint: '↑↓ navigate · Enter select · Tab category · Ctrl+E edit',
           sel: Math.max(0, names.indexOf(cfg.model)),
+          // Ctrl+E edits the selected model's stored details (display name, context
+          // window, output limit). These are exactly the fields resolveConfig reads,
+          // so an edit takes effect on the next turn without editing config.toml by hand.
+          onCtrlE: (item) => {
+            if (!item || item.action === 'add-model') { appErr('Select a model first, then Ctrl+E to edit it.'); return; }
+            const entry = models[item.label] || {};
+            const provider = entry.provider || cfg.provider || '';
+            const modelId = entry.model || bareModelId(provider, item.label, entry);
+            openForm({
+              title: `Edit ${item.label}`,
+              fields: [
+                { key: 'display_name', label: 'Display Name', value: entry.display_name || entry.displayName || '' },
+                { key: 'context', label: 'Context Tokens', value: String(entry.context_length || entry.contextLength || '') },
+                { key: 'output', label: 'Max Output Tokens', value: String(entry.max_output_tokens || entry.maxOutputTokens || entry.max_tokens || '') },
+              ],
+              type: null,
+              hideType: true,
+              labelW: 20,
+              hint: 'Tab next field · Enter save · Esc cancel (blank clears the value)',
+              onSubmit: (values) => {
+                const num = (v) => { const n = Number(String(v || '').replace(/[^0-9]/g, '')); return n > 0 ? n : undefined; };
+                // Reasoning is NOT edited here: the thinking LEVEL is chosen in the
+                // picker's Thinking footer (sourced from models.dev), and whether a
+                // model supports reasoning is a property of the model, not a field to
+                // hand-toggle. This form edits only stored metadata.
+                upsertModel(provider, modelId, {
+                  display_name: (values.display_name || '').trim() || undefined,
+                  contextLength: num(values.context),
+                  maxOutputTokens: num(values.output),
+                });
+                // Keep the in-memory config in sync so the status line / next turn see
+                // the change immediately (a restart is not required).
+                cfg.raw.models = cfg.raw.models || {};
+                const k = modelKey(provider, modelId);
+                cfg.raw.models[k] = {
+                  ...entry,
+                  provider,
+                  model: modelId,
+                  display_name: (values.display_name || '').trim() || undefined,
+                  context_length: num(values.context),
+                  max_output_tokens: num(values.output),
+                };
+                applyModel(state, cfg, resolveProvider(cfg, provider));
+                app(`Saved ${item.label}: context ${num(values.context) || 'default'}, output ${num(values.output) || 'default'}`);
+              },
+            });
+          },
           footerFor: (item) => {
             if (!item || item.action === 'add-model') return { label: 'Thinking', options: ['off', 'on'], value: state.effort || 'off', focused: false };
             const itemOpts = effortOptions(cfg, item.label);
             if (!itemOpts.length) return null;
             const cur = item.label === cfg.model ? (state.effort && itemOpts.includes(state.effort) ? state.effort : 'off') : (itemOpts.includes(state.effort) ? state.effort : itemOpts.includes('off') ? 'off' : itemOpts[0]);
             return { label: 'Thinking', options: itemOpts, value: cur, focused: false };
+          },
+          // Choosing a model has TWO parts here — the model and its thinking level — so a
+          // CLICK on a row must not close the menu before the level can be clicked.
+          clickKeepsOpen: true,
+          onFooterPick: (level) => {
+            setEffort(state, cfg, level);
+            persist();
+            app(`Model → ${cfg.model}${state.effort && state.effort !== 'off' ? ` (thinking ${state.effort})` : ''}`);
+            return true;
           },
           onPick: (it) => {
             if (it.action === 'add-model') {
@@ -4880,18 +6814,55 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
     case 'provider': {
+      // The provider list is rebuilt in three places — on open, after a delete, and
+      // after an edit — so it is built in ONE place. The edit case is why: its
+      // handler used to write `state.picker.items` directly, but `openForm` had
+      // already set `state.picker = null`, so saving an edit threw
+      // "Cannot set properties of null" and the uncaughtException handler exited
+      // hncode. Reopening the picker is both the fix and the intent (the list has to
+      // show the new name/URL).
+      const providerItems = () => {
+        const pr = (cfg.raw && cfg.raw.providers) || {};
+        const rows = Object.keys(pr).map((name) => ({
+          label: name,
+          sub: (pr[name].base_url || pr[name].baseUrl || '').replace(/^https?:\/\//, '') || '(no base_url)',
+          current: name === cfg.provider,
+        }));
+        rows.push({ label: '＋ Add provider…', sub: 'create a new [providers.*] entry', action: 'add' });
+        return rows;
+      };
       const pr = (cfg.raw && cfg.raw.providers) || {};
       const names = Object.keys(pr);
-      const items = names.map((name) => {
-        const p = pr[name] || {};
-        return { label: name, sub: (p.base_url || p.baseUrl || '').replace(/^https?:\/\//, '') || '(no base_url)', current: name === cfg.provider };
-      });
-      items.push({ label: '＋ Add provider…', sub: 'create a new [providers.*] entry', action: 'add' });
-      openPicker({
-        title: names.length ? 'Select a provider' : 'No providers yet',
-        items,
-        sel: Math.max(0, names.indexOf(cfg.provider)),
-        hint: names.length ? '↑↓ navigate · Enter edit · Delete remove · Esc cancel' : 'Enter to add your first provider · Esc cancel',
+      // The whole picker is a named function so the EDIT path can build a fresh one:
+      // by the time its form submits, `state.picker` is null (openForm clears it) and
+      // the old code wrote `state.picker.items` straight into that null, throwing and
+      // taking the process down.
+      //
+      // The selection is computed from a FRESH key list, not the `names` captured at
+      // command time: after a rename or a delete, `names` no longer describes the
+      // rows on screen and the highlight landed on the wrong provider.
+      const openProviderPicker = (selName) => {
+        const keys = Object.keys(cfg.raw.providers || {});
+        return openPicker({
+          title: keys.length ? 'Select a provider' : 'No providers yet',
+          items: providerItems(),
+          sel: Math.max(0, keys.indexOf(selName || cfg.provider)),
+          // The hint must NAME the keys this picker actually handles. It defines
+          // onCtrlR (re-fetch models) and onDelete (remove the provider) but the
+          // default hint text mentions neither, so both actions were invisible —
+          // a listener with no advertised shortcut is the same as no feature.
+          //
+          // Short enough to fit the row (which is clipped, not wrapped, at the
+          // terminal width): the dropped words are the guessable ones — arrows, Esc,
+          // and "type to search", which the title suffix already says.
+          hint: '↑↓ navigate · Enter edit · Del remove · Ctrl+R refresh',
+          // Ctrl+R: re-fetch the selected provider's models from /v1/models, or from
+          // the whole models.dev catalog when the provider is a catalog one. Replaces
+          // the provider's model entries rather than appending.
+        onCtrlR: (it) => {
+          if (!it || it.action === 'add') { appErr('Select a provider first, then Ctrl+R to refresh its models.'); return; }
+          refreshProviderModels(state, cfg, it.label, h).catch((e) => appErr(`Refresh failed: ${e.message}`));
+        },
         onDelete: (it) => {
           if (!it || it.action === 'add') return false;
           removeProvider(it.label);
@@ -4899,14 +6870,12 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           for (const key of Object.keys(cfg.raw.models || {})) {
             if (key.split('/')[0] === it.label) delete cfg.raw.models[key];
           }
-          const left = Object.keys(cfg.raw.providers || {});
-          state.picker.items = left.map((name) => ({
-            label: name,
-            sub: ((cfg.raw.providers[name] || {}).base_url || '').replace(/^https?:\/\//, '') || '(no base_url)',
-            current: name === cfg.provider,
-          }));
-          state.picker.items.push({ label: '＋ Add provider…', sub: 'create a new [providers.*] entry', action: 'add' });
-          state.picker.sel = Math.max(0, Math.min(state.picker.sel, state.picker.items.length - 1));
+          // The picker is still open here (Delete runs from the list), so the rows
+          // are refreshed in place.
+          if (state.picker) {
+            state.picker.items = providerItems();
+            state.picker.sel = Math.max(0, Math.min(state.picker.sel, state.picker.items.length - 1));
+          }
           if (cfg.provider === it.label) { cfg.provider = ''; state.provider = ''; }
           app(`Provider removed: ${it.label}`);
           return true;
@@ -4932,12 +6901,17 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
                       { key: 'api_key', label: 'API Key', kind: 'mask' },
                     ],
                     type: null,
+                    // Same as the edit form: picking a Type IS the final decision
+                    // here, so a click on it saves. Without this a mouse user had to
+                    // click the type and then still press Enter.
+                    typeClickSubmits: true,
                     hint: 'Tab next field · ↑/↓ field · ←/→ type · Enter save · Esc cancel',
                     onSubmit: (values, type) => {
                       if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
-                      if (!type) { appErr('Cancelled: choose a Type (OpenAI / Anthropic).'); return; }
-                      const protocol = type === 'Anthropic' ? 'anthropic' : 'openai';
-                      registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, type);
+                      if (!type) { appErr('Cancelled: choose a Type (OpenAI / OpenAI Responses / Anthropic).'); return; }
+                      const protocol = typeToProtocol(type);
+                      // A hand-entered provider is NOT from the catalog: known=false.
+                      registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, type, false);
                     },
                   });
                   return true;
@@ -4947,15 +6921,24 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
                 fetchCatalog().then((catalog) => {
                   const entries = catalog
                     ? Object.values(catalog)
-                        .filter((p) => p && p.id && p.api)
-                        .map((p) => ({ id: p.id, name: p.name || p.id, api: p.api, doc: p.doc || '' }))
+                        .filter((p) => p && p.id)
+                        .map((p) => ({
+                          id: p.id,
+                          name: p.name || p.id,
+                          api: p.api || catalogDefaultUrl(p.id),
+                          npm: p.npm || '',
+                          doc: p.doc || '',
+                          models: p.models || {},
+                        }))
                         .sort((a, b) => String(a.name).localeCompare(String(b.name)))
                     : [];
                   const items = entries.map((p) => ({
                     label: p.name,
-                    sub: p.api.replace(/^https?:\/\//, ''),
+                    sub: p.id,
                     providerId: p.id,
                     base_url: p.api,
+                    npm: p.npm,
+                    catalogModels: p.models,
                     action: 'pickKnown',
                   }));
                   if (!items.length) {
@@ -4968,57 +6951,85 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
                     searchable: true,
                     hint: '↑↓ navigate · type to search · Enter select · Esc cancel',
                     onPick: (pit) => {
+                      // Protocol is DETECTED, not asked: models.dev marks the SDK via
+                      // `npm`. Everything that is not the Anthropic SDK speaks the
+                      // OpenAI wire format (the catalog is dominated by openai-compatible).
+                      const protocol = /anthropic/i.test(pit.npm || '') ? 'anthropic' : 'openai';
                       openForm({
-                        title: `Edit ${pit.label}`,
+                        title: `Add ${pit.label}`,
+                        // Name is PRE-FILLED with the catalog id but editable — you may
+                        // want a different key (e.g. two accounts for the same provider).
+                        // The URL comes from the catalog (or the provider's well-known
+                        // default) and the protocol was detected above, so neither needs
+                        // a field. Only the key is empty and must be typed.
                         fields: [
-                          { key: 'name', label: 'Provider Name', value: pit.name },
-                          { key: 'base_url', label: 'Base URL', value: pit.base_url },
-                          { key: 'api_key', label: 'API Key', kind: 'mask', value: pit.api_key || '' },
-                          { key: 'type', label: 'Type', options: ['OpenAI', 'Anthropic'], value: pit.type || (pit.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') },
+                          // Pre-fill the DISPLAY name (mixed case, e.g. "Deep Infra"),
+                          // not the catalog id — it reads better and the user can edit it.
+                          { key: 'name', label: 'Provider Name', value: pit.label || pit.providerId },
+                          { key: 'api_key', label: 'API Key', kind: 'mask', value: '' },
                         ],
                         type: null,
+                        hideType: true,
                         hint: 'Tab next field · Enter save · Esc cancel',
                         onSubmit: async (values) => {
-                          if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
-                          const protocol = values.type === 'Anthropic' ? 'anthropic' : 'openai';
-                          registerProvider(state, cfg, h, values.name, values.base_url, values.api_key, protocol, values.type);
-                          
-                          // Auto-fetch models and configure context/thinking settings
+                          const name = (values.name || '').trim() || pit.label || pit.providerId;
+                          const base_url = pit.base_url;
+                          // known=true records the SOURCE (models.dev); the catalog id is
+                          // kept separately so a renamed provider still maps to its entry.
+                          registerProvider(state, cfg, h, name, base_url, values.api_key, protocol, protocolToType(protocol), true, pit.providerId);
+
+                          // Auto-fetch models; the catalog's own per-model limits
+                          // (limit.context / limit.output) and reasoning options are
+                          // merged in, so models whose endpoint reports nothing still
+                          // get correct values. models.dev is the SOURCE OF TRUTH for
+                          // thinking levels — we never guess them.
                           try {
-                            const models = await fetchModels({ 
-                              baseUrl: values.base_url, 
-                              apiKey: values.api_key, 
-                              protocol 
-                            });
-                            
-                            if (models.length > 0) {
-                              // Add each model with its configuration
-                              for (const m of models) {
-                                const key = modelKey(values.name, m.id);
-                                if (!cfg.raw.models[key]) {
-                                  addModel(values.name, m.id, {
-                                    display_name: m.display,
-                                    contextLength: m.contextLength,
-                                    maxTokens: m.maxTokens,
-                                  });
-                                  
-                                  // Configure model entry in raw config
-                                  if (!cfg.raw.models) cfg.raw.models = {};
-                                  cfg.raw.models[key] = {
-                                    provider: values.name,
-                                    model: m.id,
-                                    display_name: m.display,
-                                    context_length: m.contextLength,
-                                    max_tokens: m.maxTokens,
-                                    reasoning: m.reasoning,
-                                    efforts: m.efforts,
-                                  };
-                                }
+                            const models = await fetchModels({ baseUrl: base_url, apiKey: values.api_key, protocol });
+                            const cat = pit.catalogModels || {};
+                            const enrich = (id, base = {}) => {
+                              const c = cat[id] || {};
+                              return {
+                                ...base,
+                                limit: (base.limit) || c.limit || {},
+                                reasoning: base.reasoning !== undefined ? base.reasoning : c.reasoning,
+                                reasoningOptions: base.reasoningOptions || c.reasoning_options,
+                                cost: base.cost || c.cost,
+                              };
+                            };
+                            const merged = models.length
+                              ? models.map((m) => enrich(m.id, m))
+                              : Object.entries(cat).map(([id, m]) => enrich(id, { id, display: m.name || id }));
+                            if (merged.length > 0) {
+                              for (const m of merged) {
+                                const lim = m.limit || {};
+                                const ctxLen = m.contextLength || lim.context || undefined;
+                                const maxOut = m.maxOutputTokens || lim.output || undefined;
+                                // Thinking levels come ONLY from models.dev's
+                                // reasoning_options; effortsFromOptions returns null
+                                // when there is nothing usable, so no guessing happens.
+                                const efforts = m.efforts || effortsFromReasoning(m.reasoningOptions);
+                                // Pricing comes from the catalog too. Without it /usage
+                                // can only report tokens, never what they cost.
+                                const cost = costFromCatalog(m.cost);
+                                const key = modelKey(name, m.id);
+                                addModel(name, m.id, {
+                                  display_name: m.display,
+                                  contextLength: ctxLen,
+                                  maxTokens: m.maxTokens,
+                                  maxOutputTokens: maxOut,
+                                  reasoning: m.reasoning === true,
+                                  efforts,
+                                  cost,
+                                });
+                                if (!cfg.raw.models) cfg.raw.models = {};
+                                // Merge over any existing entry: fields this fetch
+                                // did not report keep the values already there
+                                // (same rule as the Ctrl+R refresh).
+                                cfg.raw.models[key] = mergeRefreshedModelEntry(name, m, cfg.raw.models[key]);
                               }
-                              
-                              app(`Added ${models.length} model(s) with auto-configured context windows and thinking capabilities.`);
+                              app(`Added ${merged.length} model(s) with limits from the catalog.`);
                             } else {
-                              app(`Provider added. No models found at this endpoint.`);
+                              app(`Provider added. No models found at this endpoint or in the catalog.`);
                             }
                           } catch (error) {
                             app(`Provider added. Failed to fetch models: ${error.message}`);
@@ -5043,32 +7054,73 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
               { key: 'base_url', label: 'Base URL', value: p.base_url || p.baseUrl || '' },
               { key: 'api_key', label: 'API Key', kind: 'mask', value: p.api_key || p.apiKey || '' },
             ],
-            type: p.protocol || 'openai',
-            hideType: true,
+            // `type` here is the LABEL the form cycles through, so convert the stored
+            // protocol back to its label (passing the raw 'openai' showed a Type field
+            // whose selection did not match what was saved).
+            type: protocolToType(p.protocol || 'openai'),
+            // The Type field is SHOWN here — editing a provider is exactly where you
+            // switch between OpenAI / OpenAI Responses / Anthropic. It used to be
+            // hidden, so the protocol could never be changed after creation and the
+            // "←/→ type" hint pointed at a field that was not on screen.
+            hideType: false,
+            // Clicking a Type finishes the edit, like Enter does — the type is the
+            // last decision on this form, so a mouse user should not have to reach
+            // for the keyboard afterwards.
+            typeClickSubmits: true,
             hint: 'Tab next field · ←/→ type · Enter save · Esc cancel',
             onSubmit: (values, type) => {
               if (!values.name) { appErr('Cancelled: provider name is required.'); return; }
-              const protocol = values.type === 'Anthropic' ? 'anthropic' : 'openai';
-              addProvider(values.name, { base_url: values.base_url, api_key: values.api_key, protocol });
+              // The chosen Type arrives as the SECOND arg (`values` holds only the
+              // text fields) — `values.type` was undefined and silently saved 'openai'.
+              const protocol = typeToProtocol(type);
+              // Preserve the source flags of the entry being edited (known / catalog),
+              // otherwise a rename would silently forget it is a models.dev provider.
+              const catalogId = p.catalog;
+              const wasKnown = p.known;
+              // A RENAME has to delete the old `[providers.<old>]` block explicitly:
+              // addProvider() only replaces a block whose name matches, so writing the
+              // new name left the old entry in config.toml and the provider showed up
+              // TWICE (the stale one with the old URL, until a restart read the file).
+              // Only on a rename — calling it for an in-place edit would delete the
+              // block addProvider just wrote.
+              if (values.name !== it.label) removeProvider(it.label);
+              addProvider(values.name, { base_url: values.base_url, api_key: values.api_key, protocol, known: wasKnown, catalog: catalogId });
               delete (cfg.raw.providers || {})[it.label];
-              for (const key of Object.keys(cfg.raw.models || {})) {
-                if (key.split('/')[0] === it.label) delete cfg.raw.models[key];
+              // Keep the IN-MEMORY provider table in step with the file: without this
+              // the old entry lingered with its old protocol/URL, and the model menu
+              // read stale data until a restart.
+              cfg.raw.providers = cfg.raw.providers || {};
+              cfg.raw.providers[values.name] = {
+                base_url: values.base_url || undefined,
+                api_key: values.api_key || undefined,
+                protocol,
+                known: wasKnown,
+                catalog: catalogId,
+              };
+              // The picker is GONE by now — openForm set `state.picker = null` — so the
+              // refreshed list is built as a NEW picker rather than written into the
+              // old one. That write is what threw "Cannot set properties of null" and
+              // exited hncode; reopening also re-points the selection at the renamed
+              // entry and shows the user the new name/URL.
+              if (values.name === cfg.provider) {
+                // Re-resolve so a protocol/URL change takes effect on the NEXT turn
+                // instead of waiting for a restart.
+                applyModel(state, cfg, resolveProvider(cfg, values.name));
               }
-              state.picker.items = Object.keys(cfg.raw.providers || {}).map((name) => ({
-                label: name,
-                sub: ((cfg.raw.providers[name] || {}).base_url || '').replace(/^https?:\/\//, '') || '(no base_url)',
-                current: name === cfg.provider,
-              }));
-              state.picker.items.push({ label: '＋ Add provider…', sub: 'create a new [providers.*] entry', action: 'add' });
-              state.picker.sel = Math.max(0, Math.min(state.picker.sel, state.picker.items.length - 1));
-              if (values.name === cfg.provider) { applyModel(state, cfg, resolveProvider(cfg, values.name)); }
+              // Re-discover models under the new name (the old list was just dropped).
+              fetchAndRegisterModels(state, cfg, values.name, h);
               app(`Provider updated: ${values.name}`);
+              openProviderPicker(values.name);
               return true;
             },
           });
           return true;
         },
-      });
+          });   // closes openPicker({ … })
+      };        // closes the openProviderPicker arrow body
+      // Open the picker for the first time. Everything above only DEFINED the
+      // handlers; without this call the command rendered nothing.
+      openProviderPicker(cfg.provider);
       return;
     }
 
@@ -5097,20 +7149,44 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       state.ctxMax = cfg.maxContextTokens || state.ctxMax;
       state.tokRate = 0;
       state._tokTimes = [];
+      // The spend belongs to the session that is ending, so a new session starts
+      // from zero. The session object is reused, so `usage` must be CLEARED here
+      // rather than just left out.
+      state.usage = {};
+      state.lastUsage = null;
+      refreshCost(state, cfg);
+      // `shellHistory` belongs to the conversation that just ended. The session object
+      // is REUSED here, so leaving it in place carried the previous session's
+      // `!command` rows into a session the user had just started — and they showed up
+      // again after the next `--continue`, because saveSession persists whatever is on
+      // the object. An entry whose anchor is 0 (a `!command` run before the first
+      // message) renders even in a session that has said nothing at all.
+      session.shellHistory = [];
+      delete session.usage;
       saveSession(session);
       app(`Started a new session (${session.id}).`);
       return;
-    case 'sessions': {
+    case 'sessions':
+    case 'all-sessions': {
+      const everyWorkspace = cmd === 'all-sessions';
       const all = sess.listSessions();
       const cwd = path.resolve(state.cwd || state.workspace || process.cwd());
-      // Filter to only show sessions from the current workspace.
-      const list = all.filter((s) => {
+      // `/sessions` is scoped to THIS directory; `/all-sessions` deliberately is not,
+      // so a conversation started elsewhere can be resumed without cd-ing into it
+      // first. Both share ONE implementation below — a second copy of this resume
+      // logic would have to be kept in step with every fix made to it.
+      const list = everyWorkspace ? all : all.filter((s) => {
         const sessionCwd = s.workspace ? path.resolve(s.workspace) : null;
         return sessionCwd === cwd;
       });
-      if (!list.length) { app(all.length ? `No sessions in this directory (${cwd}).` : 'No saved sessions.'); return; }
+      if (!list.length) {
+        app(everyWorkspace
+          ? 'No saved sessions.'
+          : (all.length ? `No sessions in this directory (${cwd}). Try /all-sessions.` : 'No saved sessions.'));
+        return;
+      }
       openPicker({
-        title: 'Resume a session',
+        title: everyWorkspace ? 'Resume a session (all workspaces)' : 'Resume a session',
         items: list.slice(0, 50).map((s) => ({
           label: (s.title || 'untitled').slice(0, 30),
           sub: `${new Date(s.updatedAt || s.createdAt || 0).toLocaleString().slice(0, 19)} · ${(s.messages || []).length} msgs · ${s.workspace || ''}${s.lastTurnMs ? ` · last turn ${fmtDuration(s.lastTurnMs)}` : ''}`,
@@ -5138,12 +7214,23 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
             state.rounds = session.rounds || 0;
             state.steps = session.steps || 0;
             state.lastTurnMs = session.lastTurnMs || 0;
-            // The resumed session may live in another directory. `!` passthrough
-            // runs in `state.cwd || state.workspace`, so leaving the PREVIOUS
-            // session's cwd here ran the command in the wrong place.
+            // The resumed session may live in another directory, and EVERY tool path
+            // resolves against it (`resolvePath` uses `ctx.cwd || ctx.workspace`,
+            // and the agent copies `cfg` into `ctx` each turn). Updating only
+            // state.cwd moved the STATUS LINE while Edit/Read/Bash kept writing to
+            // the previous workspace — the resume looked right and hit the wrong
+            // files. `cfg` is the one the tools read, so it moves too.
             if (full.workspace) {
               state.cwd = full.workspace;
               state.workspace = full.workspace;
+              cfg.workspace = full.workspace;
+              cfg.cwd = full.workspace;
+              // An in-flight agent holds its own ctx copy; keep it in step so a
+              // resume while a turn is running cannot split the two.
+              if (state.agent && state.agent.ctx) {
+                state.agent.ctx.cwd = full.workspace;
+                state.agent.ctx.workspace = full.workspace;
+              }
               refreshGitInfo(state, { force: true });
             }
 
@@ -5184,7 +7271,6 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       app(want
         ? 'Swarm mode ON - the model will decompose work across parallel subagents (AgentSwarm)'
         : 'Swarm mode OFF');
-      return;
       return;
     }
     case 'swarm-sub-agent': {
@@ -5252,45 +7338,116 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
     case 'fork': {
-      const forked = { ...session, id: sess.newId(), title: `${session.title || 'untitled'} (fork)`, createdAt: Date.now(), messages: (session.messages || []).slice() };
+      // Forking is the whole point of the command: the two conversations must be able to
+      // diverge without touching each other. `forkOf` owns that guarantee
+      // (a copy per message, the lineage, and the counters that belong to the
+      // conversation rather than to the copy) and lives in its own module so it can be
+      // tested directly.
+      const forked = forkOf(session, sess.newId);
       sess.saveSession(forked);
       app(`Session forked (${forked.id}). Still in the original; switch via /sessions.`);
+      renderFrame();
       return;
     }
     case 'undo': {
-      const count = Math.max(1, parseInt(raw || '1', 10) || 1);
       const msgs = session.messages || [];
-      let idx = msgs.length;
-      for (let i = 0; i < count; i++) {
-        let j = idx - 1;
-        while (j >= 0 && msgs[j].role !== 'user') j--;
-        if (j < 0) break;
-        idx = j;
+      // Indexes of REAL user prompts. Harness-generated `role: 'user'` notes (the
+      // truncation-recovery nudge, compaction handoffs wrapped in <system-reminder>)
+      // must not count: they inflate the tally and would show up as fake prompts in
+      // the picker. `beginTurn` runs once per real prompt, so this list is what the
+      // file-history turns line up with.
+      const promptIdx = [];
+      for (let i = 0; i < msgs.length; i++) if (isRealUserPrompt(msgs[i])) promptIdx.push(i);
+
+      // Bare `/undo` opens a PICKER of the prompts (cline-style): choose one and the
+      // session rewinds TO JUST BEFORE it — transcript and files together. A numeric
+      // argument keeps the old "go back N prompts" behaviour, so scripts and muscle
+      // memory are unaffected.
+      const argStr = String(raw || '').trim();
+      if (!argStr || !/^\d+$/.test(argStr)) {
+        if (!promptIdx.length) { app('Nothing to undo.'); return; }
+        const items = promptIdx.map((mi, k) => {
+          const text = String(msgs[mi].content == null ? '' : msgs[mi].content).replace(/\s+/g, ' ').trim();
+          return {
+            label: text.length > 64 ? text.slice(0, 61) + '…' : (text || '(empty prompt)'),
+            sub: `prompt ${k + 1} of ${promptIdx.length} · rewinds ${promptIdx.length - k} turn(s)`,
+            _k: k,
+          };
+        });
+        openPicker({
+          title: 'Rewind to just before…',
+          items,
+          searchable: true,
+          hint: '↑↓ navigate · type to filter · Enter rewind · Esc cancel',
+          onPick: (it) => {
+            if (!it || it._k == null) return true;
+            const count = promptIdx.length - it._k;   // turns to drop, newest first
+            confirmUndo(count, it.label, () => doUndo(count));
+            return true;
+          },
+        });
+        return;
       }
-      if (idx >= msgs.length) { app('Nothing to undo.'); return; }
-      const removed = msgs.slice(idx);
-      session.messages = msgs.slice(0, idx);
-      state.chat = state.chat.slice(0, Math.max(0, state.chat.length - removed.length));
-      saveSession(session);
-      // Rewind the FILES too. This used to only truncate the transcript and then
-      // say "Undid 1 prompt", while every Edit/Write the agent had made stayed on
-      // disk — so the user believed the work was withdrawn and then found their
-      // files still rewritten. file-history.js holds the pre-turn content of each
-      // file the agent touched, taken on the first write to it in that turn.
-      const rewound = rewindFiles(session.id, count);
-      const filesNote = describeRewind(rewound);
-      // The files on disk are now older than what the model Read, so every hash in
-      // the Read snapshot pool describes content that is no longer there. Clear it,
-      // or the model's next Edit is rejected as "changed since it was Read" against
-      // a file the user just watched being restored.
-      if (state.agent && state.agent.readPool) {
-        try { state.agent.readPool.clear(); } catch { /* best-effort */ }
-      }
-      if (rewound.failed.length) {
-        for (const f of rewound.failed) appErr(`Could not restore ${f.path}: ${f.error}`);
-      }
-      app(`Undid ${count} prompt${count > 1 ? 's' : ''}${filesNote ? ` — ${filesNote}` : ' (no files changed)'}.`);
-      renderFrame();
+
+      const count = Math.max(1, parseInt(argStr, 10) || 1);
+      // CONFIRM before rewinding. This destroys work: the transcript truncates AND
+      // file-history puts every file the turns touched back (deleting files they
+      // created). There is no redo, and with the picker above a stray Enter used to
+      // be enough. A y/n picker that names the file count is the cheapest guard.
+      const confirmUndo = (n, summary, run) => {
+        openPicker({
+          title: `Rewind ${n} prompt(s)?`,
+          searchable: false,
+          hint: '↑↓ choose · Enter confirm · Esc cancel',
+          items: [
+            { label: 'Cancel', sub: 'keep everything as it is' },
+            { label: 'Rewind', sub: `${summary} — the transcript truncates and the files those turns changed are restored (no redo)` },
+          ],
+          onPick: (it) => {
+            if (it && it.label === 'Rewind') run();
+            else app('Rewind cancelled.');
+            return true;
+          },
+        });
+        renderFrame();
+      };
+      // Shared rewind used by both paths (numeric arg and picker). Defined here so
+      // it closes over session/state/saveSession; the picker's onPick fires later
+      // but still holds this closure.
+      const doUndo = (count) => {
+        const cur = session.messages || [];
+        let ci = cur.length;
+        for (let i = 0; i < count; i++) {
+          let j = ci - 1;
+          while (j >= 0 && !isRealUserPrompt(cur[j])) j--;
+          if (j < 0) break;
+          ci = j;
+        }
+        if (ci >= cur.length) { app('Nothing to undo.'); return; }
+        const removed = cur.slice(ci);
+        state.chat = state.chat.slice(0, Math.max(0, state.chat.length - removed.length));
+        saveSession(session);
+        // Rewind the FILES too. This used to only truncate the transcript and then
+        // say "Undid 1 prompt", while every Edit/Write the agent had made stayed on
+        // disk — so the user believed the work was withdrawn and then found their
+        // files still rewritten. file-history.js holds the pre-turn content of each
+        // file the agent touched, taken on the first write to it in that turn.
+        const rewound = rewindFiles(session.id, count);
+        const filesNote = describeRewind(rewound);
+        // The files on disk are now older than what the model Read, so every hash in
+        // the Read snapshot pool describes content that is no longer there. Clear it,
+        // or the model's next Edit is rejected as "changed since it was Read" against
+        // a file the user just watched being restored.
+        if (state.agent && state.agent.readPool) {
+          try { state.agent.readPool.clear(); } catch { /* best-effort */ }
+        }
+        if (rewound.failed.length) {
+          for (const f of rewound.failed) appErr(`Could not restore ${f.path}: ${f.error}`);
+        }
+        app(`Undid ${count} prompt${count > 1 ? 's' : ''}${filesNote ? ` — ${filesNote}` : ' (no files changed)'}.`);
+        renderFrame();
+      };
+      confirmUndo(count, `the last ${count} prompt(s)`, () => doUndo(count));
       return;
     }
     case 'title': {
@@ -5664,11 +7821,18 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         });
         return;
       }
+      const selfTest = selfTestRules(rules);
       const lines = [
         'Standing permission rules, checked BEFORE the mode shortcuts',
         '(so a deny cannot be bypassed with Auto, and an ask still prompts):',
         '',
         describeRules(rules),
+        '',
+        'Session approvals:',
+        describeSessionApprovals(session.sessionApprovals),
+        '',
+        'Rule self-test:',
+        describeSelfTest(selfTest),
         '',
         `Config file: ${hncodeConfigFile()}`,
         'Edit with:   /permissions edit',
@@ -5678,8 +7842,14 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         '  Bash(npm run test)      that exact command',
         '  Bash(npm run test *)    a command starting with `npm run test `',
         '  Read(./src/**)          a tool whose path argument matches the glob',
+        '',
+        'Examples, checked here and reported above:',
+        '  Bash(git push *)  # match: git push origin | not_match: git pull',
       ];
-      openPanel('Permissions', lines);
+      h.openPanel('Permissions', lines);
+      if (selfTest.failed.length) {
+        appErr(`${selfTest.failed.length} rule example(s) failed — see /permissions.`);
+      }
       if (!n('allow') && !n('ask') && !n('deny')) {
         app('No permission rules set — /permissions edit to add some.');
       }
@@ -5833,7 +8003,6 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         : '/init — analyzing the workspace to generate AGENTS.md…');
       sendPrompt(base + update + extra);
       return;
-      return;
     }
 
     case 'goal': {
@@ -5860,12 +8029,16 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
 
     case 'help':
       h.openPanel('hncode — commands', [
-        ...allCommands().map((c) => `  /${c.name.padEnd(14)} ${(c.argumentHint || '').padEnd(26)} ${c.desc}`),
+        ...allCommands().map((c) => `  /${c.name.padEnd(14)} ${(c.argumentHint || '').padEnd(26)} ${c.description || c.desc}`),
         '',
         'Skills',
         `  /${SKILL_PREFIX}<name>     run an installed skill (Tab completes the name)`,
         '  /import-skill <file.md>  add or overwrite a skill from a Markdown file',
-        '  /skills                  list installed skills',
+        '  /skills                  open the skill manager (Tab switches tabs)',
+        '  /skills install <name>   download one from the repo, without the panel',
+        '  /skills remove <name>    delete the local copy',
+        '  /plugins                 open the plugin manager',
+        '  /plugins install <name>  download one from the repo',
         '',
         'Shortcuts',
         '  Enter          send the message',
@@ -5907,15 +8080,35 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const msgs = session.messages || [];
       const approx = Math.round(JSON.stringify(msgs).length / 3.5);
       const g = C.gray, w = C.white, b = C.bold;
+      const u = state.usage || {};
       const lines = [
         w + b + 'Session usage' + C.reset,
         '  ' + g + 'messages      ' + C.reset + w + msgs.length + C.reset,
-        '  ' + g + 'approx tokens ' + C.reset + w + approx + C.reset,
-        '',
-        w + b + 'Context window' + C.reset,
-        '  ' + g + 'used          ' + C.reset + w + `${state.ctxPercent}% `
-          + g + `(${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})` + C.reset,
       ];
+      // Provider-reported totals when there are any: they are what the model
+      // actually billed. The estimate is the fallback for an endpoint that reports
+      // nothing (or predates `stream_options`).
+      if (u.calls) {
+        const cr = u.input ? Math.round((u.cached || 0) / u.input * 100) : 0;
+        lines.push('  ' + g + 'requests      ' + C.reset + w + fmtCount(u.calls) + C.reset);
+        lines.push('  ' + g + 'input tokens  ' + C.reset + w + fmtCount(u.input || 0) + C.reset
+          + (u.cached ? g + `  (${cr}% cached)` + C.reset : ''));
+        lines.push('  ' + g + 'output tokens ' + C.reset + w + fmtCount(u.output || 0) + C.reset);
+        if (u.reasoning) {
+          lines.push('  ' + g + 'reasoning     ' + C.reset + w + fmtCount(u.reasoning) + C.reset
+            + g + '  included in output' + C.reset);
+        }
+        lines.push('  ' + g + 'total tokens  ' + C.reset + w + fmtCount((u.input || 0) + (u.output || 0)) + C.reset);
+        lines.push('  ' + g + 'est. cost     ' + C.reset + formatCost(usageCost(u, modelCost(cfg))) + C.reset);
+      } else {
+        lines.push('  ' + g + 'approx tokens ' + C.reset + w + fmtCount(approx) + C.reset);
+        lines.push('  ' + g + 'token totals  ' + C.reset + C.gray
+          + 'not reported by this endpoint yet' + C.reset);
+      }
+      lines.push('');
+      lines.push(w + b + 'Context window' + C.reset);
+      lines.push('  ' + g + 'used          ' + C.reset + w + `${state.ctxPercent}% `
+        + g + `(${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})` + C.reset);
       // Trend of the request size across this session's steps: rises as history
       // accumulates and drops when a compaction trims it.
       const hist = Array.isArray(state.tokenHistory) ? state.tokenHistory : [];
@@ -5934,25 +8127,524 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       }
       sayRich(lines.join('\n'));
       return;
+    }
+    case 'cost': {
+      // What this session has spent, at the CURRENT model's rates. The token totals
+      // come from the provider's own accounting (`usage` events); the prices come
+      // from models.dev, stored per model entry. Either half can be missing, and the
+      // readout says which rather than printing a confident $0.00.
+      //
+      // `/cost usd` and `/cost cny` SWITCH the currency: the choice is written to
+      // config.toml (`cost_currency`), so the status row and every later /cost use
+      // it. Bare `/cost` reports in the currency already selected.
+      const asked = normalizeCurrency(raw);
+      if (raw && !asked) {
+        appErr(`Unknown currency: ${raw} (expected ${SUPPORTED_CURRENCIES.join(' / ')})`);
+        return;
+      }
+      const current = costCurrency(cfg);
+      if (asked && asked !== current) {
+        try { setConfigString('cost_currency', asked); }
+        catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+        cfg.raw.cost_currency = asked;
+      }
+      const wantCurrency = asked || current;
+      // The row needs the rate SYNCHRONOUSLY, so warm the module's rate cache before
+      // refreshing, otherwise a fresh `cny` switch would draw in USD until the next
+      // usage event happened to refresh it.
+      let fx = syncRate(wantCurrency, { override: cfgCnyPerUsd(cfg) });
+      if (!fx && wantCurrency !== 'USD') {
+        fx = await usdRate(wantCurrency, { override: cfgCnyPerUsd(cfg) });
+      }
+      refreshCost(state, cfg);
+      const switched = asked && asked !== current;
+
+      const u = state.usage || {};
+      const usdCost = usageCost(u, modelCost(cfg));
+      const cost = modelCost(cfg);
+      const g = C.gray, w = C.white, b = C.bold;
+      const lines = [w + b + `Cost — ${state.modelLabel || cfg.model || '(no model)'}` + C.reset, ''];
+      if (switched) {
+        lines.push('  ' + g + `Currency → ${wantCurrency} (saved to config.toml)` + C.reset);
+        lines.push('');
+      }
+      if (!u.calls) {
+        lines.push('  ' + g + 'No token usage reported yet. Send a message — or the' + C.reset);
+        lines.push('  ' + g + 'endpoint may not support streaming usage.' + C.reset);
+        sayRich(lines.join('\n'));
+        return;
+      }
+      lines.push('  ' + g + 'requests      ' + C.reset + w + fmtCount(u.calls) + C.reset);
+      lines.push('  ' + g + 'input  tokens ' + C.reset + w + fmtCount(u.input || 0) + C.reset);
+      lines.push('  ' + g + 'output tokens ' + C.reset + w + fmtCount(u.output || 0) + C.reset);
+      if (u.cached) lines.push('  ' + g + 'cache reads   ' + C.reset + w + fmtCount(u.cached) + C.reset);
+      if (u.cacheWrite) lines.push('  ' + g + 'cache writes  ' + C.reset + w + fmtCount(u.cacheWrite) + C.reset);
+      lines.push('');
+      if (!cost) {
+        // A made-up $0.00 reads as "this was free", which is a lie in the one
+        // direction that matters. Say the price is unknown, and show the exact TOML
+        // to paste — a self-hosted or gateway provider (a local proxy, a company
+        // endpoint) has no entry in models.dev, so the user is the only source.
+        lines.push('  ' + C.red + 'No pricing for this model.' + C.reset);
+        lines.push('  ' + g + 'A provider not added from the models.dev catalog has no' + C.reset);
+        lines.push('  ' + g + 'price to read. Add one to config.toml:' + C.reset);
+        lines.push('');
+        lines.push('  ' + g + `[models.${JSON.stringify(cfg.model)}]` + C.reset);
+        lines.push('  ' + g + 'cost_input = 0.15      # USD per 1M input tokens' + C.reset);
+        lines.push('  ' + g + 'cost_output = 0.6      # USD per 1M output tokens' + C.reset);
+        lines.push('  ' + g + 'cost_cache_read = 0.003' + C.reset);
+        sayRich(lines.join('\n'));
+        return;
+      }
+      const per = (v) => (v === undefined ? '—' : `$${v}`);
+      lines.push('  ' + g + 'per 1M tokens ' + C.reset + w
+        + `in ${per(cost.input)} · out ${per(cost.output)} · cache-read ${per(cost.cacheRead)}` + C.reset);
+      if (wantCurrency === 'USD') {
+        lines.push('  ' + w + b + 'estimated total ' + C.reset + formatCost(usdCost));
+        lines.push('  ' + g + 'Switch with /cost cny for ￥ at the current rate.' + C.reset);
+      } else if (!fx) {
+        // Converting at a guessed 7.0 would be wrong in a way the user cannot see,
+        // so show the true USD figure and say what is missing.
+        lines.push('  ' + w + b + 'estimated total ' + C.reset + formatCost(usdCost));
+        lines.push('  ' + C.red + `No ${wantCurrency} rate available (offline?).` + C.reset);
+        lines.push('  ' + g + 'Set cny_per_usd in config.toml, or HNCODE_CNY_PER_USD.' + C.reset);
+      } else {
+        const local = convert(usdCost, wantCurrency, fx.rate);
+        lines.push('  ' + w + b + 'estimated total ' + C.reset
+          + formatCost(local, wantCurrency) + g + `  (${formatCost(usdCost)} @ ${fx.rate})` + C.reset);
+        lines.push('  ' + g + `rate ${fx.rate} ${wantCurrency}/USD — ${fx.source}` + C.reset);
+        lines.push('  ' + g + 'Switch back with /cost usd.' + C.reset);
+      }
+      sayRich(lines.join('\n'));
+      return;
+    }
+    case 'raw': {
+      // Verbatim rendering of assistant replies. Not persisted on purpose: it is a
+      // debug view, and a session restored tomorrow should render normally.
+      const a = raw.toLowerCase();
+      let want;
+      if (a === 'on') want = true;
+      else if (a === 'off') want = false;
+      else if (a === '') want = !state.rawMode;
+      else { appErr('Usage: /raw [on|off]'); return; }
+      state.rawMode = want;
+      // The layout cache keys on rawMode (see metricsSignature), so invalidating the
+      // metrics memo is enough — but the per-message row caches also carry it, and
+      // both are keyed on it now, so nothing else has to be dropped here.
+      state._metrics = null;
+      app(want
+        ? 'Raw mode: ON — replies shown exactly as the model sent them.'
+        : 'Raw mode: OFF — Markdown rendering restored.');
+      return;
+    }
+    case 'reduced-motion': {
+      // Replaces every animation (spinner rotation, sweeps, pulse) with a dot that
+      // slowly brightens and dims. Persisted because it is an accessibility choice:
+      // a user who needs it should not have to re-enter it every launch.
+      const a = raw.toLowerCase();
+      let want;
+      if (a === 'on') want = true;
+      else if (a === 'off') want = false;
+      else if (a === '') want = !state.reducedMotion;
+      else { appErr('Usage: /reduced-motion [on|off]'); return; }
+      state.reducedMotion = want;
+      try { setConfigString('reduced_motion', want ? 'true' : 'false'); } catch { /* not fatal */ }
+      app(want
+        ? 'Reduced motion: ON — animation is replaced by a slow-breathing dot.'
+        : 'Reduced motion: OFF — animation restored.');
+      return;
+    }
+    case 'shimmer-edge': {
+      // The sweep's band shape. Purely a matter of taste; persisted next to the other
+      // look options. `cosine` matches codex's soft-both-edges band; `linear` is the
+      // original one-sided ramp.
+      const a = raw.trim().toLowerCase();
+      if (!a || a === 'show') {
+        app(`Shimmer edge: ${state.shimmerEdge}. /shimmer-edge cosine | linear`);
+        return;
+      }
+      if (a !== 'cosine' && a !== 'linear') { appErr('Usage: /shimmer-edge cosine|linear'); return; }
+      state.shimmerEdge = a;
+      try { setConfigString('shimmer_edge', a); } catch { /* not fatal */ }
+      app(`Shimmer edge: ${a}.`);
+      return;
+    }
+    case 'output-style': {
+      // Output styles, loaded from FILES (see output-styles.js). The style is
+      // injected as a per-request system reminder rather than baked into the system
+      // prompt, so switching does not invalidate the prompt cache.
+      const arg = raw.trim();
+      const lower = arg.toLowerCase();
+      if (lower === 'off' || lower === 'none' || lower === 'clear') {
+        state.outputStyle = null;
+        cfg.outputStyle = null;
+        try { setConfigString('output_style', ''); } catch { /* not fatal */ }
+        app('Output style cleared.');
+        return;
+      }
+      if (lower === 'edit') {
+        const file = state.outputStyle && state.outputStyle.file;
+        if (!file) { appErr('No style selected. Pick one with /output-style, or create one with /output-style new <name>.'); return; }
+        openEditor({
+          title: `Output style — ${file}`,
+          text: (() => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } })(),
+          caretRow: 0, caretCol: 0,
+          onSave: (value) => {
+            try { fs.writeFileSync(file, String(value)); }
+            catch (e) { appErr('Could not write ' + file + ': ' + e.message); return; }
+            // Re-read so an edit takes effect on the NEXT request.
+            const again = findStyle(state.outputStyle.name, state.cwd);
+            state.outputStyle = again;
+            app(`Style saved: ${again ? again.name : file}`);
+          },
+        });
+        return;
+      }
+      if (lower.startsWith('new')) {
+        const name = arg.slice(3).trim();
+        const dir = styleDirs(state.cwd)[0];
+        const { file, created } = writeStyleTemplate(dir, name || 'my-style');
+        app(created ? `Created ${file} — /output-style edit to fill it in.` : `Already exists: ${file}`);
+        openEditor({
+          title: `New output style — ${file}`,
+          text: (() => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } })(),
+          caretRow: 3, caretCol: 0,
+          onSave: (value) => {
+            try { fs.writeFileSync(file, String(value)); } catch (e) { appErr('Could not write: ' + e.message); return; }
+            const s = findStyle(nameFromFile(file), state.cwd);
+            if (s) { state.outputStyle = s; cfg.outputStyle = s.name; app(`Output style → ${s.name}`); }
+            else app(`Saved ${file} (no body yet, so it is not selectable).`);
+          },
+        });
+        return;
+      }
+      // A name selects it; a bare `/output-style` lists what is available.
+      const styles = listStyles(state.cwd);
+      if (!arg) {
+        if (!styles.length) {
+          h.openPanel('Output styles', [
+            'No styles found.',
+            '',
+            `Directory: ${styleDirs(state.cwd)[0]}`,
+            'Create one with: /output-style new <name>',
+            '',
+            'A style is a Markdown file. The first line may be a name, and the',
+            'body is the instruction added to every request.',
+          ]);
+          return;
+        }
+        openPicker({
+          title: 'Output styles',
+          items: [
+            { label: 'None', sub: 'use the default formatting rules', action: 'none' },
+            ...styles.map((s) => ({
+              label: s.name,
+              sub: s.description || path.basename(s.file),
+              current: !!(state.outputStyle && state.outputStyle.name === s.name),
+              style: s,
+            })),
+          ],
+          searchable: true,
+          onPick: (it) => {
+            if (it.action === 'none') {
+              state.outputStyle = null; cfg.outputStyle = null;
+              try { setConfigString('output_style', ''); } catch { /* not fatal */ }
+              app('Output style cleared.');
+              return true;
+            }
+            state.outputStyle = it.style;
+            cfg.outputStyle = it.style.name;
+            try { setConfigString('output_style', it.style.name); } catch { /* not fatal */ }
+            app(`Output style → ${it.style.name}`);
+            return true;
+          },
+        });
+        return;
+      }
+      const found = findStyle(arg, state.cwd);
+      if (!found) { appErr(`No style matching "${arg}". /output-style to list them.`); return; }
+      state.outputStyle = found;
+      cfg.outputStyle = found.name;
+      try { setConfigString('output_style', found.name); } catch { /* not fatal */ }
+      app(`Output style → ${found.name}`);
+      return;
+    }
+    case 'experiments': {
+      // Feature flags (see experiments.js). Bare `/experiments` lists them with
+      // their state; `/experiments <name> on|off` sets one. The list is what makes
+      // a bug report reproducible, so the flags are shown with what they do.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const stateNow = experimentState(cfg);
+      if (!parts.length) {
+        const rows = describeExperiments(stateNow);
+        const lines = [
+          'Unfinished features. Off unless enabled here or in config.toml.',
+          '',
+          ...rows.map((r) => `  ${r.on ? '[on] ' : '[off]'} ${r.name.padEnd(22)} ${r.desc}`),
+          '',
+          'Toggle:  /experiments <name> on|off',
+          'Env:     HNCODE_EXPERIMENTS=name1,name2 turns them on for one run',
+          `Config:  [experiments] in ${hncodeConfigFile()}`,
+        ];
+        h.openPanel('Experiments', lines);
+        const on = rows.filter((r) => r.on);
+        if (on.length) app(`${on.length} experiment(s) on: ${on.map((r) => r.name).join(', ')}`);
+        return;
+      }
+      const name = parts[0];
+      if (!isExperiment(name)) {
+        appErr(`Unknown experiment: ${name}. /experiments lists them.`);
+        return;
+      }
+      let want;
+      if (parts[1] === 'on') want = true;
+      else if (parts[1] === 'off') want = false;
+      else if (!parts[1]) want = !stateNow[name];
+      else { appErr('Usage: /experiments <name> [on|off]'); return; }
+      const merged = mergeExperiments(cfg.raw.experiments, { [name]: want });
+      try {
+        setConfigString('experiments', JSON.stringify(merged));
+      } catch (e) { appErr('Could not write config.toml: ' + e.message); return; }
+      cfg.raw.experiments = merged;
+      app(`Experiment ${name}: ${want ? 'ON' : 'OFF'}`);
+      // A flag can only affect code that reads it, and most of them are read when a
+      // request is built, so the change is announced as taking effect next turn
+      // rather than pretending to be live.
+      app('Takes effect on the next request.');
+      return;
+    }
+    case 'btw':
+    case 'aside': {
+      // A side question, shown in a BOX DOCKED ABOVE THE COMPOSER — kimi's placement.
+      // The conversation you are asking about stays visible, and the composer is where
+      // you keep typing: a follow-up question needs no command at all, because
+      // sendPrompt routes to this box while it is open (see the composer path).
+      //
+      // The side thread FORKS the conversation, so the model knows what you are working
+      // on; nothing it says is written back to the session.
+      const question = raw.trim();
+
+      if (!question) {
+        // Bare `/btw`: open the box (asking nothing yet) or explain it.
+        if (state.btwPanel) { app('The side-thread box is already open — type a question, or press Esc to close it.'); return; }
+        state.btwPanel = { turns: [], model: '', reasoning: false };
+        state.btwScroll = 0;
+        app('Side thread box open — type a question and press Enter. Esc closes it.');
+        renderFrame();
+        return;
+      }
+      if (question.toLowerCase() === 'clear') {
+        state.sideThread = null;
+        state.btwPanel = null;
+        state.btwScroll = 0;
+        app('Side thread closed.');
+        renderFrame();
+        return;
+      }
+
+      if (!state.sideThread) {
+        const modelCfg = secondaryModelCfg(cfg);
+        state.sideThread = new SideThread({
+          basePrompt: (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT,
+          // The fork: the conversation as it stands NOW. A copy, so nothing the side
+          // thread appends can reach the session.
+          history: forkMessages(session),
+          tools: SIDE_RO_TOOLS,
+          model: modelCfg.model || cfg.model,
+        });
+      }
+      if (!state.btwPanel) state.btwPanel = { turns: [], model: '', reasoning: false };
+      await askSideQuestion(state, cfg, question, renderFrame);
+      return;
+    }
+    case 'recap': {
+      // Where the session got to. Read-only: it changes nothing, unlike /compact.
+      const stats = digestStats(session.messages);
+      // A recap is ABOUT the conversation, so it gets the real history rather than a
+      // digest — a lossy summary of a summary is worse than the original. Bounded, so
+      // a very long session does not send its opening messages to answer "where am I".
+      const history = forkMessages(session, { limit: 80 });
+      if (!history.length) {
+        app('Nothing to recap yet — this session has no conversation.');
+        return;
+      }
+      const modelCfg = secondaryModelCfg(cfg);
+      const llm = new LLM({ ...modelCfg, maxOutputTokens: Math.max(512, modelCfg.maxOutputTokens || 0) });
+      notice(`Recapping (${modelCfg.model || cfg.model})…`, 'info');
+      try {
+        const text = await llm.requestText(recapMessages(history), { noTools: true, noReasoning: true });
+        if (text === null) { appErr('The recap request failed.'); return; }
+        if (!text.trim()) { appErr('The recap came back empty.'); return; }
+        h.openPanel('Recap', [
+          `${stats.users} prompt(s), ${stats.assistants} repl(y|ies), ${stats.total} entries`,
+          '',
+          ...text.trim().split('\n'),
+          '',
+          '/replay walks the same session step by step.',
+        ]);
+      } catch (e) {
+        appErr(`Recap failed: ${e.message}`);
+      }
+      return;
+    }
+    case 'secondary-model': {
+      // The model for side work. Stored by NAME in config.toml; empty means "use the
+      // session's model", which is the safe default — a model the user never chose
+      // should not be invented from whatever happens to be in the list.
+      const arg = raw.trim();
+      if (!arg) {
+        const models = Object.keys((cfg.raw && cfg.raw.models) || {});
+        h.openPicker({
+          title: 'Secondary model (side questions, recaps)',
+          items: [
+            { label: '(same as this session)', sub: cfg.model || '(none)', action: 'off' },
+            ...models.map((m) => ({ label: m, current: cfg.secondaryModel === m, action: 'set', model: m })),
+          ],
+          searchable: true,
+          onPick: (it) => {
+            const value = it.action === 'off' ? '' : it.model;
+            try { setConfigString('secondary_model', value); }
+            catch (e) { appErr('Could not write config.toml: ' + e.message); return true; }
+            cfg.secondaryModel = value;
+            cfg.raw.secondary_model = value;
+            app(value ? `Secondary model → ${value}` : 'Secondary model cleared — side work uses this session\'s model.');
+            return true;
+          },
+        });
+        return;
+      }
+      if (arg.toLowerCase() === 'off' || arg.toLowerCase() === 'none') {
+        try { setConfigString('secondary_model', ''); } catch (e) { appErr(e.message); return; }
+        cfg.secondaryModel = '';
+        cfg.raw.secondary_model = '';
+        app('Secondary model cleared.');
+        return;
+      }
+      // Accept a partial name, like /model does, so the user does not have to type the
+      // whole provider-prefixed key.
+      const keys = Object.keys((cfg.raw && cfg.raw.models) || {});
+      const hit = keys.find((k) => k === arg)
+        || keys.find((k) => k.toLowerCase() === arg.toLowerCase())
+        || keys.find((k) => k.toLowerCase().includes(arg.toLowerCase()));
+      if (!hit) { appErr(`No model matching "${arg}". /secondary-model lists them.`); return; }
+      try { setConfigString('secondary_model', hit); } catch (e) { appErr(e.message); return; }
+      cfg.secondaryModel = hit;
+      cfg.raw.secondary_model = hit;
+      app(`Secondary model → ${hit}`);
+      return;
+    }
+    case 'replay':
+    case 'rollout': {
+      // Step through the session. A read-only VIEW: nothing is resumed or re-sent.
+      const steps = buildSteps(session.messages);
+      if (!steps.length) { app('This session has nothing to replay.'); return; }
+      const arg = raw.trim().toLowerCase();
+      const pos = (() => {
+        const cur = Number.isFinite(state.replayStep) ? state.replayStep : steps.length - 1;
+        if (arg === 'first') return 0;
+        if (arg === 'last' || arg === '') return steps.length - 1;
+        if (arg === 'next' || arg === 'n') return Math.min(steps.length - 1, cur + 1);
+        if (arg === 'prev' || arg === 'p') return Math.max(0, cur - 1);
+        const n = Number(arg);
+        // A 1-based step number, because the frame shows `step 3/12`.
+        return Number.isInteger(n) && n >= 1 ? Math.min(steps.length - 1, n - 1) : steps.length - 1;
+      })();
+      state.replayStep = pos;
+      const summary = replaySummary(steps);
+      h.openPanel('Replay', [
+        ...renderStep(steps, pos, { width: 78 }),
+        '',
+        `${summary.total} step(s): ${Object.entries(summary.counts).map(([k, v]) => `${v} ${k}`).join(', ')}`,
+        'Next: /replay next · prev: /replay prev · jump: /replay <n>',
+      ]);
+      return;
+    }
+    case 'schedule': {
+      // Recurring prompts. `list` shows them; `run <id>` fires one now for testing
+      // (which is the only way to check a schedule without waiting for the clock).
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (sub === 'run') {
+        const id = parts[1];
+        const rows = listSchedules(cfg.schedule);
+        const entry = rows.find((e) => e.id === id);
+        if (!entry) { appErr(`No schedule "${id || ''}". /schedule lists them.`); return; }
+        if (!entry.valid) { appErr(`Schedule "${id}" is invalid: ${entry.error}`); return; }
+        app(`Running schedule "${id}" now.`);
+        sendPrompt(entry.prompt, { fromSchedule: id });
+        return;
+      }
+      if (sub && sub !== 'list') { appErr('Usage: /schedule [list | run <id>]'); return; }
+      const rows = listSchedules(cfg.schedule);
+      const bad = rows.filter((e) => !e.valid);
+      h.openPanel('Schedules', [
+        'Prompts queued on this session while it is open.',
+        '',
+        describeSchedules(cfg.schedule),
+        '',
+        `Config file: ${hncodeConfigFile()}`,
+        'A schedule fires ONCE per due minute; a session closed over the due time',
+        'does not fire a catch-up burst when it starts again.',
+        '',
+        'Field order: minute hour day-of-month month day-of-week',
+        'When BOTH day fields are set, cron fires on EITHER (that is the standard rule).',
+      ]);
+      if (bad.length) appErr(`${bad.length} schedule(s) are invalid — see /schedule.`);
+      return;
+    }
+    case 'teleport': {
+      // Export or import a session, rewriting the workspace path if it moved.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (sub === 'import') {
+        const file = parts.slice(1).join(' ');
+        if (!file) { appErr('Usage: /teleport import <file>'); return; }
+        let text = '';
+        try { text = fs.readFileSync(file, 'utf8'); }
+        catch (e) { appErr(`Could not read ${file}: ${e.message}`); return; }
+        let pack;
+        try { pack = parseTeleport(text); }
+        catch (e) { appErr(`Not a usable teleport: ${e.message}`); return; }
+        const { session: imported, warnings } = unpackInto(pack, {
+          workspace: state.workspace || cfg.workspace,
+          newId: () => sess.newId(),
+        });
+        for (const w of warnings) app(`Note: ${w}`);
+        imported.id = imported.id || sess.newId();
+        try { sess.saveSession(imported); } catch (e) { appErr(`Could not save: ${e.message}`); return; }
+        app(`Imported "${imported.title || 'untitled'}" as ${imported.id} — resume it with /sessions.`);
+        return;
+      }
+      if (sub && sub !== 'export') { appErr('Usage: /teleport [export [path] | import <file>]'); return; }
+      const pack = packSession(session, {
+        from: state.workspace || cfg.workspace,
+        to: state.workspace || cfg.workspace,
+      });
+      const dir = path.join(path.dirname(hncodeConfigFile()), 'teleport');
+      const out = parts.slice(1).join(' ') || path.join(dir, teleportFileName(session));
+      try {
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        fs.writeFileSync(out, serializeTeleport(pack), 'utf8');
+      } catch (e) { appErr(`Could not write ${out}: ${e.message}`); return; }
+      h.openPanel('Teleport exported', [
+        out,
+        '',
+        describeTeleport(pack),
+        '',
+        'What travels: the conversation, with paths rewritten.',
+        'What does not: background jobs, token totals, and session approvals —',
+        'those describe THIS machine and would be wrong on another.',
+        '',
+        'Move it with scp/ssh, then on the other side:',
+        `  /teleport import ${path.basename(out)}`,
+      ]);
       return;
     }
     case 'context': {
       // Break the context window down by what actually occupies it, so the user
       // can see WHERE the tokens go instead of one percentage. Mirrors Claude
       // Code's ContextVisualization.
-      const msgs = session.messages || [];
-      const byRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
-      const countByRole = { system: 0, user: 0, assistant: 0, tool: 0, other: 0 };
-      for (const m of msgs) {
-        const t = estimateMessagesTokens([m], cfg);
-        const r = (m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool') ? m.role : 'other';
-        byRole[r] += t;
-        countByRole[r] += 1;
-      }
-      // Tool definitions ride every request (name + schema), priced here the same
-      // way usedTokens() prices them.
-      const toolCount = Array.isArray(cfg.toolFilter) ? cfg.toolFilter.length : (toolNames().length);
-      const toolDefTokens = toolCount * 8;
+      const { byRole, countByRole, toolDefTokens, toolCount } = contextBreakdown(session, cfg);
       const total = byRole.system + byRole.user + byRole.assistant + byRole.tool + byRole.other + toolDefTokens;
       const max = state.ctxMax || cfg.maxContextTokens || 1;
       const pct = (n) => `${(n / max * 100).toFixed(1)}%`;      // A simple bar so the biggest consumer is obvious at a glance.
@@ -5993,7 +8685,6 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (total / max > 0.8) tips.push('Over 80% — auto-compaction is close. /compact now to keep control.');
       if (tips.length) lines.push('', ...tips.map((t) => g + '  ' + t + C.reset));
       sayRich(lines.join('\n'));
-      return;
       return;
     }
     case 'search': {
@@ -6186,7 +8877,11 @@ case 'trim': {
       // user scrolls back through is intact.
       const parts = raw.trim().split(/\s+/).filter(Boolean);
       let keepRatio = Number.isFinite(cfg.trimKeepRatio) ? cfg.trimKeepRatio : 0.3;
-      const USAGE = 'Usage: /trim [0.3]  (a fraction, or a percent like 30%)';
+      // `[keep-ratio]`, not `[0.3]`: 0.3 is the DEFAULT, not the only accepted
+      // value. The code takes a fraction (`0.3`) or a percent (`30%` / `30`), so the
+      // placeholder names the TYPE and the default moves into the text — the same
+      // shape as /compact's `[ratio]` and /effort's `[level]`.
+      const USAGE = `Usage: /trim [keep-ratio]  (a fraction like 0.3, or a percent like 30%; default ${keepRatio})`;
       if (parts.length > 1) { appErr(USAGE); return; }
       if (parts.length === 1) {
         const spec = String(parts[0]).trim();
@@ -6205,9 +8900,29 @@ case 'trim': {
       const before = estimateMessagesTokens(target);
       const res = trimToolResults(target, { sessionId: session && session.id, keepRatio });
       if (!res || !res.elided) { app('Nothing to trim — no tool result is large enough to elide.'); return; }
+      // `trimToolResults` rewrote content IN PLACE, and the target may be the agent's
+      // own live message array. The agent keeps a rolling token total over it, so it
+      // has to be told: otherwise its ledger still describes the pre-trim bodies, the
+      // next request is priced as if nothing had been freed, and auto-compaction fires
+      // on a history that was just trimmed.
+      if (state.agent && target === state.agent.messages && state.agent._ledger) state.agent._ledger.reset();
       const after = estimateMessagesTokens(target);
+      // Update the STATUS LINE, not just the transcript. The context gauge is fed
+      // by request events (llm.js emits `tokens`/`after`), so trimming between
+      // requests left it showing the pre-trim number until the next turn — the user
+      // had to send a message to see the effect. `/trim` knows the exact count, so
+      // push it into the same state fields the events would have set.
+      state.ctxTokens = after;
+      state.ctxPercent = usagePercent(after, state.ctxMax || cfg.maxContextTokens || 1);
+      if (session) {
+        try {
+          session.tokenHistory = Array.isArray(session.tokenHistory) ? session.tokenHistory : [];
+          if (session.tokenHistory[session.tokenHistory.length - 1] !== after) session.tokenHistory.push(after);
+        } catch { /* history is best-effort */ }
+      }
       app(`Trimmed ${res.elided} tool result(s): ~${fmtTokens(res.elidedBytes / 4)} tokens of output elided, keeping ~${Math.round(keepRatio * 100)}%.`);
       app(`Context now ~${fmtTokens(after)} (was ~${fmtTokens(before)}). The removed text is on disk — the model can Read it back.`);
+      renderFrame();
       return;
     }
     case 'update': {
@@ -6245,13 +8960,106 @@ case 'trim': {
       h.openPanel('hncode — mcp', lines);
       return;
     }
+    case 'doctor': {
+      // Diagnose the environment. Read-only: nothing here repairs or writes, so it is
+      // safe to run on a machine whose state matters.
+      const cfgMcp = loadMcpConfig(state.workspace || cfg.workspace);
+      const results = runDoctor({
+        cfg,
+        workspace: state.workspace || cfg.workspace || state.cwd,
+        sessionsDir: sess.sessionsDir(),
+        mcpServers: cfgMcp.servers,
+        mcpConnections: getLiveConnections(),
+        dims: dims(),
+      });
+      const showAll = ['--all', '-a'].includes(String(raw || '').trim());
+      const lines = formatDoctor(results, { showOk: showAll, version: VERSION });
+      h.openPanel('hncode — doctor', lines);
+      return;
+    }
     case 'mcp-config': {
       const mcpFile = path.join(os.homedir(), '.hncode', 'mcp.json');
-      let doc = { mcpServers: {} };
-      try { doc = JSON.parse(fs.readFileSync(mcpFile, 'utf8')); } catch {}
-      doc.mcpServers = doc.mcpServers || {};
+      const readDoc = () => {
+        let doc = { mcpServers: {} };
+        try { doc = JSON.parse(fs.readFileSync(mcpFile, 'utf8')); } catch { /* new/empty */ }
+        doc.mcpServers = doc.mcpServers || {};
+        return doc;
+      };
+      const writeDoc = (doc) => {
+        fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
+        fs.writeFileSync(mcpFile, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+      };
       const [action, name, ...rest] = raw.split(/\s+/).filter(Boolean);
-      if (!action || action === 'list') {
+
+      // Bare `/mcp-config` -> an interactive MANAGER (cline-style dialog), not a
+      // text dump. Listing is still available (`list`) for scripts, and the
+      // add/remove forms below stay so existing usage keeps working.
+      if (!action) {
+        const doc = readDoc();
+        const names = Object.keys(doc.mcpServers);
+        const items = names.map((n) => {
+          const s = doc.mcpServers[n] || {};
+          return { label: n, sub: s.url ? s.url : `${s.command || ''} ${(s.args || []).join(' ')}`.trim(), _name: n };
+        });
+        items.push({ label: '＋ Add a server…', sub: 'register a new MCP server', _add: true });
+        openPicker({
+          title: `MCP servers (${names.length})`,
+          items,
+          searchable: true,
+          hint: '↑↓ navigate · Enter manage · Esc close',
+          onPick: (it) => {
+            if (it && it._add) {
+              openForm({
+                title: 'Add MCP server',
+                fields: [
+                  { key: 'name', label: 'Name', value: '' },
+                  { key: 'target', label: 'Command or URL', value: '' },
+                  { key: 'args', label: 'Args (space-separated)', value: '' },
+                ],
+                type: null,
+                hint: 'Tab next field · Enter save · Esc cancel',
+                onSubmit: (values) => {
+                  const n = (values.name || '').trim();
+                  const target = (values.target || '').trim();
+                  if (!n || !target) { appErr('Name and command/URL are required.'); return; }
+                  const d = readDoc();
+                  d.mcpServers[n] = /^https?:\/\//.test(target)
+                    ? { url: target }
+                    : { command: target, args: (values.args || '').split(/\s+/).filter(Boolean) };
+                  writeDoc(d);
+                  app(`MCP server added: ${n}. Start a new session to apply.`);
+                },
+              });
+              return true;
+            }
+            if (!it || !it._name) return true;
+            // Pick a server -> manage it: remove, with the file named so the action
+            // is not a mystery. (Editing a server's target is rare; remove+re-add.)
+            openPicker({
+              title: `Manage "${it._name}"`,
+              searchable: false,
+              hint: '↑↓ choose · Enter confirm · Esc cancel',
+              items: [
+                { label: 'Back', sub: 'do nothing' },
+                { label: 'Remove', sub: `delete this server from ${mcpFile} — start a new session to apply` },
+              ],
+              onPick: (sel) => {
+                if (!sel || sel.label !== 'Remove') return true;
+                const d = readDoc();
+                delete d.mcpServers[it._name];
+                writeDoc(d);
+                app(`MCP server removed: ${it._name}. Start a new session to apply.`);
+                return true;
+              },
+            });
+            return true;
+          },
+        });
+        return;
+      }
+
+      const doc = readDoc();
+      if (action === 'list') {
         const names = Object.keys(doc.mcpServers);
         sayPanel(names.length ? `MCP servers (${mcpFile}):\n` + names.map((n) => `  ${n}`).join('\n') : `No MCP servers configured. File: ${mcpFile}`);
         return;
@@ -6259,8 +9067,7 @@ case 'trim': {
       if (['remove', 'rm', 'delete'].includes(action)) {
         if (!name || !doc.mcpServers[name]) { appErr(`No such MCP server: ${name || '(none)'}`); return; }
         delete doc.mcpServers[name];
-        fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
-        fs.writeFileSync(mcpFile, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+        writeDoc(doc);
         app(`MCP server removed: ${name}. Start a new session to apply.`);
         return;
       }
@@ -6268,19 +9075,263 @@ case 'trim': {
         const target = rest[0] || '';
         if (!name || !target) { appErr('Usage: /mcp-config add <name> <command|url> [args...]'); return; }
         doc.mcpServers[name] = /^https?:\/\//.test(target) ? { url: target } : { command: target, args: rest.slice(1) };
-        fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
-        fs.writeFileSync(mcpFile, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+        writeDoc(doc);
         app(`MCP server added: ${name} → ${mcpFile}. Start a new session to apply.`);
         return;
       }
-      appErr('Usage: /mcp-config [list] | add <name> <command|url> [args...] | remove <name>');
+      appErr('Usage: /mcp-config (manage) | list | add <name> <command|url> [args...] | remove <name>');
       return;
     }
 
+    case 'save-history': {
+      // What the DISPLAY-ONLY transcript keeps on disk: the notices, warnings, compaction
+      // results, plan cards, background-task cards and reasoning blocks that have no home
+      // in `session.messages` (that array is what gets sent to the model). Reasoning is
+      // split out because it is the bulk of the cost — a long session's file grows by more
+      // than its own answers — so the short notices can be kept without the megabytes.
+      const on = (v) => (v === false ? 'on' : 'off');
+      const what = String(raw || '').toLowerCase();
+      if (what === 'on' || what === 'off') {
+        state.saveHistory = what === 'on';
+        // A settings change must reach disk at once, or a restart silently reverts it.
+        session.saveHistory = state.saveHistory;
+        session.saveThinking = state.saveThinking;
+        persistState();
+      } else if (what === 'thinking') {
+        state.saveThinking = true;
+        session.saveThinking = true;
+        persistState();
+      } else if (what === 'nothinking') {
+        state.saveThinking = false;
+        session.saveThinking = false;
+        persistState();
+      } else if (what) {
+        appErr('Usage: /save-history [on|off|thinking|nothinking]');
+        return;
+      }
+      say(`Saved history — display rows: ${on(state.saveHistory)} · reasoning: ${on(state.saveThinking)}`);
+      renderFrame();
+      return;
+    }
+
+    case 'theme': {
+      // The theme system already existed (colors.js THEMES + setTheme) but nothing could
+      // REACH it: no command, and no config key, so `light` only ever applied when a light
+      // terminal happened to be detected. This is the missing entry point.
+      const arg = raw.trim().toLowerCase();
+      const apply = (name) => {
+        if (!hasTheme(name)) { appErr(`Unknown theme "${name}". Known: ${THEME_NAMES.join(', ')}`); return false; }
+        state.theme = name;
+        setTheme(name);
+        try { setConfigString('theme', name); } catch { /* not fatal: the session still uses it */ }
+        return true;
+      };
+      if (THEME_NAMES.includes(arg)) {
+        if (!apply(arg)) return;
+        // A FULL repaint, not a diff. `setTheme` mutates `C` in place, and the differential
+        // painter compares against the frame it believes it painted — so every row already
+        // on screen would keep its old escapes and a diff would emit nothing. Dropping the
+        // cached frame is what makes the next paint rewrite every cell.
+        lastFrame = null;
+        app(`Theme: ${arg}`);
+        return;
+      }
+      if (arg) { appErr(`Usage: /theme [name]  — known: ${THEME_NAMES.join(', ')}`); return; }
+      openPicker({
+        title: 'Theme',
+        items: THEME_NAMES.map((n) => ({
+          label: n + (state.theme === n ? '  ← current' : ''),
+          sub: THEME_LABELS[n] || '',
+          value: n,
+        })),
+        onPick: (it) => {
+          if (apply(it.value)) { lastFrame = null; app(`Theme: ${it.value}`); }
+          return true;
+        },
+      });
+      return;
+    }
+    case 'keybindings': {
+      // Bindings live in ~/.hncode/keybindings.json; this is the editing entry point.
+      // A binding names a target the key dispatcher ALREADY understands (another key) or
+      // a slash command, so nothing here can invent a state the UI cannot render.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      const { file, doc } = readOrEmpty();
+      if (!sub || sub === 'list') {
+        h.openPanel('hncode — keybindings', describeKeybindings(loadKeybindings()));
+        return;
+      }
+      if (sub === 'edit') {
+        let text = '';
+        try { text = fs.readFileSync(file, 'utf8'); } catch { text = '{\n  \n}\n'; }
+        openEditor({
+          title: `Keybindings — ${file}`,
+          text, caretRow: 1, caretCol: 2,
+          onSave: (value) => {
+            try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, String(value), 'utf8'); }
+            catch (e) { appErr(`Could not write ${file}: ${e.message}`); return; }
+            const now = refreshKeybindings();
+            app(now.errors.length ? `Saved with ${now.errors.length} problem(s) — /keybindings to see them.` : `Saved. ${now.bindings.size} binding(s) active.`);
+          },
+        });
+        return;
+      }
+      if (sub === 'add') {
+        const from = parts[1];
+        const to = parts.slice(2).join(' ');
+        if (!from || !to) { appErr('Usage: /keybindings add <key> <key|/command>   e.g. /keybindings add ctrl+e /theme'); return; }
+        const src = normalizeKey(from);
+        if (!src) { appErr(`"${from}" is not a usable key name.`); return; }
+        // Validate BEFORE writing: a file the loader would reject is worse than a refusal,
+        // because the user then has a broken config and no idea which line did it.
+        if (to.startsWith('/')) doc[src] = to.trim();
+        else {
+          const dst = normalizeKey(to);
+          if (!dst) { appErr(`"${to}" is not a usable key name or a /command.`); return; }
+          if (dst === src) { appErr('A key cannot be bound to itself.'); return; }
+          doc[src] = dst;
+        }
+        try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
+        const now = refreshKeybindings();
+        app(now.errors.length
+          ? `Added ${src} → ${to}, but the file now has ${now.errors.length} problem(s).`
+          : `Bound ${src} → ${to}`);
+        return;
+      }
+      if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        const src = normalizeKey(parts[1] || '');
+        if (!src) { appErr('Usage: /keybindings remove <key>'); return; }
+        if (!(src in doc)) { appErr(`No binding for ${src}.`); return; }
+        delete doc[src];
+        try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
+        refreshKeybindings();
+        app(`Unbound ${src}`);
+        return;
+      }
+      // An unadorned key name sets that ONE binding, which is the shortest useful form.
+      if (parts.length === 2) {
+        const src = normalizeKey(parts[0]);
+        if (src) {
+          const to = parts[1];
+          if (to.startsWith('/')) doc[src] = to.trim();
+          else {
+            const dst = normalizeKey(to);
+            if (!dst || dst === src) { appErr('Target must be a different key or a /command.'); return; }
+            doc[src] = dst;
+          }
+          try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
+          refreshKeybindings();
+          app(`Bound ${src} → ${to}`);
+          return;
+        }
+      }
+      appErr('Usage: /keybindings [list | add <key> <key|/command> | remove <key> | edit]');
+      return;
+    }
+    case 'agents': {
+      // Control running subagents from the terminal, without spending a turn: the same
+      // operations the model has as tools, for when the USER is the one watching a
+      // subagent go wrong.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        const rows = describeRuns();
+        h.openPanel('hncode — subagents', rows);
+        return;
+      }
+      if (sub === 'message' || sub === 'msg') {
+        const id = parts[1];
+        const text = parts.slice(2).join(' ');
+        if (!id || !text) { appErr('Usage: /agents message <agent-id> <text>'); return; }
+        const r = sendToRun(id, text);
+        if (r.ok) app(r.message); else appErr(r.message);
+        return;
+      }
+      if (sub === 'interrupt' || sub === 'stop') {
+        const id = parts[1];
+        if (!id || id === 'all') {
+          const all = interruptAll();
+          app(all.ok ? `Interrupted ${all.count} subagent(s): ${all.agents.join(', ')}` : 'No subagent is running.');
+          return;
+        }
+        const r = interruptRun(id);
+        if (r.ok) app(r.message); else appErr(r.message);
+        return;
+      }
+      if (sub === 'close') {
+        const id = parts[1];
+        if (!id) { appErr('Usage: /agents close <agent-id>'); return; }
+        const r = closeRun(id);
+        if (r.ok) app(r.message); else appErr(r.message);
+        return;
+      }
+      appErr('Usage: /agents [list | message <id> <text> | interrupt [id|all] | close <id>]');
+      return;
+    }
+    case 'files': {
+      // The walker is tools/ignore.js — the SAME one Grep and Glob use, so the browser can
+      // never show a file the tools would refuse to search. Directories come from the flat
+      // result, so there is no second traversal to disagree with the first.
+      const filter = raw.trim();
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      let files = [];
+      try {
+        files = walkFiles(cwd, { includeIgnored: false });
+      } catch (e) { appErr(`Could not read ${cwd}: ${e.message}`); return; }
+      const root = buildTree(files, cwd);
+      if (!root.children.length) { app(`No files found under ${cwd}.`); return; }
+      // Open the FIRST level by default: a fully collapsed tree makes the user press →
+      // before they can see anything, and a fully expanded one on a big repo dumps
+      // thousands of rows.
+      const expanded = new Set();
+      for (const c of root.children) if (c.dir) expanded.add(c.rel);
+      state.fileTree = { root, expanded, sel: 0, scroll: 0, filter, cwd };
+      // Close the other overlays so only one thing owns the screen.
+      state.picker = null; state.form = null; state.panel = null; state.menuOpen = false;
+      renderFrame();
+      return;
+    }
+    case 'checkpoints': {
+      // Per-FILE checkpoints. /undo rewinds whole TURNS (transcript + every file those turns
+      // touched); this is the surgical counterpart — "give me back this one file as it was
+      // before that edit" — which the existing index already records but nothing could reach.
+      const sid = session && session.id;
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        h.openPanel('hncode — checkpoints', describeCheckpoints(sid, state.workspace || cfg.workspace));
+        return;
+      }
+      const n = Number(parts[1]);
+      if (!Number.isFinite(n) || n < 1) { appErr('Usage: /checkpoints [list | restore <n> | diff <n>]'); return; }
+      const all = listCheckpoints(sid);
+      const entry = all.find((c) => c.index === n);
+      if (!entry) { appErr(`No checkpoint ${n}. /checkpoints lists them.`); return; }
+      if (sub === 'diff') {
+        const d = checkpointDelta(entry);
+        if (!d) { appErr('No size comparison available for that checkpoint.'); return; }
+        const rel = entry.path;
+        sayPanel(`${rel}\nthen: ${d.before} line(s)\nnow:  ${d.after} line(s)\nchange: ${d.lines >= 0 ? '+' : ''}${d.lines}`);
+        return;
+      }
+      if (sub === 'restore') {
+        const r = restoreCheckpoint(sid, entry);
+        if (!r.ok) { appErr(`Could not restore: ${r.error}`); return; }
+        app(r.action === 'deleted'
+          ? `Removed ${entry.path} (it did not exist at that checkpoint).`
+          : `Restored ${entry.path} from checkpoint ${n}.`);
+        return;
+      }
+      appErr('Usage: /checkpoints [list | restore <n> | diff <n>]');
+      return;
+    }
     case 'statusline':
       openPicker({
         title: 'Status line items',
+        title: 'Status line items',
         items: (() => {
+          // `sub` must be set here, not only in onPick: the picker renders
           // `sub` must be set here, not only in onPick: the picker renders
           // item.sub, so without an initial value every toggle showed a blank
           // state until the user toggled it once.
@@ -6446,13 +9497,27 @@ case 'trim': {
         lastTurnMs: session.lastTurnMs,
       };
       sess.saveSession(newSession);
-      // Update state to use the new session.
+      // Hand the new session BACK to the caller. Assigning the local parameter used to be
+      // the whole of this step, and it changed nothing outside `dispatch`: the caller keeps
+      // its own `session` binding, so every later save wrote the OLD object — still stamped
+      // with the directory being left behind. `h.replaceSession` is what rebinds it.
+      if (h.replaceSession) h.replaceSession(newSession);
       session = newSession;
       // The directory changed, so the status line (path + git badge) must follow.
       // It previously kept showing the OLD path because state.cwd was never
       // updated here.
+      // `cfg` follows too, for the same reason as /sessions: the tools resolve their
+      // paths against `ctx.cwd || ctx.workspace`, which the agent copies from `cfg`
+      // each turn. Moving only the status line left Edit/Read/Bash pointed at the
+      // directory being left behind.
       state.cwd = target;
       state.workspace = target;
+      cfg.workspace = target;
+      cfg.cwd = target;
+      if (state.agent && state.agent.ctx) {
+        state.agent.ctx.cwd = target;
+        state.agent.ctx.workspace = target;
+      }
       refreshGitInfo(state, { force: true });
       state.chat = reconstructChat(session);
       state.scroll = 0;
@@ -6466,6 +9531,7 @@ case 'trim': {
 
     case 'reload': {
       try {
+        // Full reload: re-read config AND re-load plugins, without restarting the process.
         const fresh = h.reloadConfig ? h.reloadConfig() : null;
         if (fresh) {
           Object.assign(cfg, fresh);
@@ -6475,11 +9541,34 @@ case 'trim': {
           state.reasoning = !!cfg.reasoning;
           cfg.effort = state.reasoning ? state.effort : '';
           if (cfg.raw && cfg.raw.theme) { state.theme = cfg.raw.theme; setTheme(state.theme); }
-          // Refresh the context gauge from the NEW limit. `state.ctxMax` is a
-          // cached copy (see makeState) and every other reader falls back to it, so
-          // without this a changed `context_length` reloaded fine but the readout —
-          // and the percentage derived from it — kept showing the old window. That
-          // is why /reload looked like a no-op.
+          const beforeMax = state.ctxMax;
+          state.ctxMax = cfg.maxContextTokens || state.ctxMax;
+          state.ctxPercent = usagePercent(state.ctxTokens || 0, state.ctxMax);
+          const changed = beforeMax !== state.ctxMax;
+          app(changed
+            ? `Config reloaded. Context window: ${fmtTokens(beforeMax)} -> ${fmtTokens(state.ctxMax)} (now ${state.ctxPercent}% used)`
+            : 'Config reloaded.');
+          app('Config and plugins reloaded.');
+        }
+        // Re-load plugins so an added/edited plugin takes effect without a restart.
+        if (h.reloadPlugins) {
+          const notes = await h.reloadPlugins();
+          for (const n of (notes || [])) app(`${n.level === 'error' ? '!' : '?'}[plugin] ${n.text}`);
+        }
+      } catch (e) { appErr(`Reload failed: ${e.message}`); }
+      return;
+    }
+    case 'reload-config': {
+      try {
+        const fresh = h.reloadConfig ? h.reloadConfig() : null;
+        if (fresh) {
+          Object.assign(cfg, fresh);
+          state.model = cfg.model;
+          state.provider = cfg.provider;
+          state.modelLabel = modelLabel(cfg) || cfg.model || '';
+          state.reasoning = !!cfg.reasoning;
+          cfg.effort = state.reasoning ? state.effort : '';
+          if (cfg.raw && cfg.raw.theme) { state.theme = cfg.raw.theme; setTheme(state.theme); }
           const beforeMax = state.ctxMax;
           state.ctxMax = cfg.maxContextTokens || state.ctxMax;
           state.ctxPercent = usagePercent(state.ctxTokens || 0, state.ctxMax);
@@ -6490,24 +9579,62 @@ case 'trim': {
         }
       } catch (e) { appErr(`Reload failed: ${e.message}`); }
       return;
-    }
-    case 'plugins': {
-      const { pluginCommands, API } = await import('./plugin.js');
-      // `loadedPlugins` is module-private; the public way to read it is the
-      // API.plugins getter. Importing a non-exported name yielded `undefined`
-      // and crashed on `.length`.
-      const loadedPlugins = API.plugins;
-      if (!loadedPlugins.length) { app('No plugins loaded. Check ~/.hncode/plugins/'); return; }
-      const lines = ['Loaded plugins:', ...loadedPlugins.map((p) => `  • ${p.name} v${p.version} (${p.id})`)];
-      if (pluginCommands.length) {
-        lines.push('', 'Plugin commands:', ...pluginCommands.map((c) => `  /${c.name.padEnd(14)} ${c.description || ''}`));
+    }    case 'plugins': {
+      // Only the remove/install fast paths need these; `list` goes through the
+      // browser, which loads what it needs itself.
+      const remote = await import('./remote.js');
+      const parts = raw.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || '').toLowerCase();
+
+      if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        const name = parts[1];
+        if (!name) { appErr('Usage: /plugins remove <name>'); return; }
+        const ok = remote.removeLocalPlugin(name);
+        if (!ok) { appErr(`No such plugin: ${name}`); return; }
+        // Removing the files does not unload the code already registered in this
+        // process, so point at the command that does. Saying so avoids the impression
+        // that the removal failed.
+        app(`Plugin removed: ${name} (run /plugins reload, or restart hncode)`);
+        return;
       }
-      h.openPanel('hncode — plugins', lines);
+      if (sub === 'install' || sub === 'add' || sub === 'i') {
+        const name = parts[1];
+        if (!name) { appErr(`Usage: /plugins install <name>  (see /plugins list)\nRepo: https://github.com/${remote.DEFAULT_REPO}/tree/${remote.DEFAULT_REF}/plugins`); return; }
+        notice(`Downloading plugin ${name}…`, 'info');
+        const res = await remote.installRemotePlugin(name);
+        if (!res.ok) { appErr(`Install failed: ${res.error}`); return; }
+        app(`Plugin ${res.replaced ? 'updated' : 'installed'}: ${res.name} (${res.files.join(', ')})`);
+        app('Reload them with /plugins reload, or restart hncode.');
+        return;
+      }
+      if (sub === 'reload') {
+        // Hot reload: unload every plugin (running its dispose + collected teardown),
+        // then re-import the files with cache busting. The alternative was a restart,
+        // which is what made plugin development painful.
+        if (!h.reloadPlugins) { appErr('Reload is unavailable in this host.'); return; }
+        const notes = await h.reloadPlugins();
+        const errs = (notes || []).filter((n) => n.level === 'error').length;
+        if (errs) {
+          for (const n of notes) if (n.level === 'error') appErr(`[plugin] ${n.text}`);
+        }
+        app(`Plugins reloaded${errs ? ` with ${errs} error${errs === 1 ? '' : 's'}` : ''} — /plugins list to inspect.`);
+        return;
+      }
+
+      // `list` (or bare) opens the interactive manager (tabs + descriptions, like
+      // kimi's panel). An unknown subcommand still errors rather than silently opening
+      // it as if the word had been understood.
+      if (sub !== 'list' && sub !== '') {
+        appErr('Usage: /plugins [list] | install <name> | remove <name> | reload');
+        return;
+      }
+      await h.openRegistryBrowser('plugins');
       return;
     }
     case 'skills': {
       const parts = raw.split(/\s+/).filter(Boolean);
       const sub = (parts[0] || '').toLowerCase();
+      const remote = await import('./remote.js');
       if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
         const name = parts[1];
         if (!name) { appErr('Usage: /skills remove <name>'); return; }
@@ -6515,23 +9642,23 @@ case 'trim': {
         app(ok ? `Skill removed: ${normalizeSkillName(name)}` : `No such skill: ${name}`);
         return;
       }
-      if (sub === 'list' || sub === '') {
-        const items = listSkills();
-        if (!items.length) {
-          say(`No skills installed. Add one with /import-skill <file.md> (dir: ${skillsDir()}).`);
-          return;
-        }
-        h.openPanel('hncode — skills', [
-          `Installed skills (${items.length}) — activate with /${SKILL_PREFIX}<name>:`,
-          '',
-          ...items.map((s) => `  /${SKILL_PREFIX}${s.name}${s.description ? '  — ' + s.description : ''}`),
-          '',
-          `Directory: ${skillsDir()}`,
-          'Remove one with /skills remove <name>.',
-        ]);
+      if (sub === 'install' || sub === 'add' || sub === 'i') {
+        const name = parts[1];
+        if (!name) { appErr(`Usage: /skills install <name>  (see /skills list)\nRepo: https://github.com/${remote.DEFAULT_REPO}/tree/${remote.DEFAULT_REF}/skills`); return; }
+        notice(`Downloading skill ${name}…`, 'info');
+        const res = await remote.installRemoteSkill(name);
+        if (!res.ok) { appErr(`Install failed: ${res.error}`); return; }
+        app(`Skill ${res.replaced ? 'updated' : 'installed'}: ${res.name}${res.description ? ' — ' + res.description : ''}`);
+        app(`Activate it with /${SKILL_PREFIX}${res.name}`);
         return;
       }
-      appErr(`Usage: /skills [list] | remove <name>`);
+      if (sub === 'list' || sub === '') {
+        // The interactive manager (tabs + descriptions). It fetches the remote list for
+        // its Available tab itself, so nothing is fetched here.
+        await h.openRegistryBrowser('skills');
+        return;
+      }
+      appErr('Usage: /skills [list] | install <name> | remove <name>');
       return;
     }
     case 'import-skill': {
@@ -6815,14 +9942,69 @@ case 'trim': {
         app(r.reused ? `Worktree already exists: ${r.path}` : `Worktree created: ${r.path}${r.branch ? ` [${r.branch}]` : ''}`);
         return;
       }
+      // cline's `--worktree`: spin up an ISOLATED worktree and move the session into
+      // it, so an experiment cannot touch the working tree you were just in. Unlike
+      // `add`, there is nothing to type: the path and branch are derived. A DETACHED
+      // worktree is the default — it is disposable, needs no branch name, and cannot
+      // collide with an existing branch.
+      if (sub === 'new' || sub === 'create') {
+        const slug = (parts.slice(1).join('-') || `${session.id || 'session'}`)
+          .replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'wt';
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const root = path.join(os.homedir(), '.hncode', 'worktrees', `${slug}-${stamp}`);
+        const wantBranch = /--branch/.test(raw);   // opt in to a real branch
+        const r = gitmod.addWorktree(root, wantBranch ? slug : null, cwd, { detach: !wantBranch });
+        if (!r.ok) { appErr(`Could not create worktree: ${r.error}`); return; }
+        // Move the session into it, the same way /sessions switches a workspace:
+        // status line, cfg, and the live agent ctx all have to follow or the tools
+        // keep writing to the directory we just left.
+        const target = r.path;
+        state.cwd = target;
+        state.workspace = target;
+        cfg.workspace = target;
+        cfg.cwd = target;
+        if (state.agent && state.agent.ctx) {
+          state.agent.ctx.cwd = target;
+          state.agent.ctx.workspace = target;
+        }
+        refreshGitInfo(state, { force: true });
+        app(`Worktree ready: ${target}${r.branch ? ` [${r.branch}]` : ' (detached)'} — this session now works there.`);
+        return;
+      }
       if (sub === 'remove' || sub === 'rm') {
         const dir = parts[1];
         if (!dir) { appErr('Usage: /worktree remove <dir>'); return; }
-        const r = gitmod.removeWorktree(dir, cwd, { force: parts.includes('--force') });
-        app(r.ok ? `Worktree removed: ${dir}` : `Could not remove worktree: ${r.error}`);
+        const force = parts.includes('--force');
+        const doRemove = () => {
+          const r = gitmod.removeWorktree(dir, cwd, { force });
+          app(r.ok ? `Worktree removed: ${dir}` : `Could not remove worktree: ${r.error}`);
+          renderFrame();
+        };
+        // `--force` discards uncommitted work in that worktree, and git will NOT
+        // refuse — so this is the one path where a mistyped dir really loses data.
+        // Confirm it; the non-forced form is already safe (git rejects a dirty tree).
+        if (force) {
+          openPicker({
+            title: `Force-remove worktree "${dir}"?`,
+            searchable: false,
+            hint: '↑↓ choose · Enter confirm · Esc cancel',
+            items: [
+              { label: 'Cancel', sub: 'keep the worktree' },
+              { label: 'Force remove', sub: 'discards uncommitted changes in that worktree — cannot be undone' },
+            ],
+            onPick: (it) => {
+              if (it && it.label === 'Force remove') doRemove();
+              else app('Worktree removal cancelled.');
+              return true;
+            },
+          });
+          renderFrame();
+          return;
+        }
+        doRemove();
         return;
       }
-      appErr('Usage: /worktree [list] | add <dir> [branch] | remove <dir>');
+      appErr('Usage: /worktree [list] | new [name] [--branch] | add <dir> [branch] | remove <dir>');
       return;
     }
     case 'logout': {
@@ -6892,12 +10074,19 @@ case 'trim': {
           appErr(`No such skill: ${name}. Use /skills to list them, or /import-skill to add one.`);
           return;
         }
+        // `raw` is whatever was typed AFTER the skill name, and it is the user's own
+        // instruction: it has to reach the model AND appear in the transcript. It was
+        // appended only to the hidden `skillBody` system message while the row showed
+        // the bare `/skill:name`, so the user's text disappeared from the conversation
+        // and the model saw it as a detached system note rather than as their words.
         const extra = String(raw || '').trim();
         const prompt = skillPrompt(sk) + (extra ? `\n\n${extra}` : '');
-        // The transcript/user message stays the SHORT command; the skill body is
-        // injected as a system message so it reaches the model without ever
-        // appearing as the user's own words (mirrors kimi's activation card).
-        await sendPrompt('/' + SKILL_PREFIX + name, { skillBody: prompt });
+        // The row is a SKILL ACTIVATION card, not a user bubble and not the literal
+        // `/skill:foo` text (which read as the user having typed a command). The body
+        // rides a system message so it never renders as the user's own speech — the
+        // distinction kimi draws, and the reason this row exists at all.
+        addChat({ role: 'skill', text: name, args: extra, _conv: true });
+        await sendPrompt('/' + SKILL_PREFIX + name, { skillBody: prompt, bubbleText: extra });
         return;
       }
       // Check if this is a plugin-registered command.
@@ -6918,7 +10107,6 @@ case 'trim': {
         }
       }
       // Unknown command: show error message
-      // Unknown command: show error message
       appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
       return;
     }
@@ -6931,6 +10119,34 @@ case 'trim': {
 // mis-described the two auto modes once neither one asks any more.
 const PERMISSION_LABEL = { ask: 'Ask', yolo: 'Yolo', auto: 'Auto' };
 function setPermission(state, mode) { state.mode = mode; }
+
+// The shortcuts hncode dispatches itself, as tokens in the same vocabulary the keybindings
+// file and `registerKeybind` use. A plugin asking `api.isKeyBound('ctrl+t')` needs to know
+// these are taken, and they cannot be discovered by reading a data structure — the handlers
+// are a long switch. The list is the REACHABLE set, so a plugin is warned about the ones a
+// user would notice losing; the switch's internal cursor keys are deliberately absent,
+// because a plugin claiming those is not something to guard against.
+const BUILTIN_KEYS = new Set([
+  'c-c',   // interrupt / quit
+  'c-b',   // background a running Bash command
+  'c-d',   // exit on an empty composer
+  'c-l',   // expand the plugin log block
+  'c-o',   // expand tool output and diffs
+  'c-p',   // command palette
+  'c-r',   // reload the current session from disk
+  'c-s',   // steer the running turn
+  'c-t',   // expand/collapse the todo panel
+  'c-v',   // paste
+  'c-x',   // (reserved; Ctrl+Shift+X is paste-and-run)
+  'c-s-c', // copy the selection or last answer
+  'c-s-v', // paste as a bracketed paste
+  'c-up', 'c-down',   // scroll the output area
+  'escape',
+  'tab', 's-tab',
+  'enter', 'newline',
+  'up', 'down', 'left', 'right',
+  'home', 'end', 'pgup', 'pgdn',
+]);
 
 
 // Is `p` inside the workspace (or one of the extra directories added via
@@ -6949,6 +10165,106 @@ export function isInWorkspace(state, p) {
     if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return true;
   }
   return false;
+}
+
+/**
+ * The config for SIDE work — /btw, /recap. Uses `secondaryModel` when it resolves,
+ * else the session's own config unchanged.
+ *
+ * A model the user selected but that no longer resolves falls back SILENTLY to the
+ * session model: the alternative is a side question failing because of a config
+ * entry set weeks ago, which is worse than using a more expensive model. The panel
+ * header shows which model answered, so the fallback is visible.
+ */
+function secondaryModelCfg(cfg) {
+  const name = cfg && cfg.secondaryModel;
+  if (!name) return cfg;
+  if (!(cfg.raw && cfg.raw.models && cfg.raw.models[name])) return cfg;
+  try { return resolveModelArg(cfg, name) || cfg; }
+  catch { return cfg; }
+}
+
+/**
+ * Ask one side question, streaming the reply into the docked box.
+ *
+ * The turn is pushed BEFORE the request so a running turn renders immediately
+ * ("Waiting for answer…" plus a caret), and the answer accumulates IN PLACE — the
+ * same live-update shape kimi's `appendAnswer` gives, so the reply is watched as it
+ * arrives rather than appearing all at once at the end.
+ *
+ * Returns the turn after the request settles, so a caller can report a failure.
+ */
+export async function askSideQuestion(state, cfg, question, repaint) {
+  // The repaint is INJECTED rather than imported: renderSoon lives inside startTUI
+  // (it owns the frame timer), and this function is called from dispatch() too.
+  const paint = typeof repaint === 'function' ? repaint : (() => {});
+  const modelCfg = secondaryModelCfg(cfg);
+  const panel = state.btwPanel || (state.btwPanel = { turns: [], model: '', reasoning: false });
+  const turn = {
+    prompt: String(question || '').trim(),
+    answer: '',
+    thinking: '',
+    phase: 'running',
+  };
+  panel.turns.push(turn);
+  panel.model = modelCfg.model || cfg.model;
+  // A new question means the user wants to SEE it, so any scrollback is dropped.
+  state.btwScroll = 0;
+  paint();
+
+  // Only the reading tools are exposed; a call to anything else is refused at the
+  // runner (see sideToolAllowed). The model still sees every tool DEFINITION, which
+  // is what keeps the prompt cache shared with the main thread.
+  const sideCfg = {
+    ...modelCfg,
+    toolFilter: SIDE_RO_TOOLS,
+    sideThreadTools: SIDE_RO_TOOLS,
+    noDelegation: true,
+    maxOutputTokens: cfg.maxOutputTokens,
+  };
+  try {
+    if (!state.sideThread) {
+      state.sideThread = new SideThread({
+        basePrompt: (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT,
+        tools: SIDE_RO_TOOLS,
+        model: modelCfg.model || cfg.model,
+      });
+    }
+    const payload = state.sideThread.payload(turn.prompt);
+    // The Agent loop, not a bare request: a side question may READ a file to answer,
+    // and only the loop can run a tool.
+    const sideAgent = new Agent({
+      cfg: sideCfg,
+      messages: payload,
+      onApproval: async (toolName) => sideToolAllowed(toolName),
+      onEvent: (e) => {
+        if (e.type === 'data' && e.text) { turn.answer += e.text; paint(); }
+        if (e.type === 'think' && e.text) { turn.thinking += e.text; paint(); }
+      },
+    });
+    await sideAgent.run();
+    turn.answer = String(turn.answer).trim();
+    if (!turn.answer) {
+      turn.error = 'The side question came back empty.';
+      turn.phase = 'failed';
+    } else {
+      turn.phase = 'done';
+      state.sideThread.record(turn.prompt, turn.answer);
+    }
+  } catch (e) {
+    turn.error = `Side question failed: ${e.message}`;
+    turn.phase = 'failed';
+  }
+  paint();
+  return turn;
+}
+
+// Record a Ctrl+A approval on the SESSION (not on config). Kept as a thin wrapper
+// so the storage location is stated once: a persisted grant would apply to next
+// week's work, which is not what "approve for this session" means.
+function approveForSession(state, toolName, args) {
+  if (!state) return;
+  state.sessionApprovals = rememberApproval(state.sessionApprovals, toolName, args);
 }
 
 // Decide whether a tool call stays inside the workspace. Anything we cannot PROVE
@@ -6975,52 +10291,60 @@ function isInsideWorkspace(state, toolName, args) {
   }
 }
 
-// Obvious "this is not a routine workspace edit" patterns.
-const DESTRUCTIVE_RE = /(\brm\b[^|]*\s-\w*[rf]|\bdel\b|Remove-Item[^|]*-Recurse|\bformat\b|\bmkfs\b|\bshutdown\b|\breboot\b|\bgit\s+push\b|\bgit\s+reset\b[^|]*--hard|\bgit\s+clean\b|>\s*\/dev\/|:\(\)\s*\{|~\/(\.ssh|\.aws|\.config)|\$HOME\/\.(ssh|aws))/i;
+// The destructive / read-only verdicts live in shell-safety.js: they need a real
+
+// The destructive / read-only verdicts live in shell-safety.js: they need a real
+// split of the command into segments and a peel of its wrappers, which a single
+// regex over the whole line cannot do. These wrappers stay because they are the
+// names the rest of the TUI (and any plugin patching tui.js#isReadOnlyCommand)
+// already uses.
 function isDestructiveCommand(cmd) {
-  return DESTRUCTIVE_RE.test(String(cmd || ''));
+  return shellIsDestructiveCommand(cmd);
 }
-
-// A read-only shell command: one whose FIRST word is a known query/inspection
-// tool AND that contains no shell metacharacters that could run something else
-// (pipes, redirection, command substitution, `&&`/`;`). Anything that MUTATES
-// (rm, mv, sed -i, git commit, npm install …) is not on the list, and anything
-// wrapped in a pipe/subshell is rejected outright — the wrapper could hide a
-// write. Mirrors the intent of Claude Code's readOnlyValidation, trimmed to the
-// commands that actually show up in a coding session.
-const READ_ONLY_BINS = new Set([
-  'ls', 'dir', 'pwd', 'cd', 'echo', 'cat', 'head', 'tail', 'wc', 'sort', 'uniq',
-  'grep', 'rg', 'ag', 'find', 'fd', 'which', 'where', 'whoami', 'hostname',
-  'date', 'env', 'printenv', 'stat', 'file', 'du', 'df', 'tree', 'type',
-  'jq', 'tr', 'cut', 'diff', 'man', 'help', 'true', 'test', '[',
-  'git',   // further restricted to read-only verbs below
-  // NOT here on purpose: node/python/npm/npx/make/docker/kubectl/gh — each can
-  // execute arbitrary code or mutate state via a flag (`node -e`, `python -c`,
-  // `npm install`), so allowing the bare binary would be a hole.
-]);
-// `git` is allowed only for read-only verbs. Anything that writes is excluded.
-const GIT_WRITE_SUBCMDS = new Set([
-  'push', 'reset', 'clean', 'commit', 'merge', 'rebase', 'checkout', 'switch',
-  'cherry-pick', 'revert', 'tag', 'branch', 'remote', 'stash', 'apply', 'am',
-  'init', 'clone', 'fetch', 'pull', 'submodule', 'worktree', 'config', 'gc',
-  'prune', 'rm', 'mv', 'add', 'restore', 'update-ref', 'notes',
-]);
-
 export function isReadOnlyCommand(cmd) {
-  const s = String(cmd || '').trim();
-  if (!s) return false;
-  // Reject anything that could chain or redirect into a different command.
-  if (/[|&;<>`$()]|\|\||&&|\$\(/.test(s)) return false;
-  if (/\b>\s*\S/.test(s)) return false;                 // redirection
-  const words = s.split(/\s+/);
-  const bin = words[0].replace(/^.*[\\/]/, '').replace(/\.(exe|cmd|bat|ps1)$/i, '');
-  if (!READ_ONLY_BINS.has(bin)) return false;
-  if (bin === 'git') {
-    const sub = (words[1] || '').toLowerCase();
-    if (!sub || GIT_WRITE_SUBCMDS.has(sub)) return false;
-  }
-  return true;
+  return shellIsReadOnlyCommand(cmd);
 }
+
+/**
+ * The rows a reasoning block draws. Exported for the test that an EMPTY block draws
+ * none — the rule lives in `messageLines`, which is reached through a full frame, and
+ * asserting it through the frame alone cannot tell "no rows" from "one blank row".
+ */
+export function makeThinkingLineForTest(state, msg) {
+  return messageLines(msg, (state && state.termCols) || 80, (state && state.cwd) || process.cwd(), false, 0, 0, false,
+    (state && state.shimmerEdge) || (state && state.cfg && state.cfg.shimmerEdge));
+}
+
+/**
+ * Add one display-only row to `session.transcript`, or extend the open reasoning block.
+ *
+ * THE TEXT IS ASSIGNED, NOT APPENDED. `appendThinking` records the SAME live block on
+ * every streamed chunk, and that block's `text` is already the whole reasoning so far —
+ * so appending it re-added everything seen before on each delta, growing the stored text
+ * as O(n²). A 5000-character chain arriving five characters at a time landed as 2.5 MB,
+ * and one long turn pushed a session file past the 512 MB limit where `JSON.stringify`
+ * throws `Invalid string length` — losing the turn outright and making the session
+ * unlistable. Any OTHER producer of a thinking row hands over a complete block too, so
+ * the block on record is always the whole thing.
+ *
+ * Module-level and exported so a test can drive the real write path: a round trip through
+ * `saveSession` cannot catch this, because whatever was stored does round-trip — only the
+ * SIZE of it is wrong.
+ *
+ * @returns {boolean} true when an open block was extended rather than a row added.
+ */
+export function appendTranscriptRow(list, anchor, row, pending) {
+  const last = list[list.length - 1];
+  if (last && last.anchor === anchor && row.role === 'thinking'
+      && last.row && last.row.role === 'thinking' && last.row.pending) {
+    last.row.text = row.text || '';
+    last.row.pending = pending;
+    return true;
+  }
+  list.push({ anchor, ts: Date.now(), row: { ...row, pending } });
+  return false;
+}
+
 
 // True when every absolute / parent-relative path mentioned in the command lies
 // inside the workspace. Relative paths are resolved against the command's cwd.
@@ -7059,6 +10383,11 @@ function applyModel(state, cfg, next) {
   // model showed "73% — 364k/1M": two numbers that cannot both be true.
   state.ctxMax = cfg.maxContextTokens || state.ctxMax;
   state.ctxPercent = usagePercent(state.ctxTokens || 0, state.ctxMax);
+  // Prices belong to the MODEL, so the session's cost is re-priced on a switch.
+  // Accumulating dollars per event instead would price every earlier request at
+  // whatever model happened to be active at the time — which is not what the
+  // session total means.
+  refreshCost(state, cfg);
   try { if (cfg.model) rememberModel(cfg.model); } catch {}
 }
 
@@ -7068,10 +10397,13 @@ function setEffort(state, cfg, value) {
   cfg.effort = state.reasoning ? value : '';
 }
 
-function registerProvider(state, cfg, h, name, baseUrl, apiKey, protocol, typeLabel) {
-  addProvider(name, { base_url: baseUrl, api_key: apiKey, protocol });
+function registerProvider(state, cfg, h, name, baseUrl, apiKey, protocol, typeLabel, known, catalogId) {
+  addProvider(name, { base_url: baseUrl, api_key: apiKey, protocol, known, catalog: catalogId });
   cfg.raw.providers = cfg.raw.providers || {};
-  cfg.raw.providers[name] = { base_url: baseUrl || undefined, api_key: apiKey || undefined, protocol };
+  cfg.raw.providers[name] = {
+    base_url: baseUrl || undefined, api_key: apiKey || undefined, protocol,
+    known: !!known, catalog: catalogId || undefined,
+  };
   applyModel(state, cfg, resolveProvider(cfg, name));
   h.notice(`Provider added: ${name} (${typeLabel}) → ${hncodeConfigFile()}`, 'info');
   fetchAndRegisterModels(state, cfg, name, h);
@@ -7087,18 +10419,187 @@ async function fetchAndRegisterModels(state, cfg, providerName, h) {
   cfg.raw.models = cfg.raw.models || {};
   for (const m of models) {
     addModel(providerName, m.id, { display_name: m.display, contextLength: m.contextLength, maxTokens: m.maxTokens });
-    cfg.raw.models[modelKey(providerName, m.id)] = {
-      provider: providerName,
-      model: m.id,
-      display_name: m.display || undefined,
-      maxTokens: m.maxTokens || undefined,
-      contextLength: m.contextLength || undefined,
-      ownedBy: m.ownedBy || undefined,
-      reasoning: m.reasoning || undefined,
-      efforts: m.efforts || undefined,
-    };
+    // Merge over any existing entry rather than replacing it: discovery reports
+    // fewer fields than the user may have set (context_length, pricing, …), and a
+    // field the endpoint did not report must not blank out a value already there.
+    const key = modelKey(providerName, m.id);
+    cfg.raw.models[key] = mergeRefreshedModelEntry(providerName, m, cfg.raw.models[key]);
   }
   h.notice(`Discovered ${models.length} models for ${providerName}. Use /model to pick one.`, 'info');
+}
+
+// Merge ONE refreshed model's data over its previous config entry.
+//
+// A refresh REPLACES the provider's entries wholesale, but the source (models.dev
+// catalog or /v1/models) does not report every field for every model. Building
+// the new entry from the fetch ALONE therefore wiped anything the user had set by
+// hand — most visibly `context_length`, which then resolved back to the default
+// window: a "refresh" that overwrote user settings with nothing.
+//
+// The rule: a field the source REPORTED wins (that is what a refresh is for); a
+// field it did NOT report keeps the value already in the entry — including the
+// camelCase spellings older writers used (`contextLength`/`maxTokens`/
+// `displayName`), which are folded into the canonical keys here because
+// resolveConfig checks `contextLength` BEFORE `context_length`: leaving both on
+// the entry would let the stale camelCase copy shadow the fresh value.
+export function mergeRefreshedModelEntry(providerName, m, prev) {
+  const src = m || {};
+  const lim = src.limit || {};
+  const p = prev || {};
+  const {
+    contextLength: pCtx, context_window: pCtxW, max_context_size: pCtxMax,
+    maxTokens: pMaxTok, maxOutputTokens: pMaxOut, displayName: pDisplay,
+    ...rest
+  } = p;
+  const ctxLen = src.contextLength || lim.context
+    || rest.context_length || pCtx || pCtxW || pCtxMax;
+  const maxOut = src.maxOutputTokens || lim.output || rest.max_output_tokens || pMaxOut;
+  const maxTok = src.maxTokens || rest.max_tokens || pMaxTok;
+  const display = src.display || rest.display_name || pDisplay;
+  // Thinking levels: models.dev reasoning_options is the ONLY source of graded
+  // lists (effortsFromReasoning returns null for "nothing usable"), so absent
+  // that we keep the entry's own list instead of dropping a user's choice.
+  const efforts = src.efforts || effortsFromReasoning(src.reasoningOptions) || rest.efforts;
+  // The source said true/false -> its value (an explicit `false` must win over an
+  // old `true`). The source was silent -> keep what the entry had.
+  const reasoning = src.reasoning === true ? true
+    : (src.reasoning === false ? false : rest.reasoning);
+  // Pricing: only DEFINED fields overwrite, so a partial (or absent) cost report
+  // cannot blank out prices the entry already carries.
+  const costFields = Object.fromEntries(
+    Object.entries(costEntry(costFromCatalog(src.cost))).filter(([, v]) => v !== undefined),
+  );
+  return {
+    ...rest, // everything else the entry carried (ownedBy, custom keys …)
+    provider: providerName,
+    model: src.id,
+    display_name: display,
+    context_length: ctxLen,
+    max_tokens: maxTok,
+    max_output_tokens: maxOut,
+    reasoning,
+    efforts: efforts || undefined,
+    ownedBy: src.ownedBy || rest.ownedBy,
+    ...costFields,
+  };
+}
+
+// Ctrl+R in /provider: re-discover the selected provider's model list. Two cases:
+//   * the provider came from models.dev (its key is a catalog id) -> take the WHOLE
+//     catalog model list for it, enriched with limit.context / limit.output and
+//     reasoning_options. This also covers providers whose /v1/models is empty or
+//     wrong, since the catalog is authoritative.
+//   * any other provider -> just re-fetch its /v1/models.
+// Existing entries are REPLACED (a refresh, not an append), so a removed model
+// really disappears instead of lingering as a stale row. Fields the refresh did
+// NOT fetch are KEPT from the existing entry (see mergeRefreshedModelEntry): a
+// refresh may update settings, never blank them.
+async function refreshProviderModels(state, cfg, providerName, h) {
+  if (!providerName || providerName.startsWith('＋')) return;
+  const p = (cfg.raw.providers || {})[providerName] || {};
+  const baseUrl = p.base_url || p.baseUrl || '';
+  const protocol = p.protocol || 'openai';
+  const apiKey = p.api_key || p.apiKey || '';
+  h.notice(`Refreshing models for ${providerName}…`, 'info');
+
+  // SOURCE decides where models come from:
+  //   known = true  -> models.dev catalog. `catalog` says WHICH entry (so a renamed
+  //                    provider still maps correctly); it falls back to the provider
+  //                    name for entries written before `catalog` existed.
+  //   known = false (or the key is absent on an old config) -> the endpoint's own
+  //                    /v1/models. For an old config with no `known` key we still
+  //                    accept a name that matches a catalog id, so existing
+  //                    models.dev providers keep working without a rewrite.
+  const knownFlag = p.known === true ? true
+    : (p.known === false ? false : null);
+  const catalogId = p.catalog || providerName;
+  let catModels = {};
+  if (knownFlag !== false) {
+    try {
+      const catalog = await fetchCatalog();
+      const catEntry = catalog ? catalog[catalogId] : null;
+      if (catEntry && catEntry.models) catModels = catEntry.models;
+    } catch { /* catalog is optional */ }
+  }
+  const catIds = Object.keys(catModels);
+  const inCatalog = catIds.length > 0;
+
+  let merged;
+  if (inCatalog) {
+    // The provider IS in models.dev, and the catalog already carries the model
+    // list plus limit.context / limit.output / reasoning_options. That is strictly
+    // more than /v1/models reports, so we use it directly and make NO network call
+    // to the endpoint — one less request, and no failure when the key is unset or
+    // the endpoint is slow/wedged.
+    merged = catIds.map((id) => {
+      const m = catModels[id] || {};
+      return {
+        id,
+        display: m.name || id,
+        limit: m.limit || {},
+        reasoning: m.reasoning,
+        reasoningOptions: m.reasoning_options,
+        // Pricing, so a refresh does not silently DROP the cost data the first
+        // install wrote — the entries are replaced wholesale below.
+        cost: m.cost,
+      };
+    });
+  } else {
+    // Custom / self-hosted provider not in the catalog: the only source is the
+    // endpoint's own /v1/models.
+    let list = [];
+    if (baseUrl) {
+      try { list = await fetchModels({ baseUrl, apiKey, protocol }); } catch { list = []; }
+    }
+    if (!list.length) {
+      h.notice(`No models found for ${providerName} (not in the catalog and the endpoint reported none).`, 'error');
+      return;
+    }
+    merged = list;
+  }
+
+  cfg.raw.models = cfg.raw.models || {};
+  // Replace this provider's entries: SNAPSHOT the current ones first (the merge
+  // below needs them), then drop them. Models the source no longer lists still
+  // disappear — that is what makes Ctrl+R a real refresh.
+  const prevByKey = new Map();
+  for (const key of Object.keys(cfg.raw.models)) {
+    if (key.split('/')[0] !== providerName) continue;
+    prevByKey.set(key, cfg.raw.models[key]);
+    delete cfg.raw.models[key];
+  }
+  const persisted = [];
+  for (const m of merged) {
+    const key = modelKey(providerName, m.id);
+    const entry = mergeRefreshedModelEntry(providerName, m, prevByKey.get(key));
+    cfg.raw.models[key] = entry;
+    // The file write gets the SAME merged values: persisting the raw fetch would
+    // re-wipe on disk what the merge just preserved in memory.
+    persisted.push({
+      id: m.id,
+      display_name: entry.display_name,
+      contextLength: entry.context_length,
+      maxTokens: entry.max_tokens,
+      maxOutputTokens: entry.max_output_tokens,
+      reasoning: entry.reasoning,
+      efforts: entry.efforts,
+      cost: {
+        input: entry.cost_input,
+        output: entry.cost_output,
+        cacheRead: entry.cost_cache_read,
+        cacheWrite: entry.cost_cache_write,
+      },
+    });
+  }
+  // Persist the REPLACEMENT so the refresh survives a restart. Without this the
+  // in-memory list looked refreshed but config.toml kept the old entries, and the
+  // next launch silently reverted (stale models back, removed ones still present).
+  try { replaceProviderModels(providerName, persisted); }
+  catch (e) { h.notice(`Refreshed in memory, but writing config failed: ${e.message}`, 'error'); }
+  // If the active model belonged to this provider, re-resolve so the status line
+  // and the next turn see the refreshed values.
+  if (cfg.provider === providerName) applyModel(state, cfg, resolveProvider(cfg, providerName));
+  h.notice(`Refreshed ${merged.length} model(s) for ${providerName} (saved).`, 'info');
 }
 
 function buildMarkdown(session) {
@@ -7114,7 +10615,7 @@ function buildMarkdown(session) {
 }
 
 // ---- key tokenizer (raw bytes -> tokens) ----
-function tokenize(str) {
+export function tokenize(str) {
   const out = [];
   let i = 0;
   while (i < str.length) {
@@ -7147,6 +10648,13 @@ function tokenize(str) {
           const arrows = { 0xE000: 'up', 0xE001: 'down', 0xE003: 'left', 0xE002: 'right' };
           const a = arrows[cp];
           if (a) { out.push({ key: 'shift-' + a }); i += ku[0].length; continue; }
+        }
+        // Ctrl+Arrow (CSI-u form) -> c-up / c-down / c-left / c-right, matching the
+        // legacy CSI path above so both encodings behave the same.
+        if (ctrl && !shift && !alt && cp >= 0xE000 && cp < 0xE100) {
+          const arrows = { 0xE000: 'up', 0xE001: 'down', 0xE003: 'left', 0xE002: 'right' };
+          const a = arrows[cp];
+          if (a) { out.push({ key: 'c-' + a }); i += ku[0].length; continue; }
         }
         if (shift && !ctrl && !alt && (cp === 0xE014 || cp === 0xE015)) {
           out.push({ key: cp === 0xE014 ? 'shift-home' : 'shift-end' });
@@ -7192,8 +10700,13 @@ function tokenize(str) {
           continue;
         }
         let j = i + 2;
-        while (j < str.length && str[j] >= '0' && str[j] <= '9') j++;
-        if (str[j] === '?') { j++; while (j < str.length && str[j] >= '0' && str[j] <= '9') j++; }
+        // Scan the whole parameter run: digits, `;` separators, and a leading `?`
+        // (private mode). It used to scan DIGITS ONLY, so `1;5A` (Ctrl+Up) stopped
+        // at the `;`, `fin` became `;`, and the `!/[A-Za-z~]/` guard below aborted
+        // the sequence — Ctrl+Arrow/Shift+Arrow sent in the legacy CSI form were
+        // silently DROPPED. The `;`-parameter parsing further down was unreachable.
+        while (j < str.length && (str[j] >= '0' && str[j] <= '9' || str[j] === ';')) j++;
+        if (str[j] === '?') { j++; while (j < str.length && (str[j] >= '0' && str[j] <= '9' || str[j] === ';')) j++; }
         const fin = str[j];
         if (fin === undefined || !/[A-Za-z~]/.test(fin)) break;
         const rawParams = str.slice(i + 2, j);
@@ -7207,6 +10720,15 @@ function tokenize(str) {
         const base = csiName(params, fin);
         if (shift && !ctrl && ['up', 'down', 'left', 'right', 'home', 'end'].includes(base)) {
           out.push({ key: 'shift-' + base });
+          i = j + 1;
+          continue;
+        }
+        // Ctrl+Arrow. Without this the modifier was dropped and Ctrl+Up arrived as
+        // a plain `up` — indistinguishable from an unmofified arrow. Emitted as its
+        // own token so the key handler can give it a distinct action (scroll the
+        // output area).
+        if (ctrl && !shift && ['up', 'down', 'left', 'right', 'home', 'end'].includes(base)) {
+          out.push({ key: 'c-' + base });
           i = j + 1;
           continue;
         }
@@ -7241,19 +10763,27 @@ function tokenize(str) {
     // Ctrl+X is the same story: raw 0x18. Ctrl+Shift+X comes through the CSI-u
     // path above as `c-s-x` on terminals that report modified keys.
     else if (c === '\x18') { out.push({ key: 'c-x' }); i++; }
+    // Backspace must be matched BEFORE the general Ctrl rule below: 0x08 is also
+    // the "Ctrl+H" code, and terminals send it for Backspace.
     else if (c === '\x7f' || c === '\x08') { out.push({ key: 'backspace' }); i++; }
+    // Every other Ctrl+<letter> arrives as the raw byte 0x01-0x1A (A-Z). Without
+    // this general rule only the hand-listed few above were recognised and the
+    // rest fell through to `{ ch: '\x05' }` — a literal control character, so
+    // Ctrl+E (0x05) and friends were simply dead on legacy terminals. The listed
+    // codes are matched first, so this only catches the ones not spelled out.
+    else if (c >= '\x01' && c <= '\x1a') { out.push({ key: 'c-' + String.fromCharCode(c.charCodeAt(0) + 96) }); i++; }
     else { out.push({ ch: c }); i++; }
   }
   return { tokens: out, rest: str.slice(i) };
 }
 // Lower-case letter (or space) a control-key code point stands for, else null.
-function ctrlLetter(cp) {
+export function ctrlLetter(cp) {
   if (cp >= 97 && cp <= 122) return String.fromCharCode(cp);
   if (cp >= 65 && cp <= 90) return String.fromCharCode(cp + 32);
   if (cp === 32) return ' ';
   return null;
 }
-function csiName(params, fin) {
+export function csiName(params, fin) {
   if (fin === 'A') return 'up';
   if (fin === 'B') return 'down';
   if (fin === 'C') return 'right';
@@ -7275,7 +10805,11 @@ function csiName(params, fin) {
 
 // ---- TUI entry point ----
 export async function startTUI(opts) {
-  const { cfg, session } = opts;
+  const { cfg } = opts;
+  // `let`, and mirrored on `state.session`, because /move REPLACES the session: the command
+  // hands back a new object, and every later save would otherwise keep writing the old one —
+  // which is how /move left the session stamped with the directory it was moved away from.
+  let session = opts.session;
   
   // FIRST: Ensure model is initialized before restoring session
   if (!cfg.model || !cfg.innerModel) {
@@ -7285,11 +10819,49 @@ export async function startTUI(opts) {
       return 1;
     }
   }
-  
+
   const state = makeState({ cfg, session, opts });
+  // Mirror the session on the state so `/move` can rebind ONE binding and have every
+  // consumer follow (see `replaceSession`).
+  state.session = session;
+
   cfg.effort = state.reasoning ? state.effort : '';
+  // Price the session's restored tokens against the model it is about to use, so
+  // /cost and the status badge are right before the first new request.
+  refreshCost(state, cfg);
+  // Restore the selected OUTPUT STYLE by NAME, re-reading its file: the body may
+  // have been edited since the session was saved, and the name is what config.toml
+  // stores (see config.outputStyle). A name that no longer resolves is reported
+  // rather than silently ignored — the user set it and would otherwise be left
+  // wondering why their style stopped applying.
+  if (cfg.outputStyle) {
+    const s = findStyle(cfg.outputStyle, state.cwd);
+    if (s) state.outputStyle = s;
+    else appErr(`Output style "${cfg.outputStyle}" no longer exists — /output-style to pick another.`);
+  }
+  // FEATURE FLAGS: resolved once here so the whole session reads a stable set, and
+  // so /experiments has something to show. A flag enabled from the ENVIRONMENT is
+  // announced, because a behaviour that differs from config.toml with no visible
+  // reason is the worst kind of surprise.
+  state.experiments = experimentState(cfg);
+  {
+    const fromEnv = enabledExperiments({ raw: {} }, process.env);
+    if (fromEnv.length) app(`Experiments from environment: ${fromEnv.join(', ')}`);
+  }
   // Force dark theme (theme removed from state)
   setTheme('dark');
+
+  // Live argument completions for the composer menu. /effort completes from the
+  // CURRENT model's thinking levels (models.dev data), which the static hint
+  // cannot express — so the hint stays a generic placeholder and the real words
+  // come from here. Reads `cfg`/`state` live on every call, so a /model switch is
+  // reflected immediately.
+  setArgCompletionProvider((name) => {
+    if (name === 'effort' || name === 'thinking') {
+      return effortOptions(cfg, state.model);
+    }
+    return null;
+  });
   
   // Calculate initial context usage from loaded session
   if (session && session.messages && session.messages.length) {
@@ -7297,6 +10869,24 @@ export async function startTUI(opts) {
     state.ctxTokens = approx;
     state.ctxPercent = usagePercent(approx, state.ctxMax);
   }
+
+  // Warm the models.dev catalogue in the background. It is what supplies PRICES
+  // for a model entry that predates them (see config.modelCost), so without this
+  // `/cost` and the status badge report "unknown" until the user happens to open
+  // /provider. Deliberately not awaited: a slow catalog must not delay the first
+  // paint, and the cost readout is only consulted on demand.
+  //
+  // The RATE is warmed here too, when the saved currency is not USD: the render
+  // path reads it synchronously, so without this a session resumed with
+  // `/cost cny` set would draw its cost in USD until the next usage event.
+  void (async () => {
+    try {
+      const cur = costCurrency(cfg);
+      await fetchCatalog();
+      if (cur !== 'USD') await usdRate(cur, { override: cfgCnyPerUsd(cfg) });
+      refreshCost(state, cfg);
+    } catch { /* offline: the readout says the price is unknown */ }
+  })();
   
   // NOW: Restore session with the correct model context.
   // The shellHistory test matters as much as the messages one: `!command` output
@@ -7646,8 +11236,41 @@ function commandsForWeb() {
     return null;
   }
 
+  // Roles that exist only on screen, so `session.messages` cannot carry them: that array
+  // is what gets SENT to the model, and a notice or a warning in it would spend context on
+  // prose the model has already acted on. They are persisted to `session.transcript`
+  // instead, which nothing sends to a provider.
+  //
+  // `rich` is deliberately not here. Those rows are command OUTPUT — /diff, /log, /cost,
+  // /context — and replaying them on resume shows a snapshot of a moment that has passed:
+  // a diff from an earlier commit, a cost that has since changed. They also carry their
+  // own ANSI, which has no place in a JSON transcript.
+  //
+  // `bash` and `tool_result` are not here either: `runShellCommand` already records both
+  // in `session.shellHistory`, and reconstructChat rebuilds them from it. Recording them
+  // a second time would double every `!cmd` on resume.
+  const PERSISTED_ROLES = new Set(['system', 'warn', 'plan', 'compaction', 'bg_task', 'skill', 'steer', 'thinking']);
+
+  function recordTranscriptRow(msg) {
+    if (!session) return;
+    if (state.saveHistory === false) return;           // the user's switch
+    const row = normalizeMsg(msg);
+    if (!PERSISTED_ROLES.has(row.role)) return;
+    // Reasoning is the one long-text role here and the bulk of the cost, so it has its
+    // own flag: the short notices stay cheap enough to keep on by default.
+    if (row.role === 'thinking' && state.saveThinking === false) return;
+    const list = (session.transcript = session.transcript || []);
+    const anchor = (session.messages || []).length;
+    // `pending` is dropped by normalizeMsg but the extend test needs it, so it is read
+    // off the live message rather than the normalized copy.
+    const pending = !!(msg && msg.pending);
+    appendTranscriptRow(list, anchor, row, pending);
+  }
+
+
   const addChat = (msg) => {
     state.chat.push(normalizeMsg(msg));
+    recordTranscriptRow(msg);
     // Auto-follow / re-anchor is delegated to anchorScroll() so exactly ONE place
     // adjusts `scroll`. This block used to run its own row-delta compensation
     // against a second baseline (_addChatRows) which — like anchorScroll's old
@@ -7673,23 +11296,63 @@ function commandsForWeb() {
   }
   let lastFrame = null;
   let paintScheduled = false;
+  // Deadline for the next FULL repaint. A differential painter compares against the frame
+  // it BELIEVES it painted, never the real screen, so any divergence between the two is
+  // permanent: it survives every later frame because the comparison keeps saying "that row
+  // has not changed". Divergence has several possible causes — a terminal that does not
+  // cancel the pending-wrap flag on a cursor move, a width model that disagrees with the
+  // terminal's for some glyph, a resize that `getWindowSize` reported late — and rather
+  // than only defend against the ones we know about, bound the damage: repaint the whole
+  // frame unconditionally every few seconds, so anything stray is gone within that window
+  // instead of lingering until the user re-enters the session.
+  //
+  // The cost is one full frame per interval of ACTIVITY (an idle session paints rarely,
+  // so it pays almost nothing), and `diffFrame` wraps the write in a synchronized update,
+  // so a full repaint does not flicker.
+  const FULL_REPAINT_MS = 3000;
+  let lastFullPaint = 0;
   function paintNow() {
     paintScheduled = false;
     const { cols, rows } = dims();
     const frame = composeFrame(state, cols, rows);
-    const out = diffFrame(lastFrame, frame);
+    const now = Date.now();
+    const forceFull = (now - lastFullPaint) >= FULL_REPAINT_MS;
+    const out = diffFrame(forceFull ? null : lastFrame, frame);
+    if (forceFull) lastFullPaint = now;
     lastFrame = frame;
     state._hitboxes = frame.hitboxes || [];
     state._composerMeta = frame.composerMeta || [];
     if (out) stdout.write(out);
+    // "Painted" becomes observable here: everything that reaches the screen goes
+    // through this one function, so the tick advancing means bytes left this process.
+    // See src/flush-tick.js for what reads it.
+    noteTerminalFlush();
     // Mirror the transcript to the web UI, if one is attached. Done HERE because
     // every change reaches the screen through this one function, so it catches the
     // rows that bypass addChat (streamed prose, tool rows, the plan bubble, an
     // abort) without instrumenting each of those call sites. `syncChat` is a no-op
     // until `/web` runs, and it is incremental, so an idle frame costs nothing.
     if (web) void syncWeb();
+    // Re-set AFTER the write: `_frameTickAt` names the LAST frame, so it has to be
+    // captured once that frame is on the terminal, not before it.
+    state._frameTickAt = getTerminalFlushTick();
   }
   function renderFrame() { paintNow(); }
+  // Paint the pending frame NOW, if there is one.
+  //
+  // The mouse handlers read geometry that `composeFrame` produced — `_bodyScreenTop` for
+  // row mapping, the hitbox list for what a click hit — and a click frequently arrives in
+  // the window between a state change and its `renderSoon()`. The values are usually
+  // right (the pending paint renders the same state again), but a resize or a re-entrant
+  // render can make that pending paint a DIFFERENT frame, and then the click acts on a
+  // row the user never sees. Settling it here is cheaper than any timeout: at most one
+  // extra frame, and only when a click lands mid-paint.
+  //
+  // It clears `paintScheduled` itself through `paintNow`, so the queued immediate
+  // becomes a no-op rather than painting twice.
+  function flushFrame() {
+    if (paintScheduled) paintNow();
+  }
   // Let module-level helpers (refreshGitInfo) ask for a repaint once their async
   // data lands, without holding a reference to this closure.
   state._requestRender = renderFrame;
@@ -7718,16 +11381,34 @@ function commandsForWeb() {
       onPick: p.onPick || (() => true),
       onDelete: p.onDelete || null,
       onCancel: p.onCancel || null,
+      onCtrlE: p.onCtrlE || null,     // Ctrl+E "edit selected" hook (e.g. /model)
+      onCtrlR: p.onCtrlR || null,     // Ctrl+R "refresh selected" hook (e.g. /provider)
+      onFooterPick: p.onFooterPick || null,  // a CLICK on a footer option (see below)
+      // A picker with a second decision on its footer row (/model: the list picks the
+      // model, the row picks the thinking level) must not close on a list CLICK — the
+      // mouse could otherwise never reach the footer. The keyboard is unaffected: Enter
+      // still picks and closes.
+      clickKeepsOpen: !!p.clickKeepsOpen,
       footerFor: p.footerFor || null,
       footer,
       categories: p.categories || null,   // list of category labels (first is "All")
       category: p.category || null,        // active category (null = "All")
+      // Screen position the box should open AT, instead of centred. Used by the
+      // right-click context menu, which by convention appears under the pointer: a
+      // menu that jumps to the middle of the screen loses the one piece of context
+      // that told the user which row they right-clicked. `{ row, col }` in absolute
+      // frame coordinates. Null (the default) means "centre it".
+      anchor: p.anchor || null,
     };
     state.pickerQuery = '';
     state.pickerCategory = (state.picker.categories && state.picker.categories.length)
       ? (p.category || state.picker.categories[0]) : null;
     state.form = null;
     state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    // The previous frame's hover described a DIFFERENT layout (the row the pointer
+    // was over, before this overlay replaced those rows). Keeping it tinted whatever
+    // the new overlay happened to draw on that row.
+    state.hoverHit = null;
     // A dialog usually replaces the composer, so the half-typed prompt is
     // cleared — but the right-click context menu is an overlay ON TOP of the
     // composer and must leave it (text + caret) untouched, otherwise opening it
@@ -7735,6 +11416,8 @@ function commandsForWeb() {
     if (!p.keepInput) { state.input = ''; state.caret = 0; }
     renderFrame();
   }
+
+  // ---- @ file completion ----------------------------------------------------
 
   // ---- @ file completion ----------------------------------------------------
   // Typing `@` shows an INLINE candidate list above the composer — the same widget
@@ -7863,10 +11546,19 @@ function commandsForWeb() {
       title: spec.title || '',
       fields,
       fieldIdx: 0,
-      type: spec.type !== undefined ? spec.type : 'OpenAI',
+      type: spec.type !== undefined ? spec.type : PROTOCOL_TYPES[0],
+      // The selectable Type values. Kept on the form so the keyboard cycle uses the
+      // SAME list the renderer draws — a 2-item toggle here silently dropped any
+      // third option (e.g. "OpenAI Responses").
+      types: Array.isArray(spec.types) && spec.types.length ? spec.types : PROTOCOL_TYPES,
       hideType: !!spec.hideType,
       labelW,
       hint: spec.hint || 'Tab next field · ←/→ type · Enter submit · Esc cancel',
+      // Opt-in: a CLICK on a Type option submits the form, the same as Enter. Off by
+      // default so a form where the type is one of several decisions keeps the click
+      // as a plain selection. /provider turns it on: there the type IS the last
+      // decision, and the user asked for the click to finish.
+      typeClickSubmits: !!spec.typeClickSubmits,
       onSubmit: spec.onSubmit || (() => {}),
       onCancel: spec.onCancel || null,
     };
@@ -7939,6 +11631,9 @@ function commandsForWeb() {
     if (p.flashTimer) clearTimeout(p.flashTimer);
     if (p.pollTimer) clearInterval(p.pollTimer);
     state.tasksPanel = null;
+    // Full-screen takeover: its hitbox rows say nothing about the frame that is
+    // about to be restored, so the hover highlight goes with it.
+    state.hoverHit = null;
     renderFrame();
   }
 
@@ -7948,6 +11643,253 @@ function commandsForWeb() {
     p.flash = msg;
     if (p.flashTimer) clearTimeout(p.flashTimer);
     p.flashTimer = setTimeout(() => { p.flash = ''; renderFrame(); }, 2500);
+  }
+
+  // ---- /skills and /plugins manager (kimi's registry panel) ------------------
+  // Both commands open the SAME browser; only `kind` differs, so the two cannot drift
+  // apart the way two copies would.
+
+  /**
+   * Load what the browser shows.
+   *
+   * The LOCAL half is read synchronously from disk and published FIRST, then the remote
+   * half is fetched and merged in. The order matters: the panel opens on a local tab
+   * (Loaded / On disk / Installed), and making those wait on a network round-trip meant
+   * a slow or blocked GitHub left the user staring at "Loading…" for information that
+   * was available instantly. Only `busy` describes the fetch, and the panel now shows
+   * local rows while it is set.
+   */
+  async function loadRegistryData(kind) {
+    const remote = await import('./remote.js');
+    const b = state.registryBrowser;
+    if (!b) return;
+
+    // 1. Local data: no network, no await. Available immediately.
+    if (kind === 'skills') {
+      b.data = {
+        installed: listSkills().map((s) => ({ name: s.name, description: s.description })),
+        remote: b.data?.remote || [],
+        remoteError: '',
+      };
+    } else {
+      const { pluginLoaded } = await import('./plugin.js');
+      b.data = {
+        loaded: pluginLoaded.map((p) => ({ name: p.name, version: p.version, id: p.id })),
+        onDisk: remote.listLocalPlugins(),
+        remote: b.data?.remote || [],
+        remoteError: '',
+      };
+    }
+    b.busy = 'Fetching the repo list…';
+    renderFrame();
+
+    // 2. Remote data, best-effort. A failure is recorded per-half so each tab can say
+    //    something true about itself.
+    try {
+      const listed = kind === 'skills'
+        ? await remote.listRemoteSkillsDetailed()
+        : await remote.listRemotePlugins();
+      b.data.remote = listed.ok ? listed.items : [];
+      b.data.remoteError = listed.ok ? '' : listed.error;
+    } catch (e) {
+      b.data.remote = [];
+      b.data.remoteError = String((e && e.message) || e);
+    }
+    b.busy = null;
+    renderFrame();
+  }
+
+  async function openRegistryBrowser(kind) {
+    state.registryBrowser = {
+      kind,
+      tab: kind === 'skills' ? 'installed' : 'loaded',
+      selectedIndex: 0,
+      data: null,
+      busy: null,
+      flash: '',
+    };
+    // Close the other overlays so only one thing owns the screen.
+    state.picker = null; state.form = null; state.panel = null;
+    state.menuOpen = false; state.menuList = []; state.menuSel = 0;
+    renderFrame();
+    await loadRegistryData(kind);
+  }
+
+  function closeRegistryBrowser() {
+    state.registryBrowser = null;
+    state.hoverHit = null;
+    renderFrame();
+  }
+
+  /** Run the selected row's action, then reload so the list reflects reality. */
+  async function registryAct() {
+    const b = state.registryBrowser;
+    if (!b || !b.data) return;
+    const { rowsForTab } = await import('./registry-browser.js');
+    const remote = await import('./remote.js');
+    const rows = rowsForTab(b, b.tab);
+    const row = rows[Math.min(b.selectedIndex || 0, Math.max(0, rows.length - 1))];
+    if (!row || row.disabled || row.action === 'none') return;
+    const name = row.name;
+    b.busy = row.action.startsWith('install') ? `Installing ${name}…` : `Removing ${name}…`;
+    renderFrame();
+    try {
+      if (row.action === 'install-skill' || row.action === 'reinstall-skill') {
+        const r = await remote.installRemoteSkill(name);
+        b.flash = r.ok ? `Skill ${r.replaced ? 'updated' : 'installed'}: ${r.name}` : `Install failed: ${r.error}`;
+      } else if (row.action === 'remove-skill') {
+        const ok = remote.removeLocalSkill(name);
+        b.flash = ok ? `Skill removed: ${name}` : `Could not remove ${name}`;
+      } else if (row.action === 'install-plugin' || row.action === 'reinstall-plugin') {
+        const r = await remote.installRemotePlugin(name);
+        b.flash = r.ok ? `Plugin ${r.replaced ? 'updated' : 'installed'}: ${r.name} — restart hncode to load it` : `Install failed: ${r.error}`;
+      } else if (row.action === 'remove-plugin') {
+        const ok = remote.removeLocalPlugin(name);
+        b.flash = ok ? `Plugin removed: ${name} — restart hncode to unload it` : `Could not remove ${name}`;
+      }
+    } catch (e) {
+      b.flash = `Failed: ${String((e && e.message) || e)}`;
+    }
+    b.busy = null;
+    await loadRegistryData(b.kind);
+  }
+
+  // Key handling for the /files tree. A full-screen takeover: it owns every key while open.
+  //
+  // Arrows navigate and →/← open and close, which is the shape everyone already knows from
+  // a file manager. Enter INSERTS the path into the composer rather than opening the file:
+  // the point of browsing here is to bring a path into the conversation, and opening an
+  // external editor would take the user out of hncode mid-turn.
+  function handleFileTreeKey(t) {
+    const ctx = state.fileTree;
+    if (!ctx) return false;
+    const rows = ctx._rows || visibleRows(ctx.root, ctx.expanded);
+    const count = rows.length;
+
+    if (t.key === 'escape' || t.key === 'c-c') {
+      state.fileTree = null;
+      state.hoverHit = null;
+      renderFrame();
+      return true;
+    }
+    if (t.key === 'up' || t.key === 'c-p') { ctx.sel = moveSel(ctx.sel, -1, count); renderFrame(); return true; }
+    if (t.key === 'down' || t.key === 'c-n') { ctx.sel = moveSel(ctx.sel, 1, count); renderFrame(); return true; }
+    if (t.key === 'home') { ctx.sel = 0; renderFrame(); return true; }
+    if (t.key === 'end') { ctx.sel = Math.max(0, count - 1); renderFrame(); return true; }
+    if (t.key === 'pgup') { ctx.sel = moveSel(ctx.sel, -10, count); renderFrame(); return true; }
+    if (t.key === 'pgdn') { ctx.sel = moveSel(ctx.sel, 10, count); renderFrame(); return true; }
+
+    const cur = rows[ctx.sel];
+    if (t.key === 'right' || t.key === 'l') {
+      // Open the selected directory. A FILE is left alone: there is nothing under it, and
+      // silently doing nothing is better than a message the user did not ask for.
+      if (cur && cur.node.dir && !ctx.expanded.has(cur.node.rel)) {
+        ctx.expanded.add(cur.node.rel);
+        renderFrame();
+      }
+      return true;
+    }
+    if (t.key === 'left' || t.key === 'h') {
+      if (cur && cur.node.dir && ctx.expanded.has(cur.node.rel)) {
+        ctx.expanded.delete(cur.node.rel);
+        renderFrame();
+        return true;
+      }
+      // On a closed directory (or a file), go UP to the parent: the usual tree behaviour,
+      // and the only way to reach a sibling of a deep node without many keypresses.
+      if (cur && cur.node.rel.includes('/')) {
+        const parentRel = cur.node.rel.slice(0, cur.node.rel.lastIndexOf('/'));
+        const at = rows.findIndex((r) => r.node.rel === parentRel);
+        if (at >= 0) { ctx.sel = at; renderFrame(); return true; }
+      }
+      return true;
+    }
+    if (t.key === 'c-o') {
+      // Expand/collapse the whole tree, so a big repo can be surveyed at once.
+      const dirs = allDirs(ctx.root);
+      const allOpen = dirs.length > 0 && dirs.every((d) => ctx.expanded.has(d));
+      ctx.expanded = allOpen ? new Set() : new Set(dirs);
+      renderFrame();
+      return true;
+    }
+    if (t.key === 'enter') {
+      if (!cur) return true;
+      const rel = cur.node.rel;
+      // The INSERTED form is relative with forward slashes: that is what the tools accept
+      // on every platform, and an absolute Windows path in a prompt is noise. Same append
+      // the /search picker does, so both "bring a file into the composer" paths agree.
+      state.input = (state.input || '') + rel;
+      state.caret = state.input.length;
+      state.fileTree = null;
+      refreshMenu(state);
+      renderFrame();
+      notice(`Inserted ${rel}`, 'info');
+      return true;
+    }
+    if (t.key === 'tab') return true;   // swallow: a tree has no tabs to switch
+    // Anything else that is a printable character is ignored rather than typed into a
+    // hidden composer — the overlay owns the screen, so a stray keystroke must not
+    // silently edit text the user cannot see.
+    if (t && t.ch) return true;
+    return false;
+  }
+
+  function handleRegistryRowKey(t) {
+    if (!b) return false;
+
+    // MOUSE first: the browser is a full-screen takeover, so it gets the same
+    // click/hover treatment as the tasks browser. It registers its own hitboxes
+    // (`_regHits`, frame rows) and the conversion from the 1-based screen row
+    // happens here, once.
+    if (t.key === 'mousedown' || t.key === 'mousehover') {
+      // Record the pointer BEFORE anything else, exactly like handleMouse does.
+      // `resolveHoverHit` (used by takeoverFrame to tint) works off `_lastMouse`,
+      // so without this the highlight was resolved from a stale/no position and
+      // never appeared — clickable rows with no hover.
+      state._lastMouse = t;
+      const hits = b._regHits || [];
+      const row = (t.row || 1) - 1;
+      const col = (t.col || 1) - 1;
+      let hit = null;
+      for (let i = hits.length - 1; i >= 0; i--) {
+        const hb = hits[i];
+        if (hb.row === row && col >= hb.col0 && col <= hb.col1) { hit = hb; break; }
+      }
+      if (t.key === 'mousehover') {
+        // The tint itself is applied by takeoverFrame from `_lastMouse`; here we
+        // only keep the row marker in sync and repaint.
+        b.hoverIndex = hit && hit.kind === 'regRow' ? hit.index : null;
+        renderFrame();
+        return true;
+      }
+      if (!hit) return true;                       // click on empty space: consume it
+      if (hit.kind === 'regTab') {
+        b.tab = hit.tab;
+        b.selectedIndex = 0;
+        renderFrame();
+        return true;
+      }
+      if (hit.kind === 'regRow') {
+        // First click selects; clicking the ALREADY-selected row performs its
+        // action (the same thing Enter does), so install/remove is reachable by
+        // mouse without a separate button.
+        if (b.selectedIndex === hit.index) {
+          const action = handleRegistryBrowserKey(b, { key: 'enter' });
+          if (action === 'install' || action === 'remove') { void registryAct(); return true; }
+        }
+        b.selectedIndex = hit.index;   // the index came from the rendered row list
+        renderFrame();
+        return true;
+      }
+      return true;
+    }
+
+    const action = handleRegistryBrowserKey(b, t);
+    if (action === 'close') { closeRegistryBrowser(); return true; }
+    if (action === 'install' || action === 'remove') { void registryAct(); return true; }
+    if (action === 'reload') { void loadRegistryData(b.kind); return true; }
+    renderFrame();
+    return true;
   }
 
   function openTaskOutputViewer(taskId) {
@@ -7960,7 +11902,22 @@ function commandsForWeb() {
 
   function closeTaskOutputViewer() {
     state.tasksViewer = null;
+    state.hoverHit = null;
     renderFrame();
+  }
+
+  // Map a mouse token onto the tasks browser's own hitboxes. The browser works in
+  // FRAME cells (row 0 = header), the mouse reports 1-based screen cells, so the
+  // conversion happens here once instead of in every branch below.
+  function taskPanelHit(p, t) {
+    const hits = p._taskHits || [];
+    const row = (t.row || 1) - 1;
+    const col = (t.col || 1) - 1;
+    for (let i = hits.length - 1; i >= 0; i--) {
+      const hb = hits[i];
+      if (hb.row === row && col >= hb.col0 && col <= hb.col1) return hb;
+    }
+    return null;
   }
 
   // Returns true when the key was consumed by the panel / viewer.
@@ -7968,6 +11925,42 @@ function commandsForWeb() {
     const p = state.tasksPanel;
     if (!p) return false;
     const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
+    // MOUSE first: the browser is a full-screen takeover, so a click on a row selects
+    // it (and a second click opens its output), a click on a footer word runs that
+    // word's action, and moving over either highlights it.
+    if (t.key === 'mousehover' || t.key === 'mousedown') {
+      const hit = taskPanelHit(p, t);
+      if (t.key === 'mousehover') {
+        const next = hit ? { row: hit.row, col0: hit.col0, col1: hit.col1 } : null;
+        const prev = state.hoverHit;
+        const changed = (!!next !== !!prev)
+          || (next && prev && (next.row !== prev.row || next.col0 !== prev.col0 || next.col1 !== prev.col1));
+        if (changed) { state.hoverHit = next; renderFrame(); }
+        // Keep the list row under the pointer highlighted too, so the tint and the
+        // per-row marker agree.
+        p.hoverIndex = hit && hit.kind === 'taskRow' ? hit.index : null;
+        return true;
+      }
+      if (!hit) return true;                       // a click on empty space: consume it
+      if (hit.kind === 'taskRow') {
+        p.selectedIndex = hit.index;
+        renderFrame();
+        return true;
+      }
+      if (hit.kind === 'taskFooter') {
+        // Re-dispatch the click as the KEY that word advertises, so a click and a
+        // keypress go through exactly the same path.
+        const asKey = { select: null, output: 'enter', stop: 's', refresh: 'r', filter: 'tab', close: 'escape' }[hit.action];
+        if (hit.action === 'confirmStop') return handleTasksPanelKey({ ch: 'y' });
+        if (hit.action === 'cancelStop') return handleTasksPanelKey({ key: 'escape' });
+        if (hit.action === null || asKey == null) return true;
+        if (asKey === 'enter') return handleTasksPanelKey({ key: 'enter' });
+        if (asKey === 'tab') return handleTasksPanelKey({ key: 'tab' });
+        if (asKey === 'escape') return handleTasksPanelKey({ key: 'escape' });
+        return handleTasksPanelKey({ ch: asKey });
+      }
+      return true;
+    }
     // Snapshot the STOP target BEFORE the key handler clears pendingStop on 'y'.
     const stopTarget = p.pendingStop;
     const action = handleTasksBrowserKey(p, t);
@@ -8052,13 +12045,54 @@ function commandsForWeb() {
   stdin.resume();
   stdin.setEncoding('utf8');
 
+  // ASK THE TERMINAL before writing anything it might not understand. Three things
+  // below depend on the answer — the synchronized-output wrapper, the Kitty keyboard
+  // protocol, and which theme is readable — and until now all three were guesses (see
+  // src/term-caps.js). This must run BEFORE the first paint so a light-background
+  // terminal never flashes a frame in the dark theme, and it owns stdin while it runs
+  // because a query REPLY arrives on the same stream as keystrokes.
+  const probe = await probeTerminal({ stdin, stdout });
+  const caps = terminalCaps();
+  if (caps.bg) state.termBg = caps.bg;
+  // An EXPLICIT theme (config `theme =`, or /theme) wins over the probe: the probe is
+  // guessing from a background colour, and a user who named a theme has told us. Only
+  // when nothing is configured does a light terminal force the light theme — the frame
+  // pads its rows with plain spaces and paints no background, so the terminal's shows
+  // through, and the dark theme's normal text is WHITE, i.e. white on white.
+  const configuredTheme = cfg.raw && cfg.raw.theme;
+  if (configuredTheme && hasTheme(configuredTheme)) {
+    state.theme = configuredTheme;
+    setTheme(configuredTheme);
+  } else if (isLightBg(caps.bg)) {
+    state.theme = 'light';
+    setTheme('light');
+  } else {
+    state.theme = state.theme || 'dark';
+  }
+
+  stdout.write(alternateScreen(true));
   stdout.write(alternateScreen(true));
   stdout.write(clearScreen());
-  stdout.write('\x1b[>1u');
-  stdout.write('\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h');
+  // Kitty keyboard protocol. Great when supported (finer key reporting), but a
+  // terminal that does not implement `>1u` reacts badly to it (dropped/mangled
+  // input) — so it is enabled only when the probe heard the terminal speak it.
+  // `caps.kitty === null` (nothing answered) keeps the old default of ON, so a
+  // terminal that simply says nothing is treated exactly as before.
+  if (process.env.HNCODE_NO_KITTY_KEYS !== '1' && kittyKeysUsable()) stdout.write('\x1b[>1u');
+  // Mouse modes, split so that an UNSUPPORTED one cannot take the others down:
+  // a terminal that rejects `?1003h` (any-motion — the least widely supported)
+  // would, in a single write, often drop click/drag too. Bracket-paste + SGR +
+  // click/drag/sgr go first (universally supported); any-motion (hover) last,
+  // and skippable via HNCODE_NO_MOUSE_HOVER=1 when a terminal chokes on it.
+  stdout.write('\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+  if (process.env.HNCODE_NO_MOUSE_HOVER !== '1') stdout.write('\x1b[?1003h');
   // Start the PowerShell clipboard helper now: its cold start is seconds long,
   // and doing it lazily on the first Ctrl+Shift+V made the shortcut look dead.
-  warmClipboard();
+  // Deferred by one turn of the event loop, though: `spawn` costs ~950ms here (the
+  // OS creating the process; measured, not our code), and running it inline held the
+  // FIRST paint back by that much. One turn is early enough — the shell needs ~2s to
+  // warm anyway, and the handler that could paste is not live until after this tick.
+  setTimeout(warmClipboard, 0);
   setTip(state);
   // Fill the git badge — asynchronously, AFTER the first paint. It used to run
   // before renderFrame() with a blocking spawnSync git, which added ~330ms to
@@ -8112,6 +12146,34 @@ function commandsForWeb() {
     const after = state._gitInfo && `${state._gitInfo.branch}|${state._gitInfo.insertions}|${state._gitInfo.deletions}`;
     if (before !== after) renderFrame();
   }, GIT_REFRESH_MS);
+  // SCHEDULES (/schedule): checked every 30s, because a cron expression has minute
+  // resolution and a slower tick could miss the minute entirely. Skipped while a turn
+  // is running, so a due schedule queues its work rather than interrupting — safe
+  // because the run record makes it fire once per due minute, not once per tick.
+  //
+  // The record lives in a side file (`schedule-state.json`) rather than in
+  // config.toml: rewriting the user's whole configuration once a minute is both
+  // risky and wrong in kind — a run record is state, not configuration.
+  let lastScheduleCheck = '';
+  const scheduleTimer = setInterval(() => {
+    if (state.running) return;
+    const configFile = hncodeConfigFile();
+    let history;
+    try { history = readScheduleHistory(configFile); } catch { return; }
+    let due;
+    try { due = dueWithHistory(cfg.schedule, history); } catch { return; }
+    if (!due.length) return;
+    lastScheduleCheck = due[0].minuteKey;
+    history = { ...history };
+    for (const d of due) history[d.id] = d.minuteKey;
+    writeScheduleHistory(configFile, history);
+    for (const d of due) {
+      notice(`Schedule "${d.id}" is due — queuing its prompt.`, 'info');
+      try { sendPrompt(d.prompt, { fromSchedule: d.id }); }
+      catch (e) { appErr(`Schedule "${d.id}" could not queue its prompt: ${e.message}`); }
+    }
+  }, 30 * 1000);
+  void lastScheduleCheck;
   const spinTimer = setInterval(() => {
     if (!state.running) return;
     // Monotonic tick counter — do NOT wrap it at SPINNER.length, or the
@@ -8121,6 +12183,22 @@ function commandsForWeb() {
     state.spin = (state.spin || 0) + 1;
     renderFrame();
   }, 80);
+
+  // Paced reveal tick. The 80ms spinner tick above is too coarse for this: at 12.5
+  // frames a second a burst drips out in visible steps of ~48 characters, which is
+  // exactly the stair-step the buffer exists to remove. ~16ms gives the same visual
+  // rate the controller caps at, and the tick is a no-op when nothing is buffered, so
+  // an idle session pays nothing for it.
+  //
+  // It runs whenever the buffer holds text, NOT only while `state.running`: the tail of
+  // a reply can still be draining as the turn ends, and that text must reach the screen
+  // rather than waiting for the next turn to start.
+  const STREAM_TICK_MS = 16;
+  const streamTimer = setInterval(() => {
+    if (streamBuf.isEmpty) return;
+    if (drainStream()) renderSoon();
+  }, STREAM_TICK_MS);
+  if (streamTimer.unref) streamTimer.unref();
 
   const TOK_WINDOW_MS = 1000;
   const tokTimer = setInterval(() => {
@@ -8157,7 +12235,9 @@ function commandsForWeb() {
   }
 
 
-  let keyBuf = '';
+  // Keys typed while the capability probe owned stdin were handed back rather than
+  // dropped, so the composer starts with them instead of losing them.
+  let keyBuf = probe.rest || '';
   let escTimer = null;
   let escRetries = 0;
   let confirmTimer = null;
@@ -8180,7 +12260,18 @@ function commandsForWeb() {
     }
   };
 
+  // A terminal that did not answer the capability probe in time may still answer
+  // AFTERWARDS, and those bytes arrive on this same stream — the key parser would type
+  // them into the composer as garbage. Only possible when the probe never saw its DA1
+  // sentinel (so something was still outstanding), and only for a short window: the
+  // replies are a single burst, ~1ms after the queries.
+  const replyFilterUntil = probe.complete ? 0 : Date.now() + 2000;
+
   stdin.on('data', (chunk) => {
+    if (Date.now() < replyFilterUntil) {
+      chunk = stripProbeReplies(chunk);
+      if (!chunk) return;
+    }
     keyBuf += chunk;
     escRetries = 0;
     if (escTimer) clearTimeout(escTimer);
@@ -8192,6 +12283,20 @@ function commandsForWeb() {
     }
   });
 
+  // Keys the probe handed back are dispatched HERE. The handler above only runs on a
+  // NEW data event, so bytes seeded into `keyBuf` would otherwise sit there unparsed
+  // until the user pressed another key. Deferred by a turn of the event loop: this
+  // point is still in the middle of `startTUI`'s synchronous setup, and `handleKey`
+  // touches state that is not finished being built yet.
+  if (keyBuf) {
+    setImmediate(() => {
+      if (!keyBuf) return;
+      const { tokens, rest } = tokenize(keyBuf);
+      keyBuf = rest;
+      for (const t of tokens) handleKey(t);
+    });
+  }
+
   function mouseToCell(t) {
     const { cols } = dims();
     const col = Math.max(0, Math.min(cols - 1, (t.col || 1) - 1));
@@ -8202,7 +12307,17 @@ function commandsForWeb() {
     // absolute. Treating one as the other offset every hit by the rows sitting
     // above the transcript — a short session has `topPad` of them — so a drag
     // selected the wrong lines and copied text from elsewhere, or nothing.
-    const screenTop = state._bodyScreenTop != null ? state._bodyScreenTop : 0;
+    // `_bodyScreenTop === null` means the TRANSCRIPT BODY IS NOT ON SCREEN this
+    // frame — an overlay (panel / form / picker / editor) replaced it, and
+    // composeFrame clears the field so that only the body branch sets it. `_bodyTop`
+    // is then a leftover from the previous frame, so mapping through it turns a drag
+    // over the panel into a selection of transcript rows the user cannot see: the
+    // highlight is applied to the (undrawn) chat, so NOTHING looks selected, and
+    // Ctrl+Shift+C copies those hidden lines. Report "no transcript cell" instead.
+    if (state._bodyScreenTop == null) {
+      return { col, screenRow, rowInBody: -1, lineIdx: -1, row: -1 };
+    }
+    const screenTop = state._bodyScreenTop;
     const rowInBody = screenRow - screenTop;
     const lineIdx = (state._bodyTop != null ? state._bodyTop : 0) + rowInBody;
     // A row outside the body (the padding above it, or the chrome below) maps to
@@ -8225,10 +12340,30 @@ function commandsForWeb() {
   function scrollFromThumb(rowF) {
     const sb = state._sb;
     if (!sb) return;
+    // `sb` is the scrollbar geometry of the frame currently on screen, so it is only
+    // correct because `handleMouse` settles any pending paint before dispatching
+    // (see flushFrame). Read it here, change the scroll, and paint immediately — the
+    // next drag move then works from the frame this one produced.
     state.scroll = scrollFromThumbPos(sb, rowF, state.sbDragOffset || 0);
     dropScrollPin(state);   // deliberate move: reseed the anchor on the next paint
     renderFrame();
-    renderFrame();
+  }
+  // Advance the AskUserQuestion dialog after a question is answered: next question,
+  // or the trailing "Other" tab when it was the last one. Module-level so BOTH the
+  // keyboard path (handleKey) and the click path (dispatchHit's questionItem case)
+  // advance identically — duplicated logic here would drift.
+  function advanceQuestion(qs) {
+    const total = qs.items.length;
+    if (qs.index < total - 1) {
+      qs.index++;
+      qs.sel = 0;
+      qs.picked = new Set();
+      return;
+    }
+    qs.index = total;   // the Other tab
+    qs.editing = 'supplement';
+    qs.editingText = qs.supplement || '';
+    qs.editingCaret = qs.editingText.length;
   }
   function hitAt(t) {
     const hbs = state._hitboxes || [];
@@ -8240,8 +12375,56 @@ function commandsForWeb() {
     }
     return null;
   }
+
+  // Close whatever OVERLAY is up, honouring its cancel callback. Shared by the
+  // click-outside path and Ctrl+C so the two cannot drift apart (Esc has its own
+  // per-overlay handling that also restores a draft in some cases).
+  // `hoverHit` is dropped too: it is a SCREEN row, and the overlay's rows are about
+  // to be replaced by the transcript. Keeping it left whatever now occupies that row
+  // tinted — the highlight visibly stuck to unrelated text until the pointer moved.
+  function dismissOverlay() {
+    state.hoverHit = null;
+    if (state.picker) {
+      const cb = state.picker.onCancel;
+      state.picker = null;
+      state.pickerQuery = '';
+      state.pickerCategory = null;
+      if (cb) cb();
+      return true;
+    }
+    if (state.form) { state.form = null; return true; }
+    if (state.panel) { state.panel = null; return true; }
+    if (state.editor) { state.editor = null; return true; }
+    return false;
+  }
+  // Run a command from a STATUS-LINE CLICK. The command opens a picker, and
+  // openPicker clears the composer (correct when the user TYPED the command; wrong
+  // when they clicked a status widget and never touched their draft). Snapshot the
+  // composer, dispatch, and restore it once the picker has opened.
+  function dispatchFromStatusBar(cmd) {
+    const savedInput = state.input || '';
+    const savedCaret = state.caret || 0;
+    Promise.resolve(dispatch(cmd, '', state, cfg, session, host, submit, stdout))
+      .catch(() => {})
+      .then(() => {
+        // Only restore when the picker is the thing now open and it did not itself
+        // seed the composer (a command may legitimately write to state.input).
+        if (state.picker && !(state.input || '')) {
+          state.input = savedInput;
+          state.caret = Math.min(savedCaret, savedInput.length);
+        }
+        renderFrame();
+      });
+    renderFrame();
+  }
   function dispatchHit(hb) {
     if (!hb) return false;
+    // A hitbox is a row RANGE, so its geometry is only meaningful once the frame that
+    // produced it is on screen — `handleMouse` settles any pending paint before it gets
+    // here, which is what makes that true. Left explicit rather than implicit, because
+    // a future call site that dispatches a hit directly would otherwise act on a row
+    // the user never saw.
+    if (hb.row !== undefined) flushFrame();
     switch (hb.kind) {
       case 'mentionItem': {
         // Mirror menuItem: clicking an @candidate selects AND accepts it. The
@@ -8272,6 +12455,22 @@ function commandsForWeb() {
         }
         return true;
       }
+      case 'statusMode': {
+        // Click the permission-mode group in the status line -> /permission (the
+        // mode SELECTOR). It was dispatching /permissions (plural, the allow/ask/
+        // deny RULES panel) — the wrong command, which opened the rules list and
+        // (before that was fixed) crashed on an undefined openPanel.
+        // The command opens a picker, and openPicker CLEARS the composer (right for
+        // a typed command, wrong for a status-bar CLICK — the user never touched the
+        // draft). Snapshot and restore it around the dispatch.
+        dispatchFromStatusBar('permission');
+        return true;
+      }
+      case 'statusModel': {
+        // Click the model name in the status line -> /model (see statusMode).
+        dispatchFromStatusBar('model');
+        return true;
+      }
       case 'composerRow': {
         const { cols } = dims();
         const insideW = Math.max(0, cols - 2);
@@ -8291,9 +12490,15 @@ function commandsForWeb() {
         if (!state.editor) return false;
         const ed = state.editor;
         const ls = ed.text.split('\n');
-        // Set caret to clicked position
-        ed.caretRow = hb.row;
-        ed.caretCol = Math.min((ls[ed.caretRow] || '').length, 1000); // Cap at reasonable length
+        // `line` is the text-line index (see the addHit above); `row` would have
+        // been mangled by the frame's topPad/topTrim correction.
+        ed.caretRow = Math.max(0, Math.min(ls.length - 1, hb.line));
+        // Put the caret at the clicked COLUMN, converting the terminal's VISUAL
+        // column into a string index (they differ on wide glyphs — CJK text made the
+        // caret land to the RIGHT of the click).
+        const t = state._lastMouse;
+        const col = t ? Math.max(0, (t.col || 1) - 1) : 0;
+        ed.caretCol = charIndexForVisualCol(ls[ed.caretRow] || '', col);
         renderFrame();
         return true;
       }
@@ -8308,15 +12513,42 @@ function commandsForWeb() {
         if (it) {
           const before = state.picker;
           const done = state.picker.onPick ? state.picker.onPick(it) : true;
+          // A picker whose footer holds the second half of the decision (/model) stays
+          // open on a CLICK so the mouse can also reach it. With no footer row to click
+          // there is nothing left to do, so the pick closes as usual. A pick that opened
+          // ANOTHER picker (the "Add model…" row) has already replaced `state.picker`,
+          // and that new one is not the one asking to stay open.
+          if (state.picker === before && state.picker.clickKeepsOpen && state.picker.footer) { renderFrame(); return true; }
           if (done && state.picker === before) { state.picker = null; state.pickerQuery = ''; state.pickerCategory = null; }
           renderFrame();
         }
+        return true;
+      }
+      case 'pickerCategory': {
+        // Click a category tab ("All" / a provider). Mirrors Tab: switch the active
+        // category, reset selection and search so the list is not filtered by an
+        // invisible stale query. Previously the tab row had no hitbox at all, so a
+        // click did nothing and there was no hover.
+        if (!state.picker) return false;
+        state.pickerCategory = hb.label;
+        state.picker.sel = 0;
+        state.pickerQuery = '';
+        renderFrame();
         return true;
       }
       case 'pickerFooterOpt': {
         if (!state.picker || !state.picker.footer) return false;
         state.picker.footer.focused = true;
         state.picker.footer.value = hb.option;
+        // Only a picker that declares onFooterPick treats a click on an option as the
+        // decision (and closes on it). Others, /presets among them, use the row as a
+        // Tab/←→ selector whose value Enter applies, so a click must not close them.
+        if (state.picker.onFooterPick) {
+          const before = state.picker;
+          if (state.picker.onFooterPick(hb.option) && state.picker === before) {
+            state.picker = null; state.pickerQuery = ''; state.pickerCategory = null;
+          }
+        }
         renderFrame();
         return true;
       }
@@ -8328,8 +12560,71 @@ function commandsForWeb() {
       }
       case 'formType': {
         if (!state.form) return false;
-        state.form.fieldIdx = (state.form.fields || []).length;
-        state.form.type = hb.option;
+        const f = state.form;
+        f.fieldIdx = (f.fields || []).length;
+        f.type = hb.option;
+        // A click on the Type is the LAST decision in this form, so it submits — the
+        // same thing Enter does on the Type row. Without this the click only selected
+        // the option and the user still had to reach for the keyboard, which is what
+        // "点对应的 type 就算完成" was about.
+        if (f.typeClickSubmits) {
+          const values = {};
+          for (const fl of f.fields || []) values[fl.key] = String(fl.value || '').trim();
+          state.form = null;
+          f.onSubmit(values, f.type);
+          renderFrame();
+          return true;
+        }
+        renderFrame();
+        return true;
+      }
+      case 'pickerBody': {
+        // A click inside the picker popup (title, hint, border, margins of an
+        // item row): consume it so the mousedown does not reach the "click
+        // outside an overlay closes it" path. Only a click OUTSIDE the box
+        // dismisses the picker. Registered BEFORE the precise item/tab/footer
+        // hits: hitAt iterates backward (last registered wins), so those still
+        // win where they overlap.
+        return true;
+      }
+      case 'panelBody': {
+        // A click inside the info panel (h.openPanel): consume it so the mousedown
+        // does not reach the "click outside an overlay closes it" path. The panel
+        // itself has no per-row action, so absorbing is the whole behaviour.
+        return true;
+      }
+      case 'questionItem': {
+        // Click an option in the AskUserQuestion dialog. `hb.index` is the position
+        // in [options..., Other] for the CURRENT question tab. Without this case the
+        // click fell through to `default: return false` and did nothing — the only
+        // way to answer was the keyboard, even though the rows were click targets.
+        if (!state.question) return false;
+        const qs = state.question;
+        const total = qs.items.length;
+        if (qs.index >= total) return true;            // on the "Other" tab: nothing to pick
+        if (qs.editing) return true;                    // a text field owns the keys
+        const cur = qs.items[qs.index] || { options: [] };
+        const options = cur.options || [];
+        const isOther = hb.index >= options.length;     // the trailing "Other" row
+        qs.sel = hb.index;
+        if (isOther) {
+          // Mirror Enter/Space on the Other row: open its free-text editor.
+          qs.editing = 'other';
+          qs.editingText = qs.otherText || '';
+          qs.editingCaret = qs.editingText.length;
+          renderFrame();
+          return true;
+        }
+        if (cur.multiSelect) {
+          // Toggle, exactly like Space — do NOT advance; multi-select needs an
+          // explicit Enter to confirm.
+          if (qs.picked.has(hb.index)) qs.picked.delete(hb.index); else qs.picked.add(hb.index);
+          renderFrame();
+          return true;
+        }
+        // Single-select: choose and advance to the next question, like Enter.
+        qs.answers[cur.question] = options[hb.index] && options[hb.index].label;
+        advanceQuestion(qs);
         renderFrame();
         return true;
       }
@@ -8339,12 +12634,55 @@ function commandsForWeb() {
   }
   function handleMouse(t) {
     state._lastMouse = t;
+    // Every branch below maps the pointer through geometry `composeFrame` produced —
+    // `hitAt` reads the hitbox list, `mouseToCell` reads `_bodyScreenTop`. A click can
+    // land in the window between a state change and its `renderSoon()`, and the frame
+    // that paint produces may be superseded by a resize or a re-entrant render, so the
+    // row acted upon would be one the user never sees painted. Settling the pending
+    // paint first makes the geometry the CURRENT frame's, which is what the user is
+    // looking at. Costs one extra frame, and only when something is actually pending.
+    flushFrame();
     if (t.key === 'mousedown') {
       const hb = hitAt(t);
       if (hb && dispatchHit(hb)) return;
     }
     if (state.picker || state.form || state.panel || state.editor) {
       if (t.key === 'wheelup' || t.key === 'wheeldown') handleKey(t);
+      // Hover must still update, or a picker row never lights up: the early
+      // return below left `state.hoverHit` stale while an overlay was open, so the
+      // hover tint (applied in composeFrame) never reached the menu rows.
+      if (t.key === 'mousehover') {
+        const hb = hitAt(t);
+        // Same exclusion as the normal path: the composer rows are click targets
+        // (mousedown places the caret) but are never tinted — the prompt you are
+        // typing must not light up.
+        const next = (hb && hb.kind !== 'composerRow') ? { row: hb.row, col0: hb.col0, col1: hb.col1 } : null;
+        const prev = state.hoverHit;
+        const changed = (!!next !== !!prev)
+          || (next && prev && (next.row !== prev.row || next.col0 !== prev.col0 || next.col1 !== prev.col1));
+        if (changed) { state.hoverHit = next; renderFrame(); }
+        return;
+      }
+      // Clicking OUTSIDE the overlay dismisses it, the way every menu behaves.
+      // Without this the press was swallowed here (no hitbox matched, so
+      // dispatchHit returned false) and the overlay stayed open — Esc was the only
+      // way out, which is not what a right-click context menu implies.
+      //
+      // A RIGHT-CLICK outside the card is the one case that MOVES the overlay rather
+      // than dismissing it: re-opening a context menu at the pointer is what a second
+      // right-click is asking for, and this branch used to swallow it (`return` at the
+      // bottom), so the menu appeared frozen — it neither moved nor closed. Only a
+      // picker that came FROM a right-click has an anchor; anything else (a /model list,
+      // a form) treats the press as a dismissal below.
+      if (t.key === 'rightclick' && state.picker && state.picker.anchor) {
+        openContextMenu(t);
+        return;
+      }
+      if (t.key === 'mousedown' && !hitAt(t)) {
+        dismissOverlay();
+        renderFrame();
+        return;
+      }
       return;
     }
     if (t.key === 'mousedown') {
@@ -8511,18 +12849,34 @@ function commandsForWeb() {
       }
       renderFrame();
       return;
-      renderFrame();
-      return;
     }
     if (t.key === 'rightclick') {
       openContextMenu(t);
       return;
     }
   }
-  function selectionText() {
+  // `allowHidden` is for an EXPLICIT action the user just asked for — the
+  // right-click menu's Copy. That menu is a picker overlay, so the transcript is
+  // not drawn while it is up and `_bodyScreenTop` is null; the guard below then
+  // returned '' and Copy always answered "Nothing to copy", even with text plainly
+  // selected. The guard exists to stop a drag/keystroke from silently copying rows
+  // the user cannot see, which is not what picking "Copy" means.
+  function selectionText(allowHidden = false) {
     const sel = state.selection;
     if (!sel || !sel.anchor || !sel.head) return '';
+    // A selection only means something while the TRANSCRIPT is the thing on screen.
+    // With an overlay open the body is not drawn, so the highlighted rows are not
+    // the rows the user is looking at — copying would hand back text that was never
+    // visible. `_bodyScreenTop` is null exactly then (composeFrame clears it every
+    // frame and only the body branch sets it).
+    if (!allowHidden && state._bodyScreenTop == null) return '';
     const { cols } = dims();
+    // The FULL transcript, and that is correct here: `selection.row` is an ABSOLUTE
+    // transcript row, not a screen row. mouseToCell() already converted it
+    // (`_bodyTop + rowInBody`), and composeFrame's highlight indexes the windowed
+    // array with the same absolute number — the windowed array keeps the transcript's
+    // absolute length and fills off-screen slots with '', so index N is the same row
+    // in both. Verified by printing drawn-vs-full side by side at several scrolls.
     const rawChat = renderChatLines(state, cols);
     const a = sel.anchor, h = sel.head;
     const start = (h.row < a.row || (h.row === a.row && h.col < a.col)) ? h : a;
@@ -8585,7 +12939,10 @@ function commandsForWeb() {
   // single [paste #N +L lines] marker. Shared by a bracketed paste (what
   // Ctrl+Shift+V sends in most terminals), the Ctrl+Shift+V shortcut and the
   // right-click menu's Paste, so all three behave identically.
-  function insertComposerPaste(raw) {
+  // `kind` = 'image' collapses the insert into a `[paste #N image]` chip instead
+  // of dumping the payload (a temp file path) into the prompt. The payload is kept
+  // in state.pastes and expanded back on submit, exactly like a multi-line paste.
+  function insertComposerPaste(raw, kind = 'paste') {
     const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n');
     if (!text) return false;
 // A paste starting with `!` into an EMPTY prompt means "run this in the
@@ -8594,16 +12951,18 @@ function commandsForWeb() {
     // CSS `!important`). Requiring a command-like token after the bang keeps a
     // copied `![alt](url)` from silently switching into shell mode.
     let body = text;
-    if (state.inputMode !== 'bash' && (state.input || '').length === 0 && /^!+[A-Za-z0-9_\/.~-]/.test(body)) {
+    if (kind === 'paste' && state.inputMode !== 'bash' && (state.input || '').length === 0 && /^!+[A-Za-z0-9_\/.~-]/.test(body)) {
       state.inputMode = 'bash';
       body = body.replace(/^!+/, '');
     }
     const lineCount = body.split('\n').length;
     let insert = body;
-    if (lineCount > 1) {
+    // An image always collapses (its payload is a path, not something the user
+    // typed); text collapses only when it spans more than one line.
+    if (kind === 'image' || lineCount > 1) {
       const id = ++state.pasteCounter;
-      state.pastes.set(id, { text: body, lines: lineCount });
-      insert = pasteMarker(id, lineCount);
+      state.pastes.set(id, { text: body, lines: lineCount, kind });
+      insert = pasteMarker(id, lineCount, kind);
     }
     state.input = (state.input || '').slice(0, state.caret) + insert + (state.input || '').slice(state.caret);
     state.caret += insert.length;
@@ -8611,6 +12970,9 @@ function commandsForWeb() {
     if (state.inputMode !== 'bash') refreshMenu(state);
     return true;
   }
+
+  // Async so the notice can be painted BEFORE the clipboard read: a cold
+  // PowerShell took ~3s, which read as "the shortcut does nothing".
   // Async so the notice can be painted BEFORE the clipboard read: a cold
   // PowerShell took ~3s, which read as "the shortcut does nothing".
   async function pasteFromClipboard(fastPathOnly = false) {
@@ -8620,8 +12982,12 @@ function commandsForWeb() {
     // on the PRE-WARMED helper (~10ms) instead of a cold spawn (~2.9s).
     const { text, via } = await readClipboardContentAsync();
     if (text) {
-      insertComposerPaste(text);
-      notice(via === 'text' ? 'Pasted' : `Pasted ${via} as path`, 'info');
+      // An image collapses to a `[paste #N image]` chip, the same way a multi-line
+      // paste becomes `[paste #N +L lines]`, so the prompt does not fill up with a
+      // temp file path. On submit the chip expands back to that path, which is what
+      // the agent's ReadMediaFile needs.
+      insertComposerPaste(text, via === 'image' ? 'image' : 'paste');
+      notice(via === 'image' ? 'Pasted image' : (via === 'text' ? 'Pasted' : `Pasted ${via} as path`), 'info');
       renderFrame();
       return;
     }
@@ -8703,10 +13069,23 @@ function commandsForWeb() {
       title: 'Actions',
       items,
       searchable: false,
+      // A context menu belongs AT THE POINTER. It opened centred before, which threw
+      // away the one cue that said which row was right-clicked — the menu landed
+      // halfway across the screen from the selection it acts on. `t.row`/`t.col` are
+      // the absolute frame coordinates of the click; the renderer nudges the box back
+      // inside the frame when the click is near an edge.
+      anchor: { row: t.row, col: t.col },
       keepInput: true, // the composer's text and caret must survive this menu
       hint: '↑↓ navigate · Enter run · Esc cancel',
       onPick: (it) => {
-        if (it.action === 'copy') copyToClipboard(selectionText());
+        if (it.action === 'copy') {
+          // allowHidden: the menu itself is an overlay, so the transcript is not
+          // drawn right now and selectionText()'s "the body must be on screen"
+          // guard returned '' — Copy always answered "Nothing to copy".
+          const text = selectionText(true);
+          if (text) copyToClipboard(text);
+          else notice('Nothing to copy — select text first', 'error');
+        }
         else if (it.action === 'copy-composer') {
           const sel = state.composerSel;
           const a = Math.min(sel.anchor, sel.head);
@@ -8742,11 +13121,62 @@ function commandsForWeb() {
     renderFrame();
   }
 
+  // User keybindings, re-read on every keypress rather than cached: the file is tiny, the
+  // read costs microseconds, and it means an edit takes effect immediately. A malformed
+  // file is reported ONCE per change (tracked by its errors string) and then ignored, so a
+  // typo cannot swallow every key while also not spamming the transcript.
+  let keybindings = loadKeybindings();
+  let keybindingsErrored = '';
+  function refreshKeybindings() {
+    keybindings = loadKeybindings();
+    const errs = keybindings.errors.join('|');
+    if (errs && errs !== keybindingsErrored) {
+      keybindingsErrored = errs;
+      for (const e of keybindings.errors) app(`!keybindings: ${e}`);
+    } else if (!errs) {
+      keybindingsErrored = '';
+    }
+    return keybindings;
+  }
+
   function handleKey(t) {
-    // Full-screen takeovers own EVERY key while open.
+    // USER KEYBINDINGS, their own layer. A binding either REPLACES a key with another key
+    // (applied by rewriting `t.key` below, so the whole switch sees the bound key without
+    // knowing bindings exist) or runs a slash command. Mouse and wheel events are never
+    // remapped: those names are not keys a user can write, and rewriting them would break
+    // the geometry the mouse handlers rely on.
+    if (t && t.key && !String(t.key).startsWith('mouse') && t.key !== 'wheelup' && t.key !== 'wheeldown') {
+      const bound = resolveKey(t.key, refreshKeybindings().bindings);
+      if (bound.command) {
+        // The command runs INSTEAD of the key: doing both would fire two unrelated
+        // actions from one press. Routed through the same `dispatch` a typed command
+        // uses, so a bound command cannot reach a state a typed one could not.
+        const text = bound.command;
+        const sp = text.indexOf(' ');
+        const c = sp === -1 ? text : text.slice(0, sp);
+        const arg = sp === -1 ? '' : text.slice(sp + 1).trim();
+        Promise.resolve(dispatch(c, arg, state, cfg, session, host, submit, stdout))
+          .catch((err) => {
+            try { host.notice(`keybinding ${t.key} → ${text} failed: ${(err && err.message) || err}`, 'error'); }
+            catch { /* the UI itself is broken */ }
+          });
+        renderFrame();
+        return;
+      }
+      if (bound.key !== t.key) { t = { ...t, key: bound.key }; }
+    }
+    // Plugin global keybinds: a plugin claims e.g. 'ctrl+k'. Keyboard events only
+    // (never mouse/hover), and never while a full-screen surface owns every key.
+    const kbEvents = t && t.key && !t.ch && !String(t.key).startsWith('mouse') && t.key !== 'wheelup' && t.key !== 'wheeldown';
+    const kbFree = !state.editor && !state.panel && !state.form && !state.picker && !state.registryBrowser && !state.tasksViewer && !state.tasksPanel && !state.hoverHit;
+    if (kbEvents && kbFree) {
+      try { if (runKeybindsSync(t.key)) { renderFrame(); return; } } catch (e) {}
+    }
     // Full-screen takeovers own EVERY key while open.
     if (state.tasksViewer) { handleTasksViewerKey(t); return; }
     if (state.tasksPanel) { handleTasksPanelKey(t); return; }
+    if (state.registryBrowser) { handleRegistryRowKey(t); return; }
+    if (state.fileTree) { handleFileTreeKey(t); return; }
     if (t.key === 'mousedown' || t.key === 'mousemove' || t.key === 'mouseup' || t.key === 'rightclick' || t.key === 'mousehover') {
       handleMouse(t);
       return;
@@ -8760,6 +13190,20 @@ function commandsForWeb() {
         renderFrame();
         return;
       }
+      // Ctrl+A approves this AND remembers the decision for the rest of the
+      // session, so the same prompt does not come back every turn. The key is `a`
+      // for "always", chosen because Enter is already "approve once" and a modifier
+      // is needed for the stronger action.
+      if (t.key === 'c-a') {
+        const ap = state.approvalPending;
+        const resolve = ap.resolve;
+        state.approvalPending = null;
+        approveForSession(state, ap.toolName, ap.args);
+        notice(`Approved for this session: ${sessionApprovalLabel(ap.toolName, ap.args)}`, 'info');
+        resolve(true);
+        renderFrame();
+        return;
+      }
       if (t.key === 'escape') {
         const resolve = state.approvalPending.resolve;
         state.approvalPending = null;
@@ -8767,12 +13211,9 @@ function commandsForWeb() {
         renderFrame();
         return;
       }
-      // Everything else (typing, arrows, paste, backspace) belongs to the
-      // composer: only Enter/Esc are reserved for the prompt, so the user can
-      // keep drafting while deciding.
       if (t.key === 'c-c') return;
     }
-    // Plan review: the model produced a <plan> and Plan mode is waiting.
+    // Plan review: the model produced a <|plan|> and Plan mode is waiting.
     // Enter/Space = approve & execute, e = edit first, Esc = keep planning.
     if (state.planPending) {
       const settle = (outcome) => {
@@ -8795,12 +13236,13 @@ function commandsForWeb() {
       // screen), and a second Ctrl+C — often the very key the user pressed again
       // to dismiss the prompt — quit the app and discarded the draft.
       if (state.menuOpen || state.picker || state.form || state.panel || state.question || state.editor) {
-        if (state.picker) { const cb = state.picker.onCancel; state.picker = null; if (cb) cb(); }
-        if (state.form) { const cb = state.form.onCancel; state.form = null; if (cb) cb(); }
+        // One shared dismissal so Ctrl+C and a click outside cannot drift apart:
+        // this used to clear `state.form` without calling its `onCancel`, while the
+        // click path (added later) does — two ways to close one dialog with two
+        // different outcomes.
+        dismissOverlay();
         // Ctrl+C on the question dialog = dismiss, the same as Esc.
         if (state.question) { const r = state.question.resolve; state.question = null; r({}); }
-        state.panel = null;
-        state.editor = null;   // Ctrl+C cancels the editor, like Esc
         state.menuOpen = false; state.menuList = []; state.menuSel = 0; state.menuOffset = 0;
         renderFrame();
         return;
@@ -8837,21 +13279,8 @@ function commandsForWeb() {
       };
       // After a question is answered, move to the NEXT question; if it was the last
       // one, jump to the Other tab (where Enter submits) — never auto-submit, so
-      // the user can leave a note.
-      const advance = () => {
-        if (qs.index < total - 1) {
-          qs.index++;
-          qs.sel = 0;
-          qs.picked = new Set();
-          renderFrame();
-          return;
-        }
-        qs.index = total;   // the Other tab
-        qs.editing = 'supplement';
-        qs.editingText = qs.supplement || '';
-        qs.editingCaret = qs.editingText.length;
-        renderFrame();
-      };
+      // the user can leave a note. Shared with the click handler (questionItem).
+      const advance = () => { advanceQuestion(qs); renderFrame(); };
       const switchTab = (dir) => {
         // Fold any half-typed free text into its slot before switching.
         if (qs.editing === 'other') qs.otherText = qs.editingText || '';
@@ -8974,6 +13403,71 @@ function commandsForWeb() {
 
     if (state.confirmExit) { state.confirmExit = false; if (confirmTimer) clearTimeout(confirmTimer); }
 
+    // Ctrl+Up / Ctrl+Down — scroll the AI output area, ALWAYS (independent of the
+    // composer, unlike the plain arrows which first move the caret / walk history).
+    // This is the dedicated "read back the transcript" key the user asked for.
+    // Handled AFTER the overlay branches above, so an open picker/form/panel keeps
+    // its own arrow behaviour on the un-modified keys.
+    if (t.key === 'c-up' || t.key === 'c-down') {
+      if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
+        scrollChat(state, t.key === 'c-up' ? 3 : -3);
+        renderFrame();
+        return;
+      }
+    }
+
+    // Ctrl+L — expand / collapse the plugin log block(s). The last one is the
+    // useful target (it is the most recent), but every pluginLog message is toggled
+    // so a session with several reloads behaves predictably.
+    if (t.key === 'c-l') {
+      if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
+        const logs = (state.chat || []).filter((m) => m && m.pluginLog);
+        if (logs.length) {
+          const want = !logs[logs.length - 1].expanded;
+          for (const m of logs) m.expanded = want;
+          renderFrame();
+          return;
+        }
+      }
+    }
+
+    // Ctrl+P — command palette (cline-style): one searchable list of every command,
+    // regardless of whether the composer already starts with `/`. Choosing one drops
+    // `/name ` into the composer (focus stays there) so arguments can still be typed.
+    // The `/`-typed completion menu only appears after a slash is typed, so this is
+    // the discoverable entry point.
+    if (t.key === 'c-p') {
+      if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
+        const cmds = allCommands();
+        if (!cmds.length) { renderFrame(); return; }
+        openPicker({
+          title: 'Commands',
+          searchable: true,
+          hint: '↑↓ navigate · type to filter · Enter insert · Esc cancel',
+          // The palette must not wipe a half-typed prompt, so it opts out of the
+          // composer-clear that openPicker does by default.
+          keepInput: true,
+          items: cmds.map((c) => ({
+            label: '/' + c.name,
+            sub: c.description || c.desc || '',
+            _name: c.name,
+          })),
+          onPick: (it) => {
+            if (!it || !it._name) return true;
+            // Insert rather than execute: arguments almost always follow, and a
+            // command that opens a dialog would otherwise swallow the keystroke.
+            state.input = '/' + it._name + ' ';
+            state.caret = state.input.length;
+            refreshMenu(state);
+            renderFrame();
+            return true;
+          },
+        });
+        renderFrame();
+        return;
+      }
+    }
+
     // Ctrl+X / Ctrl+Shift+X — CUT. Removes the composer's selected text (or the
     // whole line when nothing is selected) and puts it on the clipboard, like a
     // normal editor. Ctrl+Shift+X is accepted as an alias because some terminals
@@ -9063,7 +13557,30 @@ function commandsForWeb() {
     }
 
     if (t.key === 'c-t' && !state.editor) {
+      // An explicit expand/collapse REPLACES any manual drag height, otherwise the
+      // `todoRows` value won over `todosExpanded` in todoRowCount and Ctrl+T did
+      // nothing once the panel had been dragged.
+      // An explicit expand/collapse REPLACES any manual drag height, otherwise the
+      // `todoRows` value won over `todosExpanded` in todoRowCount and Ctrl+T did
+      // nothing once the panel had been dragged.
+      state.todoRows = undefined;
+      const total = (state.todos || []).length;
+      const before = todoRowCount(state);
+      // When the list already fits (<= TODO_MAX_VISIBLE) the automatic view shows
+      // everything, so neither state can change the row count: Ctrl+T has no effect
+      // here, so do NOT flip the flag (a half-set `todosExpanded` would be state
+      // that lies) and say so plainly.
       state.todosExpanded = !state.todosExpanded;
+      const after = todoRowCount(state);
+      if (before === after) {
+        state.todosExpanded = !state.todosExpanded;   // undo: nothing to toggle
+        notice(total ? `Todo panel already shows all ${total}` : 'No todos yet', 'info');
+        renderFrame();
+        return;
+      }
+      notice(state.todosExpanded
+        ? `Todo panel expanded (${after} of ${total})`
+        : `Todo panel collapsed (${after} of ${total})`, 'info');
       renderFrame();
       return;
     }
@@ -9174,10 +13691,7 @@ function commandsForWeb() {
           // key fall through to history. That is the usual shell/editor rule —
           // typing a paragraph must not have ↑ yank the draft away.
           if (cur !== '' && targetRow >= 0 && targetRow < layout.rows.length) {
-            const starts = rowStartOffsets(cur, layout.rows.length, insideW);
-            const colInRow = Math.max(0, layout.caretCol - 1);
-            const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
-            state.caret = Math.min(cur.length, targetStart + colInRow);
+            state.caret = verticalCaretIndex(state, cur, layout, targetRow);
             state.composerSel = null;
             renderFrame();
             return;
@@ -9209,7 +13723,7 @@ function commandsForWeb() {
         renderFrame();
       };
       const curLines = () => ed.text.split('\n');
-      if (t.key === 'escape') { state.editor = null; renderFrame(); return; }
+      if (t.key === 'escape') { state.editor = null; state.hoverHit = null; renderFrame(); return; }
       // Ctrl+S: save.
       if (t.key === 'c-s') {
         const cb = ed.onSave;
@@ -9286,7 +13800,7 @@ function commandsForWeb() {
 
     if (state.panel) {
       const p = state.panel;
-      if (t.key === 'escape') { state.panel = null; renderFrame(); return; }
+      if (t.key === 'escape') { state.panel = null; state.hoverHit = null; renderFrame(); return; }
       if (t.key === 'up') { p.top = Math.max(0, (p.top || 0) - 1); renderFrame(); return; }
       if (t.key === 'down') { p.top = (p.top || 0) + 1; renderFrame(); return; }
       if (t.key === 'pageup') { p.top = Math.max(0, (p.top || 0) - 10); renderFrame(); return; }
@@ -9301,13 +13815,16 @@ function commandsForWeb() {
       const nRows = f.fields.length + (f.hideType ? 0 : 1);
       const onType = !f.hideType && f.fieldIdx >= f.fields.length;
       const field = f.fields[f.fieldIdx];
-      if (t.key === 'escape') { const cb = f.onCancel; state.form = null; if (cb) cb(); renderFrame(); return; }
+      if (t.key === 'escape') { const cb = f.onCancel; state.form = null; state.hoverHit = null; if (cb) cb(); renderFrame(); return; }
       if (t.key === 'up') { f.fieldIdx = (f.fieldIdx - 1 + nRows) % nRows; renderFrame(); return; }
       if (t.key === 'down') { f.fieldIdx = (f.fieldIdx + 1) % nRows; renderFrame(); return; }
       if (t.key === 'tab') { f.fieldIdx = (f.fieldIdx + 1) % nRows; renderFrame(); return; }
       if (onType) {
         if (t.key === 'left' || t.key === 'right' || t.ch === ' ') {
-          f.type = f.type === 'OpenAI' ? 'Anthropic' : 'OpenAI';
+          const list = (f.types && f.types.length) ? f.types : PROTOCOL_TYPES;
+          const i = Math.max(0, list.indexOf(f.type));
+          const d = t.key === 'left' ? -1 : 1;
+          f.type = list[(i + d + list.length) % list.length];
           renderFrame(); return;
         }
         if (t.key === 'enter') {
@@ -9429,12 +13946,32 @@ function commandsForWeb() {
         state.pickerQuery = '';
         renderFrame(); return;
       }
-      // (Ctrl+E provider edit removed: Enter now opens the edit form in /provider's onPick.)
+      // Ctrl+E: a picker may expose an "edit the selected item" action (used by
+      // /model to edit the selected model's details). Generic hook, so any picker
+      // can opt in without hard-coding the key here.
+      if (t.key === 'c-e' && typeof state.picker.onCtrlE === 'function') {
+        const item = list[state.picker.sel];
+        if (item) state.picker.onCtrlE(item);
+        renderFrame();
+        return;
+      }
+      // Ctrl+R: a picker may expose a "refresh the selected item" action (used by
+      // /provider to re-discover the selected provider's models).
+      if (t.key === 'c-r' && typeof state.picker.onCtrlR === 'function') {
+        const item = list[state.picker.sel];
+        if (item) state.picker.onCtrlR(item);
+        renderFrame();
+        return;
+      }
       if (t.key === 'escape') {
         const cb = state.picker.onCancel;
         state.picker = null;
         state.pickerQuery = '';
         state.pickerCategory = null;
+        // Drop the hover highlight: its row numbering described the MENU, and the
+        // transcript is about to take those rows back — leaving it tinted whatever
+        // ended up there until the pointer moved again.
+        state.hoverHit = null;
         if (cb) cb();
         renderFrame();
         return;
@@ -9456,6 +13993,28 @@ function commandsForWeb() {
         }
       }
       return;
+    }
+
+    // The side-thread box owns Esc and ↑/↓ while it is open, the same way the
+    // `/`-menu and the `@file` list do. Esc CLOSES it before clearing the composer,
+    // because "get me out of this box" is the more specific intent.
+    if (state.btwPanel && state.btwPanel.turns && state.btwPanel.turns.length) {
+      if (t.key === 'escape') {
+        state.btwPanel = null;
+        state.btwScroll = 0;
+        state.sideThread = null;
+        notice('Side thread closed.', 'info');
+        renderFrame();
+        return;
+      }
+      // ↑/↓ scroll the box's history, in ROWS. Held on the state as an offset from
+      // the tail, matching the transcript's convention.
+      if (t.key === 'up' || t.key === 'down') {
+        const step = t.key === 'up' ? 4 : -4;
+        state.btwScroll = Math.max(0, (state.btwScroll || 0) + step);
+        renderFrame();
+        return;
+      }
     }
 
     if (t.key === 'escape') {
@@ -9557,7 +14116,6 @@ function commandsForWeb() {
     }
     if (t.key === 'wheelup' || t.key === 'wheeldown') {
       // With the pointer ON the scrollbar, scroll one line per notch: the bar is
-      // With the pointer ON the scrollbar, scroll one line per notch: the bar is
       // the precision control, and 3-line steps there feel jumpy on a long
       // transcript. Everywhere else keeps the usual 3-line step.
       const onBar = !!(state._lastMouse && isOnScrollbar(state._lastMouse));
@@ -9627,29 +14185,34 @@ function commandsForWeb() {
       if (dirName === 'left') {
         const mk = adjacentPasteMarker(cur, caret, -1);
         next = mk ? mk.start : Math.max(0, caret - 1);
+        state._caretPrefCol = null;
       } else if (dirName === 'right') {
         const mk = adjacentPasteMarker(cur, caret, 1);
         next = mk ? mk.end : Math.min(cur.length, caret + 1);
+        state._caretPrefCol = null;
       } else if (dirName === 'home') {
         next = 0;
+        state._caretPrefCol = null;
       } else if (dirName === 'end') {
         next = cur.length;
+        state._caretPrefCol = null;
       } else {
-        // up/down: move a visual row keeping the column, like the plain arrows,
-        // so a multi-line prompt can be selected across lines.
+        // up/down: move a visual row keeping the column, like the plain arrows, so
+        // a multi-line prompt can be selected across lines. Same sticky column as
+        // the plain ↑/↓ (see verticalCaretIndex).
         const insideW = Math.max(0, dims().cols - 2);
         const layout = composerLayout(state, insideW - 3);
         const targetRow = layout.caretRow + (dirName === 'down' ? 1 : -1);
         if (targetRow < 0 || targetRow >= layout.rows.length) { renderFrame(); return; }
-        const starts = rowStartOffsets(cur, layout.rows.length, insideW);
-        const colInRow = Math.max(0, layout.caretCol - 1);
-        const targetStart = starts[targetRow] != null ? starts[targetRow] : 0;
-        next = Math.min(cur.length, targetStart + colInRow);
+        next = verticalCaretIndex(state, cur, layout, targetRow);
       }
       state.caret = next;
       state.composerSel = (anchor === next) ? null : { anchor, head: next };
       renderFrame(); return;
     }
+
+
+
 
     if (t.key === 'left' || t.key === 'right') {
       const dir = t.key === 'left' ? -1 : 1;
@@ -9661,6 +14224,8 @@ function commandsForWeb() {
       } else {
         state.caret = Math.min(state.input.length, (state.caret || 0) + 1);
       }
+      // A horizontal move abandons the sticky column (kimi's setCursorCol).
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
@@ -9669,6 +14234,7 @@ function commandsForWeb() {
       const layout = composerLayout(state, insideW);
       const starts = rowStartOffsets(state.input || '', layout.rows.length, insideW);
       state.caret = starts[layout.caretRow] != null ? starts[layout.caretRow] : 0;
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
@@ -9679,9 +14245,11 @@ function commandsForWeb() {
       const next = starts[layout.caretRow + 1];
       state.caret = (next != null ? next - 1 : (state.input || '').length);
       state.caret = Math.max(0, Math.min((state.input || '').length, state.caret));
+      state._caretPrefCol = null;
       state.composerSel = null;
       renderFrame(); return;
     }
+
     if (t.key === 'enter') {
       // Enter commits whatever is in the composer. When the `/` MENU is open it
       // selects a command, but the composer's own text is still what was typed —
@@ -9785,6 +14353,17 @@ function commandsForWeb() {
     if (t.paste !== undefined) {
       // A bracketed paste (Ctrl+Shift+V in most terminals): shared with the
       // Ctrl+Shift+V shortcut and the right-click menu's Paste.
+      //
+      // An EMPTY bracketed paste is the signal that the clipboard held something
+      // the terminal cannot send as text — an image. That is exactly what the other
+      // agents do on paste (kimi: onPasteImage; claude: empty-paste -> read
+      // clipboard; cline: paste event with an image/* mime type), so fall through
+      // to the clipboard reader instead of inserting nothing. Without this, pasting
+      // a screenshot in Windows Terminal did nothing at all.
+      if (t.paste === '') {
+        void pasteFromClipboard();
+        renderFrame(); return;
+      }
       insertComposerPaste(t.paste);
       renderFrame(); return;
     }
@@ -9832,6 +14411,64 @@ function commandsForWeb() {
     return starts;
   }
 
+  // Where the caret lands after a VERTICAL move (↑/↓, plain or Shift+).
+  //
+  // A faithful port of kimi-code's editor (packages/pi-tui/src/components/editor.ts):
+  // `moveToVisualLine()` + `computeVerticalMoveColumn()` + its sticky
+  // `preferredVisualCol`. The UNITS are what the previous attempt got wrong —
+  // everything below is a CHARACTER offset, never a display column:
+  //   * `layout.meta[i].start/.end` are character indices into the whole buffer;
+  //   * a row's length is `end - start` CHARACTERS, and the caret's column is
+  //     measured from that row's `start` (kimi: `cursorCol - vl.startCol`);
+  //   * `layout.caretCol` is NOT usable here: it is `1 + prefixWidth +
+  //     displayColumns`, so it mixes in the `❯ ` prefix and counts a double-width
+  //     glyph as two. Comparing that against a character length is what made the
+  //     caret walk left and right instead of holding its column.
+  //
+  // Decision table (P = a preference is stored, S = the caret sits mid-row,
+  // T = this row is shorter than the current column, U = this row is shorter than
+  // the preference), verbatim from kimi:
+  //   !P || S : T -> store current, go to row end   |  else -> clear, keep current
+  //   P       : T || U -> go to row end (keep pref) |  else -> use pref, clear it
+  function verticalCaretIndex(state, text, layout, targetRow) {
+    const curMeta = layout.meta[layout.caretRow];
+    const targetMeta = layout.meta[targetRow];
+    if (!curMeta || !targetMeta) return state.caret;
+
+    const rowLen = (m) => Math.max(0, m.end - m.start);
+    // Only the LAST wrap segment of a logical line may put the caret at the line's
+    // end; on any other segment the caret stops one character short, or it would sit
+    // on the first character of the next row and ↑/↓ would look like it skipped one.
+    const isLastSeg = (m) => (m.segIdx || 0) >= (m.segCount || 1) - 1;
+    const maxColOf = (m) => (isLastSeg(m) ? rowLen(m) : Math.max(0, rowLen(m) - 1));
+
+    const currentVisualCol = state.caret - curMeta.start;
+    const sourceMaxVisualCol = maxColOf(curMeta);
+    const targetMaxVisualCol = maxColOf(targetMeta);
+
+    const hasPref = state._caretPrefCol != null;                          // P
+    const cursorInMiddle = currentVisualCol < sourceMaxVisualCol;         // S
+    const targetTooShort = targetMaxVisualCol < currentVisualCol;         // T
+    const targetCantFitPref = hasPref && targetMaxVisualCol < state._caretPrefCol; // U
+
+    let moveTo;
+    if (!hasPref || cursorInMiddle) {
+      if (targetTooShort) { state._caretPrefCol = currentVisualCol; moveTo = targetMaxVisualCol; }
+      else { state._caretPrefCol = null; moveTo = currentVisualCol; }
+    } else if (targetTooShort || targetCantFitPref) {
+      moveTo = targetMaxVisualCol;
+    } else {
+      moveTo = state._caretPrefCol;
+      state._caretPrefCol = null;
+    }
+
+    // kimi clamps against the end of the LOGICAL line, so a caret pushed past the
+    // target segment still lands inside the line rather than mid-buffer.
+    const paraMeta = layout.meta.filter((m) => m.line === targetMeta.line);
+    const paraEnd = (paraMeta[paraMeta.length - 1] || targetMeta).end;
+    return Math.min(targetMeta.start + Math.max(0, moveTo), Math.max(targetMeta.start, paraEnd));
+  }
+
   function statusExtra(state) {
     // No `notice` term: the notice shares the context row instead of taking a
     // row of its own, so it must not shrink the calculated chat viewport either.
@@ -9851,9 +14488,14 @@ function commandsForWeb() {
 
   function scrollChat(state, delta) {
     const cols = dims().cols, rows = dims().rows;
-    const chat = renderChatLines(state, cols);
+    // Only the TOTAL row count is needed to clamp the scroll position. This used to
+    // call the full renderer with no viewport, which renders every message's rows —
+    // so each wheel tick re-rendered the entire transcript just to learn a number,
+    // and scrolling a long session stalled. chatRowTotal reuses the last paint's
+    // metrics when the transcript has not changed, which is the scrolling case.
+    const total = chatRowTotal(state, cols);
     const ch = Math.max(1, rows - (composerHeight(state, cols) + statusExtra(state) + STATUS_H + CTX_H));
-    const maxScroll = Math.max(0, chat.length - ch);
+    const maxScroll = Math.max(0, total - ch);
     state.scroll = Math.min(maxScroll, Math.max(0, (state.scroll || 0) + delta));
     // A deliberate move: the previous frame's anchor no longer describes where the
     // user is looking, so the next paint must seed a fresh one from this value.
@@ -9909,7 +14551,17 @@ function commandsForWeb() {
       const sp = text.indexOf(' ');
       const c = sp === -1 ? text : text.slice(0, sp);
       const arg = sp === -1 ? '' : text.slice(sp + 1).trim();
-      dispatch(c, arg, state, cfg, session, host, submit, stdout);
+      // A command that rejects must NOT take the process down. `dispatch` is async
+      // and was called without a .catch(), so any throw inside a command (e.g. the
+      // registry browser hitting a bad field) surfaced as an unhandledRejection,
+      // which the process handler turns into process.exit(1) — the whole session
+      // died with no in-UI explanation. Catch here, report, and keep running.
+      Promise.resolve(dispatch(c, arg, state, cfg, session, host, submit, stdout))
+        .catch((err) => {
+          try { host.notice(`/${String(c).replace(/^\//, '')} failed: ${(err && err.message) || err}`, 'error'); }
+          catch { /* the UI itself is broken; the process handler will log it */ }
+          try { renderFrame(); } catch { /* ignore */ }
+        });
       if (state._quit) { quit(); return; }
       renderFrame();
       return;
@@ -10018,9 +14670,17 @@ function commandsForWeb() {
   // skips the user bubble. Used by the approved-plan handoff: the plan is not
   // something the user typed, so it must not appear (or persist) as their message.
   async function runAgent(text, opts = {}) {
+    // Drop any compaction row left dangling by an interrupted turn so the next
+    // auto-compaction starts clean (no ghost 'running' row that blinks with nothing
+    // behind it). The live reference is dropped too.
     const asSystem = !!opts.asSystem;
-    if (!asSystem) addChat({ role: 'user', text: opts.bubbleText != null ? opts.bubbleText : text, _conv: true });
-    // Fresh buffer for this turn's <plan> split (see appendAssistant).
+    // `bubbleText` overrides the row drawn in the transcript. A SKILL activation has
+    // already drawn its own card (see dispatch), so it passes the user's args here
+    // only to feed the MODEL — with no args that is '', and a user bubble for an
+    // empty string would show a blank `❯` row under the card.
+    const bubble = opts.bubbleText != null ? opts.bubbleText : text;
+    if (!asSystem && String(bubble).trim()) addChat({ role: 'user', text: bubble, _conv: true });
+    // Fresh buffer for this turn's plan-tag split (see appendAssistant).
     state._planBuf = '';
     // A message the user JUST SENT should always bring the newest content into
     // view, even if they were scrolled up reading history. (Queue/steer do NOT
@@ -10074,7 +14734,7 @@ function commandsForWeb() {
       sysText += '\n\n' + CALM_MODE_INSTRUCTION;
     }
     // PLAN MODE (/plan): tell the model what to PRODUCE. The tool filter alone
-    // only removed its write tools — this is what makes it emit a <plan> block.
+    // only removed its write tools — this is what makes it emit a plan block.
     if (state.plan) {
       sysText += '\n\n' + PLAN_MODE_INSTRUCTION;
     }
@@ -10094,6 +14754,13 @@ function commandsForWeb() {
     if (memory) {
       sysText += '\n\n' + memory;
     }
+    // OUTPUT STYLE (/output-style): a form-of-reply instruction read from a file,
+    // re-read per turn like the notes above so editing the file takes effect on the
+    // next request. Placed AFTER the preferences and memory but BEFORE AGENTS.md:
+    // the project's own instructions are the most specific thing here and must win.
+    if (state.outputStyle && state.outputStyle.body) {
+      sysText += '\n\n' + styleReminder(state.outputStyle);
+    }
     // AGENTS.md: the PROJECT's own instructions, read fresh each turn like the
     // personal notes above, so an edit (or a fresh /init) takes effect on the next
     // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
@@ -10104,6 +14771,8 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
       sysText += '\n\n' + agents;
     }
     let messages = [{ role: 'system', content: sysText }];
+    // Mixin seam: let plugins rewrite the assembled system prompt before the turn.
+    try { sysText = await runPatch('systemPrompt', { text: sysText }, (c) => c.text); messages = [{ role: 'system', content: sysText }]; } catch (e) { console.error('[hncode-plugin] systemPrompt patch error:', e.message); }
     // A skill body is injected as its OWN system message so it reaches the model
     // but never appears (or persists) as the user's words, mirroring kimi's
     // activation card. It is filtered out of the saved session like sysText.
@@ -10124,10 +14793,30 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
     // from the harness, not something the user typed, and it must not show up as a
     // user bubble or be persisted as one.
-messages.push(asSystem ? { role: 'system', content: text } : { role: 'user', content: opts.modelText != null ? opts.modelText : text });
+    //
+    // A SKILL activation's `text` is only the `/skill:<name>` marker. Sending that as
+    // the user turn told the model nothing and DROPPED the user's own instruction
+    // (`/skill:foo make it blue` lost "make it blue"). So:
+    //   * with args  -> the args ARE the user turn (the body rides a system message);
+    //   * without args -> there is no user text at all. Pushing the marker would put
+    //     the literal `/skill:foo` into the conversation, which is worse than an empty
+    //     turn: the model reads it as the user having typed a command. The skill body
+    //     is the whole instruction in that case, so no user message is added.
+    const argsText = opts.bubbleText != null ? String(opts.bubbleText).trim() : '';
+    const isSkill = opts.bubbleText != null;
+    if (asSystem) messages.push({ role: 'system', content: text });
+    else if (isSkill && !argsText) { /* body-only activation: nothing for the user turn */ }
+    else messages.push({ role: 'user', content: opts.modelText != null ? opts.modelText : (argsText || text) });
     // Only the conversation is persisted; the system message does not go into the
     // session. Saving a turn is left to the end of the turn (after agent.run) —
     // writing mid-turn would make sending feel sluggish.
+    //
+    // The assembled prompt is parked on `state` instead, for the length of the turn. It
+    // cannot live in `session.messages` (see contextSegments): the array is trimmed to
+    // non-system roles here and again at every step boundary, so with nothing carrying the
+    // text the status bar's `system prompt` segment collapses to zero columns and vanishes
+    // mid-turn, then returns at turn end when the untrimmed request is assigned back.
+    state.turnSystemPrompt = sysText;
 Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
     // The user's message is on disk before the agent has done anything. A crash
     // this early used to lose the entire prompt, because the first save was at
@@ -10148,6 +14837,11 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
       try { sess.saveSession(session); } catch { }
     }
 
+    // Focus is a ONE-TURN mode: it narrows the toolset for the turn the user set it
+    // on, and turns itself off when that turn ends (see the end of this function).
+    // Remember the value HERE, at the start, so that a /focus the user sets while the
+    // turn is running survives instead of being cancelled by the turn-end cleanup.
+    const focusAtTurnStart = !!state.focus;
     if (state.plan) {
       cfg.toolFilter = ['Read', 'Grep', 'Glob'];
     } else if (state.focus) {
@@ -10207,6 +14901,19 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
 
       if (rule !== 'ask') {
         if (cur === 'auto') return true;
+      }
+      // Session approvals (Ctrl+A on a prompt) come AFTER the configured rules and
+      // BEFORE the mode shortcuts:
+      //   * after, so a `deny` or an explicit `ask` rule still wins — a transient
+      //     grant must not override a decision the user wrote down;
+      //   * before, so an approval covers the modes that would otherwise ask again.
+      // A destructive command is excluded inside the check, whatever was approved.
+      {
+        const destructive = toolName === 'Bash'
+          && isDestructiveCommand(String((args && (args.command || args.cmd)) || ''));
+        if (rule !== 'ask' && isApprovedForSession(session.sessionApprovals, toolName, args, destructive)) {
+          return true;
+        }
       }
       // Read-only tools never need permission in any mode. AskUserQuestion is on
       // this list because ASKING the user is not a side effect — gating it behind
@@ -10319,7 +15026,12 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
       // `tasks` is handed to the agent so its ctx REUSES the same store: background
       // bash jobs and background subagents outlive the turn that started them, and
       // a fresh store per turn made them disappear (while still running).
-      cfg: { ...cfg, sessionId: (session && session.id) || cfg.sessionId, tasks: (state.tasks = state.tasks || {}) },
+      // `swarm` rides the per-turn cfg so the Agent can gate AgentSwarm on it: the
+      // mode is on `state`, but a tool the model is OFFERED is decided in the
+      // constructor, which only ever sees cfg. Read here rather than relying on the
+      // `/swarm` handler writing cfg, so a session resumed with swarm on gets the
+      // tool and a session with it off never does.
+      cfg: { ...cfg, swarm: !!state.swarm, sessionId: (session && session.id) || cfg.sessionId, tasks: (state.tasks = state.tasks || {}) },
       messages, onApproval,
       // Shell hooks are re-read per turn so an edit to hooks.json (or a /hooks
       // change) takes effect on the next message without restarting.
@@ -10364,6 +15076,17 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           // Open a LIVE compaction block (kimi's CompactionComponent): a blinking
           // bullet while the summary round-trip runs, so the turn does not sit
           // silent for seconds. The same row is upgraded in place on `compacted`.
+          // If a compaction block from a PREVIOUS (interrupted) turn is still in the
+          // transcript, settle it first so we never leave two blinking rows or let a
+          // stale cancelled block get re-promoted to running.
+          const stale = state.compactionMsg;
+          if (stale && state.chat.indexOf(stale) >= 0 && stale.phase !== 'running') {
+            const idx = state.chat.indexOf(stale); if (idx >= 0) state.chat.splice(idx, 1);
+          } else if (stale && state.chat.indexOf(stale) < 0) {
+            for (let i = state.chat.length - 1; i >= 0; i--) {
+              if (state.chat[i] && state.chat[i].role === 'compaction') state.chat.splice(i, 1);
+            }
+          }
           state.compactionMsg = {
             role: 'compaction', phase: 'running', startedAt: Date.now(),
             instruction: e.instruction || '',
@@ -10410,9 +15133,15 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           return;
         }
         if (e.type === 'data') {
-          const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
-          if (t) t.pending = false;
-          appendAssistant(e.text);
+          // Feed the answer text into the paced buffer instead of painting it. The
+          // buffer closes any open reasoning region itself, in arrival order, so the
+          // block settles exactly when the provider moved on rather than when the next
+          // render happened to run.
+          //
+          // The push RETURNS the characters that are due right now, and they are
+          // already off the buffer's queue — applying them is what keeps the delta
+          // whole. Dropping the return value silently lost the head of every delta.
+          applyStreamOps(streamBuf.pushText(e.text));
           renderSoon(); return;
         }
         if (e.type === 'context') {
@@ -10435,8 +15164,35 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           }
           renderSoon(); return;
         }
-        if (e.type === 'think') { state.seenThinking = true; appendThinking(e.text); renderSoon(); return; }
+        if (e.type === 'usage') {
+          // Real token accounting from the provider. Folded into a session total
+          // that /usage and /cost report, and persisted with the session so a
+          // --resume does not lose what the session has already spent.
+          //
+          // The COST is recomputed from the total rather than accumulated per
+          // event: switching models mid-session would otherwise price every
+          // earlier request at the new model's rates.
+          if (!state.usage) state.usage = {};
+          state.usage = addUsage(state.usage, e.usage);
+          if (session) session.usage = state.usage;
+          state.lastUsage = e.usage;
+          refreshCost(state, cfg);
+          renderSoon(); return;
+        }
+        if (e.type === 'think') {
+          state.seenThinking = true;
+          // Reasoning goes through the SAME buffer as the answer, so both are paced
+          // together and reveal in arrival order. Pacing only the answer would let a
+          // reasoning block pop in provider-sized clumps. The push's return value
+          // carries the characters due now — see the `data` handler above.
+          applyStreamOps(streamBuf.pushReasoning(e.text));
+          renderSoon(); return;
+        }
         if (e.type === 'aborted') {
+          // Show whatever the model had actually produced before the interrupt: the
+          // buffer is holding it, and an aborted turn is exactly when the user is
+          // reading to see how far it got.
+          flushStream();
           const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
           if (t) t.pending = false;
           // Settle any RUNNING tool rows too. A tool that was mid-flight when the
@@ -10466,12 +15222,14 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
         }
         if (e.type === 'tool_start') {
           // A tool call means the model finished this step's reasoning and is now
-          // acting on it. Settle the still-pending thinking block so its spinner
-          // stops instead of turning forever while the tool runs, and so the block
-          // reads as "reasoned, then acted" rather than as one endless thought.
+          // acting on it, so the turn's text has to be fully on screen first: the tool
+          // row is drawn UNDER the reply, and text still trickling in afterwards would
+          // push it back down. Draining the buffer here is what keeps that from
+          // happening, and it settles the pending thinking block as a side effect (the
+          // close marker rides in the same ordered queue).
           // The NEXT `think` event opens a new block under the tool output.
-          const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
-          if (t) t.pending = false;
+          flushStream();
+          settleThinking();
           const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
           if (!dup) {
             state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now(), _conv: true });
@@ -10590,11 +15348,26 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           // result as the live progress block above (cells + status pip bar), so a
           // `↳ Swarm finished: …` dump underneath would print the same thing twice.
           const isSwarm = e.name === 'AgentSwarm' && entry && Array.isArray(entry.swarmMembers);
+          // No diff for Write. A write REPLACES a file rather than editing a span of
+          // it, so the "before/after" the renderer would show is the whole old
+          // content against the whole new one — a new file turns into every line
+          // being an addition, and the result row fills the screen with `+` lines
+          // that say nothing about what the model did. The receipt line ("File
+          // written: … N bytes") already reports the outcome, and the Write row
+          // itself streams the content while it arrives.
           const resultMsg = normalizeMsg({
             role: 'tool_result', text: e.content, failed: failedRun,
-            diff: e.name === 'Write' ? (entry && entry.diff || []) : (entry && entry.diff),
+            diff: e.name === 'Write' ? undefined : (entry && entry.diff),
+            // `bodyOnToolRow`: the TOOL row already drew this result's body (a Write
+            // streams the file's content there), so the receipt below it must not
+            // open a second `↳` block. Without this flag the renderer could only
+            // guess, and it guessed wrong — a Write showed
+            //     ↳  1 line one
+            //     ↳ File written: a.txt (1372 bytes)
+            // with two markers for one body.
+            bodyOnToolRow: e.name === 'Write' && !!(entry && entry.streamContent),
             _conv: true,
-          });
+});
           if (entry && !isSwarm) {
             const at = state.chat.indexOf(entry);
             // Skip any rows already sitting between the call and the transcript
@@ -10628,7 +15401,7 @@ Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.ro
           // request (agent.js's trim pass). Say so, including that nothing was lost:
           // without a row the transcript quietly looks like output went missing, and
           // the user has no way to know the text is still readable.
-          addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk.` });
+          addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk. You can modify or disable this feature by using "/auto-trim"` });
         }
 else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; if (web && hub) { try { hub.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ } } }
         renderFrame();
@@ -10672,10 +15445,16 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 
     // ---- PLAN MODE: finalize the plan and ask to proceed --------------------
     // The plan bubble is ALREADY on screen (appendAssistant streams the text after
-    // `<plan>` straight into it), so this only: closes the tags out of the prose,
+    // the plan tag straight into it), so this only: closes the tags out of the prose,
     // asks for approval, and clears the streaming buffer.
     let approvedPlan = null;
     if (state.plan) {
+      // Clearing the buffer is what makes the rest of this block correct, and it was
+      // the one part the comment above promised and the code never did: the review
+      // prompt and the plan the user approves are read OUT of the bubbles, while the
+      // paced buffer can still be holding the tail of the reply (a burst drains over
+      // seconds). Reading early summarised — and approved — a truncated plan.
+      flushStream();
       const lastAssistant = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
       // Prefer what arrived on the wire; fall back to scanning the prose for the
       // case where the tags were split across bubbles.
@@ -10750,18 +15529,28 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     state.ctxTokens = approx;
     state.ctxMax = cfg.maxContextTokens || state.ctxMax;
     state.ctxPercent = usagePercent(approx, state.ctxMax);
+    // `session.messages` now holds the full request, system prompt included, so the bar
+    // reads the real text from here on and the turn-scoped copy must not be counted too.
+    state.turnSystemPrompt = null;
     session.messages = messages;
+    session.rounds = state.rounds;
+    session.steps = state.steps;
     session.rounds = state.rounds;
     session.steps = state.steps;
     // The todo list is part of the session's visible state: persist it here
     // too, so resuming (or `hncode -c`) brings the panel back.
     session.todos = state.todos || [];
-    // Also save runtime mode/flags so they persist across restarts.
-    session.mode = state.mode || 'ask';
-    session.plan = !!state.plan;
-    session.planPath = state.planPath || null;
+    // Focus is one turn: the turn it was set for has now ended, so it goes off. Done
+    // HERE, before the save below, so `session.focus` is written false and resuming
+    // the session does not bring the narrowed toolset back. `focusAtTurnStart` (not
+    // the current value) decides, so a /focus issued while the turn ran still stands.
+    if (focusAtTurnStart) state.focus = false;
     session.focus = !!state.focus;
     session.swarm = !!state.swarm;
+    // The turn's token totals, so a resumed session keeps the running cost rather
+    // than restarting it at zero (the numbers have to sum across the whole
+    // session for a cost readout to mean anything).
+    session.usage = state.usage || {};
     sess.saveSession(session);
     const turnMs = state.turnStart ? Date.now() - state.turnStart : 0;
     const dur = fmtDuration(turnMs);
@@ -10784,6 +15573,10 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     state.finishAnim = null;
     // Also clear startAnim if it's still active (should be cleared already by composeFrame)
     state.startAnim = null;
+    // The turn is over: everything the model said must be on screen NOW. Draining here
+    // is what stops the last of the reply from trickling out behind the "[turn took …]"
+    // row and behind whatever the next turn draws.
+    flushStream();
     state.running = false;
     // The agent may have written or edited files this turn: refresh the git badge
     // now so the diff totals reflect it immediately, instead of waiting for the
@@ -10794,6 +15587,14 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       state.lastTurnMs = turnMs;
       session.lastTurnMs = turnMs;
       sess.saveSession(session);
+      // The turn is on screen but may NOT be on disk. A save failure was silent apart
+      // from a line in ~/.hncode/session-errors.log, and a session whose transcript had
+      // grown past the string limit failed every save for over an hour without the user
+      // being told — each turn looked saved and was not. Say so where they are looking.
+      const saveErr = sess.lastSaveFailure();
+      if (saveErr && saveErr.id === session.id) {
+        addChat({ role: 'warn', text: `This turn could NOT be saved: ${saveErr.detail}. The conversation is on screen only — see ~/.hncode/session-errors.log.` });
+      }
       // Same shape the sweep animated into: `[turn took <dur>]`.
       addChat({ role: 'system', text: `[turn took ${dur}]` });
     }
@@ -10837,6 +15638,11 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     session.steps = state.steps || 0;
     session.rounds = state.rounds || 0;
     if (state.lastTurnMs) session.lastTurnMs = state.lastTurnMs;
+    // How much of the display-only transcript reaches disk. Persisted with the rest of the
+    // session settings, so `/save-history` survives a restart instead of silently reverting
+    // to the default on the next launch.
+    session.saveHistory = state.saveHistory !== false;
+    session.saveThinking = state.saveThinking !== false;
     try { sess.saveSession(session); } catch {}
   }
 
@@ -11015,7 +15821,7 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     hub.actions.setConfig = async (key, value) => {
       const ALLOWED = new Set([
         'calm_mode', 'auto_update', 'auto_compact', 'prompt_cache',
-        'tool_allow_external_paths', 'subagent_model', 'swarm_mode',
+        'tool_allow_external_paths', 'subagent_model', 'swarm_mode', 'theme',
       ]);
       const k = String(key || '');
       if (!ALLOWED.has(k)) throw new Error(`not a settable key: ${k}`);
@@ -11029,7 +15835,6 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       return effectiveSnapshot(cfg);
     };
 
-    // ---- providers and models -------------------------------------------------
     // ---- providers and models -------------------------------------------------
     //
     // These edit config.toml through the same helpers /provider uses, then
@@ -11061,7 +15866,8 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       const n = String(name || '').trim();
       if (!n) throw new Error('provider name required');
       if (!/^[A-Za-z0-9_-]+$/.test(n)) throw new Error('name may contain letters, digits, - and _ only');
-      const proto = protocol === 'anthropic' ? 'anthropic' : 'openai';
+      // Accept the protocol value OR a Type label ("OpenAI Responses").
+      const proto = typeToProtocol(protocol);
       addProvider(n, { base_url: String(baseUrl || ''), api_key: String(apiKey || ''), protocol: proto });
       cfg.raw.providers = cfg.raw.providers || {};
       cfg.raw.providers[n] = { base_url: String(baseUrl || ''), api_key: String(apiKey || ''), protocol: proto };
@@ -11238,11 +16044,52 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 
 
   const host = {
-    addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel,
-    sendPrompt: (text, opts) => { void runAgent(text, opts || {}); },
+    addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel, openRegistryBrowser,
+    // While the side-thread box is open, a typed message goes to the SIDE THREAD, not
+    // to the agent — this is the half of kimi's design that makes the box usable:
+    // its `sendUserInput` feeds the panel from the ordinary composer, so a follow-up
+    // needs no command. `opts.toMain` is the escape hatch for the paths that must
+    // reach the agent regardless (a schedule, a command's own prompt).
+    sendPrompt: (text, opts) => {
+      const o = opts || {};
+      if (state.btwPanel && !o.toMain && !o.fromSchedule) {
+        void askSideQuestion(state, cfg, text, renderSoon);
+        return;
+      }
+      void runAgent(text, o);
+    },
     quit: () => { state._quit = true; },
-    saveSession: (s) => sess.saveSession(s),
+saveSession: (s) => { (async () => { try { const { runHooks } = await import('./plugin.js'); await runHooks('onSessionSave', s || session); } catch {} })(); sess.saveSession(s); },
+    // Rebinds the closure's session AND the mirror on `state`. /move replaces it, and without
+    // this the caller and the command disagreed about which session was current — every later
+    // save wrote the old object, still stamped with the directory it was moved away from.
+    replaceSession: (s) => { if (!s) return; session = s; state.session = s; if (s.workspace) state.workspace = s.workspace; },
+    // Rebinds the closure's session. /move replaces it, and without this the caller and the
+    // command disagreed about which session was current — every later save wrote the old one.
+    replaceSession: (s) => { if (s) session = s; },
+    getMessages: () => (session && session.messages ? session.messages : []),
+    clearSession: () => { if (session) session.messages = []; if (state) { state.ctxTokens = 0; state.ctxPercent = 0; } renderFrame(); },
+    getConfig: (key) => (cfg && key != null ? cfg[key] : undefined),
+    setConfig: (key, val) => { if (cfg && key != null) cfg[key] = val; },
+    // Persist a TOML root-level key to config.toml and keep the live cfg in sync.
+    persistConfig: (key, val) => {
+      try {
+        setConfigString(String(key), typeof val === 'string' ? val : JSON.stringify(val));
+        if (cfg && key != null) cfg[key] = val;
+        return true;
+      } catch (e) { return false; }
+    },
     reloadConfig: () => resolveConfig(),
+    // Full reload: unload the current plugins, then re-run discovery/load and return
+    // any notices (so a freshly added/edited plugin shows up without restarting).
+    // `fresh: true` re-imports each file with a cache-busting query — without it the
+    // ESM cache hands back the module instance from the previous load and an EDIT to
+    // a plugin file would change nothing.
+    reloadPlugins: async () => {
+      const { loadPlugins, takePluginNotices } = await import('./plugin.js');
+      await loadPlugins(cfg.pluginDir || undefined, { fresh: true });
+      return takePluginNotices();
+    },
     persistState,
     startWeb,
     startWebGlobal: attachGlobalWeb,
@@ -11253,7 +16100,108 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     // started calling it, which threw "renderFrame is not a function". Reaching it
     // through `host` means a future caller cannot forget it again.
     renderFrame,
+
+    // ---- capabilities a plugin can drive -------------------------------------
+    //
+    // These forward to the SAME code the slash commands use, so a plugin cannot reach a
+    // state the command could not: opening the tree runs the identical builder, and
+    // switching the theme drops `lastFrame` the same way /theme does (without which the
+    // differential painter would emit nothing and the screen would keep the old colours).
+
+    openFileTree(filter) {
+      const cwd = state.cwd || cfg.workspace || process.cwd();
+      let files = [];
+      try { files = walkFiles(cwd, { includeIgnored: false }); } catch { return false; }
+      const root = buildTree(files, cwd);
+      if (!root.children.length) return false;
+      const expanded = new Set();
+      for (const c of root.children) if (c.dir) expanded.add(c.rel);
+      state.fileTree = { root, expanded, sel: 0, scroll: 0, filter: String(filter || '').trim(), cwd };
+      state.picker = null; state.form = null; state.panel = null; state.menuOpen = false;
+      renderFrame();
+      return true;
+    },
+    closeFileTree() {
+      if (!state.fileTree) return;
+      state.fileTree = null;
+      state.hoverHit = null;
+      renderFrame();
+    },
+    getTheme() { return state.theme || null; },
+    setTheme(name) {
+      if (!hasTheme(name)) return false;
+      state.theme = name;
+      setTheme(name);
+      try { setConfigString('theme', name); } catch { /* the session still uses it */ }
+      // The full repaint: see the same note in the /theme command.
+      lastFrame = null;
+      renderFrame();
+      return true;
+    },
+    subagents() { return listRuns().map((r) => ({ id: r.agentId, runId: r.runId, taskId: r.taskId, type: r.type, description: r.description, startedAt: r.startedAt })); },
+    messageSubagent(ref, text) { return sendToRun(ref, text); },
+    interruptSubagent(ref) { return ref ? interruptRun(ref) : interruptAll(); },
+    closeSubagent(ref) { return closeRun(ref); },
+    isKeyBound(key) {
+      const k = normalizeKey(key);
+      if (!k) return false;
+      // Three sources, and all three have to be checked or a plugin gets a wrong answer:
+      //   * the user's own keybindings file (a data structure);
+      //   * a plugin's claim from registerKeybind (also data);
+      //   * the BUILT-IN keys the TUI dispatches in its switch — not data, so the list
+      //     below is the subset a plugin would realistically take and silently break.
+      if (keybindings.bindings.has(k)) return true;
+      if (pluginKeybinds().some((kb) => kb.key === k)) return true;
+      return BUILTIN_KEYS.has(k);
+    },
+    boundKeys() {
+      const out = new Set([...keybindings.bindings.keys()]);
+      for (const k of BUILTIN_KEYS) out.add(k);
+      for (const kb of pluginKeybinds()) out.add(kb.key);
+      return [...out];
+    },
   };
+
+  // Hand the full host surface to the plugin system so api.* can forward (sendPrompt,
+  // openPanel, notice, getMessages, setConfig, ...). Done once, here, after `host` exists.
+  (async () => { try { const { setPluginHost } = await import('./plugin.js'); setPluginHost(host); } catch {} })();
+
+  // Surface what the plugins did. `loadPlugins()` already ran (index.js, before the TUI
+  // existed) and collected its notices, including any load failure — which previously went
+  // only to stderr, invisible while the TUI owns the screen. A plugin that failed to load
+  // simply did not appear, with nothing explaining why.
+  void (async () => {
+    try {
+      const { takePluginNotices, runHooks } = await import('./plugin.js');
+      // onStartup: plugins that want to greet / schedule / open a panel on launch.
+      try { await runHooks('onStartup'); } catch (e) { console.error('[hncode-plugin] onStartup error:', e.message); }
+      const notes = takePluginNotices();
+      if (!notes.length) return;
+      // ONE collapsible block instead of a wall of lines: a plugin set can emit
+      // dozens of notices, which pushed the actual conversation off screen at
+      // startup. Collapsed it is a single summary line; Ctrl+L expands it in place
+      // (see the `c-l` handler next to the other Ctrl shortcuts).
+      const icon = { error: '✗', warn: '!', info: '•' };
+      const detail = notes.map((n) => `${icon[n.level] || '•'} plugin: ${n.text}`);
+      const errs = notes.filter((n) => n.level === 'error').length;
+      const first = notes[0];
+      const summary = `plugin: ${first.text}`;
+      const suffix = notes.length > 1
+        ? `  (+${notes.length - 1} more${errs ? `, ${errs} error${errs === 1 ? '' : 's'}` : ''} · ctrl+l)`
+        : '';
+      const msg = {
+        role: notes.some((n) => n.level === 'error') ? 'aborted' : 'system',
+        text: summary + suffix,
+        // Collapsed by default; Ctrl+L flips `expanded` and the renderer prints
+        // `allLines` instead of the single summary.
+        pluginLog: true,
+        expanded: false,
+        allLines: detail,
+      };
+      state.chat.push(msg);
+      renderFrame();
+    } catch { /* notices are best-effort; never break startup */ }
+  })();
 
   // Appending streamed text can also add rows (the message wraps as it grows).
   // No arithmetic is needed here: renderChatLines() anchors the scrolled-up window
@@ -11262,19 +16210,71 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
   function anchorScroll() {
     renderSoon();
   }
+  // ---- paced streaming ------------------------------------------------------
+  // Answer and reasoning deltas are NOT painted as they arrive: they go into a
+  // StreamBuffer that drips them out at a smooth, time-paced rate. A provider that
+  // coalesces its deltas into lumps (Anthropic) then looks the same as one that emits
+  // token-level deltas (OpenAI); see src/stream-buffer.js for the controller.
+  //
+  // The buffer holds BOTH kinds in one ordered queue, so a reasoning block can never
+  // overtake the answer text that followed it, and the reasoning region closes at
+  // exactly the point the provider closed it.
+  const streamBuf = new StreamBuffer();
 
+  // Apply revealed ops to the transcript. EVERY producer of ops goes through here.
+  //
+  // The push methods (`pushText` / `pushReasoning`) do not only queue: they return the
+  // characters the pacing controller says are due RIGHT NOW, and those characters are
+  // already off the queue when they come back. A caller that drops the return value
+  // therefore loses them for good — that is exactly how the first ~30 characters of
+  // every provider delta went missing, and with them the prose (and the `<|plan|>` tag)
+  // at the head of a Plan-mode reply.
+  function applyStreamOps(ops) {
+    if (!ops || !ops.length) return false;
+    for (const o of ops) {
+      if (o.op === StreamOp.Text) appendAssistant(o.text);
+      else if (o.op === StreamOp.Reasoning) appendThinking(o.text);
+      else if (o.op === StreamOp.CloseReasoning) settleThinking();
+    }
+    return true;
+  }
 
+  // Apply whatever the buffer has ready. Called from the paced tick (so a lone burst
+  // still drains); the delta handlers reveal through the push return value instead.
+  function drainStream() {
+    return applyStreamOps(streamBuf.flushSmoothFrame());
+  }
 
-  // Live split of the streamed reply into prose vs. <plan> block.
-  // While Plan mode is on and the model is inside <plan>…</plan>, the text is
-  // routed into a `plan` bubble so it renders in its frame AS IT ARRIVES — the old
-  // behaviour buffered the whole reply and only showed the plan at turn end, so
-  // the user watched prose and then the plan popped in.
+  // Stop the still-pending reasoning block: the provider moved on to the answer, so the
+  // "reasoned, then acted" split has to be visible. Shared by the close marker and the
+  // turn-end paths so the block can never be left spinning.
+  function settleThinking() {
+    const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
+    if (t) t.pending = false;
+  }
+
+  // Reveal everything still buffered, RIGHT NOW. Every path that ends the turn (a tool
+  // starting, an abort, an error, the turn finishing) must call this: leaving text in
+  // the buffer would let the answer keep trickling out after the turn it belonged to
+  // had already ended, which reads as the UI lagging behind reality.
+  function flushStream() {
+    return applyStreamOps(streamBuf.flush());
+  }
+
+  // Live split of the streamed reply into prose vs. plan block.
+  // While Plan mode is on and the model is inside the plan tags, the text is routed into
+  // a `plan` bubble so it renders in its frame AS IT ARRIVES — the old behaviour
+  // buffered the whole reply and only showed the plan at turn end, so the user watched
+  // prose and then the plan popped in.
+  // While Plan mode is on and the model is inside the plan tags, the text is routed into
+  // a `plan` bubble so it renders in its frame AS IT ARRIVES — the old behaviour
+  // buffered the whole reply and only showed the plan at turn end, so the user watched
+  // prose and then the plan popped in.
   function appendAssistant(text) {
     if (state.plan && typeof text === 'string' && text) {
       state._planBuf = (state._planBuf || '') + text;
       const buf = state._planBuf;
-      const open = buf.toLowerCase().indexOf('<plan>');
+      const open = buf.toLowerCase().indexOf(PLAN_OPEN_TAG);
       if (open === -1) {
         // Still in the prose part (or the tag has not finished arriving).
         const last = state.chat[state.chat.length - 1];
@@ -11285,8 +16285,8 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       }
       // Everything before the tag is prose; everything after it is the plan body.
       const prose = buf.slice(0, open);
-      const body = buf.slice(open + 6);
-      const close = body.toLowerCase().indexOf('</plan>');
+      const body = buf.slice(open + PLAN_OPEN_TAG.length);
+      const close = body.toLowerCase().indexOf(PLAN_CLOSE_TAG);
       const planSoFar = close === -1 ? body : body.slice(0, close);
       setStreamedProse(prose);
       setStreamedPlan(planSoFar);
@@ -11426,12 +16426,19 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 
   function appendThinking(text) {
     const last = state.chat[state.chat.length - 1];
+    let live;
     if (last && last.role === 'thinking' && last.pending) {
       last.text += text;
       last.spin = state.spin || 0;
+      live = last;
     } else {
-      state.chat.push({ role: 'thinking', text: text || '', pending: true, spin: state.spin || 0 });
+      live = { role: 'thinking', text: text || '', pending: true, spin: state.spin || 0 };
+      state.chat.push(live);
     }
+    // Reasoning does not go through addChat, so it is recorded here. `live` is the same
+    // block the previous chunk extended, so this appends to the open entry rather than
+    // writing one per character.
+    recordTranscriptRow(live);
     anchorScroll();
   }
 
@@ -11446,9 +16453,13 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       failed: !!(m && m.failed),
     };
     if (m && Array.isArray(m.diff)) out.diff = m.diff;
-    // Keep `card`: a background-task lifecycle card carries its phase/headline/
-    // detail here (see the `bg_task` renderer). Dropping it left the row with the
-    // fallback text instead of what actually happened.
+    // `bodyOnToolRow`: the tool row above already rendered this result's body, so the
+    // receipt must not open a second `↳` marker (see the tool_result branch).
+    if (m && m.bodyOnToolRow) out.bodyOnToolRow = true;
+    // Keep `card`: a background-task lifecycle card carries its phase/headline/detail
+    // here (see the `bg_task` renderer). The comment claimed this while the line itself
+    // was missing, so every card fell back to its placeholder text.
+    if (m && m.card) out.card = m.card;
     if (m && m._conv) out._conv = true;
     // Keep the compaction block's live fields: the header is rebuilt from `phase`,
     // the token pair and the (collapsed) summary every frame, so dropping them left
@@ -11471,6 +16482,7 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     try { stdin.pause(); } catch {}
     if (tipTimer) clearInterval(tipTimer);
     if (spinTimer) clearInterval(spinTimer);
+    if (streamTimer) clearInterval(streamTimer);
     if (tokTimer) clearInterval(tokTimer);
     if (confirmTimer) clearTimeout(confirmTimer);
     // The /tasks panel owns a flash timer; leaving it armed keeps the process
@@ -11501,6 +16513,8 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 // Run the SessionEnd hook, then exit. Bounded: a hung hook must not stop the
 // process from quitting, so the whole thing races a short timer.
 function quit() {
+  // Let plugins clean up (close files, flush logs, cancel timers) before we exit.
+  try { runHooks('onShutdown'); } catch (e) {}
   stop();
   let done = false;
   const bye = () => { if (!done) { done = true; process.exit(0); } };
@@ -11542,7 +16556,6 @@ function quit() {
         running: !!state.running,
         busy: !!state.agent,
         raw: wasRaw,
-        raw: wasRaw,
         // A stop() running means the TUI already tore down its terminal state, i.e.
         // a deliberate exit; without it this was a shutdown nobody asked for.
         tornDown: stopped,
@@ -11559,6 +16572,10 @@ function quit() {
     // but a process.exit elsewhere or a crash skips it; the one place a session
     // survives an abrupt halt is right here. sess.saveSession is synchronous fs.
     try { sess.saveSession(session); } catch {}
+    // Pasted screenshots are temp files with no further use once we are leaving;
+    // delete them here so they cannot pile up in the temp dir. Synchronous, and it
+    // runs on the graceful AND the crash path because 'exit' always fires.
+    try { cleanupPastedImages(); } catch { /* never block the exit */ }
     noteExit(`exit code=${code}`);
     if (stopped) return;
     try { stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l' + alternateScreen(false) + showCursor()); } catch {}
@@ -11602,7 +16619,7 @@ function quit() {
   let control = null;
   if (opts.control != null) {
     try {
-      control = await startControlServer({
+        control = await startControlServer({
         prompt: async (text) => { await submit(text); },
         status: async () => ({
           busy: !!(state.running),

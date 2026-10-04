@@ -1,0 +1,42 @@
+{
+  "name": "@hncode/hncode-sdk",
+  "version": "0.1.1",
+  "description": "Runtime helpers and TypeScript types for writing hncode plugins.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./targets": {
+      "types": "./targets.d.ts",
+      "default": "./targets.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "targets.js",
+    "targets.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "gen": "node scripts/gen-targets.mjs",
+    "prepublishOnly": "node scripts/gen-targets.mjs"
+  },
+  "keywords": [
+    "hncode",
+    "plugin",
+    "sdk",
+    "types"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "author": "NiceHello666",
+  "dependencies": {}
+}

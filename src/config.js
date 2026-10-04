@@ -27,7 +27,10 @@ export const DEFAULTS = {
   protocol: 'openai',
   // Fallback context window when neither config nor /v1/models provides one.
   maxContextTokens: 512000,
-  maxOutputTokens: 4096,
+  // Fallback output-token limit when neither config nor the model itself provides
+  // one. This is the per-response cap, not the context window — most models allow
+  // well above the old 4096, but it must stay within what the API accepts.
+  maxOutputTokens: 10000,
   reasoning: false,
   workspace: process.cwd(),
   allowExternal: false,
@@ -336,7 +339,9 @@ const b = baseUrl.replace(/\/+$/, '');
   // An empty base URL produces a relative endpoint like "/chat/completions",
   // which fetch() rejects with a URL-scheme error the model can't decode. Leave
   // the endpoint empty instead so the caller can show "not set".
-  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`);
+  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages`
+    : protocol === 'responses' ? `${b}/responses`
+    : `${b}/chat/completions`);
 
   // Context window: an explicit env/root override wins, then the model's own
   // `contextLength` (discovered from the provider's /v1/models), then the
@@ -344,7 +349,20 @@ const b = baseUrl.replace(/\/+$/, '');
   const overrideContext = process.env.HNCODE_MAX_CONTEXT || root.max_context_size || root.max_context_tokens;
   const modelContext = Number(modelEntry.contextLength || modelEntry.context_length || modelEntry.context_window || modelEntry.max_context_size || 0);
   const maxContext = Number(overrideContext || modelContext || DEFAULTS.maxContextTokens);
-  const maxOutput = Number(process.env.HNCODE_MAX_OUTPUT || root.max_output_size || DEFAULTS.maxOutputTokens);
+  // Output limit, resolved like the context window: an explicit override wins, then
+  // the model's OWN declared limit (from /v1/models), then the default. Ignoring the
+  // model's value pinned every model to the default even when it supported far more.
+  const modelMaxOutput = Number(
+    modelEntry.maxOutputTokens
+    || modelEntry.max_output_tokens   // models.dev `limit.output`, persisted on the entry
+    || modelEntry.max_tokens
+    || 0,
+  );
+  const maxOutput = Number(
+    process.env.HNCODE_MAX_OUTPUT
+    || root.max_output_size
+    || (modelMaxOutput > 0 ? modelMaxOutput : DEFAULTS.maxOutputTokens),
+  );
   const reasoning = process.env.HNCODE_REASONING ? /^(1|true|yes)$/i.test(process.env.HNCODE_REASONING) : !!root.reasoning;
   const allowExternal = process.env.HNCODE_ALLOW_EXTERNAL === '1' || !!root.tool_allow_external_paths;
 
@@ -387,13 +405,31 @@ const b = baseUrl.replace(/\/+$/, '');
       // Backwards-compat: read legacy cool_mode key if calm_mode is not set.
       : (root.calm_mode === true || root.calm_mode === 'true'
          || root.cool_mode === true || root.cool_mode === 'true'),
-    // SUBAGENT MODEL (/swarm-sub-agent): the model each subagent runs on. Empty
-    // (the default) means "follow this session's model", which is what the Agent
-    // and AgentSwarm tools fall back to. Set from config.toml so it persists.
     subagentModel: process.env.HNCODE_SUBAGENT_MODEL || root.subagent_model || '',
-    // Plugin directory (default: ~/.hncode/plugins). Set to "" or "false" to
-    // disable plugin loading entirely.
-    pluginDir: process.env.HNCODE_PLUGINS || root.plugins_dir || '',
+    // SECONDARY MODEL (/secondary-model): the cheap model for side work — /btw,
+    // /recap and the compaction summary run on it, so a long main-context model is
+    // not billed for a question that needed none of that context. Empty means
+    // "use the session's model", which is the safe default: a model choice the user
+    // never made should not be invented from a model list.
+    secondaryModel: process.env.HNCODE_SECONDARY_MODEL || root.secondary_model || '',
+    // OUTPUT STYLE (/output-style): the NAME of a style file under
+    // ~/.hncode/output-styles/. Stored as a name, not as the text, so editing the
+    // file changes the style without touching config.toml.
+    outputStyle: process.env.HNCODE_OUTPUT_STYLE || root.output_style || '',
+    // FEATURE FLAGS (/experiments): a table of name -> boolean. Read by
+    // experiments.js, which owns the registry and the defaults.
+    experiments: (root.experiments && typeof root.experiments === 'object') ? root.experiments : {},
+    // SCHEDULED PROMPTS (/schedule): cron-like entries that queue a prompt on a
+    // running session. Stored as TOML inline tables under [schedule.<id>].
+    schedule: (root.schedule && typeof root.schedule === 'object') ? root.schedule : {},
+    // Plugin directory (default: ~/.hncode/plugins). Loaded on every launch so
+    // plugins installed via /plugins actually take effect. Set to "" or "false"
+    // (config or env) to disable plugin loading entirely; unset means the default.
+    pluginDir: (() => {
+      const v = process.env.HNCODE_PLUGINS || root.plugins_dir;
+      if (v === 'false' || v === false || v === '' || v === null || v === undefined) return v === 'false' || v === false || v === '' ? '' : path.join(homeDir(), '.hncode', 'plugins');
+      return v;
+    })(),
     // AUTO-UPDATE (/auto-update): when true, hncode checks npm for a newer
     // version at startup and then every 30 minutes, installing in the background
     // without interrupting the session.
@@ -444,9 +480,24 @@ const b = baseUrl.replace(/\/+$/, '');
     promptCache: process.env.HNCODE_PROMPT_CACHE
       ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_PROMPT_CACHE)
       : (root.prompt_cache === false || root.prompt_cache === 'false' ? false : true),
+    // REDUCED MOTION (/reduced-motion, config.toml or the environment). When on,
+    // every animation is replaced by a static or slow-breathing form: the spinner
+    // does not rotate, the sweeps do not run, and the pulse does not cycle. For a
+    // user who finds the motion distracting or nauseating, and for a terminal that
+    // repaints badly, this is the difference between usable and not. Default OFF —
+    // motion is the intended experience, so this is an opt-out.
+    reducedMotion: process.env.HNCODE_REDUCED_MOTION
+      ? /^(1|true|yes|on)$/i.test(process.env.HNCODE_REDUCED_MOTION)
+      : (root.reduced_motion === true || root.reduced_motion === 'true'),
+    // SHIMMER EDGE (`shimmer_edge`): `cosine` gives the sweep a soft LEADING edge
+    // like codex's, `linear` keeps the original hard-on/soft-off ramp. Exposed
+    // because the two are a matter of taste and the cost is one branch.
+    shimmerEdge: String(root.shimmer_edge || process.env.HNCODE_SHIMMER_EDGE || 'cosine').toLowerCase() === 'linear'
+      ? 'linear' : 'cosine',
     raw: root,
   };
 }
+
 
 export function saveConfig(overlay) {
   const dir = hncodeConfigFile();
@@ -617,7 +668,7 @@ function renderTomlString(key, value) {
 
 // Append (or replace) a [providers.<name>] table in config.toml without
 // clobbering unrelated content. Used by /provider's "Add provider…" flow.
-export function addProvider(name, { base_url, api_key, protocol } = {}) {
+export function addProvider(name, { base_url, api_key, protocol, known, catalog } = {}) {
   const file = hncodeConfigFile();
   let text = '';
   try { text = fs.readFileSync(file, 'utf8'); } catch { /* new file */ }
@@ -646,6 +697,14 @@ export function addProvider(name, { base_url, api_key, protocol } = {}) {
   if (base_url) out.push(`base_url = ${q(base_url)}`);
   if (api_key) out.push(`api_key = ${q(api_key)}`);
   if (protocol) out.push(`protocol = ${q(protocol)}`);
+  // `known` records the SOURCE: true = added from the models.dev catalog, false =
+  // a plain endpoint the user typed in. It is written even when false, so the two
+  // cases are distinguishable instead of relying on a missing key.
+  if (known !== undefined) out.push(`known = ${known ? 'true' : 'false'}`);
+  // `catalog` records WHICH models.dev entry this provider maps to, so a renamed
+  // provider (e.g. "anthropic-work") still resolves the real catalog id. Only
+  // meaningful when `known` is true.
+  if (catalog) out.push(`catalog = ${q(catalog)}`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, out.join('\n') + '\n', 'utf8');
   return file;
@@ -718,12 +777,245 @@ export function addModel(provider, modelId, opts = {}) {
   // size the context bar per model (not a global 128k).
   if (opts.contextLength) lines.push(`context_length = ${Number(opts.contextLength)}`);
   if (opts.maxTokens) lines.push(`max_tokens = ${Number(opts.maxTokens)}`);
+  // Per-model output limit (from models.dev `limit.output`, or a provider's
+  // `max_output_tokens`). Its own key so it is not confused with `max_tokens`,
+  // which some endpoints use for the same thing and others do not.
+  if (opts.maxOutputTokens) lines.push(`max_output_tokens = ${Number(opts.maxOutputTokens)}`);
+  if (opts.reasoning !== undefined && opts.reasoning !== null) lines.push(`reasoning = ${opts.reasoning ? 'true' : 'false'}`);
+  // Thinking levels, from models.dev `reasoning_options` (or a user's own list).
+  if (Array.isArray(opts.efforts) && opts.efforts.length) {
+    lines.push(`efforts = [ ${opts.efforts.map((e) => `"${String(e).replace(/"/g, '\\"')}"`).join(', ')} ]`);
+  }
+  lines.push(...costLines(opts.cost));
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, '\n' + lines.join('\n') + '\n', 'utf8');
   return file;
 }
 
+// ---- pricing ----------------------------------------------------------------
+// Four flat keys rather than a nested table, because the TOML writer here is
+// hand-rolled and a nested `[models."k".cost]` table would have to be tracked
+// through three separate writers. Prices are USD per 1M tokens, which is the unit
+// models.dev publishes and the unit the cost readout divides by.
+const COST_KEYS = {
+  input: 'cost_input',
+  output: 'cost_output',
+  cacheRead: 'cost_cache_read',
+  cacheWrite: 'cost_cache_write',
+};
+
+/** `{ input, output, cacheRead, cacheWrite }` USD-per-1M -> TOML lines. */
+function costLines(cost) {
+  if (!cost || typeof cost !== 'object') return [];
+  const out = [];
+  for (const [field, key] of Object.entries(COST_KEYS)) {
+    const n = Number(cost[field]);
+    if (Number.isFinite(n) && n > 0) out.push(`${key} = ${n}`);
+  }
+  return out;
+}
+
+/**
+ * Convert a models.dev catalog `cost` object into our shape, USD per 1M tokens.
+ *
+ * ZERO IS A PRICE. The catalog marks a free model as `{input: 0, output: 0}` — 637
+ * entries do — and there is no `free` flag to look for. Treating 0 as "missing" (the
+ * `n > 0` test) turned every free model into "no pricing", and the readout then fell
+ * through to a guess. So the test is `>= 0` and a zero is carried through as a real
+ * price: `usageCost` multiplies out to exactly 0 and the readout shows `$0.00`, which
+ * is true for a free service.
+ */
+export function costFromCatalog(cost) {
+  if (!cost || typeof cost !== 'object') return undefined;
+  const pick = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : undefined; };
+  const out = {
+    input: pick(cost.input),
+    output: pick(cost.output ?? cost.reasoning),
+    cacheRead: pick(cost.cache_read ?? cost.cacheRead),
+    cacheWrite: pick(cost.cache_write ?? cost.cacheWrite),
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
+
+/**
+ * A stored model entry's pricing, or null when the model has none.
+ *
+ * Falls back to the ALREADY-FETCHED models.dev catalog. Every model entry written
+ * before pricing existed has no cost keys, and re-adding each provider to backfill
+ * them is a migration the user should not have to perform — the catalog that
+ * produced the entry in the first place already knows the price. The fallback is
+ * free (a Map lookup into a memoized object) and silent: when the catalog has not
+ * been fetched this session there is simply no fallback, and the readout says the
+ * price is unknown rather than guessing.
+ */
+export function modelCost(cfg, modelKeyName) {
+  const models = (cfg && cfg.raw && cfg.raw.models) || {};
+  const key = modelKeyName || (cfg && cfg.model);
+  const entry = models[key] || {};
+  // `>= 0`, like costFromCatalog: a model the user priced at ZERO is priced, and must
+  // `>= 0`, like costFromCatalog: a model the user priced at ZERO is priced, and must
+  // not fall through to the catalog (which would charge it someone else's rate).
+  const pick = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : undefined; };
+  const stored = {
+    input: pick(entry.cost_input ?? entry.costInput),
+    output: pick(entry.cost_output ?? entry.costOutput),
+    cacheRead: pick(entry.cost_cache_read ?? entry.costCacheRead),
+    cacheWrite: pick(entry.cost_cache_write ?? entry.costCacheWrite),
+  };
+  if (Object.values(stored).some((v) => v !== undefined)) return stored;
+  return catalogCostFor(cfg, entry, key);
+}
+
+// ---- catalog price lookup ----------------------------------------------------
+// A model entry with no price keys of its own: look it up in models.dev by its EXACT
+// provider bucket and model id. That is the whole rule.
+//
+// WHY THERE IS NO GUESSING BEYOND THAT. An unmatched model belongs to a provider
+// models.dev does not list — a local proxy, a company endpoint, someone's free
+// gateway — and there is NO WAY to know what it costs. Earlier versions tried to infer
+// a price from the model id (a `deepseek-` prefix looked like DeepSeek's vendor entry;
+// or the same bare name appearing under other providers, taking the most common rate).
+// That produced a CONFIDENT, WRONG number rather than an honest gap: a FREE local
+// proxy serving `workbuddy/deepseek-v4.1-flash` was billed DeepSeek's official rate,
+// and the status line showed $2.57 for a service that charges nothing.
+//
+// An invented price is worse than a missing one. The readout omits the cost segment
+// entirely when there is no price, which is visibly "unknown"; a wrong number is not
+// detectable at all. A provider that resells under a different name can still be
+// priced, but only by SAYING SO: `catalog = "<models.dev id>"` on the provider.
+//
+// The second lookup is the provider's own id inside the bucket: some endpoints report
+// a model as `deepseek-ai/deepseek-flash` where the catalog keys it as `deepseek-flash`,
+// and taking the last path segment matches that without matching a different model.
+function catalogCostFor(cfg, entry, key) {
+  if (!catalogCache) return null;
+  const providerName = entry.provider || String(key || '').split('/')[0];
+  const prov = ((cfg && cfg.raw && cfg.raw.providers) || {})[providerName] || {};
+  // `catalog` records which models.dev entry a renamed provider maps to, so a gateway
+  // serving a vendor's models under its own name can be priced — because the user
+  // declared the mapping, not because we guessed it from the model's name.
+  const catalogId = prov.catalog || providerName;
+  const modelId = entry.model || String(key || '').split('/').slice(1).join('/');
+  const bucket = catalogCache[catalogId];
+  if (!bucket || !bucket.models) return null;
+  const hit = bucket.models[modelId] || bucket.models[String(modelId).split('/').pop()];
+  if (!hit) return null;
+  return costFromCatalog(hit.cost) || null;
+}
+
+
+/**
+ * USD spent for a token total, given pricing. `usage` is the normalised
+ * accumulator shape ({ input, output, cached, cacheWrite }), with `cached` being
+ * the part of `input` that was a cache READ — so it is billed at the cache price
+ * and the remainder at the input price.
+ *
+ * Returns null when the model has no pricing: an unknown model must report
+ * "unknown", never a made-up $0.00 that reads like "this was free".
+ */
+export function usageCost(usage, cost) {
+  if (!usage || !cost) return null;
+  const per = (tokens, price) => (Number(tokens) || 0) / 1e6 * (Number(price) || 0);
+  const cached = Number(usage.cached) || 0;
+  const input = Number(usage.input) || 0;
+  // Cache READS are a subset of the reported input; bill the difference at the
+  // plain input rate. Without this the input side was billed twice.
+  const freshInput = Math.max(0, input - cached);
+  let total = per(freshInput, cost.input) + per(Number(usage.output) || 0, cost.output);
+  if (cached) total += per(cached, cost.cacheRead !== undefined ? cost.cacheRead : cost.input);
+  if (usage.cacheWrite) total += per(usage.cacheWrite, cost.cacheWrite !== undefined ? cost.cacheWrite : cost.input);
+  return total;
+}
+
+
+// Replace (or create) a single `[models."<key>"]` block. Unlike addModel, which is
+// append-only and a no-op when the key exists, this REWRITES the block so the
+// /model editor can change display name / context / output limits. A key passed as
+// undefined or '' is OMITTED, so clearing a field removes it from the file rather
+// than writing an empty value. Other tables are left untouched.
+export function upsertModel(provider, modelId, opts = {}) {
+  const file = hncodeConfigFile();
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { /* new file */ }
+  const key = modelKey(provider, modelId);
+  const unq = (s) => String(s).replace(/\\(.)/g, '$1');
+  const modelRe = /^\s*\[models\.\s*"((?:[^"\\]|\\.)*)"\s*\]\s*$/;
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let skipping = false;
+  for (const ln of lines) {
+    const mm = modelRe.exec(ln);
+    if (mm) { skipping = unq(mm[1]) === key; if (skipping) continue; }
+    else if (/^\s*\[/.test(ln)) skipping = false;
+    if (!skipping) out.push(ln);
+  }
+  while (out.length && out[out.length - 1].trim() === '') out.pop();
+  out.push('');
+  const q = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  out.push(`[models.${q(key)}]`);
+  out.push(`provider = ${q(provider)}`);
+  out.push(`model = ${q(modelId)}`);
+  if (opts.display_name) out.push(`display_name = ${q(opts.display_name)}`);
+  if (opts.contextLength) out.push(`context_length = ${Number(opts.contextLength)}`);
+  if (opts.maxTokens) out.push(`max_tokens = ${Number(opts.maxTokens)}`);
+  if (opts.maxOutputTokens) out.push(`max_output_tokens = ${Number(opts.maxOutputTokens)}`);
+  // Pricing, when the caller knows it. A blank means "leave the entry without
+  // prices", which is what an entry edited by hand in config.toml keeps.
+  out.push(...costLines(opts.cost));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, out.join('\n') + '\n', 'utf8');
+  return file;
+}
+
+// Replace EVERY `[models."<provider>/*"]` block with the given list, persisting a
+// provider's model set after a refresh. `entries` is an array of
+// { id, display_name, contextLength, maxTokens, maxOutputTokens, reasoning, efforts }.
+// Unlike upsertModel (one key) this is the bulk form: entries the provider no longer
+// offers DISAPPEAR from the file, which is what makes Ctrl+R in /provider a real
+// refresh rather than an in-memory-only illusion that the next launch undoes.
+export function replaceProviderModels(provider, entries) {
+  const file = hncodeConfigFile();
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { /* new file */ }
+  const unq = (s) => String(s).replace(/\\(.)/g, '$1');
+  const modelRe = /^\s*\[models\.\s*"((?:[^"\\]|\\.)*)"\s*\]\s*$/;
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let skipping = false;
+  for (const ln of lines) {
+    const mm = modelRe.exec(ln);
+    if (mm) { skipping = unq(mm[1]).split('/')[0] === provider; if (skipping) continue; }
+    else if (/^\s*\[/.test(ln)) skipping = false;
+    if (!skipping) out.push(ln);
+  }
+  while (out.length && out[out.length - 1].trim() === '') out.pop();
+  const q = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  for (const e of (entries || [])) {
+    const id = String(e.id || '').trim();
+    if (!id) continue;
+    out.push('');
+    out.push(`[models.${q(modelKey(provider, id))}]`);
+    out.push(`provider = ${q(provider)}`);
+    out.push(`model = ${q(id)}`);
+    if (e.display_name) out.push(`display_name = ${q(e.display_name)}`);
+    if (e.contextLength) out.push(`context_length = ${Number(e.contextLength)}`);
+    if (e.maxTokens) out.push(`max_tokens = ${Number(e.maxTokens)}`);
+    if (e.maxOutputTokens) out.push(`max_output_tokens = ${Number(e.maxOutputTokens)}`);
+    if (e.reasoning !== undefined && e.reasoning !== null) out.push(`reasoning = ${e.reasoning ? 'true' : 'false'}`);
+    if (Array.isArray(e.efforts) && e.efforts.length) {
+      out.push(`efforts = [ ${e.efforts.map((x) => `"${String(x).replace(/"/g, '\\"')}"`).join(', ')} ]`);
+    }
+    out.push(...costLines(e.cost));
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, out.join('\n') + (out.length ? '\n' : ''), 'utf8');
+  return file;
+}
+
 function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+
 
 // Fetch the model list from a provider's API. The base URL is used as given and
 // we append only `/models` (so `https://host/v1` → `https://host/v1/models`).
@@ -777,37 +1069,80 @@ export async function fetchModels({ baseUrl, apiKey, protocol, throwOnError = fa
   } finally { clearTimeout(timer); }
 }
 
-// ---- thinking effort capability ----
+/**
+ * Turn models.dev `reasoning_options` into a level list, or null when there is
+ * nothing usable. This is the ONLY source of graded thinking levels — we never
+ * derive a grade from the model id.
+ *
+ * The catalog shape is an array of typed entries:
+ *   { type: 'effort',        values: ['low','medium','high'] }  -> use `values`
+ *   { type: 'budget_tokens', min: 1024 }                        -> on/off
+ *   { type: 'toggle' }                                          -> on/off
+ * `none` in an effort list means "off"; it is normalised to 'off' and kept first.
+ * A model may declare SEVERAL entries and they are not ordered, so the whole array
+ * is scanned and an `effort` list wins over the plain toggle. Returns null (not [])
+ * when the model declares no options, so the caller can tell "no catalog data" from
+ * "explicitly no reasoning".
+ */
+export function effortsFromReasoning(reasoningOptions) {
+  const opts = Array.isArray(reasoningOptions) ? reasoningOptions : [];
+  let graded = null;
+  let toggle = false;
+  // Read every entry before deciding. DeepSeek is what made this necessary: its
+  // catalog data is `[{ type: 'toggle' }, { type: 'effort', values: [low, high,
+  // max] }]`, and returning at the FIRST entry read only the toggle — so a model
+  // with three grades showed a plain off/on and `max` was unreachable.
+  for (const o of opts) {
+    if (!o || typeof o !== 'object') continue;
+    if (!graded && o.type === 'effort' && Array.isArray(o.values) && o.values.length) {
+      const vals = o.values.map((v) => (String(v).toLowerCase() === 'none' ? 'off' : String(v).toLowerCase()));
+      // De-dup and make sure 'off' is first when present.
+      const uniq = [...new Set(vals)];
+      uniq.sort((a, b) => (a === 'off' ? -1 : b === 'off' ? 1 : 0));
+      graded = uniq;
+    }
+    if (o.type === 'budget_tokens' || o.type === 'toggle') toggle = true;
+  }
+  if (graded) {
+    // A `toggle` beside the grades means thinking can also be switched off, which
+    // the effort list does not always spell out itself.
+    return toggle && !graded.includes('off') ? ['off', ...graded] : graded;
+  }
+  return toggle ? ['off', 'on'] : null;
+}
 
 // ---- thinking effort capability ----
 // The set of selectable efforts for a model. Honours, in order:
-//   1. an explicit `efforts` / `reasoning_efforts` list on the model entry
-//   2. an explicit `reasoning = false` (model cannot think)
-//   3. a name heuristic for models known to expose graded effort
-// Returns [] when the model has no thinking control (then /model shows no
-// effort row and /effort reports it is unsupported).
-// Selectable thinking efforts for a model, mirroring kimi's `segmentsFor`:
-//   * a model that declares `efforts` uses exactly those (plus a leading 'off'
-//     unless it is `always_thinking`, which cannot be turned off)
-//   * `reasoning = false` / `thinking = false` -> no control at all
-//   * otherwise fall back to id heuristics: graded OpenAI models get
-//     off/low/medium/high, Anthropic and everything else get off/on.
+//   1. an explicit `efforts` list on the model entry — this is what a catalog
+//      install writes (from models.dev `reasoning_options`), and what a user can
+//      also set by hand in config.toml (e.g. to name their own "max"/"xhigh")
+//   2. an explicit `reasoning = false` (model cannot think) -> no control
+//   3. `reasoning = true` with no declared levels -> the plain off/on toggle
+// Returns [] when the model has no thinking control (then /model shows no effort
+// row and /effort reports it is unsupported). Grades are NEVER guessed from the
+// model id: models.dev is the source of truth, and a model it does not know simply
+// gets the on/off toggle rather than an invented level list.
 export function effortOptions(cfg, modelKeyName) {
   const models = (cfg.raw && cfg.raw.models) || {};
   const entry = models[modelKeyName || cfg.model] || {};
+  // 1. A user-declared list wins outright (config.toml `efforts = [...]`), so a
+  //    user can name their own levels (max, xhigh, …) even for a model the catalog
+  //    does not know.
   const declared = Array.isArray(entry.efforts) ? entry.efforts.filter(Boolean).slice() : [];
   const alwaysOn = entry.always_thinking === true || entry.alwaysThinking === true;
-  if (declared.length) return alwaysOn ? declared : (declared[0] === 'off' ? declared : ['off', ...declared]);
-  if (alwaysOn) return ['on'];
-  if (entry.reasoning === false || entry.thinking === false) return [];
-  const id = String(entry.model || modelKeyName || cfg.innerModel || '').toLowerCase();
-  // OpenAI-style graded efforts.
-  if (/(^|\/)(gpt-5|o1|o3|o4)/.test(id) || /gpt-5|o1-|o3-|o4-/.test(id)) {
-    return ['off', 'low', 'medium', 'high'];
+  if (declared.length) {
+    // Prepend 'off' unless the list already has it or thinking cannot be turned off.
+    return alwaysOn || declared[0] === 'off' ? declared : ['off', ...declared];
   }
-  // Anthropic extended thinking is a budget, not a grade — expose on/off only.
-  if (cfg.protocol === 'anthropic') return ['off', 'on'];
-  // Default: thinking is on/off.
+  // 2. An explicit `reasoning = false` / `thinking = false` means no control.
+  if (entry.reasoning === false || entry.thinking === false) return [];
+  if (alwaysOn) return ['on'];
+  // 3. No declared levels. `reasoning = true` (supported) AND a missing field
+  //    (unknown — e.g. an entry created before the catalog stored efforts) both get
+  //    the plain off/on toggle. Grades are NEVER guessed from the model id: the
+  //    graded list is models.dev's to declare, stored as `efforts` when the provider
+  //    was added from the catalog. An entry with no reasoning field is UNKNOWN, not
+  //    "unsupported", so it must not lose its toggle.
   return ['off', 'on'];
 }
 
@@ -817,6 +1152,11 @@ export function effortWire(cfg, effort) {
   if (cfg.protocol === 'anthropic') {
     const budget = { on: 8000, low: 2000, medium: 8000, high: 16000, max: 32000 }[effort] || 8000;
     return { thinking: { type: 'enabled', budget_tokens: budget } };
+  }
+  // Responses API nests the grade: `reasoning: { effort }`.
+  if (cfg.protocol === 'responses') {
+    const grade = effort === 'on' ? 'medium' : effort;
+    return { reasoning: { effort: grade } };
   }
   // OpenAI-compatible: `reasoning_effort`. "on" is not a valid grade, so map it
   // to "medium"; concrete grades pass through.
@@ -941,7 +1281,9 @@ export function resolveProvider(cfg, providerName, innerModel) {
   const protocol = (prov.protocol) || cfg.protocol;
   const inner = prov.model || (innerModel != null ? innerModel : cfg.innerModel);
   const b = String(baseUrl || '').replace(/\/+$/, '');
-  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages` : `${b}/chat/completions`);
+  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages`
+    : protocol === 'responses' ? `${b}/responses`
+    : `${b}/chat/completions`);
   // Provider switch may move the active model too; refresh the context window
   // so the gauge reflects the newly active model, not the old one.
   const maxContextTokens = contextForModel(cfg, cfg.model);
@@ -962,4 +1304,4 @@ export function resolveModelArg(cfg, modelName) {
   return { ...resolveProvider(cfg, provider, inner), model: modelName, maxContextTokens };
 }
 
-export default { resolveConfig, saveConfig, effectiveSnapshot, resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, rememberModel, hncodeConfigFile };
+export default { resolveConfig, saveConfig, effectiveSnapshot, resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, upsertModel, replaceProviderModels, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, rememberModel, hncodeConfigFile, effortsFromReasoning, effortOptions, costFromCatalog, modelCost, usageCost };

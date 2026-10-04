@@ -61,7 +61,7 @@ const RULES = {
     ],
     // Only for models with no dedicated reasoning channel.
     tagFallback: [
-      'Put all internal reasoning inside <think>...</think> and close the block before your answer. Reasoning must never appear outside it.',
+      'Put all internal reasoning inside <|thinking|>...<|/thinking|> and close the block before your answer. Reasoning must never appear outside it.',
     ],
   },
   scope: [

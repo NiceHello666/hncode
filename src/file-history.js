@@ -175,3 +175,115 @@ export function describeRewind(res) {
   if (res.failed.length) parts.push(`${res.failed.length} could not be restored`);
   return parts.join(', ');
 }
+
+/**
+ * Every checkpoint on record, newest turn first, as one flat list.
+ *
+ * WHY THIS EXISTS BESIDE `rewind`
+ * -------------------------------
+ * `rewind(n)` is all-or-nothing across whole turns: to get one file back you must also roll
+ * back every other file those turns touched. That is the right default (a turn is a unit of
+ * intent) and the wrong tool for "I want the version of THIS file from before that one
+ * edit". The index already records exactly that — one entry per file per turn, with the
+ * content it had — so the list is a rearrangement of existing data, not new bookkeeping.
+ *
+ * @returns {Array<{turn:number, at:number, path:string, existed:boolean, backup:string,
+ *   size:number|null, ageMs:number}>} turn is 1-based, counting from the oldest.
+ */
+export function listCheckpoints(sessionId, opts = {}) {
+  const doc = readIndex(sessionId);
+  const only = opts.path ? path.resolve(opts.path) : null;
+  const out = [];
+  const now = Date.now();
+  for (let i = doc.turns.length - 1; i >= 0; i--) {
+    const turn = doc.turns[i];
+    for (const f of turn.files) {
+      if (only && f.path !== only) continue;
+      let size = null;
+      if (f.existed && f.backup) {
+        try { size = fs.statSync(f.backup).size; } catch { size = null; }
+      }
+      out.push({
+        // `index` is 1-based over the whole list, newest first — the number the panel
+        // prints and `restore <n>` accepts. Assigned here rather than derived from `turn`
+        // so a row keeps its identity even after another turn is recorded.
+        index: 0,
+        turn: i + 1,
+        at: turn.at,
+        path: f.path,
+        existed: f.existed !== false,
+        backup: f.backup || '',
+        size,
+        ageMs: Math.max(0, now - (turn.at || now)),
+      });
+    }
+  }
+  out.forEach((c, i) => { c.index = i + 1; });
+  return out;
+}
+
+/**
+ * Restore ONE file from one checkpoint, leaving every other file and the turn index alone.
+ *
+ * The index is deliberately NOT truncated: this is a surgical restore, not a rewind, so the
+ * remaining checkpoints stay valid. A file that did not exist at that checkpoint is deleted,
+ * which is what "restore" means for a file the agent created.
+ *
+ * @returns {{ok: boolean, action?: 'restored'|'deleted', error?: string}}
+ */
+export function restoreCheckpoint(sessionId, entry) {
+  const target = entry && entry.path;
+  if (!target) return { ok: false, error: 'no path on that checkpoint' };
+  try {
+    if (entry.existed === false) {
+      fs.rmSync(target, { force: true });
+      return { ok: true, action: 'deleted' };
+    }
+    if (!entry.backup) return { ok: false, error: 'that checkpoint has no content copy' };
+    // Read BEFORE creating the directory: a missing backup must not leave an empty
+    // directory behind where there was none.
+    const content = fs.readFileSync(entry.backup);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
+    return { ok: true, action: 'restored' };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
+/** A `+N -M` size delta for a checkpoint against the current file, or null when either side
+ *  is unavailable. Cheap: it reads only the backup (the current file is stat'ed). */
+export function checkpointDelta(entry) {
+  if (!entry || !entry.existed || !entry.backup) return null;
+  try {
+    const before = fs.readFileSync(entry.backup, 'utf8').split(/\r?\n/).length;
+    const after = fs.readFileSync(entry.path, 'utf8').split(/\r?\n/).length;
+    return { before, after, lines: after - before };
+  } catch { return null; }
+}
+
+/** Lines for the /checkpoints panel: one row per checkpoint, grouped visually by turn. */
+export function describeCheckpoints(sessionId, workspace) {
+  const all = listCheckpoints(sessionId);
+  if (!all.length) {
+    return ['No checkpoints recorded for this session yet.', '',
+      'A checkpoint is taken the first time the agent changes a file in a turn,',
+      'so this fills in as you work.'];
+  }
+  const lines = [`Checkpoints (${all.length}) across ${new Set(all.map((c) => c.turn)).size} turn(s)`, ''];
+  let lastTurn = null;
+  for (const c of all) {
+    if (c.turn !== lastTurn) {
+      lastTurn = c.turn;
+      const when = c.at ? new Date(c.at).toISOString().slice(0, 16).replace('T', ' ') : '?';
+      lines.push(`turn ${c.turn}  ${when}`);
+    }
+    const rel = workspace && String(c.path).startsWith(workspace)
+      ? path.relative(workspace, c.path).split(path.sep).join('/')
+      : c.path;
+    const what = c.existed ? `${c.size == null ? '?' : c.size} B` : 'created here';
+    lines.push(`  ${String(c.index).padStart(3)}  ${what.padEnd(12)} ${rel}`);
+  }
+  lines.push('', 'Restore one with /checkpoints restore <n>');
+  return lines;
+}

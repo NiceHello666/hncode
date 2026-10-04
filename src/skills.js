@@ -127,6 +127,33 @@ export function importSkill(file, name) {
   return { ok: true, name: skillName, path: dest, replaced };
 }
 
+// Register (write or overwrite) a skill from an in-memory Markdown string rather
+// than a file on disk. Used by plugins that want to ship a skill as code instead of
+// requiring the user to /import-skill a file. The string must contain a leading
+// `--- … ---` front-matter block with at least a `name` (or pass `name` explicitly);
+// otherwise the name falls back to `name`/`fileName`. Returns the same shape as
+// importSkill: { ok: true, name, path, replaced } or { ok: false, error }.
+export function addSkillFromText(text, name, fileName = 'skill.md') {
+  const content = String(text == null ? '' : text);
+  if (!content.trim()) return { ok: false, error: 'Skill content is empty.' };
+  const destDir = skillsDir();
+  // Derive the name the way importSkill does, so the two paths agree.
+  const { meta } = parseFrontMatter(content);
+  const derived = name || meta.name || String(fileName || 'skill').replace(/\.md$/i, '');
+  const skillName = normalizeSkillName(derived);
+  if (!skillName) return { ok: false, error: 'Could not derive a skill name (pass one explicitly).' };
+  if (/[\\/]/.test(skillName)) return { ok: false, error: `Invalid skill name: ${skillName}` };
+  const dest = path.join(destDir, `${skillName}.md`);
+  const replaced = fs.existsSync(dest);
+  try {
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.writeFileSync(dest, content, 'utf8');
+  } catch (e) {
+    return { ok: false, error: `Cannot write ${dest}: ${e.message}` };
+  }
+  return { ok: true, name: skillName, path: dest, replaced };
+}
+
 export function deleteSkill(name) {
   const n = normalizeSkillName(name);
   if (!n) return false;

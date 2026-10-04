@@ -2,7 +2,7 @@
 
 [English](https://github.com/NiceHello666/hncode/blob/main/README.md) | 简体中文 | [Wiki](https://github.com/NiceHello666/hncode/blob/main/README_WIKI_CN.md)
 
-> **这是我 Vibe Coding 的产物，可能不是特别好，但是如果有什么建议的话也欢迎提 issue**
+> **这是我vibe coding的产物. 我在尽全力让它变的完美, 所以如果你有何建议, 欢迎开一个issue.**
 
 一个基于终端用户界面（TUI）的 AI 编程助手，灵感源自 [Kimi Code](https://github.com/MoonshotAI/kimi-code)。它提供青色蓝调 (Cyan-blue) 的 TUI 界面，支持 OpenAI 和 Anthropic 双协议，配备 MCP 风格的工具集和智能上下文管理。
 
@@ -52,24 +52,10 @@ npx @hncode/hncode
 
 ## 🤝 贡献
 
-这个项目是通过 Vibe Coding 创建的。虽然它可能不够完美，但我欢迎您的反馈！
-
 **欢迎：**
 - 提交问题报告 bug 或提出建议
 - Fork 并创建拉取请求
 - 分享您使用 hncode 的体验
-
----
-
-## 🙏 致谢
-
-hncode 从以下几个优秀项目中汲取了灵感：
-
-- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - 原始的青色蓝调终端界面 AI 编程助手，启发了本项目的设计和理念
-- **[Claude Code](https://github.com/anthropics/claude-code)** - 对话流程和工具交互模式
-- **[Codex](https://github.com/openai/codex)** - 通过阅读其开源实现，本项目确定了几处行为：AGENTS.md 的加载规则、未获明确许可不得开启子代理、计划工具的状态流转约束、代码审查的判定标准，以及系统提示词的部分内容
-
-特别感谢这些项目背后的社区，它们推动了 AI 辅助编程的边界。
 
 ---
 

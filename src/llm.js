@@ -10,6 +10,7 @@
 import { llmTools } from './tools/index.js';
 import { effortWire } from './config.js';
 import { applyPromptCache } from './cache.js';
+import { runPatch, runPatchSync } from './plugin.js';
 
 export function openAiToolDefs(tools) {
   // Guard: a caller that passes null/undefined (e.g. setToolsList(null)) used to
@@ -147,6 +148,75 @@ export function toAnthropic(messages) {
 return { system: sys.join('\n\n').trim(), messages: out };
 }
 
+/** Responses: content parts use `input_text` / `input_image`. */
+function toResponsesContent(c) {
+  const parts = [];
+  const text = mediaText(c);
+  if (text) parts.push({ type: 'input_text', text });
+  for (const m of c.media) {
+    if (m && m.type === 'image' && m.data) {
+      parts.push({ type: 'input_image', image_url: `data:${m.mimeType || 'image/png'};base64,${m.data}` });
+    }
+  }
+  if (!parts.length) return text || '';
+  return parts;
+}
+
+// Internal canonical messages -> OpenAI RESPONSES API request shape.
+//
+// The Responses API is NOT chat/completions with a different name: the message
+// array becomes a flat `input` ITEM list, the system prompt moves to a top-level
+// `instructions`, tools are FLAT (no nested `function` object), a tool call is its
+// own item (`function_call`) and its result is another (`function_call_output`,
+// keyed by `call_id` rather than `tool_call_id`). Returns { instructions, input }.
+export function toResponsesInput(messages) {
+  const sys = [];
+  const input = [];
+  for (const m of messages) {
+    if (m.role === 'system') { sys.push(m.content); continue; }
+    if (m.role === 'user') {
+      input.push({ role: 'user', content: isMediaContent(m.content) ? toResponsesContent(m.content) : [{ type: 'input_text', text: String(m.content == null ? '' : m.content) }] });
+      continue;
+    }
+    if (m.role === 'tool') {
+      // Tool output is a top-level item, not a role:'tool' message.
+      const out = isMediaContent(m.content)
+        ? toResponsesContent(m.content)
+        : String(m.content == null ? '' : m.content);
+      input.push({ type: 'function_call_output', call_id: m.toolCallId, output: out });
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const hasText = typeof m.content === 'string' && m.content.trim();
+      const hasCalls = Array.isArray(m.toolCalls) && m.toolCalls.length;
+      if (!hasText && !hasCalls) continue;
+      if (hasText) {
+        input.push({ role: 'assistant', content: [{ type: 'output_text', text: m.content }] });
+      }
+      for (const tc of (m.toolCalls || [])) {
+        input.push({
+          type: 'function_call',
+          call_id: tc.id,
+          name: tc.name,
+          arguments: JSON.stringify(tc.args || {}),
+        });
+      }
+    }
+  }
+  return { instructions: sys.join('\n\n').trim(), input };
+}
+
+// Responses tools are FLAT: { type:'function', name, description, parameters }.
+// (chat/completions nests all of that under a `function` key.)
+export function responsesToolDefs(tools) {
+  return (Array.isArray(tools) ? tools : []).map((t) => ({
+    type: 'function',
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+  }));
+}
+
 function authHeaders(cfg) {
   const h = { 'content-type': 'application/json' };
   if (cfg.apiKey) {
@@ -163,7 +233,12 @@ function authHeaders(cfg) {
 function buildBody(cfg, messages, streaming = true, opts = {}) {
   const common = { stream: streaming, max_tokens: cfg.maxOutputTokens };
   if (cfg.temperature != null) common.temperature = cfg.temperature;
-  // Thinking / reasoning. The wire form depends on the protocol and the chosen
+  // Ask for the token accounting on the FINAL stream frame. Without this the
+  // OpenAI-compatible stream carries no `usage` at all, so the only token numbers
+  // available were our own estimates (see /usage, which divided the transcript's
+  // JSON length by 3.5). `includeUsage` is cleared after a 400 (see request):
+  // servers that predate the field reject the whole request.
+  if (streaming && opts.includeUsage !== false) common.stream_options = { include_usage: true };
   // effort (see config.effortWire): OpenAI-compatible sends `reasoning_effort`,
   // Anthropic sends a `thinking` budget. Models that think by default need no
   // flag, so nothing is sent when the effort is off/unset.
@@ -189,6 +264,30 @@ function buildBody(cfg, messages, streaming = true, opts = {}) {
     // so the provider bills it as a cache READ instead of fresh input. The key is
     // the SESSION id, so it stays identical across turns and never thrashes.
     return JSON.stringify(applyPromptCache('anthropic', body, {
+      enabled: cfg.promptCache !== false,
+      sessionKey: cfg.sessionId,
+    }));
+  }
+  if (cfg.protocol === 'responses') {
+    const { instructions, input } = toResponsesInput(messages);
+    const rbody = {
+      model: cfg.innerModel,
+      // `instructions` carries the system prompt; `input` is the flat item list.
+      input,
+      // NOTE: the cap is `max_output_tokens` here, NOT chat/completions'
+      // `max_tokens` — sending the wrong name is silently ignored by the API.
+      max_output_tokens: cfg.maxOutputTokens,
+      stream: streaming,
+      ...wire,
+    };
+    if (instructions) rbody.instructions = instructions;
+    if (cfg.temperature != null) rbody.temperature = cfg.temperature;
+    if (!opts.noTools) {
+      const defsR = Object.prototype.hasOwnProperty.call(opts, 'tools')
+        ? responsesToolDefs(opts.tools) : responsesToolDefs(llmToolsList);
+      if (defsR.length) rbody.tools = defsR;
+    }
+    return JSON.stringify(applyPromptCache('responses', rbody, {
       enabled: cfg.promptCache !== false,
       sessionKey: cfg.sessionId,
     }));
@@ -247,8 +346,8 @@ export class LLM {
     try {
       const res = await fetch(cfg.endpoint, {
         method: 'POST',
-        headers: authHeaders(cfg),
-        body: buildBody(cfg, messages, false, opts),
+        headers: (() => { const h = authHeaders(cfg); try { const out = runPatchSync('llmHeaders', { headers: h }, (c) => c); if (out && out.headers) return out.headers; } catch (e) {} return h; })(),
+        body: (() => { let b = buildBody(cfg, messages, false, opts); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
         signal: this.controller.signal,
       });
       if (!res || !res.ok) {
@@ -263,6 +362,17 @@ export class LLM {
         for (const cb of (json.content || [])) {
           if (cb.type === 'text' && cb.text) text += cb.text;
         }
+      } else if (cfg.protocol === 'responses') {
+        // Responses: text sits in `message` items' `output_text` parts. Some
+        // gateways also expose a top-level `output_text` convenience field.
+        if (typeof json.output_text === 'string') text = json.output_text;
+        else {
+          for (const item of (json.output || [])) {
+            if (item && item.type === 'message' && Array.isArray(item.content)) {
+              for (const c of item.content) if (c && c.type === 'output_text' && c.text) text += c.text;
+            }
+          }
+        }
       } else {
         const msg = json.choices && json.choices[0] && json.choices[0].message;
         if (msg && msg.content) text = msg.content;
@@ -275,7 +385,9 @@ export class LLM {
       if (!text) {
         const truncated = cfg.protocol === 'anthropic'
           ? (json.stop_reason === 'max_tokens')
-          : !!(json.choices && json.choices[0] && json.choices[0].finish_reason === 'length');
+          : cfg.protocol === 'responses'
+            ? !!(json.incomplete_details && json.incomplete_details.reason === 'max_output_tokens')
+            : !!(json.choices && json.choices[0] && json.choices[0].finish_reason === 'length');
         return truncated ? '' : null;
       }
       return text;
@@ -286,17 +398,26 @@ export class LLM {
   }
 
   async request(messages, onEvent) {
+    // Mixin seam: let plugins mutate the messages sent to the model.
+    try { const out = await runPatch('llmRequest', { messages, cfg: this.cfg }, (c) => c); if (out && out.messages) messages = out.messages; } catch (e) { /* patch failed; proceed with original */ }
     const cfg = this.cfg;
     let res = null;
     let lastError = null;
     let lastStatus = 0;
     let attempts = 0;
 
-    // Retry the HTTP round-trip up to 3 times. Any non-200 response is treated
-    // as a problem and retried (5xx, 429, and unexpected 4xx alike), as is a
-    // network/connection error. The only exceptions are aborts (Esc/Ctrl-C) —
-    // those end the turn — and a response that is not ok on the final attempt.
-    const RETRIES = 3;
+    // Retry the HTTP round-trip. Any non-200 response is treated as a problem and
+    // retried (5xx, 429, and unexpected 4xx alike), as is a network/connection
+    // error. The only exceptions are aborts (Esc/Ctrl-C) — those end the turn —
+    // and a response that is not ok on the final attempt. The count is
+    // `cfg.maxRetries` when set (the `--retries` flag), else 3.
+    const RETRIES = Number.isInteger(this.cfg && this.cfg.maxRetries) && this.cfg.maxRetries > 0
+      ? this.cfg.maxRetries : 3;
+    // Whether this attempt asks for streaming usage. A server that does not know
+    // `stream_options` rejects the whole request with a 400, so the first 400
+    // turns it off and the retry goes out without it — degrading to an estimate
+    // rather than failing the request over an accounting nicety.
+    const reqOpts = {};
 
     for (let attempt = 1; attempt <= RETRIES; attempt++) {
       attempts = attempt;
@@ -307,8 +428,8 @@ export class LLM {
       try {
         res = await fetch(cfg.endpoint, {
           method: 'POST',
-          headers: authHeaders(cfg),
-          body: buildBody(cfg, messages),
+          headers: (() => { const h = authHeaders(cfg); try { const out = runPatchSync('llmHeaders', { headers: h }, (c) => c); if (out && out.headers) return out.headers; } catch (e) {} return h; })(),
+          body: (() => { let b = buildBody(cfg, messages, true, reqOpts); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
           signal,
         });
       } catch (e) {
@@ -318,7 +439,12 @@ export class LLM {
         lastStatus = 0; // network error
       }
       if (res && res.ok) break;
-      if (res) lastStatus = res.status;
+      if (res) {
+        lastStatus = res.status;
+        // Drop `stream_options` and try again: a 400 here is the one error this
+        // request can fix by itself, and the accounting is optional.
+        if (res.status === 400 && reqOpts.includeUsage !== false) reqOpts.includeUsage = false;
+      }
       if (attempt < RETRIES) {
         // Small exponential backoff (200ms, 400ms). If the user hit Esc during
         // the wait, stop retrying.
@@ -392,30 +518,40 @@ export class LLM {
   }
 }
 
-// ---- inline reasoning tags -------------------------------------------------
-// Some OpenAI-compatible servers do not send a separate `reasoning_content`
-// field: they put the chain of thought INLINE in `content`, wrapped in a tag.
-// Three spellings have to be supported, because they come from three places:
-//   ` thinking…`                 — the DeepSeek-R1 token markers, as emitted by
-//                               vLLM / llama.cpp builds of that model
-//   `<thinking>…</thinking>`    — what several OpenAI-compatible servers wrap it in
-//   `<think>…</think>`          — what OUR OWN system prompt asks for (agent.js
-//                               and prompt-presets.js both instruct this)
-// The last one was missing, so a model that followed our prompt had its whole
-// reasoning trace rendered as the ANSWER, raw tags and all.
+// A model that follows OUR prompt emits `<|thinking|>…<|/thinking|>` (agent.js and
+// prompt-presets.js both instruct it). Three more spellings have to be accepted,
+// because they are not ours to change:
+//   `<|think|>` / `<|/think|>`  — the short form of the same convention, for models
+//                               that abbreviate it, and for sessions recorded before
+//                               the longer spelling became the prompt's
+//   `</|thinking|>` / `</|think|>`
+//                               — the same two with the slash written before the bar.
+//                               Accepted so the delimiter ORDER cannot be the thing
+//                               that decides whether reasoning stays out of the answer
+//   `<｜begin▁of▁thinking｜>` / `<｜end▁of▁thinking｜>`
+//                               — DeepSeek-R1's own token markers, as emitted by
+//                               vLLM / llama.cpp builds. The bars are U+FF5C and the
+//                               separators U+2581, so no prose can be mistaken for one.
+//                               The OPENING marker was missing while the closing one
+//                               was present, which left the format inside-out: the
+//                               begin marker went out as the ANSWER, and the end marker
+//                               then flipped everything after it into reasoning.
 //
-// The three are mutually distinguishable, which is what makes supporting all of
-// them safe: `</think>` does not occur inside `</thinking>`, `<think>` does not
-// occur inside `<thinking>`, and `' thinking'` does not occur inside `<think>`.
-// So an early match can never be caused by the longer tag.
+// The BARE forms are deliberately GONE: `' thinking'`, `<thinking>`, `<think>`.
+// feedContent locates a tag with `indexOf` over the whole buffer and then TOGGLES, so a
+// tag that also occurs in ordinary writing reclassifies everything after it. On `'
+// thinking'` that is a sentence like "I am thinking about this", "stop thinking and
+// answer", "after thinking it over" — and because such a reply never reaches a closing
+// tag, the remainder was emitted as REASONING and the answer disappeared into the
+// thinking block. `<think>` / `<thinking>` are legal prose too (HTML, a tutorial, a
+// quotation of this very file), which is what agent.js means when it warns that "a plain
+// <think> is ordinary text that may appear in code or prose".
 //
-// Without splitting these out, the raw tags and the whole reasoning trace are
-// rendered as the assistant's answer (and counted as output tokens). This is a
-// streaming state machine: a tag can be split across chunks, so a trailing partial
-// tag is held back until the next chunk decides what it is.
-const THINK_OPEN_TAGS = [' thinking', '<thinking>', '<think>'];
+// Mixing is intended and already works: the parser toggles on ANY opening tag and ANY
+// closing one, so `<|thinking|>…<|/think|>` closes correctly.
+const THINK_OPEN_TAGS = ['<|thinking|>', '<|think|>', '<｜begin▁of▁thinking｜>'];
 // Closing tags. If none of these appear, the block stays in think mode to EOI.
-const THINK_CLOSE_TAGS = ['<｜end▁of▁thinking｜>', '</thinking>', '</think>'];
+const THINK_CLOSE_TAGS = ['<|/thinking|>', '</|thinking|>', '<|/think|>', '</|think|>', '<｜end▁of▁thinking｜>'];
 
 // Longest suffix of `buf` that is a proper prefix of one of `tags`.
 // A single trailing space is deliberately NOT a candidate: `' '` is a prefix of
@@ -489,10 +625,75 @@ function processEvent(protocol, raw, onEvent, state) {
   let d;
   try { d = JSON.parse(raw); } catch { return 'continue'; }
   if (protocol === 'anthropic') return processAnthropic(d, onEvent, state);
+  if (protocol === 'responses') return processResponses(d, onEvent, state);
   return processOpenAI(d, onEvent, state);
 }
 
+// ---- token accounting -------------------------------------------------------
+// Every protocol reports the same facts under different names, and the only
+// numbers that are not estimates come from here. Normalised shape:
+//   { input, output, cached, cacheWrite, reasoning }
+// `cached` is the part of `input` that was a cache READ (billed far cheaper), and
+// `cacheWrite` the part written to the cache (billed dearer on Anthropic). Keeping
+// them separate is what makes the cost estimate match a real invoice.
+//
+// A field left undefined means "not reported", which is different from zero: the
+// caller adds what it gets and does not invent the rest.
+
+/** OpenAI chat/completions `usage`. */
+function normalizeOpenAIUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  const cached = u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens;
+  const reasoning = u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens;
+  return {
+    input: numOrUndef(u.prompt_tokens ?? u.input_tokens),
+    output: numOrUndef(u.completion_tokens ?? u.output_tokens),
+    cached: numOrUndef(cached),
+    reasoning: numOrUndef(reasoning),
+  };
+}
+
+/** Anthropic `usage`, which splits cache reads and writes out. */
+function normalizeAnthropicUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  return {
+    input: numOrUndef(u.input_tokens),
+    output: numOrUndef(u.output_tokens),
+    cached: numOrUndef(u.cache_read_input_tokens),
+    cacheWrite: numOrUndef(u.cache_creation_input_tokens),
+  };
+}
+
+/** OpenAI Responses `usage`. */
+function normalizeResponsesUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  const cached = u.input_tokens_details && u.input_tokens_details.cached_tokens;
+  const reasoning = u.output_tokens_details && u.output_tokens_details.reasoning_tokens;
+  return {
+    input: numOrUndef(u.input_tokens),
+    output: numOrUndef(u.output_tokens),
+    cached: numOrUndef(cached),
+    reasoning: numOrUndef(reasoning),
+  };
+}
+
+function numOrUndef(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Emit one `usage` event if the frame carried any numbers. */
+function emitUsage(onEvent, u) {
+  if (!u) return;
+  if (u.input === undefined && u.output === undefined && u.cached === undefined && u.cacheWrite === undefined) return;
+  onEvent({ type: 'usage', usage: u });
+}
+
 function processOpenAI(d, onEvent, state) {
+  // The accounting arrives on its own frame, with an EMPTY `choices` array, right
+  // before `[DONE]` — so it has to be read before the delta checks below, which
+  // would otherwise return early on it.
+  emitUsage(onEvent, normalizeOpenAIUsage(d.usage));
   const choice = d.choices && d.choices[0];
   const delta = choice && choice.delta;
   const finishReason = choice && choice.finish_reason;
@@ -561,6 +762,13 @@ function processAnthropic(d, onEvent, state) {
   const t = d.type;
   if (t === 'message_start' || t === 'message_delta' || t === 'message_stop') {
     if (t === 'message_stop') { onEvent({ type: 'end' }); return 'end'; }
+    // Anthropic splits the accounting in two: `message_start` carries the INPUT
+    // (including cache reads and writes) and `message_delta` the OUTPUT. Both are
+    // reported, and the accumulator adds them.
+    if (t === 'message_start' && d.message && d.message.usage) {
+      emitUsage(onEvent, normalizeAnthropicUsage(d.message.usage));
+    }
+    if (t === 'message_delta' && d.usage) emitUsage(onEvent, normalizeAnthropicUsage(d.usage));
     // `message_delta` carries the stop reason; `max_tokens` there means the reply
     // was cut off, not finished (see processOpenAI for the OpenAI spelling).
     if (t === 'message_delta' && d.delta && d.delta.stop_reason === 'max_tokens') {
@@ -579,8 +787,12 @@ function processAnthropic(d, onEvent, state) {
   }
   if (t === 'content_block_delta') {
     const delta = d.delta || {};
+    // A thinking delta can arrive EMPTY (the protocol sends a delta frame with no
+    // text for a block that produced none). Emitting it created an empty reasoning
+    // block, which renders as a bare `●` row. The renderer drops those as well — this
+    // is the cheaper place to stop it, and it keeps `state.chat` free of them.
     if (delta.type === 'text_delta') feedContent(delta.text || '', onEvent, state);
-    else if (delta.type === 'thinking_delta') onEvent({ type: 'think', text: delta.thinking || '' });
+    else if (delta.type === 'thinking_delta' && delta.thinking) onEvent({ type: 'think', text: delta.thinking });
     else if (delta.type === 'input_json') {
       const blk = state.tools.get(d.index);
       if (blk) { blk.argsJson += delta.partial_json || ''; onEvent({ type: 'tool_args', id: blk.id, chunk: delta.partial_json || '' }); }
@@ -595,9 +807,91 @@ function processAnthropic(d, onEvent, state) {
   return 'continue';
 }
 
+// OpenAI Responses API streaming. The wire is a TYPED event stream (much closer to
+// Anthropic than to chat/completions' `choices[].delta`):
+//   response.output_text.delta                -> answer text
+//   response.reasoning_summary_text.delta     -> thinking summary
+//   response.output_item.added (function_call)-> tool_start
+//   response.function_call_arguments.delta    -> tool_args (keyed by item_id)
+//   response.output_item.done (function_call) -> tool_end
+//   response.completed / response.incomplete  -> end (incomplete = truncated)
+// Tool calls are addressed by `item_id` (the item's own id), and the `call_id`
+// that goes back on `function_call_output` is carried on the item — the agent keys
+// its tools by the id we emit here, so we emit the call_id and remember it.
+function processResponses(d, onEvent, state) {
+  const t = d.type;
+  if (t === 'response.output_text.delta') {
+    if (d.delta) feedContent(d.delta, onEvent, state);
+    return 'continue';
+  }
+  if (t === 'response.reasoning_summary_text.delta' || t === 'response.reasoning_text.delta') {
+    if (d.delta) onEvent({ type: 'think', text: d.delta });
+    return 'continue';
+  }
+  if (t === 'response.output_item.added' || t === 'response.output_item.done') {
+    const item = d.item || {};
+    if (item.type === 'function_call') {
+      const id = item.call_id || item.id;
+      if (t === 'response.output_item.added') {
+        if (id && !state.tools.has(id)) {
+          state.tools.set(id, { id, name: item.name, argsJson: '', done: false });
+          onEvent({ type: 'tool_start', id, name: item.name });
+        }
+      } else {
+        // done: the item carries the FULL arguments, so emit any that never
+        // streamed (some servers skip the argument deltas for short calls).
+        const entry = state.tools.get(id);
+        if (entry && !entry.done) {
+          if (typeof item.arguments === 'string' && item.arguments && !entry.argsJson) {
+            entry.argsJson = item.arguments;
+            onEvent({ type: 'tool_args', id, chunk: item.arguments });
+          }
+          entry.done = true;
+          onEvent({ type: 'tool_end', id });
+        }
+      }
+    }
+    return 'continue';
+  }
+  if (t === 'response.function_call_arguments.delta') {
+    const id = d.item_id || d.call_id;
+    const entry = id ? state.tools.get(id) : null;
+    if (entry) {
+      entry.argsJson += d.delta || '';
+      onEvent({ type: 'tool_args', id, chunk: d.delta || '' });
+    }
+    return 'continue';
+  }
+  if (t === 'response.completed') {
+    // The accounting rides on the terminal event's `response` object.
+    emitUsage(onEvent, normalizeResponsesUsage(d.response && d.response.usage));
+    onEvent({ type: 'end' });
+    return 'end';
+  }
+  if (t === 'response.incomplete') {
+    // `incomplete_details.reason === 'max_output_tokens'` means the same thing as
+    // chat/completions' finish_reason:'length' — the reply was cut, not finished.
+    emitUsage(onEvent, normalizeResponsesUsage(d.response && d.response.usage));
+    const reason = d.response && d.response.incomplete_details && d.response.incomplete_details.reason;
+    if (reason === 'max_output_tokens') onEvent({ type: 'truncated' });
+    onEvent({ type: 'end' });
+    return 'end';
+  }
+  if (t === 'response.failed' || t === 'error') {
+    const msg = (d.response && d.response.error && d.response.error.message) || d.message || 'response failed';
+    onEvent({ type: 'error', error: new Error(msg) });
+    return 'end';
+  }
+  return 'continue';
+}
+
 // --- Non-streaming path ---
 export function consumeNonStreaming(protocol, json, onEvent) {
   const state = { tagPending: '', inThink: false };
+  // Same accounting, one frame. Everything below this line is unchanged.
+  emitUsage(onEvent, protocol === 'anthropic' ? normalizeAnthropicUsage(json.usage)
+    : protocol === 'responses' ? normalizeResponsesUsage(json.usage)
+      : normalizeOpenAIUsage(json.usage));
   if (protocol === 'anthropic') {
     const content = json.content || [];
     if (json.stop_reason === 'max_tokens') onEvent({ type: 'truncated' });
@@ -607,6 +901,33 @@ export function consumeNonStreaming(protocol, json, onEvent) {
         onEvent({ type: 'tool_start', id: cb.id, name: cb.name });
         onEvent({ type: 'tool_args', id: cb.id, chunk: JSON.stringify(cb.input || {}) });
         onEvent({ type: 'tool_end', id: cb.id });
+      }
+    }
+  } else if (protocol === 'responses') {
+    // Responses non-streaming: one object with an `output` ITEM list. Text lives in
+    // a `message` item's `content[]` (`output_text`), reasoning in a `reasoning`
+    // item's summary, and tool calls are their own `function_call` items.
+    const output = json.output || [];
+    if (json.incomplete_details && json.incomplete_details.reason === 'max_output_tokens') {
+      onEvent({ type: 'truncated' });
+    }
+    if (json.status === 'failed' && json.error) {
+      onEvent({ type: 'error', error: new Error(json.error.message || 'response failed') });
+      return;
+    }
+    for (const item of output) {
+      if (!item) continue;
+      if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+        for (const s of item.summary) if (s && typeof s.text === 'string') onEvent({ type: 'think', text: s.text });
+      } else if (item.type === 'message' && Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if (c && c.type === 'output_text' && c.text) feedContent(c.text, onEvent, state);
+        }
+      } else if (item.type === 'function_call') {
+        const id = item.call_id || item.id;
+        onEvent({ type: 'tool_start', id, name: item.name });
+        if (item.arguments) onEvent({ type: 'tool_args', id, chunk: item.arguments });
+        onEvent({ type: 'tool_end', id });
       }
     }
   } else {

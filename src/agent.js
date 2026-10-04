@@ -5,8 +5,8 @@
 import { LLM, setToolsList } from './llm.js';
 import { tools, getTool, llmTools } from './tools/index.js';
 import { DELEGATION_TOOLS } from './subagent-types.js';
-import { estimateMessagesTokens, estimateRequestOverhead, estimateTokens } from './term.js';
-import { runHooks } from './plugin.js';
+import { estimateMessagesTokens, estimateRequestOverhead, estimateTokens, messageTokens, TokenLedger, forgetMessageTokens } from './term.js';
+import { runHooks, runPatch, runPatchSync } from './plugin.js';
 import { loadHooks, runShellHooks } from './hooks.js';
 import {
   shapeToolResult, trimToolResults, DEFAULT_TRIM_THRESHOLD, DEFAULT_TRIM_KEEP_RATIO,
@@ -20,6 +20,27 @@ import {
 function wrapSystemReminder(content) {
   return `<system-reminder>\n${String(content).trim()}\n</system-reminder>`;
 }
+
+// ---- token accounting -------------------------------------------------------
+// The provider reports the numbers; this folds one report into a running total.
+// A field the provider did not send is left as it was, because "not reported" and
+// "zero" are different facts: summing undefined into 0 would claim a model never
+// used a cache it simply does not measure.
+export function addUsage(total, u) {
+  const out = { ...(total || {}) };
+  if (!u) return out;
+  for (const key of ['input', 'output', 'cached', 'cacheWrite', 'reasoning']) {
+    if (typeof u[key] === 'number' && Number.isFinite(u[key])) out[key] = (out[key] || 0) + u[key];
+  }
+  // How many REQUESTS contributed, so a reader can tell one big call from many
+  // small ones with the same token count. Counted on the completion side, which
+  // every protocol reports exactly once per request — Anthropic splits one
+  // request into two usage events (input at message_start, output at
+  // message_delta), so counting events would report double.
+  if (u.output !== undefined) out.calls = (out.calls || 0) + 1;
+  return out;
+}
+
 
 const COMPACTION_SUMMARY_PREFIX = [
   'The conversation so far has been compacted to free up context. What follows is your own working summary of this task — use it to continue your train of thought rather than starting over.',
@@ -194,12 +215,14 @@ Tools:
 - If a tool fails, read the error and fix your approach. After 2 failed attempts on the same goal, stop and report the blocker.
 - Independent tool calls may run in parallel; never parallelize dependent ones.
 
-Reasoning:
-- Put ALL of your internal reasoning inside <think>...</think> tags, and always emit BOTH the opening
-  and the closing tag. Do not omit the tags, do not abbreviate them, and do not leave the block unclosed.
-- Everything outside <think>...</think> is what the user reads: keep it to the answer itself — what you
-  did and what you found. Never repeat or summarise your reasoning there.
-- Keep the tags exactly as written: <think> and </think>. Do not emit any other variant.
+- Put ALL of your internal reasoning inside <|thinking|>...<|/thinking|> tags, and always emit BOTH the
+  opening and the closing tag. Do not omit the tags, do not abbreviate them, and do not leave the block
+  unclosed.
+- Everything outside <|thinking|>...<|/thinking|> is what the user reads: keep it to the answer itself —
+  what you did and what you found. Never repeat or summarise your reasoning there.
+- Keep the tags exactly as written: <|thinking|> and <|/thinking|>. Do not emit any other variant. The
+  bars matter: a plain <think> is ordinary text that may appear in code or prose, and a bare
+  "thinking" is a word this very instruction uses.
 Acting:
 - Unless the user is explicitly asking for a plan, asking a question about the code, or brainstorming,
   assume they want the work DONE. Say less and do more: implement the change rather than describing it.
@@ -260,11 +283,23 @@ export class Agent {
     const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       ? tools.filter((t) => cfg.toolFilter.includes(t.name))
       : tools
-    ).filter((t) => !(cfg.noDelegation && DELEGATION_TOOLS.includes(t.name)));
+    )
+      .filter((t) => !(cfg.noDelegation && DELEGATION_TOOLS.includes(t.name)))
+      // AgentSwarm is gated behind swarm mode, like Agent is gated behind the user
+      // having asked for delegation. It is not enough to describe the mode in the
+      // system prompt: the tool was offered on EVERY turn, so the model could fan a
+      // task out to 128 subagents in a session where the user never opted in — and
+      // the prompt's own rule ("never call this on your own initiative") was not
+      // backed by anything. Off unless /swarm turned the mode on; the Agent tool
+      // stays available for a single, deliberate delegation.
+      .filter((t) => !(t.name === 'AgentSwarm' && !cfg.swarm));
     setToolsList(filtered);
     // A block for the direct-call path too: the model can still emit a tool call
     // for a tool that is not exposed, so refuse it here rather than at execution.
     this.noDelegation = !!cfg.noDelegation;
+    // Mirrors the filter above for the direct-call path — a tool the model was told
+    // about on an earlier turn can still be emitted after /swarm goes off.
+    this.swarmMode = !!cfg.swarm;
     // AbortSignal handed to every tool so a long-running one (Bash) is killed
     // when the user presses Esc / Ctrl-C — otherwise the command keeps running
     // after the turn was interrupted.
@@ -314,7 +349,10 @@ export class Agent {
     // Auto-compaction is allowed at most once per TURN (not per step). Reset here so
     // a caller that reuses one Agent across turns still gets a fresh allowance.
     this._compactedThisTurn = false;
-    this.onApproval = onApproval; // async (toolName, args) => boolean
+    // Rolling context-token total for `this.messages` (see usedTokens). It holds no
+    // messages of its own, only the count of what it has already priced, so a
+    // compaction that replaces the array simply falls out of the fast path.
+    this._ledger = new TokenLedger();
     this.onApproval = onApproval; // async (toolName, args) => boolean
     // Shell hooks (Claude Code-style): user-configured commands run at lifecycle
     // events. ALWAYS stored as a `{ hooks: {Event: [...]} }` config, which is the
@@ -357,8 +395,12 @@ export class Agent {
   // later), so counting it both double-counted the system text and measured the
   // wrong figure — while being the only input that decides whether to compact.
   usedTokens() {
-    let total = 0;
-    for (const m of this.messages || []) total += estimateMessagesTokens([m], null);
+    // A rolling total rather than a fresh walk of the whole history. This is called at
+    // least three times per model round (before the request, after compaction, after a
+    // trim) and once more per step for the gauge, so on a long session the old full
+    // rescan priced the entire transcript — Read results included — several times per
+    // step for a number that changes by one message.
+    let total = this._ledger.sync(this.messages, null);
     if (Array.isArray(this.cfg.toolFilter)) total += this.cfg.toolFilter.length * 8;
     return total;
   }
@@ -388,7 +430,11 @@ export class Agent {
     let bestSplit;
     for (; recent < msgs.length; recent++) {
       const split = msgs.length - recent;
-      size += estimateMessagesTokens([msgs[split]], null);
+      // `messageTokens(m)`, not `estimateMessagesTokens([m])`: the latter allocated a
+      // throwaway single-element array for every message in the transcript, on every
+      // call. It is also the memoised form, so repeating this walk after a large tool
+      // result is a WeakMap hit rather than a re-measure.
+      size += messageTokens(msgs[split], null);
       if (split > floor && canSplitAfter(msgs, split - 1)) bestSplit = split;
       if (size >= maxSize && bestSplit !== undefined) break;
     }
@@ -396,6 +442,14 @@ export class Agent {
   }
 
   async run() {
+    // Clear any interrupt flag left from a previous (interrupted) turn. This runs at
+    // the start of EVERY turn, so a stalled Esc/Ctrl-C from an earlier compaction can
+    // never suppress auto-compaction on the next message. (The constructor also
+    // initializes it, but a caller that reuses one Agent across turns must get a
+    // fresh allowance here — without this, the live block would blink again with no
+    // compaction behind it.)
+    this.stopRequested = false;
+    this._compactedThisTurn = false;
     // Plugin lifecycle: `onTurnStart` fires here and `onTurnEnd` in the finally
     // block at the end of this method. Both are awaited and both swallow plugin
     // errors (see runHooks), so a broken plugin cannot abort a turn.
@@ -441,6 +495,14 @@ export class Agent {
           // loop below continues the turn instead of ending it (see the `truncated`
           // branch), so a half-written answer is never presented as a finished one.
           this._truncated = true;
+          break;
+        case 'usage':
+          // Real token accounting from the provider, as opposed to the estimates
+          // usedTokens() produces. Accumulated on the AGENT (so it survives across
+          // the steps of one turn and can be read by anything holding the agent)
+          // and forwarded for the TUI to fold into the session totals.
+          this.usage = addUsage(this.usage, e.usage);
+          this.onEvent({ type: 'usage', usage: e.usage, total: this.usage });
           break;
         case 'tool_start':
           toolCalls.push({ id: e.id, name: e.name, args: {}, argsJson: '' });
@@ -613,9 +675,14 @@ export class Agent {
           : `${COMPACTION_SUMMARY_PREFIX}\n(no summary available)`;
         this.messages = [
           ...keep,
-          { role: 'user', content: wrapSystemReminder(summaryText) },
-          { role: 'user', content: wrapSystemReminder(COMPACTION_CONTINUATION_TEXT) },
+          { role: 'user', _harness: true, content: wrapSystemReminder(summaryText) },
+          { role: 'user', _harness: true, content: wrapSystemReminder(COMPACTION_CONTINUATION_TEXT) },
         ];
+        // The array was REPLACED, so every count the ledger held describes messages
+        // that no longer exist. `sync` would notice on its own (the first/last
+        // identities no longer match), but resetting here states the intent at the
+        // point of mutation instead of relying on that check to fire.
+        this._ledger.reset();
         usedNow = this.usedTokens();
         this.onEvent({
           type: 'compacted', before, after: usedNow, kept: keep.length,
@@ -650,6 +717,12 @@ export class Agent {
           mustKeep: this._lastToolResultIndex,
         });
         if (res && res.elided > 0) {
+          // `trimToolResults` rewrites message CONTENT IN PLACE, so the array is the
+          // same one the ledger already counted and its identity check cannot see the
+          // change. Without this reset the gauge would keep reporting the PRE-trim
+          // total: the trim would look like it freed nothing, and the very next step
+          // would compact a history that had already been trimmed.
+          this._ledger.reset();
           const after = this.usedTokens();
           this.onEvent({
             type: 'results_trimmed', elided: res.elided, elidedBytes: res.elidedBytes,
@@ -697,6 +770,8 @@ export class Agent {
           content: hasText ? text : null,
           toolCalls: hasCalls ? toolCalls : undefined,
         };
+        // Mixin seam: llmResponse - plugins may rewrite the assistant text before it is saved.
+        try { const out = await runPatch('llmResponse', { content: assistantMsg.content, toolCalls: assistantMsg.toolCalls }, (c) => c); if (out) { if (out.content !== undefined) assistantMsg.content = out.content; if (out.toolCalls !== undefined) assistantMsg.toolCalls = out.toolCalls; } } catch (e) { console.error('[hncode-plugin] llmResponse error:', e.message); }
         this.messages.push(assistantMsg);
         // Plugin hook: one per assistant message committed to the history. Fired
         // here (the single point where the model's reply lands) rather than at each
@@ -734,6 +809,10 @@ export class Agent {
         truncationRecoveries++;
         this.messages.push({
           role: 'user',
+          // `_harness`: this is the harness talking, not the user. /undo and its
+          // picker skip these, and beginTurn does not run for them, so the two
+          // stay aligned on what a "prompt" is.
+          _harness: true,
           content: 'Your previous message was cut off because it reached the output token limit. Continue from exactly where it stopped — do not repeat what you already wrote, and do not start over.',
         });
         this.onEvent({ type: 'truncation_recovery', attempt: truncationRecoveries });
@@ -774,6 +853,40 @@ export class Agent {
         // right "Using …" row (a turn can run several tools in sequence).
         this._currentToolId = tc.id;
 
+        // MODE GATING COMES FIRST, BEFORE THE APPROVAL PROMPT.
+        //
+        // A tool the current mode does not allow must be refused WITHOUT asking the user.
+        // Asking first was the bug: in Plan mode the tool list is filtered to
+        // ['Read','Grep','Glob'], so Bash is not offered — but the model can still emit a
+        // call for a tool it saw on an earlier turn, and the approval prompt ran before
+        // this check. The user was asked "run this shell command?" in a mode where the
+        // answer is always no, and the prompt's own wording offered a choice that did not
+        // exist. It also meant a stray call could be APPROVED, and only then refused, which
+        // is the worst of both: a decision recorded for something that never ran.
+        //
+        // These three checks used to sit after the prompt. They all reject outright, so all
+        // three belong here — before anything with a side effect, including the session
+        // approval that a Ctrl+A on the prompt would have written.
+        if (this.noDelegation && DELEGATION_TOOLS.includes(tc.name)) {
+          const result = `You CAN'T use ${tc.name}: subagents cannot delegate. Do the work yourself and report the result to the agent that started you.`;
+          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+          return { ok: false, result, editDiff: null, media: false };
+        }
+        // The list above does not expose AgentSwarm outside swarm mode, but the system
+        // prompt describes only ONE shape for it — so refuse a stray call with the fix in
+        // the message rather than letting 128 subagents run in a session where the user
+        // never opted in.
+        if (this.swarmMode !== true && tc.name === 'AgentSwarm') {
+          const result = "You CAN'T use AgentSwarm: swarm mode is OFF. For one or two jobs use the Agent tool; for a real fan-out, ask the user to enable it with /swarm.";
+          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+          return { ok: false, result, editDiff: null, media: false };
+        }
+        if (modeName && !this.cfg.toolFilter.includes(tc.name)) {
+          const result = `You CAN'T use this tool on ${modeName} Mode. Allowed: ${this.cfg.toolFilter.join(', ')}.`;
+          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
+          return { ok: false, result, editDiff: null, media: false };
+        }
+
         // Permission check before executing each tool
         let result = null;
         let ok = true;
@@ -786,24 +899,13 @@ export class Agent {
           }
         }
 
+
         const tool = getTool(tc.name);
-        // A subagent may not delegate. The tool is not exposed to it, but the model
-        // can still emit a call for a tool it was told about earlier, so refuse it
-        // here with an actionable message instead of running a nested agent.
-        if (this.noDelegation && DELEGATION_TOOLS.includes(tc.name)) {
-          result = `You CAN'T use ${tc.name}: subagents cannot delegate. Do the work yourself and report the result to the agent that started you.`;
-          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
-          return { ok: false, result, editDiff: null, media: false };
-        }
-        if (modeName && !this.cfg.toolFilter.includes(tc.name)) {
-          result = `You CAN'T use this tool on ${modeName} Mode. Allowed: ${this.cfg.toolFilter.join(', ')}.`;
-          this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
-          return { ok: false, result, editDiff: null, media: false };
-        }
         if (!tool) {
           result = `Error: unknown tool "${tc.name}".`;
           return { ok: false, result, editDiff: null, media: false };
         }
+
         // SHELL HOOK: PreToolUse. A non-zero exit blocks the tool, and its
         // message goes back to the model in place of the tool result — that is
         // the whole point of a pre-hook (e.g. refuse a write that fails a lint
@@ -823,14 +925,21 @@ export class Agent {
         // are swallowed by runHooks — a broken plugin must not break a turn.
         await runHooks('onToolExecute', tc.name, tc.args, this.ctx);
         try {
-          result = await tool.execute(tc.args, this.ctx);
+          // Mixin seam: toolDispatch - plugins may intercept/modify tool calls before execution.
+        let _args = tc.args; let _skip = false;
+        try { const out = await runPatch('toolDispatch', { name: tc.name, args: tc.args, ctx: this.ctx }, (c) => c); if (out) { _args = out.args !== undefined ? out.args : tc.args; if (out.skip) _skip = true; } } catch (e) { console.error('[hncode-plugin] toolDispatch error:', e.message); }
+        if (_skip) { result = '[skipped by plugin: ' + tc.name + ']'; ok = true; }
+        else result = await tool.execute(_args, this.ctx);
         } catch (err) {
           result = `Error running ${tc.name}: ${err.message}`;
           ok = false;
         }
         this.ctx.lastResult = result;
-        // Plugin hook: onToolResult fires with the tool's output.
-        await runHooks('onToolResult', tc.name, result, this.ctx);
+        // Plugin hook: onToolResult fires with the tool's output. A hook may return a
+        // (redacted) replacement string — e.g. secret-guard masking keys in a Read
+        // result — which is then what the model and transcript receive.
+        const hookOut = await runHooks('onToolResult', tc.name, result, this.ctx);
+        if (typeof hookOut === 'string') result = hookOut;
         // SHELL HOOK: PostToolUse. Never blocks (the tool already ran); a
         // failure is logged. This is where "format after every edit" lives.
         await runShellHooks(this.hookConfig, 'PostToolUse',
@@ -877,7 +986,10 @@ export class Agent {
         const shaped = toolResultLimitsEnabled()
           ? shapeToolResult(rawForModel, { sessionId: this.cfg.sessionId, toolCallId: tc.id })
           : { content: rawForModel, spilled: false };
-        this.messages.push({ role: 'tool', toolCallId: tc.id, content: shaped.content });
+        let _toolContent = shaped.content;
+        // Mixin seam: toolResult (sync) - plugins may rewrite what the model receives for this call.
+        try { const out = runPatchSync('toolResult', { name: tc.name, content: shaped.content }, (c) => c); if (out && out.content !== undefined) _toolContent = out.content; } catch (e) { console.error('[hncode-plugin] toolResult error:', e.message); }
+        this.messages.push({ role: 'tool', toolCallId: tc.id, content: _toolContent });
         // Remember where the newest tool result landed: a trim must never elide the
         // output the model was handed in the step it is about to reason about.
         this._lastToolResultIndex = this.messages.length - 1;

@@ -167,6 +167,113 @@ function isWideByDefault(c) {
     || (c >= 0x2B1B && c <= 0x2B1C) || c === 0x2B50 || c === 0x2B55;
 }
 
+// ---------------------------------------------------------------------------
+// East Asian AMBIGUOUS width
+// ---------------------------------------------------------------------------
+// Unicode gives every character an East Asian Width class. `A` (Ambiguous) means
+// ONE column on a Western terminal and TWO on a CJK one — the terminal decides, the
+// character does not say. hncode's chrome leans on these heavily, which is why they
+// had to be handled rather than avoided:
+//
+//   box rules   ─ │ ╭ ╮ ╰ ╯ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼
+//   separators  ·  …  —  –
+//   markers     ↑ ↓ ← → ❯ ● ○ ✓ ✗
+//   math        ± × ÷ ≠ ≤ ≥ ∞
+//
+// Measuring them as 1 column on a CJK terminal made every row containing one N columns
+// short, so the row's right edge landed N columns past the panel it belonged to —
+// "the text pushes the wall right". The panel's own background could not hide it
+// either: the overflow is REAL cells on screen, not a measurement disagreement inside
+// one row.
+//
+// Default: follow the LOCALE. A CJK locale is the standard reason a terminal treats
+// EAW=A as wide, and it is the only signal available before anything is drawn — the
+// code page does not say (a UTF-8 Windows console still renders them wide), and no
+// terminal query reports it.
+let ambiguousWide = null;   // lazily resolved so a test can set the env first
+
+/** EAW=A ranges (Unicode 15), ascending — `inRanges` binary-searches this. */
+const AMBIGUOUS = [
+  [0x00A1, 0x00A1], [0x00A4, 0x00A4], [0x00A7, 0x00A8], [0x00AA, 0x00AA],
+  [0x00AD, 0x00AE], [0x00B0, 0x00B4], [0x00B6, 0x00BA], [0x00BC, 0x00BF],
+  [0x00C6, 0x00C6], [0x00D0, 0x00D0], [0x00D7, 0x00D8], [0x00DE, 0x00E1],
+  [0x00E6, 0x00E6], [0x00E8, 0x00EA], [0x00EC, 0x00ED], [0x00F0, 0x00F0],
+  [0x00F2, 0x00F3], [0x00F7, 0x00FA], [0x00FC, 0x00FC], [0x00FE, 0x00FE],
+  [0x0101, 0x0101], [0x0111, 0x0111], [0x0113, 0x0113], [0x011B, 0x011B],
+  [0x0126, 0x0127], [0x012B, 0x012B], [0x0131, 0x0133], [0x0138, 0x0138],
+  [0x013F, 0x0142], [0x0144, 0x0144], [0x0148, 0x014B], [0x014D, 0x014D],
+  [0x0152, 0x0153], [0x0166, 0x0167], [0x016B, 0x016B], [0x01CE, 0x01CE],
+  [0x01D0, 0x01D0], [0x01D2, 0x01D2], [0x01D4, 0x01D4], [0x01D6, 0x01D6],
+  [0x01D8, 0x01D8], [0x01DA, 0x01DA], [0x01DC, 0x01DC], [0x0251, 0x0251],
+  [0x0261, 0x0261], [0x02C4, 0x02C4], [0x02C7, 0x02C7], [0x02C9, 0x02CB],
+  [0x02CD, 0x02CD], [0x02D0, 0x02D0], [0x02D8, 0x02DB], [0x02DD, 0x02DD],
+  [0x02DF, 0x02DF], [0x0300, 0x036F], [0x0391, 0x03A1], [0x03A3, 0x03A9],
+  [0x03B1, 0x03C1], [0x03C3, 0x03C9], [0x0401, 0x0401], [0x0410, 0x044F],
+  [0x0451, 0x0451], [0x2010, 0x2010], [0x2013, 0x2016], [0x2018, 0x2019],
+  [0x201C, 0x201D], [0x2020, 0x2022], [0x2024, 0x2027], [0x2030, 0x2030],
+  [0x2032, 0x2033], [0x2035, 0x2035], [0x203B, 0x203B], [0x203E, 0x203E],
+  [0x2074, 0x2074], [0x207F, 0x207F], [0x2081, 0x2084], [0x20AC, 0x20AC],
+  [0x2103, 0x2103], [0x2105, 0x2105], [0x2109, 0x2109], [0x2113, 0x2113],
+  [0x2116, 0x2116], [0x2121, 0x2122], [0x2126, 0x2126], [0x212B, 0x212B],
+  [0x2153, 0x2154], [0x215B, 0x215E], [0x2160, 0x216B], [0x2170, 0x2179],
+  [0x2189, 0x2189], [0x2190, 0x2199], [0x21B8, 0x21B9], [0x21D2, 0x21D2],
+  [0x21D4, 0x21D4], [0x21E7, 0x21E7], [0x2200, 0x2200], [0x2202, 0x2203],
+  [0x2207, 0x2208], [0x220B, 0x220B], [0x220F, 0x220F], [0x2211, 0x2211],
+  [0x2215, 0x2215], [0x221A, 0x221A], [0x221D, 0x2220], [0x2223, 0x2223],
+  [0x2225, 0x2225], [0x2227, 0x222C], [0x222E, 0x222E], [0x2234, 0x2237],
+  [0x223C, 0x223D], [0x2248, 0x2248], [0x224C, 0x224C], [0x2252, 0x2252],
+  [0x2260, 0x2261], [0x2264, 0x2267], [0x226A, 0x226B], [0x226E, 0x226F],
+  [0x2282, 0x2283], [0x2286, 0x2287], [0x2295, 0x2295], [0x2299, 0x2299],
+  [0x22A5, 0x22A5], [0x22BF, 0x22BF], [0x2312, 0x2312], [0x2460, 0x24E9],
+  [0x24EB, 0x254B], [0x2550, 0x2573], [0x2580, 0x258F], [0x2592, 0x2595],
+  [0x25A0, 0x25A1], [0x25A3, 0x25A9], [0x25B2, 0x25B3], [0x25B6, 0x25B7],
+  [0x25BC, 0x25BD], [0x25C0, 0x25C1], [0x25C6, 0x25C8], [0x25CB, 0x25CB],
+  [0x25CE, 0x25D1], [0x25E2, 0x25E5], [0x25EF, 0x25EF], [0x2605, 0x2606],
+  [0x2609, 0x2609], [0x260E, 0x260F], [0x261C, 0x261C], [0x261E, 0x261E],
+  [0x2640, 0x2640], [0x2642, 0x2642], [0x2660, 0x2661], [0x2663, 0x2665],
+  [0x2667, 0x266A], [0x266C, 0x266D], [0x266F, 0x266F], [0x269E, 0x269F],
+  [0x26C6, 0x26CD], [0x26CF, 0x26D3], [0x26D5, 0x26E1], [0x26E3, 0x26E3],
+  [0x26E8, 0x26E9], [0x26EB, 0x26F1], [0x26F4, 0x26F4], [0x26F6, 0x26F9],
+  [0x26FB, 0x26FC], [0x26FE, 0x26FF], [0x273D, 0x273D], [0x2761, 0x2761],
+  [0x2776, 0x277F], [0x2B56, 0x2B59], [0x3248, 0x324F], [0xE000, 0xF8FF],
+  [0xFE00, 0xFE0F], [0xFFFD, 0xFFFD], [0x1F100, 0x1F10A],
+  [0x1F110, 0x1F12D], [0x1F130, 0x1F169], [0x1F170, 0x1F19A],
+];
+
+/**
+ * Should EAW=Ambiguous characters measure 2 columns?
+ *
+ * Resolved once, from (in order):
+ *   1. `HNCODE_AMBIGUOUS_WIDTH` — an explicit override, for a terminal whose setting
+ *      does not match its locale;
+ *   2. the locale — `zh`/`ja`/`ko` mean a CJK terminal, which is the standard reason a
+ *      terminal renders these wide.
+ */
+export function detectAmbiguousWide(env = process.env) {
+  const raw = env.HNCODE_AMBIGUOUS_WIDTH;
+  if (raw !== undefined && raw !== '') return /^(1|true|yes|on)$/i.test(raw);
+  let loc = '';
+  try { loc = (Intl.DateTimeFormat().resolvedOptions().locale) || ''; } catch { /* no Intl */ }
+  const tag = loc || env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  return /^(zh|ja|ko)\b/i.test(tag) || /^(zh|ja|ko)[-_]/i.test(tag);
+}
+
+export function isAmbiguousWide() {
+  if (ambiguousWide === null) ambiguousWide = detectAmbiguousWide();
+  return ambiguousWide;
+}
+
+/**
+ * Turn the ambiguous-as-wide rule on or off. Clears the width cache, which is keyed by
+ * string alone and would otherwise hand back widths measured under the other rule.
+ */
+export function setAmbiguousWide(on) {
+  const next = !!on;
+  if (next === ambiguousWide) return;
+  ambiguousWide = next;
+  widthCache.clear();
+}
+
 const inRanges = (c, ranges) => {
   let lo = 0, hi = ranges.length - 1;
   while (lo <= hi) {
@@ -255,9 +362,46 @@ function clusterGlyphWidth(cluster) {
 //   tokens = ceil(ASCII chars / 4) + non-ASCII chars
 // ASCII characters average ~4 per token; CJK and other non-ASCII are ~1 token
 // each. This is far more accurate than a uniform chars/4 ratio.
+// Token estimate. The character walk is O(len), and the context gauge re-prices
+// whole message bodies (a Read result can be hundreds of KB) every turn.
+//
+// A value cache only helps COMPLETED messages: they are immutable, so the same
+// string is measured again and again. It actively HURTS streaming text, where the
+// string grows every frame — every call is a miss, so the cache pays hashing and an
+// insert each time and (once full) an O(n) eviction sweep, measuring 1ms/call vs
+// ~0.001ms for a plain walk (30k growing-text calls: 31s cached vs 30ms uncached).
+//
+// So the cache is limited to SHORT strings: completed metadata and role names hit
+// it, while a long or growing body is just walked directly. At most 4 KB was chosen
+// because a token estimate is only ever re-asked for values that are cheap to hold
+// and genuinely stable; anything larger is better re-walked than hashed + stored.
+const tokCache = new Map();
+const TOK_CACHE_MAX = 20000;
+const TOK_CACHE_MAX_LEN = 4096;   // only memoise strings this short
+
 export function estimateTokens(text) {
+  const s = String(text ?? '');
+  if (s.length <= TOK_CACHE_MAX_LEN) {
+    const hit = tokCache.get(s);
+    if (hit !== undefined) return hit;
+    let ascii = 0, nonAscii = 0;
+    for (const ch of s) {
+      if (ch.codePointAt(0) <= 127) ascii++;
+      else nonAscii++;
+    }
+    const out = Math.ceil(ascii / 4) + nonAscii;
+    if (tokCache.size >= TOK_CACHE_MAX) {
+      // Drop the oldest half in one go: cheaper than one-at-a-time and keeps the
+      // recently measured entries that a per-entry eviction would churn.
+      let i = 0;
+      for (const k of tokCache.keys()) { tokCache.delete(k); if (++i >= TOK_CACHE_MAX / 2) break; }
+    }
+    tokCache.set(s, out);
+    return out;
+  }
+  // Long body: walk it. No memoise, no map churn.
   let ascii = 0, nonAscii = 0;
-  for (const ch of String(text ?? '')) {
+  for (const ch of s) {
     if (ch.codePointAt(0) <= 127) ascii++;
     else nonAscii++;
   }
@@ -273,15 +417,146 @@ export function estimateTokens(text) {
 // estimateRequestOverhead().
 export function estimateMessagesTokens(messages, cfg) {
   let total = 0;
-  for (const m of messages || []) {
-    total += estimateTokens(m.role || '');
-    const c = m.content;
-    total += typeof c === 'string' ? estimateTokens(c) : estimateTokens(JSON.stringify(c || ''));
-    if (m.toolCalls) for (const tc of m.toolCalls) {
-      total += estimateTokens(tc.name || '') + estimateTokens(JSON.stringify(tc.args || ''));
-    }
+  for (const m of messages || []) total += estimateMessageTokens(m, cfg);
+  return total;
+}
+
+/**
+ * Tokens for ONE message. Split out so callers that walk the history (e.g.
+ * planCompaction) can price each message ONCE instead of re-summing the whole
+ * array per message — that was O(n²) over the transcript.
+ */
+export function estimateMessageTokens(m, cfg) {
+  if (!m) return 0;
+  let total = estimateTokens(m.role || '');
+  const c = m.content;
+  total += typeof c === 'string' ? estimateTokens(c) : estimateTokens(JSON.stringify(c || ''));
+  if (m.toolCalls) for (const tc of m.toolCalls) {
+    total += estimateTokens(tc.name || '') + estimateTokens(JSON.stringify(tc.args || ''));
   }
   return total;
+}
+
+// ---- per-message token memo -----------------------------------------------
+//
+// Message objects -> { sig, tok }. WeakMap, so a message dropped from the history
+// takes its estimate with it: no unbounded growth, and no manual eviction policy.
+const msgTokMemo = new WeakMap();
+//
+// `estimateMessageTokens` above re-measures an immutable message every time it is
+// asked, and the askers are frequent: the context gauge runs at every step, and
+// compaction walks the whole history to find its cut point. A Read result can be
+// hundreds of KB, so re-walking one costs milliseconds (measured: a 300 KB body is
+// ~5.3 ms to price). Completed messages never change, so their estimate never has
+// to be recomputed.
+//
+// The memo is a WeakMap keyed on the MESSAGE OBJECT, which gives two properties for
+// free: it cannot leak (a dropped message takes its entry with it) and it cannot
+// collide (two equal messages are still two objects).
+//
+// Correctness — the one place a stored message changes underneath us —
+// --------------------------------------------------------------------
+// `trimToolResults` rewrites `m.content` IN PLACE, replacing a large body with a
+// short pointer. A memo that trusted object identity alone would keep serving the
+// pre-trim count, and the gauge would claim the context was still full right after
+// the very operation meant to shrink it — the trim would appear to do nothing and
+// the next request would compact again for no reason.
+//
+// So every entry stores a cheap SIGNATURE of the content alongside the number, and
+// a mismatch recomputes. `.length` on a string is O(1), which is what makes this
+// affordable: streaming text (which grows every frame) misses on the signature and
+// is re-walked, exactly as `estimateTokens`' own short-string cache already
+// established. Content that is neither a string nor an array gets a weaker
+// signature and is simply re-measured each time rather than risk a stale answer.
+function msgSignature(m) {
+  const c = m.content;
+  let s;
+  if (typeof c === 'string') s = 's' + c.length;
+  else if (c == null) s = 'n';
+  else if (Array.isArray(c)) s = 'a' + c.length;
+  else s = '';                       // unknown shape: never trust a memo
+  if (m.toolCalls) s += 't' + m.toolCalls.length;
+  return s;
+}
+
+/** Drop any memoised estimate for a message whose content was rewritten in place. */
+export function forgetMessageTokens(m) {
+  if (m && typeof m === 'object') msgTokMemo.delete(m);
+}
+
+/**
+ * `estimateMessageTokens`, memoised per message object.
+ *
+ * Safe to call on STREAMING messages too: the signature check misses on every
+ * frame, so a growing body is simply re-measured and never served stale.
+ */
+export function messageTokens(m, cfg) {
+  if (!m || typeof m !== 'object') return estimateMessageTokens(m, cfg);
+  const sig = msgSignature(m);
+  if (sig !== '') {
+    const hit = msgTokMemo.get(m);
+    if (hit !== undefined && hit.sig === sig) return hit.tok;
+  }
+  const tok = estimateMessageTokens(m, cfg);
+  if (sig !== '') msgTokMemo.set(m, { sig, tok });
+  return tok;
+}
+
+/**
+ * A rolling total over a message list that grows by appending.
+ *
+ * This is the idea borrowed from jcode's `ActiveCharEstimate`
+ * (`crates/jcode-base/src/compaction.rs`): keep a running count of the messages
+ * already priced, so the common append-only case never rescans history. jcode also
+ * notes why the cached value and its staleness flag are bundled into one type
+ * rather than two independent fields — a path that updated one without the other
+ * silently corrupted token accounting. Here the two are a single number,
+ * `_counted`: it is meaningless on its own and is only ever read together with the
+ * length it was computed against.
+ *
+ * `sync()` is O(new messages) when the list was only appended to, and O(n) after a
+ * compaction (which REPLACES the array, so the old count describes messages that no
+ * longer exist). Correctness does not depend on detecting appends perfectly: the
+ * boundary identities are spot-checked and any doubt falls back to a full recount,
+ * which is still cheap because the per-message memo makes each step a WeakMap hit.
+ */
+export class TokenLedger {
+  constructor() {
+    this.tokens = 0;
+    this._counted = 0;
+    this._first = null;
+    this._last = null;
+  }
+
+  /** Total tokens for `messages`, reusing the previous count where it is still valid. */
+  sync(messages, cfg) {
+    const msgs = Array.isArray(messages) ? messages : [];
+    const n = msgs.length;
+    const canExtend = this._counted > 0 && this._counted <= n
+      && this._first === msgs[0]
+      && this._last === msgs[this._counted - 1];
+    if (canExtend) {
+      for (let i = this._counted; i < n; i++) this.tokens += messageTokens(msgs[i], cfg);
+    } else {
+      // Full recount. Still O(n) WEAK-MAP LOOKUPS rather than O(n) string walks,
+      // which is the difference between milliseconds and microseconds.
+      let total = 0;
+      for (let i = 0; i < n; i++) total += messageTokens(msgs[i], cfg);
+      this.tokens = total;
+    }
+    this._counted = n;
+    this._first = n ? msgs[0] : null;
+    this._last = n ? msgs[n - 1] : null;
+    return this.tokens;
+  }
+
+  /** Forget everything — call after an in-place edit of an already-counted message. */
+  reset() {
+    this.tokens = 0;
+    this._counted = 0;
+    this._first = null;
+    this._last = null;
+  }
 }
 
 // The overhead a request carries BEYOND its messages: the system prompt plus the

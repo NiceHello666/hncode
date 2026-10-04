@@ -10,18 +10,42 @@ export const TRUECOLOR = DEPTH >= 24 || process.env.COLORTERM === 'truecolor' ||
 function rgb(r, g, b) { return TRUECOLOR ? `\x1b[38;2;${r};${g};${b}m` : `\x1b[38;5;${ansi256(r, g, b)}m`; }
 function brgb(r, g, b) { return TRUECOLOR ? `\x1b[48;2;${r};${g};${b}m` : `\x1b[48;5;${ansi256(r, g, b)}m`; }
 
-// Quantize a truecolor triple to the nearest 256-color xterm index.
+// Quantize a truecolor triple to the nearest 256-colour xterm index.
+//
+// Two different palettes live in xterm-256 and they must not be confused:
+//   * the 6x6x6 COLOUR CUBE (16..231): each channel has 6 levels — 0, then
+//     95,135,175,215,255 — so the step is 40 above a floor of 35, not 51;
+//   * the GREY RAMP (232..255): 24 levels from rgb(8) to rgb(238), steps of 10.
+//
+// The grey case used to be `232 + Math.round(v / 51)`, which collapses a whole range of
+// greys onto a few ramp entries: rgb(46,46,46) — the panel surface — quantised to 233,
+// i.e. rgb(18,18,18), three steps darker than asked for. The panel then read as a
+// near-black hole instead of a raised surface. Quantising against the ramp's own step
+// fixes that.
 function ansi256(r, g, b) {
-  const ri = Math.round(r / 51), gi = Math.round(g / 51), bi = Math.round(b / 51);
-  if (ri === gi && gi === bi) {
-    if (ri === 0) return 16;
-    if (ri === 255 / 51) return 232 + ri;
-    return 232 + ri; // grayscale ramp
+  const cube = (v) => (v < 48 ? 0 : v < 115 ? 1 : Math.min(5, Math.round((v - 35) / 40)));
+  // A triple that is (nearly) neutral belongs on the grey ramp, which has finer steps
+  // than the cube's 6 levels: rgb(46,46,46) is not representable in the cube at all.
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max - min <= 8) {
+    const v = (r + g + b) / 3;
+    const n = Math.max(0, Math.min(23, Math.round((v - 8) / 10)));
+    return 232 + n;
   }
-  return 16 + 36 * ri + 6 * gi + bi;
+  return 16 + 36 * cube(r) + 6 * cube(g) + cube(b);
 }
 
 // Brand accent: cyan-blue.
+// A BACKGROUND escape at the terminal's own colour depth: the exact triple under
+// truecolor, the nearest palette index otherwise.
+//
+// Exported because a caller computing a NEW colour at paint time — the backdrop dimming
+// does, when it pulls a fill toward the page — has to state its result in the same notation
+// the untouched fills use. Emitting `48;2;…` unconditionally loses the fill entirely on a
+// 256-colour terminal, which silently ignores what it does not implement.
+export const bgRgb = brgb;
+
 export const TEAL = rgb(0, 184, 219);
 export const CYAN = rgb(0, 215, 255);
 export const BLUE = rgb(66, 135, 245);
@@ -36,12 +60,14 @@ const THEMES = {
   auto: { 
     fg: [0, 184, 219], bg: [0, 18, 26], 
     teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
-    hover: [190, 245, 255], selBg: [0, 70, 84] 
+    hover: [190, 245, 255], selBg: [0, 70, 84],
+    surface: [46, 46, 46],
   },
   dark: {
     fg: [255, 255, 255], bg: [0, 18, 26], // White foreground for normal text
     teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180],
-    hover: [190, 245, 255], selBg: [0, 70, 84]
+    hover: [190, 245, 255], selBg: [0, 70, 84],
+    surface: [46, 46, 46],
   },
   light: {
     fg: [26, 26, 26], bg: [255, 255, 255],
@@ -49,8 +75,71 @@ const THEMES = {
     hover: [0, 78, 102], selBg: [200, 230, 239],
     red: [179, 38, 30], green: [30, 122, 60], yellow: [160, 120, 0], orange: [178, 90, 0],
     white: [26, 26, 26], gray: [85, 85, 85],
+    // A LIGHT surface is a grey that is darker than the white page but far lighter than
+    // the dark themes' — a panel has to read as raised in whichever direction the theme
+    // goes, and reusing #2e2e2e on white would be a black box.
+    surface: [232, 232, 232],
+  },
+  // The four below are the same SHAPE as `dark` with the accent hue moved, so every
+  // derived colour in `setTheme` (the scrollbar shades, hover, and the light/dark branch
+  // test) keeps working with no special case. Each keeps ONE accent family varying only in
+  // lightness, because the context bar's five fills read as a gradient and a second hue in
+  // that ramp makes the bar look broken.
+  nord: {
+    fg: [216, 222, 233], bg: [46, 52, 64],
+    teal: [136, 192, 208], cyan: [143, 188, 187], blue: [129, 161, 193], border: [94, 129, 172],
+    hover: [236, 239, 244], selBg: [59, 66, 82],
+    red: [191, 97, 106], green: [163, 190, 140], yellow: [235, 203, 139], orange: [208, 135, 112],
+    white: [236, 239, 244], gray: [129, 135, 148],
+    surface: [59, 66, 82],
+  },
+  dracula: {
+    fg: [248, 248, 242], bg: [40, 42, 54],
+    teal: [139, 233, 253], cyan: [139, 233, 253], blue: [98, 114, 164], border: [98, 114, 164],
+    hover: [255, 121, 198], selBg: [68, 71, 90],
+    red: [255, 85, 85], green: [80, 250, 123], yellow: [241, 250, 140], orange: [255, 184, 108],
+    white: [248, 248, 242], gray: [98, 114, 164],
+    surface: [68, 71, 90],
+  },
+  gruvbox: {
+    fg: [235, 219, 178], bg: [40, 40, 40],
+    teal: [142, 192, 124], cyan: [131, 165, 152], blue: [69, 133, 136], border: [146, 131, 116],
+    hover: [250, 189, 47], selBg: [60, 56, 54],
+    red: [251, 73, 52], green: [184, 187, 38], yellow: [250, 189, 47], orange: [254, 128, 25],
+    white: [235, 219, 178], gray: [146, 131, 116],
+    surface: [60, 56, 54],
+  },
+  mono: {
+    // No hue at all: every accent is a grey, so the UI is readable on a monochrome
+    // terminal or for anyone who needs colour off without losing the structure that
+    // colour was carrying. The lightness steps are what keep the context bar legible.
+    fg: [230, 230, 230], bg: [18, 18, 18],
+    teal: [190, 190, 190], cyan: [210, 210, 210], blue: [150, 150, 150], border: [110, 110, 110],
+    hover: [255, 255, 255], selBg: [60, 60, 60],
+    red: [200, 90, 90], green: [140, 190, 140], yellow: [200, 190, 120], orange: [210, 160, 110],
+    white: [240, 240, 240], gray: [130, 130, 130],
+    surface: [42, 42, 42],
   },
 };
+/** Theme name -> one-line description, for the /theme picker. */
+export const THEME_LABELS = {
+  auto: 'brand cyan-blue on the terminal’s own palette',
+  dark: 'dark teal background, brand accents',
+  light: 'for light terminals; darkened accents',
+  nord: 'cool blue-grey',
+  dracula: 'high-contrast purple and pink',
+  gruvbox: 'warm retro earth tones',
+  mono: 'greyscale, no hue',
+};
+
+/** True when a theme paints on a light background. `setTheme` uses this too. */
+export function isLightTheme(name) {
+  const t = THEMES[name];
+  return !!(t && Array.isArray(t.bg) && t.bg[0] > 128);
+}
+
+/** Whether a theme name is one we know. */
+export function hasTheme(name) { return Object.prototype.hasOwnProperty.call(THEMES, name); }
 export const THEME_NAMES = Object.keys(THEMES);
 
 export const C = {
@@ -72,7 +161,33 @@ export const C = {
   bg: BG,
   bgTeal: brgb(0, 184, 219),
   bgDim: brgb(12, 24, 30),
-  bgPanel: TRUECOLOR ? '\x1b[48;5;236m' : '\x1b[48;5;236m',
+  // Fills for the segmented context bar: five blues in one family, deepening towards
+  // black, plus a neutral free segment. Background colours, because the bar is read by
+  // FILL rather than by any text — a segment is usually only a few columns wide, so a
+  // letter inside it would be unreadable noise.
+  //
+  // The steps are deliberately narrow. Widening them makes the bar easier to tell apart
+  // at a glance but harder to keep a dark terminal readable, and the darkest member has
+  // to stay distinguishable from the page background it sits on.
+  ctxSystem: brgb(35, 48, 95),      // deepest navy
+  ctxPrompt: brgb(43, 61, 120),     // navy
+  ctxAssistant: brgb(52, 74, 146),  // indigo
+  ctxThinking: brgb(77, 107, 254),  // brand blue, the brightest used segment
+  ctxTools: brgb(90, 124, 255),     // light blue
+  ctxFree: brgb(46, 46, 46),        // neutral grey: "nothing here yet"
+  // The SURFACE colour for a floating panel (picker menus, dialogs). A NEUTRAL GREY,
+  // deliberately separate from the theme's `bg`:
+  //
+  //   * the theme background is `[0, 18, 26]` — a dark TEAL. A raised surface should be
+  //     neutral in every theme; only the ACCENTS carry the brand hue. Reusing `bg` for
+  //     the panel made every popup read blue, which is not what a panel is.
+  //   * `applyTheme` used to overwrite this with `t.bg`, so the value here only applied
+  //     before a theme was set. It is no longer touched by the theme.
+  //
+  // xterm-256's grey ramp runs 232..255 from rgb(8) to rgb(238) in steps of 10, so 236
+  // is rgb(48,48,48) = #303030 — clearly lifted off a near-black terminal without
+  // washing the text out. Truecolor gets `#2e2e2e`, the same shade written exactly.
+  bgPanel: TRUECOLOR ? '\x1b[48;2;46;46;46m' : '\x1b[48;5;236m',
   border: BORDER,
   red: '\x1b[91m',
   green: '\x1b[92m',
@@ -107,16 +222,31 @@ export const C = {
   // a selection highlight so text after it keeps its own colour (a bare ESC[0m
   // would also reset the foreground, turning a cyan/white run grey).
   bgReset: '\x1b[49m',
-  scrollTrack: '\x1b[90m',          // dim gutter
-  scrollThumb: TRUECOLOR ? rgb(0, 184, 219) : '\x1b[38;5;37m', // brand cyan-blue
-  // Scrollbar interaction states:
-  //   hover  -> a touch whiter/brighter than the brand colour
-  //   active -> BOLD + the brand colour (pressed/dragging)
-  // The pressed state used to be a DARKER colour, which on a dark background
-  // read as "the thumb disappeared". Making it bold-and-bright means a press is
-  // always unmistakably visible. Idle swaps back to scrollThumb automatically.
-  scrollThumbHover: TRUECOLOR ? rgb(120, 226, 245) : '\x1b[38;5;123m',
-  scrollThumbActive: '\x1b[1m' + (TRUECOLOR ? rgb(0, 220, 255) : '\x1b[38;5;51m'),
+  // Scrollbar, styled after OpenTUI (what cline uses): a solid block thumb on a
+  // near-black track. Only the FOREGROUND colour is stateful — the track is always the
+  // background — because that is how OpenTUI's SliderRenderable paints a cell:
+  // foreground = thumb, background = track. A `█` covers both columns with the
+  // foreground, while `▀`/`▄` expose one half to the track, so the two colours must
+  // stay DISTINCT; giving a half-cell the thumb colour as its background is what made
+  // it read as a second square, and it also survived the modal backdrop's faint
+  // attribute, which fades the foreground only.
+  //   track  #252527    thumb  #9a9ea3        (OpenTUI's defaults, inlined)
+  //   hover  #d2d6da    active #ffffff        (brighter thumb, not a new hue)
+  scrollTrackBg: TRUECOLOR ? brgb(0x25, 0x25, 0x27) : '\x1b[48;5;235m',
+  scrollTrackFg: TRUECOLOR ? rgb(0x25, 0x25, 0x27) : '\x1b[38;5;235m',
+  scrollThumbBg: TRUECOLOR ? brgb(0x9a, 0x9e, 0xa3) : '\x1b[48;5;246m',
+  scrollThumbFg: TRUECOLOR ? rgb(0x9a, 0x9e, 0xa3) : '\x1b[38;5;246m',
+  scrollThumbHoverBg: TRUECOLOR ? brgb(0xd2, 0xd6, 0xda) : '\x1b[48;5;252m',
+  scrollThumbHoverFg: TRUECOLOR ? rgb(0xd2, 0xd6, 0xda) : '\x1b[38;5;252m',
+  scrollThumbActiveBg: TRUECOLOR ? brgb(0xff, 0xff, 0xff) : '\x1b[48;5;231m',
+  scrollThumbActiveFg: TRUECOLOR ? rgb(0xff, 0xff, 0xff) : '\x1b[38;5;231m',
+  // FOREGROUND aliases kept for the todo/queue resize rule, which draws a `─` line
+  // and therefore needs a foreground, not the block's background pair.
+  scrollThumbActive: TRUECOLOR ? rgb(0xff, 0xff, 0xff) : '\x1b[38;5;231m',
+  scrollThumbHover: TRUECOLOR ? rgb(0xd2, 0xd6, 0xda) : '\x1b[38;5;252m',
+  // Legacy foreground forms, still referenced by the gutter-hover path.
+  scrollTrack: '\x1b[90m',
+  scrollThumb: TRUECOLOR ? rgb(0, 184, 219) : '\x1b[38;5;37m',
   // Hover highlight for clickable rows (menu items, picker options, form
   // fields, composer rows). An explicit bright foreground + BOLD rather than a
   // bare BOLD: BOLD only brightens the 16-colour palette (it does nothing to a
@@ -153,24 +283,39 @@ export function setTheme(name) {
   C.cyan = rgb(...t.cyan);
   C.blue = rgb(...t.blue);
   C.border = rgb(...t.border);
-  
   // Update background colors
   C.bg = brgb(...t.bg);
   C.bgTeal = brgb(...t.teal);
-  C.bgPanel = brgb(...t.bg);
+  // The panel surface is NEUTRAL GREY and comes from the theme's own `surface` triple,
+  // NOT from `bg`. It used to be set to `t.bg` (a dark teal), which made every popup
+  // carry a blue cast; a raised surface must be neutral, with only the accents following
+  // the brand hue. A light theme gets a light grey so the panel still reads as raised.
+  if (t.surface) C.bgPanel = brgb(...t.surface);
   C.selBg = brgb(...t.selBg);
   
-  // Scrollbar colours. The active (pressed/dragging) thumb is BOLD + a brighter
-  // shade of the theme colour. It used to be a DARKER shade, which on a dark
-  // background read as "the thumb vanished" mid-drag.
-  C.scrollTrack = '\x1b[90m'; // dim gutter
-  C.scrollThumb = rgb(...t.teal);
-  C.scrollThumbHover = rgb(...t.hover);
-  C.scrollThumbActive = '\x1b[1m' + rgb(
+  // Scrollbar colours. The thumb is a BLOCK, so its colour goes on BOTH the
+  // foreground and the background (a half-cell `▀`/`▄` shows the foreground, a full
+  // `█` shows the background — they must match). Hover / drag are brighter shades
+  // of the same hue, applied to the same pair, so the whole thumb changes together.
+  const active = [
     Math.min(255, Math.round(t.teal[0] * 0.6 + 255 * 0.4)),
     Math.min(255, Math.round(t.teal[1] * 0.6 + 255 * 0.4)),
     Math.min(255, Math.round(t.teal[2] * 0.6 + 255 * 0.4)),
-  );
+  ];
+  const hover = t.hover || [190, 245, 255];
+  C.scrollTrackFg = rgb(0x25, 0x25, 0x27);
+  C.scrollTrackBg = brgb(0x25, 0x25, 0x27);
+  C.scrollThumbFg = rgb(...t.teal);
+  C.scrollThumbBg = brgb(...t.teal);
+  C.scrollThumbHoverFg = rgb(...hover);
+  C.scrollThumbHoverBg = brgb(...hover);
+  C.scrollThumbActiveFg = rgb(...active);
+  C.scrollThumbActiveBg = brgb(...active);
+  // Foreground aliases for the todo/queue resize rule.
+  C.scrollTrack = '\x1b[90m';
+  C.scrollThumb = rgb(...t.teal);
+  C.scrollThumbHover = rgb(...hover);
+  C.scrollThumbActive = rgb(...active);
 
   // Hover stays visible on this theme's background (bright on dark, dark on light).
   C.hover = '\x1b[1m' + rgb(...(t.hover || [190, 245, 255]));

@@ -29,7 +29,7 @@ export const MAX_BREAKPOINTS = 4;
 export const MIN_CACHEABLE_TOKENS = 1024;
 
 export function supportsCaching(protocol) {
-  return protocol === 'anthropic' || protocol === 'openai';
+  return protocol === 'anthropic' || protocol === 'openai' || protocol === 'responses';
 }
 
 // Index (into `messages`) of the last message that belongs to the STABLE prefix.
@@ -125,6 +125,7 @@ export function withOpenAiCache(body, opts = {}) {
 export function applyPromptCache(protocol, body, opts = {}) {
   if (!opts.enabled) return body;
   if (protocol === 'anthropic') return withAnthropicCache(body, opts);
-  if (protocol === 'openai') return withOpenAiCache(body, opts);
+  // Responses API accepts the same stable `prompt_cache_key` as chat/completions.
+  if (protocol === 'openai' || protocol === 'responses') return withOpenAiCache(body, opts);
   return body;
 }

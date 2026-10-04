@@ -71,6 +71,7 @@ Each of these is enforced — a violation is rejected before any subagent starts
 Use enough subagents to keep the work focused and parallel. AgentSwarm supports up to ${MAX_AGENT_SWARM_SUBAGENTS} subagents, and launches are queued automatically, so it is safe to split large tasks into many clear, independent items.
 
 When NOT to use AgentSwarm:
+- It only exists while swarm mode is ON (\`/swarm\`). With the mode off the tool is not offered at all and calling it is refused. If a fan-out would genuinely help, say so and ask the user to turn the mode on.
 - Never call this on your own initiative. It requires the same explicit permission as \`Agent\`: the user, or the applicable AGENTS.md / project instructions, must have asked for sub-agents, delegation, or parallel agent work. Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do NOT count as permission.
 - Do not use it for two or three differently-shaped tasks: use separate \`Agent\` calls instead, which can run in parallel in one message.
 - Do not use it to fan out work you could finish yourself in a few steps.
@@ -151,9 +152,17 @@ If \`AgentSwarm\` is called, that call must be the only tool call in the respons
         } catch (e) {
           results[i] = `--- #${i + 1} ---\n[error: ${e.message}]`;
         }
-        // Stream progress into the task output so a long swarm is inspectable.
+        // Report progress down BOTH channels, and they are not interchangeable:
+        //   * the task buffer feeds TaskOutput and survives a detach;
+        //   * `ctx.onOutput` is the LIVE sink. The progress block in the transcript
+        //     reads the cells off it (see the tool_output handler's `[n/m] finished`
+        //     match), so writing only to the task buffer left every cell but the first
+        //     stuck on "Queued…" for the whole run — the TUI was told to expect these
+        //     lines on this channel and never received one.
         const done = results.filter((r) => r !== null).length;
-        appendTaskOutput(task, `[${done}/${jobs.length}] finished\n`);
+        const line = `[${done}/${jobs.length}] finished\n`;
+        appendTaskOutput(task, line);
+        if (typeof ctx.onOutput === 'function') ctx.onOutput(line);
       }
     };
     const runAll = Promise.all(Array.from({ length: Math.min(SWARM_CONCURRENCY, jobs.length) }, worker));

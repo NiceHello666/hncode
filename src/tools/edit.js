@@ -28,13 +28,14 @@ import { hashRegion as hashLines } from './read.js';
 
 export const spec = {
   name: 'Edit',
-  description: 'Edit a file. THE TWO MODES ARE MUTUALLY EXCLUSIVE — NEVER combine them:\n  - LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string. PRESERVE the exact indentation (spaces/tabs) of the lines you are replacing — copy it straight from the Read output, after its line-number prefix. PREFERRED — use it whenever you have Read the file and know the line numbers.\n  - EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use ONLY when the exact text is known and a line range is not convenient.\nDo NOT pass start_line/end_line together with old_string/new_string in one call, and do NOT pass any of these four keys when you are not using that mode. Omitting new_string is an error, not an empty replacement (in line-range mode pass new_string; in substring mode pass old_string + new_string).',
+  description: 'Edit a file. THE TWO MODES ARE MUTUALLY EXCLUSIVE — NEVER combine them:\n- LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string.\nPREFERRED — use it whenever you have Read the file and know the line numbers.\n- EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use ONLY when the exact text is known and a line range is not convenient.\nLEADING WHITESPACE — SPELL IT OUT ON EVERY LINE, INCLUDING THE FIRST. new_string is written VERBATIM in both modes: nothing is re-indented, auto-indented, or trimmed, and there is no tolerance for a missing first-line indent. Reproduce the indentation the code SHOULD have; it need not match the surrounding block. Copy it from the Read output, after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`).\nWRONG — the first line has no indentation, so it lands at column 0 inside an indented block:\nnew_string: "return total;\\n    total += 1;"\nRIGHT — every line carries the indentation it needs:\nnew_string: "    return total;\\n    total += 1;"\nThose are the same call; only the leading spaces on the FIRST line differ. The same applies to tabs, and to a line whose indentation changes partway through.\nRANGE HYGIENE — WRITE ONLY THE LINES YOU ARE REPLACING. Lines [start_line, end_line] are deleted and new_string is inserted in their place, so a line you leave OUTSIDE that range survives — and if you also restated it inside new_string you get TWO copies. Check what sits on end_line + 1 before deciding where the range ends.\nWRONG — end_line: 3 deletes lines 2-3, but line 4 is repeated because its content was also written into new_string:\nnew_string: "const a = 1;\\nconst b = 20;\\nconst c = 3;"\nRIGHT — the range covers exactly what is being replaced, and nothing beyond it is restated:\nnew_string: "const a = 1;\\nconst b = 20;"\nTo touch line 4 as well, set end_line: 4 and include its new content in new_string.\nIn SUBSTRING mode old_string is matched EXACTLY, including the indentation of its own first line.\nDo NOT pass start_line/end_line together with old_string/new_string in one call, and do NOT pass any of these four keys when you are not using that mode. Omitting new_string is an error, not an empty replacement (in line-range mode pass new_string; in substring mode pass old_string + new_string).\nMis-indented lines often still parse, so a green test run is not proof that an edit landed correctly — re-Read the region before editing it again.\',',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Path to the file to edit.' },
       old_string: { type: 'string', description: 'Exact text to replace, including whitespace and newlines. Omit when using start_line/end_line.' },
-      new_string: { type: 'string', description: 'Replacement text. In SUBSTRING mode it replaces old_string. In LINE-RANGE mode it replaces lines [start_line, end_line]. In line-range mode PRESERVE the exact leading whitespace (indentation) from Read output; copy it exactly as it appears after the line-number prefix.' },
+      new_string: { type: 'string', description: 'Replacement text, written VERBATIM in BOTH modes — no indentation is added, removed, or re-derived. Write the leading spaces on EVERY line yourself, including the FIRST one, copying them from the Read output after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`). In LINE-RANGE mode it must contain EXACTLY the lines being replaced: a line that sits outside [start_line, end_line] is not deleted, so restating it here leaves a duplicate. In SUBSTRING mode it replaces old_string, which is itself matched exactly including its own indentation.' },
+
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
       start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_string). Use this line-range mode first.' },
       end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line).' },
@@ -62,9 +63,9 @@ export const spec = {
     let p;
     try { p = resolvePath(args.path, ctx); } catch (e) { return e.message; }
     // A Jupyter notebook is JSON, not text: a snippet edit corrupts it. Point the
-    // model at the notebook-aware path instead (mirrors Claude Code errorCode 5).
+    // model at the notebook-aware tool instead (mirrors Claude Code errorCode 5).
     if (String(p).toLowerCase().endsWith('.ipynb')) {
-      return `Error: ${args.path} is a Jupyter notebook. Its .ipynb is JSON — edit the cells through a notebook-aware tool (or edit the JSON carefully), not a plain text Edit.`;
+      return `Error: ${args.path} is a Jupyter notebook, and its .ipynb is JSON — a text replacement would corrupt it. Use NotebookEdit instead: \`{ path: ${JSON.stringify(args.path)}, action: "list" }\` to see the cells, then action "replace" with the cell index.`;
     }
     let content;
     try {
@@ -388,12 +389,26 @@ function checkStaleRange(p, curLines, start, end, ctx) {
   const normContent = curLines.join('\n');
   const curFileHash = hashStr(normContent);
 
-  // A region covers the range when it fully contains it AND still hashes the
-  // same as when it was Read.
-  const covered = entry.regions.some(
-    (r) => start >= r.start && end <= r.end && hashLines(curLines, r.start, r.end) === r.hash,
-  );
-  if (covered) return null;
+  // A range is "read" when the regions the model has SEEN cover it — not only when
+  // a single region spans it. A file read in two passes (5-10 then 11-16) must
+  // allow editing 5-16: the two slices are contiguous, both still intact, so the
+  // written range is fully known. Requiring one enclosing region rejected that
+  // perfectly safe edit and forced a third Read.
+  //
+  // Only regions whose hash STILL matches count: a region whose text changed is no
+  // longer what the model saw, so it cannot vouch for anything. The cover must also
+  // be SEAMLESS — a gap (5-10 and 12-16 with 11 unread) leaves 11 unknown, so it
+  // does NOT count, and the edit is correctly refused.
+  const intact = entry.regions
+    .filter((r) => hashLines(curLines, r.start, r.end) === r.hash)
+    .sort((a, b) => a.start - b.start);
+  let reach = start - 1;                       // highest line known to be covered
+  for (const r of intact) {
+    if (r.end < start) continue;               // entirely before the target
+    if (r.start > reach + 1) break;            // a gap opens before this region: stop
+    if (r.end > reach) reach = r.end;
+    if (reach >= end) return null;             // reached the end: fully covered
+  }
 
   if (curFileHash === entry.fileHash) {
     // No "(read so far: …)" listing: the range is what the model must act on, and

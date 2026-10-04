@@ -36,20 +36,25 @@ export const spec = {
     const p = normalizeInput(args.path || '.');
     const base = path.resolve(ctx.cwd || ctx.workspace, p);
     if (!fs.existsSync(base)) return `Error: path does not exist: ${args.path}`;
-    if (!args.multiline && hasRg()) return grepRg(args, base, ctx);
+    if (!args.multiline && hasRg()) return await grepRg(args, base, ctx);
     return grepJs(args, base, ctx);
   },
 };
 
+// Is ripgrep on PATH? Probed once and memoised: the probe itself is a spawn, and
+// running it on every Grep call was a pointless synchronous stall.
+let _hasRg = null;
 function hasRg() {
+  if (_hasRg !== null) return _hasRg;
   try {
     // spawnSync does NOT throw when the binary is missing — it returns
     // { error: ENOENT, status: null }. The old try/catch therefore always
     // reported "rg available", and grepRg() then returned an empty stdout as
     // "No matches found" instead of falling back to the JS walker.
     const r = cp.spawnSync('rg', ['--version'], { stdio: 'ignore' });
-    return !r.error && r.status === 0;
-  } catch { return false; }
+    _hasRg = !r.error && r.status === 0;
+  } catch { _hasRg = false; }
+  return _hasRg;
 }
 
 function buildRgArgs(args, base) {
@@ -68,23 +73,41 @@ function buildRgArgs(args, base) {
   return a;
 }
 
+// Run ripgrep ASYNCHRONOUSLY. `spawnSync` blocked the event loop for the whole
+// search — on a large repo that froze the TUI (the spinner stopped, input lagged)
+// for as long as rg ran, which is exactly the "working indicator stalls" symptom.
+// Streaming the output with an async spawn keeps the UI responsive.
 function grepRg(args, base, ctx) {
-  let out;
-  try {
-    const r = cp.spawnSync('rg', buildRgArgs(args, base), {
-      cwd: ctx.cwd || ctx.workspace,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'utf8',
-    });
-    // spawn failure: `r.error` set, status null. Must fall back to JS, not
-    // return an empty result as "No matches found".
-    if (r.error) return grepJs(args, base, ctx);
-    out = r.stdout || '';
-    if (r.status > 1 && r.stderr) return `rg error: ${r.stderr.trim()}`;
-  } catch (e) {
-    return grepJs(args, base, ctx);
-  }
-  return paginate(out, args);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = cp.spawn('rg', buildRgArgs(args, base), { cwd: ctx.cwd || ctx.workspace });
+    } catch {
+      resolve(grepJs(args, base, ctx));
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const done = (fn) => { if (!settled) { settled = true; fn(); } };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    // spawn failure (ENOENT, etc.): fall back to the JS walker rather than
+    // reporting an empty result as "No matches found".
+    child.on('error', () => done(() => resolve(grepJs(args, base, ctx))));
+    child.on('close', (code) => done(() => {
+      if (code > 1 && stderr) resolve(`rg error: ${stderr.trim()}`);
+      else resolve(paginate(stdout, args));
+    }));
+    // Honour an aborted turn (Esc): kill rg instead of leaving it running.
+    if (ctx && ctx.signal) {
+      const onAbort = () => { try { child.kill(); } catch { /* already gone */ } done(() => resolve(paginate(stdout, args))); };
+      if (ctx.signal.aborted) onAbort();
+      else ctx.signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 function grepJs(args, base, ctx) {
@@ -109,13 +132,32 @@ function grepJs(args, base, ctx) {
     try {
       const buf = fs.readFileSync(abs);
       if (!isProbablyTextFile(buf)) continue;
-      txt = truncateBuf(buf);
+      // The WHOLE file, not `truncateBuf(buf)`. That helper caps a tool RESULT at
+      // 128 KB, which is right for what is handed back to the model and wrong as the
+      // haystack: on this repo it cut src/tui.js (878 KB) to its first 15%, so any
+      // pattern appearing later in the file reported "No matches found" — a silent
+      // false negative on the biggest, most-edited file there is. Real ripgrep
+      // searches everything and caps only its OUTPUT, which is what happens here now:
+      // the rows are collected in full and `paginate` + `head_limit` bound the result.
+      txt = buf.toString('utf8');
     } catch { continue; }
     const mode = args.output_mode;
+
+    // Normalise CRLF -> LF BEFORE anything else. Splitting on '\n' alone left a
+    // '\r' at the end of every line in a CRLF file (which every file in this repo
+    // is), and a '\r' is a real character to a regex:
+    //   * `foo$` and `^foo$` matched NOTHING, because the line really ends "\r";
+    //   * every returned match line carried a stray '\r', cleaned up by paginate()
+    //     only for the final output — after the matching had already gone wrong.
+    // One normalisation here is what `rg` does internally, and it makes the JS
+    // path agree with it.
+    const normalized = txt.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    txt = normalized;
 
     if (args.multiline) {
       const ms = Array.from(txt.matchAll(re));
       if (ms.length === 0) continue;
+      if (mode === 'files_with_matches') { out.push(abs); continue; }
       if (mode === 'files_with_matches') { out.push(abs); continue; }
       if (mode === 'count_matches') { out.push(`${abs}:${ms.length}`); continue; }
       const lines = txt.split('\n');

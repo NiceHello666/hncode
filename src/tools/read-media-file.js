@@ -52,8 +52,12 @@ export const spec = {
     let p;
     try { p = resolvePath(args.path, ctx); } catch (e) { return e.message; }
 
-    if (!fs.existsSync(p)) return `Error: file not found: ${args.path}`;
-    const stat = fs.statSync(p);
+    // Async fs throughout. These calls used to be sync, and an image may be tens
+    // of MB — reading it (plus the base64 encode) blocked the event loop long
+    // enough to freeze the TUI while the Working spinner was animating.
+    let stat;
+    try { stat = await fs.promises.stat(p); }
+    catch { return `Error: file not found: ${args.path}`; }
     if (!stat.isFile()) return `Error: not a file: ${args.path}`;
 
     const ext = path.extname(p).toLowerCase();
@@ -67,7 +71,10 @@ export const spec = {
           + 'Resize it, or raise the limit with HNCODE_MEDIA_MAX_BYTES.';
       }
       const mimeType = IMAGE_MIME[ext];
-      const data = fs.readFileSync(p).toString('base64');
+      let buf;
+      try { buf = await fs.promises.readFile(p); }
+      catch (e) { return `Error: could not read ${args.path}: ${e.message}`; }
+      const data = buf.toString('base64');
       const approxKB = Math.round(data.length / 1024);
       return {
         text: `[image] ${args.path} (${sizeKB}KB, ${mimeType})`,

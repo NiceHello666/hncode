@@ -49,7 +49,7 @@ export function isValidFormat(f) {
 //   files     — files the run wrote/edited (from tool ARGS, best-effort)
 //   error     — a fatal error message, when the run failed outright
 //   stopped   — the turn was interrupted
-export function buildResult({ reply, toolCalls, files, error, stopped, durationMs, model, sessionId }) {
+export function buildResult({ reply, toolCalls, files, error, stopped, durationMs, model, sessionId, timedOut }) {
   const hasReply = typeof reply === 'string' && reply.trim().length > 0;
   const ok = !error && !stopped && hasReply;
   const result = {
@@ -63,6 +63,9 @@ export function buildResult({ reply, toolCalls, files, error, stopped, durationM
   };
   if (error) result.error = String(error);
   if (stopped) result.stopped = true;
+  // `--timeout <seconds>` tripped: distinct from a user interrupt so a caller can
+  // tell "the model was too slow" from "someone pressed Esc" (both set stopped).
+  if (timedOut) result.timedOut = true;
   return result;
 }
 

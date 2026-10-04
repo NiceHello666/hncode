@@ -17,6 +17,7 @@
 // summarise it.
 
 import { createTask, appendTaskOutput, settleTask } from '../agent-task.js';
+import { registerRun, endRun } from '../subagent-control.js';
 import { SUBAGENT_TYPES, DEFAULT_SUBAGENT_TYPE, availableTypes, toolsForSubagent } from '../subagent-types.js';
 import { runShellHooks } from '../hooks.js';
 
@@ -53,7 +54,7 @@ function systemPromptFor(type, cfg, systemPrompt) {
 // stream, and each tool it runs) so the TUI can show it under the `Using Agent`
 // row the way Bash's output is shown. `agentId` labels the lines when several
 // subagents run at once (AgentSwarm), so the reader can tell them apart.
-async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProgress, agentId }) {
+async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProgress, agentId, onAgent }) {
   const { Agent, SYSTEM_PROMPT } = await import('../agent.js');
   const subCfg = {
     ...cfg,
@@ -105,6 +106,10 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
     if (signal.aborted) throw new Error('Interrupted by user');
     signal.addEventListener('abort', () => agent.interrupt(), { once: true });
   }
+  // Hand the LIVE agent back to the caller so a control tool can steer or interrupt it
+  // while it runs. `subagents` only learns about this run when it finishes, so without
+  // this the only way to reach a running subagent would be to interrupt the whole turn.
+  if (typeof onAgent === 'function') onAgent(agent);
   await agent.run();
   // SHELL HOOK: SubagentStop. The subagent finished (or was interrupted); the
   // parent-side hook can log/archive it. Never blocks.
@@ -237,12 +242,20 @@ ${availableTypes()}`,
       const agentId = existing ? existing.id : newAgentId();
       task.agentId = agentId;
 
+      // Register the run so a control tool can reach it while it is in flight. The handle
+      // is created BEFORE the run so both `run_in_background` and the detached-foreground
+      // path behave the same, and cleared in `finally` so a settled run can never be
+      // listed as controllable.
+      let runId = '';
+      const early = { agent: null };
+
       // Fire and forget: the task record carries the result when it lands.
       void (async () => {
         try {
           const run = await runSubagent({
             cfg: subCfg, type, prompt, history,
             signal: controller.signal,
+            onAgent: (agent) => { early.agent = agent; },
             // No live streaming into the task output: that should read as the
             // subagent's CONCLUSION. `run.text` below is the cleaned final message.
           });
@@ -258,8 +271,15 @@ ${availableTypes()}`,
           settleTask(task, stopped ? 'killed' : 'failed', { stopReason: stopped ? 'Stopped by user' : e.message });
           appendTaskOutput(task, `\n[error: ${e.message}]`);
           if (typeof ctx._onBackgroundTaskDone === 'function') ctx._onBackgroundTaskDone(task);
+        } finally {
+          if (runId) endRun(runId);
         }
       })();
+      runId = registerRun({
+        agentId, taskId: task.taskId, type, description,
+        steer: (text) => { if (early.agent) early.agent.steer(text); },
+        interrupt: () => controller.abort(),
+      });
 
       return `agent_id: ${agentId}\ntask_id: ${task.taskId}\nstatus: running\nnext_step: Continue your work; the result arrives in a later message. Use TaskOutput {task_id: "${task.taskId}"} for a non-blocking check or TaskStop to cancel.`;
     }
@@ -286,8 +306,13 @@ ${availableTypes()}`,
     // `onProgress` feeds the parent's live-output sink (ctx.onOutput), which the
     // agent tags with THIS tool call's id — the same path Bash uses, so the TUI
     // renders the subagent's stream under the `Using Agent` row and Ctrl+O folds it.
+    // The live Agent is captured as soon as `runSubagent` builds it, which is what makes
+    // this run controllable from another tool call (or the TUI) without waiting for it to
+    // finish. `live` is a box because the handle arrives asynchronously.
+    const live = { agent: null };
     const runPromise = runSubagent({
       cfg: subCfg, type, prompt, history, signal: bgController.signal,
+      onAgent: (agent) => { live.agent = agent; },
       // `_progressTag` is set by AgentSwarm to the item index, so a swarm's
       // concurrently-running subagents are distinguishable in the live stream.
       // A plain Agent call has no tag and prints its stream unlabelled.
@@ -297,6 +322,15 @@ ${availableTypes()}`,
         ctx.onOutput(tag ? text.split('\n').map((l) => (l ? tag + l : l)).join('\n') : text);
       },
     });
+    // Registered here so a foreground subagent is reachable by AgentMessage / AgentInterrupt
+    // too — that is precisely the case where a user wants to redirect one: it is the run
+    // they are watching. Cleared when the run settles, however it settles.
+    let runId = registerRun({
+      agentId, type, description,
+      steer: (text) => { if (live.agent) live.agent.steer(text); },
+      interrupt: () => bgController.abort(),
+    });
+    void runPromise.catch(() => {}).finally(() => { if (runId) { endRun(runId); runId = ''; } });
     if (ctx) {
       ctx._foreground = {
         kind: 'Agent',

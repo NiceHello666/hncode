@@ -17,8 +17,12 @@ import * as askUserQuestionMod from './ask-user-question.js';
 import { spec as agentSpec } from './agent.js';
 import { spec as agentSwarmSpec } from './agent-swarm.js';
 import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec } from './tasks.js';
+import { AgentListSpec, AgentMessageSpec, AgentInterruptSpec, AgentCloseSpec } from './agent-control.js';
+import { spec as notebookSpec } from './notebook.js';
+import { spec as diagnosticsSpec } from './diagnostics.js';
 import * as memoryMod from './memory.js';
 import { pluginTools } from '../plugin.js';
+
 
 
 // Built-in tools.
@@ -42,6 +46,12 @@ const builtinTools = [
   TaskOutputSpec,
   TaskStopSpec,
   TaskWaitSpec,
+  AgentListSpec,
+  AgentMessageSpec,
+  AgentInterruptSpec,
+  AgentCloseSpec,
+  notebookSpec,
+  diagnosticsSpec,
   memoryMod.spec,
 ];
 

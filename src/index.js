@@ -34,6 +34,8 @@ Options:
                                 json prints one result object; stream-json streams events then a result.
                                 Exit code reflects the outcome: 0 ok, 1 failure, 2 config, 3 no answer, 4 interrupted.
   --control                     Expose a local control socket (prompt/status/interrupt) while the TUI runs.
+  --timeout <seconds>           Prompt mode: abort the run after this many seconds (default: no limit).
+  --retries <n>                 Prompt mode: HTTP retries per request before failing (default: 3).
   --control <path>              Same, at an explicit socket path.
   --web                         Serve this session to a browser on 127.0.0.1 (random port).
   --web [ip][:port]             Same, on a chosen address/port (e.g. --web 0.0.0.0:8080).
@@ -45,7 +47,7 @@ Options:
 Commands:
   session list                  List sessions, most recent first.
   provider list                 Show configured providers.
-  doctor config [path]          Validate a config.toml (default: merged config).
+  doctor [config] [path]        Environment self-check (default), or validate a config.toml.
   init                          Create ~/.hncode/config.toml with defaults.
   export [id]                   Export a session to ~/.hncode/export/<id>.json.
   control status                Ask a running session (started with --control) for its status.
@@ -70,7 +72,7 @@ export function parseArgs(argv) {
       else { key = a.slice(2); val = null; }
       if (key === 'resume') key = 'session'; // `--resume <id>` is an alias for `--session <id>`
       if (['session', 'control', 'web'].includes(key) && val === null) { const nx = argv[i + 1]; out[key] = nx !== undefined && !nx.startsWith('-') ? (i++, nx) : true; }
-else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir') {
+else if (key === 'model' || key === 'prompt' || key === 'output-format' || key === 'add-dir' || key === 'timeout' || key === 'retries') {
         if (val === null) {
           const nx = argv[i + 1];
           // Only consume the next token if it is a real value, not another flag
@@ -151,6 +153,75 @@ async function cmdDoctorConfig(p) {
   }
 }
 
+// `hncode doctor` — environment self-check. Answers "will hncode actually work in
+// THIS terminal?" for the things that silently break it: too-old Node, a non-TTY
+// or odd terminal, Windows consoles that do not forward mouse sequences, a missing
+// git, an unreadable config. Every line is OK / WARN / FAIL so one paste answers a
+// support question.
+async function cmdDoctorEnv() {
+  const rows = [];
+  const add = (level, label, detail) => rows.push({ level, label, detail });
+
+  const major = Number(process.versions.node.split('.')[0]);
+  if (major >= 22) add('OK', 'node', process.version);
+  else if (major >= 20) add('WARN', 'node', process.version + ' — 20/21 work, but 22+ has TTY fixes');
+  else add('FAIL', 'node', process.version + ' — hncode needs Node >= 20');
+
+  add('OK', 'platform', process.platform + ' ' + os.release());
+  const isWin = process.platform === 'win32';
+  const term = process.env.TERM || '';
+  const wt = process.env.WT_SESSION ? 'windows-terminal' : (process.env.TERM_PROGRAM || (isWin ? 'conhost/other' : 'unknown'));
+  add(process.stdout.isTTY ? 'OK' : 'WARN', 'stdout isatty', process.stdout.isTTY ? 'yes' : 'no — colors/mouse assume a real terminal');
+  add('OK', 'terminal', wt + (term ? ' (TERM=' + term + ')' : ''));
+  if (isWin && !process.env.WT_SESSION) {
+    add('WARN', 'mouse', 'not inside Windows Terminal (WT_SESSION unset); some consoles do not forward mouse input');
+  }
+  add('OK', 'truecolor', (process.env.COLORTERM === 'truecolor' || /256color|truecolor/.test(term)) ? 'yes' : 'no — 256-color fallback in use');
+
+  try {
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync('git', ['--version'], { encoding: 'utf8' });
+    add(r.status === 0 ? 'OK' : 'WARN', 'git', r.status === 0 ? String(r.stdout).trim() : 'not found — git tools limited');
+  } catch { add('WARN', 'git', 'not found on PATH'); }
+
+  const cfgFile = process.env.HNCODE_CONFIG || path.join(os.homedir(), '.hncode', 'config.toml');
+  if (!fs.existsSync(cfgFile)) {
+    add('WARN', 'config', 'no file at ' + cfgFile + ' (run hncode init)');
+  } else {
+    try {
+      const { parse } = await import('./toml.js');
+      parse(fs.readFileSync(cfgFile, 'utf8'));
+      add('OK', 'config', cfgFile);
+    } catch (e) {
+      add('FAIL', 'config', cfgFile + ': ' + e.message);
+    }
+  }
+
+  try {
+    const cfg = resolveConfig();
+    const model = cfg.innerModel || cfg.model;
+    add(model ? 'OK' : 'WARN', 'model', model || 'none configured (run /model or set default_model)');
+    add(cfg.apiKey ? 'OK' : 'WARN', 'api key', cfg.apiKey ? 'set' : 'missing — requests will 401');
+  } catch (e) {
+    add('WARN', 'config resolve', e.message);
+  }
+
+  try {
+    const dir = path.join(os.homedir(), '.hncode', 'plugins');
+    const n = fs.existsSync(dir) ? fs.readdirSync(dir).filter((x) => fs.statSync(path.join(dir, x)).isDirectory()).length : 0;
+    add('OK', 'plugins', n + ' installed (' + dir + ')');
+  } catch { /* ignore */ }
+
+  const order = { FAIL: 0, WARN: 1, OK: 2 };
+  rows.sort((a, b) => order[a.level] - order[b.level]);
+  console.log('hncode doctor — environment check\n');
+  for (const r of rows) console.log('  [' + r.level.padEnd(4) + '] ' + r.label.padEnd(16) + ' ' + r.detail);
+  const fails = rows.filter((r) => r.level === 'FAIL').length;
+  console.log('\n' + (fails ? fails + ' problem(s) found' : 'No blocking problems found.'));
+  return fails ? 1 : 0;
+}
+
+
 function cmdInit() {
   const cfg = resolveConfig();
   const target = path.join(os.homedir(), '.hncode', 'config.toml');
@@ -222,8 +293,9 @@ async function cmdControl(sub, arg) {
 }
 
 // ---- headless prompt mode ----
-async function runPrompt({ cfg, prompt, format, session, modelArg }) {
+async function runPrompt({ cfg, prompt, format, session, modelArg, timeoutSeconds, maxRetries }) {
   cfg = resolveModelArg(cfg, modelArg);
+  if (maxRetries !== undefined) cfg.maxRetries = maxRetries;
   if (!cfg.apiKey) {
     console.error('hncode: no api_key configured. Set HNCODE_API_KEY or configure a provider first. Run `hncode doctor config` to check.');
     return EXIT.CONFIG;
@@ -265,7 +337,25 @@ async function runPrompt({ cfg, prompt, format, session, modelArg }) {
     },
   });
   saved.messages = messages;
-  await agent.run();
+  // `--timeout <seconds>`: hard wall-clock cap on the whole run, so an unattended
+  // scripted prompt cannot hang forever on a stuck model or a wedged tool. The
+  // timer calls the SAME interrupt() the TUI's Esc uses — it aborts the in-flight
+  // request and kills the tool's AbortSignal — rather than process.exit, so the
+  // session is still saved and any final output is emitted.
+  let timedOut = false;
+  let timer = null;
+  if (timeoutSeconds > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { agent.interrupt(); } catch { /* best-effort */ }
+    }, timeoutSeconds * 1000);
+    if (timer.unref) timer.unref();
+  }
+  try {
+    await agent.run();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   sess.saveSession(saved);
 
   const reply = finalReply(messages, tracker.text);
@@ -278,6 +368,7 @@ async function runPrompt({ cfg, prompt, format, session, modelArg }) {
     durationMs: Date.now() - startedAt,
     model: cfg.model,
     sessionId: saved.id,
+    timedOut,
   });
 
   if (format === 'json') {
@@ -369,7 +460,7 @@ export async function main(argv) {
   // subcommands
   const [cmd, sub] = args.positional;
   if (cmd) {
-    if (cmd === 'doctor' && !sub) { printHelp(); return 0; }
+    if (cmd === 'doctor' && !sub) { return await cmdDoctorEnv(); }
     const handler = SUBCOMMANDS[cmd];
     if (handler) {
       if (sub !== undefined) {
@@ -387,11 +478,20 @@ export async function main(argv) {
   const baseCfg = resolveConfig();
   const cfg = resolveModelArg(baseCfg, args.model);
 
-  // Load plugins (if enabled) before anything else so their tools and commands
-  // are available in both headless and TUI modes.
-  if (cfg.pluginDir) {
-    const { loadPlugins } = await import('./plugin.js');
-    await loadPlugins(cfg.pluginDir);
+  // Plugins are normally loaded by bootstrap (bin/hncode) BEFORE this module is
+  // imported, because symbol patching has to register targets before the patched
+  // modules load. Only load them here when bootstrap did NOT already do it (e.g.
+  // index.js imported directly, or a test), so tools/commands still appear in
+  // both modes without a second load tripping "tool already registered".
+  try {
+    const { pluginsAlreadyLoaded } = await import('./bootstrap.js');
+    if (cfg.pluginDir && !pluginsAlreadyLoaded() && !globalThis.__hncodePluginsLoaded) {
+      const { loadPlugins } = await import('./plugin.js');
+      await loadPlugins(cfg.pluginDir);
+      globalThis.__hncodePluginsLoaded = true;
+    }
+  } catch (e) {
+    console.error('[hncode] plugin load step failed, continuing without plugins:', e && e.message);
   }
 
   // Connect configured MCP servers and register their tools.
@@ -437,7 +537,19 @@ export async function main(argv) {
     let session = null;
     if (args.session) session = typeof args.session === 'string' ? sess.loadSession(args.session) : sess.latestSession(undefined, undefined, { skipEmpty: true });
     else if (args.continue) session = sess.latestSession(undefined, undefined, { skipEmpty: true });
-    return runPrompt({ cfg, prompt: args.prompt, format, session, modelArg: args.model });
+    // --timeout / --retries are validated here so a typo fails loudly instead of
+    // being parsed as NaN and silently ignored.
+    const timeoutSeconds = args.timeout !== undefined ? Number.parseInt(String(args.timeout), 10) : 0;
+    if (args.timeout !== undefined && (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1)) {
+      console.error(`hncode: --timeout needs a positive integer (seconds), got "${args.timeout}".`);
+      return EXIT.CONFIG;
+    }
+    const maxRetries = args.retries !== undefined ? Number.parseInt(String(args.retries), 10) : undefined;
+    if (args.retries !== undefined && (!Number.isInteger(maxRetries) || maxRetries < 0)) {
+      console.error(`hncode: --retries needs a non-negative integer, got "${args.retries}".`);
+      return EXIT.CONFIG;
+    }
+    return runPrompt({ cfg, prompt: args.prompt, format, session, modelArg: args.model, timeoutSeconds, maxRetries });
   }
 
   if (!process.stdout.isTTY) {

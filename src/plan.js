@@ -1,7 +1,8 @@
-// Plan review helpers — turning a model's <plan> block into something the user
+// Plan review helpers — turning a model's plan block into something the user
 // can actually review before any file is touched.
 //
-// Plan mode already asks the model for a <plan>…</plan> block and prompts to
+// Plan mode already asks the model for a <|plan|>…</|plan|> block and prompts to
+// approve it. What this module adds is the review material and the persistence:
 // approve it. What this module adds is the review material and the persistence:
 //
 //   * filesReferenced(plan)  — which paths the plan says it will touch, so the

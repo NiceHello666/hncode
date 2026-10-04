@@ -2,7 +2,7 @@
 
 English | [简体中文](https://github.com/NiceHello666/hncode/blob/main/README_CN.md) | [Wiki](https://github.com/NiceHello666/hncode/blob/main/README_WIKI.md)
 
-> **This is a product of my Vibe Coding session. It may not be perfect, but if you have any suggestions, feel free to open an issue.**
+> **This is a product of my vibe coding session. I'm trying my best to make it perfect, so if you have any suggestions, feel free to open an issue.**
 
 A cyan-blue terminal user interface (TUI) coding agent inspired by [Kimi Code](https://github.com/MoonshotAI/kimi-code), with OpenAI + Anthropic support, an MCP-style toolbelt, and intelligent context management.
 
@@ -16,7 +16,8 @@ A cyan-blue terminal user interface (TUI) coding agent inspired by [Kimi Code](h
 - **Prompt Caching**: Explicit cache breakpoints for the stable prefix (`/cache`)
 - **MCP-style Toolbelt**: Read, Write, Edit, Bash, Glob, Grep, TodoList, WebSearch, etc.
 - **MCP Client**: Connect real Model Context Protocol servers (stdio + HTTP) and use their tools
-- **Skills**: Package reusable prompts as Markdown (`/import-skill`, `/skill:<name>` with tab-completion)
+- **Skills**: Package reusable prompts as Markdown (`/import-skill`, `/skill:<name>` with tab-completion, plus a manager that installs them from the repo)
+- **Skills & plugins manager**: `/skills` and `/plugins` browse what is installed *and* what the repo offers, with descriptions, and install/remove in place
 - **Shell Hooks**: Run your own commands at lifecycle events (`PreToolUse`, `PostToolUse`, …)
 - **Git Workflow**: `/git`, `/commit`, `/branch`, `/worktree`, `/pr` plus a `Git` tool for the agent
 - **Plan Review**: Review what a plan will touch, edit it, then approve before any file changes
@@ -95,24 +96,10 @@ This file is a quick overview. For the **full documentation** — every command,
 
 ## 🤝 Contributing
 
-This project was created through Vibe Coding. While it may not be perfect, I welcome your feedback!
-
 **Feel free to:**
 - Submit issues for bugs or suggestions
 - Fork and create pull requests
 - Share your experience using hncode
-
----
-
-## 🙏 Acknowledgments
-
-hncode draws inspiration from several excellent projects:
-
-- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - The original cyan-blue TUI coding agent that inspired this project's design and approach
-- **[Claude Code](https://github.com/anthropics/claude-code)** - The conversation flow and tool interaction patterns
-- **[Codex](https://github.com/openai/codex)** - Several behaviours were shaped by reading its open-source implementation: the AGENTS.md loading spec, the rule against spawning subagents unprompted, the plan-tool state machine, the review rubric, and parts of the system prompt
-
-Special thanks to the communities behind these projects for pushing the boundaries of AI-assisted coding.
 
 ---
 
