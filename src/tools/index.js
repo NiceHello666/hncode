@@ -12,8 +12,18 @@ import * as fetchUrlMod from './fetch-url.js';
 import * as webSearchMod from './web-search.js';
 import * as readMediaFileMod from './read-media-file.js';
 import * as fileLinesMod from './file-lines.js';
+import * as gitMod from './git.js';
+import * as askUserQuestionMod from './ask-user-question.js';
+import { spec as agentSpec } from './agent.js';
+import { spec as agentSwarmSpec } from './agent-swarm.js';
 import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec } from './tasks.js';
+import { AgentListSpec, AgentMessageSpec, AgentInterruptSpec, AgentCloseSpec } from './agent-control.js';
+import { spec as notebookSpec } from './notebook.js';
+import { spec as diagnosticsSpec } from './diagnostics.js';
+import * as memoryMod from './memory.js';
 import { pluginTools } from '../plugin.js';
+
+
 
 // Built-in tools.
 const builtinTools = [
@@ -28,11 +38,23 @@ const builtinTools = [
   webSearchMod.spec,
   readMediaFileMod.spec,
   fileLinesMod.spec,
+  gitMod.spec,
+  askUserQuestionMod.spec,
+  agentSpec,
+  agentSwarmSpec,
   TaskListSpec,
   TaskOutputSpec,
   TaskStopSpec,
   TaskWaitSpec,
+  AgentListSpec,
+  AgentMessageSpec,
+  AgentInterruptSpec,
+  AgentCloseSpec,
+  notebookSpec,
+  diagnosticsSpec,
+  memoryMod.spec,
 ];
+
 
 // Combined list: built-ins + plugin-registered tools. Plugin tools appear after
 // built-ins so their names are visible, but built-in names take precedence in
@@ -44,8 +66,19 @@ export function combinedTools() {
 export const tools = builtinTools;
 export { builtinTools };
 
-const byName = new Map(builtinTools.map((t) => [t.name, t]));
-export function getTool(name) { return byName.get(name); }
+// NOTE: the map is built lazily over combinedTools() so plugin-registered
+// tools are resolvable. The previous Map was built from builtinTools only,
+// so `llmTools()` advertised a plugin tool to the model but `getTool(name)`
+// returned undefined and the call failed with `unknown tool`.
+let _byName = null;
+function byNameMap() {
+  if (!_byName) {
+    _byName = new Map();
+    for (const t of combinedTools()) if (!_byName.has(t.name)) _byName.set(t.name, t);
+  }
+  return _byName;
+}
+export function getTool(name) { return byNameMap().get(name); }
 export function toolNames() { return combinedTools().map((t) => t.name); }
 
 // Schemas for sending to an LLM (OpenAI `tools` array).

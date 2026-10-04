@@ -28,6 +28,7 @@ function escapeRegex(c) {
   return /[.*+?^${}()|[\]\\]/.test(c) ? '\\' + c : c;
 }
 
+// Regex SOURCE (anchored, with ^ and $) for a single plain pattern.
 export function globToRegexSource(pattern) {
   let src = '^';
   for (let i = 0; i < pattern.length; i++) {
@@ -59,10 +60,13 @@ export function globToRegexSource(pattern) {
 }
 
 // Match the whole string against a single pattern (anchored, like globToRegex).
+// The single-alternative path wraps globToRegexSource directly; the multi
+// (brace) path joins every alternative in braces so a `{a,b}` pattern cannot
+// match a substring that only matches one branch.
 export function globRegex(pattern) {
   const alts = expandBraces(pattern);
-  if (alts.length === 1) return new RegExp('^' + globToRegexSource(alts[0]));
-  return new RegExp('^(?:' + alts.map(globToRegexSource).join('|') + ')');
+  if (alts.length === 1) return new RegExp(globToRegexSource(alts[0]));
+  return new RegExp('^(?:' + alts.map((a) => globToRegexSource(a)).join('|') + ')$');
 }
 
 // True if `s` matches `pattern` (full match on `s`).

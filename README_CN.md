@@ -2,7 +2,7 @@
 
 [English](https://github.com/NiceHello666/hncode/blob/main/README.md) | 简体中文 | [Wiki](https://github.com/NiceHello666/hncode/blob/main/README_WIKI_CN.md)
 
-> **这是我 Vibe Coding 的产物，可能不是特别好，但是如果有什么建议的话也欢迎提 issue**
+> **这是我vibe coding的产物. 我在尽全力让它变的完美, 所以如果你有何建议, 欢迎开一个issue.**
 
 一个基于终端用户界面（TUI）的 AI 编程助手，灵感源自 [Kimi Code](https://github.com/MoonshotAI/kimi-code)。它提供青色蓝调 (Cyan-blue) 的 TUI 界面，支持 OpenAI 和 Anthropic 双协议，配备 MCP 风格的工具集和智能上下文管理。
 
@@ -52,8 +52,6 @@ npx @hncode/hncode
 
 ## 🤝 贡献
 
-这个项目是通过 Vibe Coding 创建的。虽然它可能不够完美，但我欢迎您的反馈！
-
 **欢迎：**
 - 提交问题报告 bug 或提出建议
 - Fork 并创建拉取请求
@@ -61,25 +59,15 @@ npx @hncode/hncode
 
 ---
 
-## 🙏 致谢
-
-hncode 从以下几个优秀项目中汲取了灵感：
-
-- **[Kimi Code](https://github.com/MoonshotAI/kimi-code)** - 原始的青色蓝调终端界面 AI 编程助手，启发了本项目的设计和理念
-- **[Claude Code](https://github.com/anthropics/claude-code)** - 对话流程和工具交互模式
-
-特别感谢这些项目背后的社区，它们推动了 AI 辅助编程的边界。
-
----
-
 ## 📄 许可证
 
-本项目的许可受 [GNU General Public License v3.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE) 保护。
+本项目的许可受 [PolyForm Noncommercial License 1.0.0](https://github.com/NiceHello666/hncode/blob/main/LICENSE) 保护。
 
 **简单来说:**
-1. ✅ 你可以自由使用、修改和分享此代码
-2. ✅ 必须保留原作者署名（NiceHello666）并链接回此仓库
-3. ❌ 不得用于商业目的（例如出售、作为付费产品的一部分）
+1. ✅ 非商业用途免费——个人项目、学习、研究、业余爱好，以及非商业组织
+2. ✅ 可以修改和分享，但任何副本都必须附带许可证全文和「不得商用」的声明
+3. ❌ 禁止任何形式的商业使用（出售、作为付费产品的一部分、或用于运营商业服务）
+4. ℹ️ 这**不是** copyleft 许可：你自己新增的部分无需开源。商业使用需向作者单独获取授权。
 
 ---
 

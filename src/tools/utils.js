@@ -3,6 +3,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { recordBeforeWrite } from '../file-history.js';
 
 export const MAX_OUTPUT_BYTES = 128 * 1024; // cap tool results to avoid token blowup
 
@@ -13,7 +14,17 @@ export function truncateBuf(buf) {
   }
   const s = String(buf);
   if (s.length <= MAX_OUTPUT_BYTES) return s;
-  return s.slice(0, MAX_OUTPUT_BYTES) + `\n...[truncated ${s.length - MAX_OUTPUT_BYTES} chars]`;
+  // The cap is a BYTE budget, but `s.length` is UTF-16 code units. Slicing by
+  // code units both under-counts non-ASCII (a 3-byte CJK char costs 1 unit)
+  // and can split a surrogate pair, emitting a lone half. Truncate by BYTES
+  // and back off to the nearest code-point boundary.
+  const bytes = Buffer.byteLength(s, 'utf8');
+  if (bytes <= MAX_OUTPUT_BYTES) return s;
+  const cut = Buffer.from(s, 'utf8').subarray(0, MAX_OUTPUT_BYTES).toString('utf8');
+  // A trailing lone surrogate (from a split pair) is dropped by decoding; the
+  // replacement char U+FFFD at the tail is also stripped so the marker is clean.
+  const safe = cut.endsWith('\uFFFD') ? cut.slice(0, -1) : cut;
+  return safe + `\n...[truncated ${bytes - MAX_OUTPUT_BYTES} bytes]`;
 }
 
 // Expand ~ and map Git-Bash /c/x -> C:\x style paths, then resolve against cwd.
@@ -42,6 +53,19 @@ export function resolvePath(input, ctx) {
 
 export function ensureDir(p) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
+}
+
+// Checkpoint `p` before a write tool modifies it, so /undo can put it back (see
+// file-history.js). The record is taken ONCE per turn, so what is captured is the
+// file as it stood before ANY of this turn's changes — the state the user would
+// expect "Undid 1 prompt" to restore.
+//
+// ctx.sessionId identifies the checkpoint store. A caller without one (a
+// subagent's own context, a test) simply gets no checkpoint rather than an error:
+// losing the safety net must never fail the actual write.
+export function checkpointBeforeWrite(p, ctx) {
+  if (!ctx || !ctx.sessionId) return false;
+  try { return recordBeforeWrite(ctx.sessionId, p); } catch { return false; }
 }
 
 // Read a file fully, returning its string. Throws if not a file.

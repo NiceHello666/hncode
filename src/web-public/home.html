@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>hncode</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="/home.css">
+</head>
+<body>
+<div class="page">
+
+  <header class="head">
+    <div class="head-left">
+      <h1>hncode <span class="dim" data-i18n="home.brandSuffix">sessions</span></h1>
+      <p class="lede" data-i18n="home.lede"></p>
+    </div>
+    <div class="head-right">
+      <div class="nav-lang" id="lang-switch"></div>
+      <button id="refresh" class="btn btn-quiet" data-i18n="home.refresh"></button>
+      <button id="logout" class="btn btn-quiet" data-i18n="home.logout"></button>
+    </div>
+  </header>
+
+  <p id="err" class="err" role="alert" hidden></p>
+
+  <main id="groups" class="groups"></main>
+
+</div>
+<script type="module" src="/home.js"></script>
+</body>
+</html>
