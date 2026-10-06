@@ -702,8 +702,10 @@ export class Agent {
       // first, so it stays recoverable.
       //
       // Trigger: the request reached `trimThreshold` (50% by default) of the window.
-      // Target: keep `trimKeepRatio` (30% by default) of the tool-result TEXT,
-      // newest first. Skipped while a compaction just ran (that already shrank
+      // Target: keep `trimKeepRatio` (30% by default) of the tool-result TEXT, newest
+      // first. A different denominator from the trigger on purpose: the trigger asks
+      // about the window, this asks about the removable output. Skipped while a
+      // compaction just ran (that already shrank
       // things) and above the compaction trigger (compaction is the right tool by
       // then, and the two must not fight over the same history).
       const trimThreshold = Number.isFinite(this.cfg.trimThreshold) ? this.cfg.trimThreshold : DEFAULT_TRIM_THRESHOLD;

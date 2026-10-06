@@ -388,6 +388,14 @@ const b = baseUrl.replace(/\/+$/, '');
     // "use the built-in SYSTEM_PROMPT". Read from config.toml so it persists
     // across restarts.
     systemPrompt: process.env.HNCODE_SYSTEM_PROMPT || root.system_prompt || '',
+    // The prompt knobs added alongside it, all editable from /settings › Prompt. Separate
+    // keys rather than one blob, because they mean different things: `append` keeps the
+    // built-in prompt and adds to it, `personal` is the user's own standing note, and the
+    // per-mode ones only apply while that mode is on.
+    appendSystemPrompt: process.env.HNCODE_APPEND_SYSTEM_PROMPT || root.append_system_prompt || '',
+    planInstructions: root.plan_instructions || '',
+    focusInstructions: root.focus_instructions || '',
+    swarmInstructions: root.swarm_instructions || '',
     // ---- Web UI daemon -------------------------------------------------------
     // One daemon serves EVERY hncode session on this machine: it holds the fixed
     // port, proxies each session's requests to that session's own loopback
@@ -1146,23 +1154,42 @@ export function effortOptions(cfg, modelKeyName) {
   return ['off', 'on'];
 }
 
+// Token budget for a NAMED grade, on a protocol that wants a number rather than a word.
+//
+// The grades the catalog declares are low/medium/high, and a user may also write their own
+// in config.toml (`efforts = ["xhigh"]`). A grade with no entry here has no honest budget to
+// send, so the field is omitted — the previous code fell back to 8000, which silently gave
+// every unknown grade the same strength as `on` and `medium`.
+const EFFORT_BUDGETS = { low: 2000, medium: 8000, high: 16000, max: 32000 };
+
 // Map a chosen effort to the wire value for the active protocol.
+//
+// `on` means "thinking on", NOT "medium". The two are different requests: a model may
+// support a plain toggle without any graded control, in which case there is no grade to
+// send and inventing one (`medium`) can be rejected outright by the provider. `on` therefore
+// sends the protocol's plain enable, or nothing at all.
 export function effortWire(cfg, effort) {
   if (!effort || effort === 'off') return null;
+  const named = Object.prototype.hasOwnProperty.call(EFFORT_BUDGETS, effort);
+
   if (cfg.protocol === 'anthropic') {
-    const budget = { on: 8000, low: 2000, medium: 8000, high: 16000, max: 32000 }[effort] || 8000;
-    return { thinking: { type: 'enabled', budget_tokens: budget } };
+    // `thinking: { type: 'enabled' }` IS the plain toggle; `budget_tokens` is optional and
+    // only meaningful for a named grade. Omitting it lets the provider pick its own budget,
+    // which is what "on" asked for.
+    return named
+      ? { thinking: { type: 'enabled', budget_tokens: EFFORT_BUDGETS[effort] } }
+      : { thinking: { type: 'enabled' } };
   }
-  // Responses API nests the grade: `reasoning: { effort }`.
-  if (cfg.protocol === 'responses') {
-    const grade = effort === 'on' ? 'medium' : effort;
-    return { reasoning: { effort: grade } };
-  }
-  // OpenAI-compatible: `reasoning_effort`. "on" is not a valid grade, so map it
-  // to "medium"; concrete grades pass through.
-  const grade = effort === 'on' ? 'medium' : effort;
-  return { reasoning_effort: grade };
+
+  // Responses API and the OpenAI-compatible shape both take a GRADE word, and neither has
+  // a value meaning "on". So a named grade passes through, and `on` sends nothing — the
+  // request carries whatever the provider does by default for that model, rather than a
+  // grade the model may not accept.
+  if (!named) return {};
+  if (cfg.protocol === 'responses') return { reasoning: { effort } };
+  return { reasoning_effort: effort };
 }
+
 
 function toTomlLine(k, v) {
   if (typeof v === 'string') return `${k} = "${v.replace(/"/g, '\\"')}"`;

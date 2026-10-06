@@ -18,10 +18,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import cp from 'node:child_process';
 import {
-  C, TRUECOLOR, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, THEME_NAMES, THEME_LABELS, isLightTheme, hasTheme, lerpColor, bgRgb,
+  C, TRUECOLOR, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, setLightBackground, currentTheme, THEME_NAMES, THEME_LABELS, isLightTheme, hasTheme, lerpColor, bgRgb,
 } from './colors.js';
 import { copyText, readText, warmClipboard, readClipboardContentAsync, cleanupPastedImages } from './clipboard.js';
 import { visualWidth, estimateTokens, estimateMessagesTokens, estimateMessageTokens, messageTokens, expandTabs } from './term.js';
+// The picker is composited onto the frame as a cell layer rather than assigned over
 // The picker is composited onto the frame as a cell layer rather than assigned over
 // it (see src/cell-buffer.js), so the transcript BESIDE the card survives.
 import { parseCells, renderCells, drawFrameBuffer } from './cell-buffer.js';
@@ -42,6 +43,7 @@ import { forkOf } from './fork.js';
 import { makeRowKey, rowCacheGet, rowCacheSet } from './row-cache.js';
 import { renderContextBar, segmentCaption } from './context-bar.js';
 import { runDoctor, formatDoctor } from './doctor.js';
+import { profileMemory, renderMemoryProfile } from './memory-profile.js';
 import { loadKeybindings, resolveKey, describeKeybindings, readOrEmpty, writeKeybindings, normalizeKey } from './keybindings.js';
 import { describeRuns, listRuns, sendToRun, interruptRun, interruptAll, closeRun } from './subagent-control.js';
 import { buildTree, visibleRows, allDirs, renderTree, moveSel } from './file-tree.js';
@@ -73,6 +75,10 @@ import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
 import { renderRegistryBrowser, handleRegistryBrowserKey } from './registry-browser.js';
+import {
+  SETTINGS_SCHEMA, SETTING_BY_KEY, populatedTabs, settingsForTab,
+  coerceSetting, effectiveValue, isSet, displayValue, changedSettings,
+} from './settings-schema.js';
 import { renderTaskOutputViewer, handleViewerKey, makeViewerState } from './task-output-viewer.js';
 import { renderSwarmProgress } from './swarm-progress.js';
 import { sortedTasks, getTask, settleTask, STATUS_LABEL, backgroundTaskCard } from './agent-task.js';
@@ -158,7 +164,8 @@ let searchSeq = 0;
 export const COMMANDS = [
   { name: 'yolo', aliases: ['yes'], desc: 'Yolo mode: anything inside the workspace (edits, writes, commands) runs automatically; paths outside it, destructive commands, questions and plans still ask.', priority: 101 },
   { name: 'permission', desc: 'Select permission mode', priority: 100 },
-  { name: 'settings', aliases: ['config'], desc: 'Open settings (model / permission / statusline)', priority: 100 },
+  { name: 'settings', aliases: ['config'], desc: 'Browse and change every setting, grouped by area', priority: 100, argumentHint: '[tab|filter]' },
+  { name: 'set', desc: 'Set one config value by key, or list what differs from the default', priority: 100, argumentHint: '[<key> [value]]' },
   { name: 'plan', desc: 'Toggle plan mode', priority: 100, argumentHint: '[on|off|clear]' },
   { name: 'focus', desc: 'Toggle Focus mode (minimal tools first, full tools after)', priority: 98, argumentHint: '[on|off]' },
   { name: 'auto', desc: 'Auto mode: never interrupts you; everything runs and is decided automatically.', priority: 99 },
@@ -182,10 +189,11 @@ export const COMMANDS = [
   { name: 'fork', desc: 'Fork the current session into a copy without switching to it', priority: 80 },
   { name: 'undo', desc: 'Withdraw the last prompt: transcript + files it changed', priority: 80, argumentHint: '[count]' },
   { name: 'trim', desc: 'Trim old tool results now, down to the keep ratio (manual)', priority: 40, argumentHint: '[keep-ratio]' },
-  { name: 'auto-trim', aliases: ['autotrim'], desc: 'Auto tool-result trimming: toggle, or set the trigger/keep ratios', priority: 40, argumentHint: '[on|off | threshold <n> | keep <n>]' },
+  { name: 'auto-trim', aliases: ['autotrim'], desc: 'Auto tool-result trimming: the threshold is a share of the WINDOW, `keep` a share of the tool-result TEXT', priority: 40, argumentHint: '[on|off | threshold <n> | keep <n>]' },
   { name: 'title', aliases: ['rename'], desc: 'Set or show session title (also sets window title)', priority: 60, argumentHint: '<title>' },
   { name: 'status', desc: 'Show current session and runtime status', priority: 60 },
-  { name: 'doctor', desc: 'Diagnose the environment: config, store, MCP, hooks, terminal', priority: 60, argumentHint: '[--all]' },
+  { name: 'doctor', desc: 'Diagnose the environment: config, store, MCP, hooks, disk, git, terminal', priority: 60, argumentHint: '[--all] [--probe]' },
+  { name: 'memory-profile', aliases: ['memprof'], desc: 'Where this session’s memory goes: text vs tool results vs tool arguments', priority: 60, argumentHint: '[--verbose]' },
   { name: 'usage', desc: 'Show real token totals (provider-reported) + context window', priority: 60 },
   { name: 'cost', desc: 'Show what this session has spent, in USD or CNY', priority: 60, argumentHint: '[usd|cny]' },
   { name: 'context', aliases: ['ctx'], desc: 'Break down what fills the context window', priority: 60 },
@@ -2984,7 +2992,8 @@ function lruKeyFor(m, rowWidth, expanded, spinKey, state) {
     raw: !!state.rawMode,
     pending: !!m.pending,
     failed: !!m.failed,
-spin: spinKey,
+    theme: currentTheme(),
+    spin: spinKey,
   });
 }
 
@@ -3063,7 +3072,13 @@ export function renderChatLines(state, w, viewport) {
       // /raw changes how an assistant row is built, so the cache must be invalidated
       // when it flips — otherwise the old Markdown rows are reused and the toggle
       // appears to do nothing.
-      && cached.raw === !!state.rawMode;
+      && cached.raw === !!state.rawMode
+      // THE PALETTE. Every cached row is finished text, escapes included, so a theme
+      // change has to invalidate all of them. Without this the chrome repainted (it is
+      // composed per frame) while the assistant's own text kept the OLD colours — white
+      // words left sitting in a gruvbox palette after a switch. `auto` resolves to a
+      // concrete name, so following the terminal is caught too.
+      && cached.theme === currentTheme();
     // An evicted message keeps only `m._count`. When its layout key still matches,
     // the row count is known, so the message is counted WITHOUT re-rendering it —
     // which is the whole point of keeping the count separate from the rows (an idle
@@ -3108,6 +3123,10 @@ export function renderChatLines(state, w, viewport) {
         const wrapped = rows.map(rowToLine);
         const isPending2 = m.pending ? 1 : 0;
         const cc = {
+          // The palette is part of the key: `rows` are finished strings with their escapes
+          // already in them, so a cached row cannot be re-tinted later. See the `valid` test
+          // above, which compares this field against `currentTheme()`.
+          theme: currentTheme(),
           rowW: rowWidth, expanded, spinKey: spinKeyNow, isPending: isPending2,
           textRef: m.text, streamRef: m.streamContent, liveRef: m.liveOutput,
           failed: m.failed, diffRef: m.diff, countsRef: m._diffCounts,
@@ -3288,6 +3307,14 @@ export function metricsSignature(state, n, w, expanded, innerW) {
   let h = 2166136261 >>> 0;
   const mix = (v) => { h ^= (v | 0); h = Math.imul(h, 16777619) >>> 0; };
   mix(n); mix(w); mix(innerW); mix(expanded ? 1 : 0); mix(state.spin || 0);
+  // THE PALETTE. This signature decides whether the WHOLE transcript is walked at all, so a
+  // theme switch that left it alone skipped the per-message `valid` check too — every cached
+  // row kept the colours it was rendered with, which is why the chrome repainted and the
+  // assistant's text did not. Hashed rather than compared by name: this is a number.
+  for (let ci = 0; ci < currentTheme().length; ci++) {
+    h ^= currentTheme().charCodeAt(ci);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
   // rawMode changes every assistant row's shape, so it is part of the layout
   // identity: without this, toggling /raw left the cached rows on screen.
   mix(state.rawMode ? 1 : 0);
@@ -4256,6 +4283,7 @@ export function composeFrame(state, cols, rows) {
     const lines = renderRegistryBrowser(state.registryBrowser, w, h);
     return takeoverFrame(lines, (state.registryBrowser._regHits || []).slice());
   }
+
   // The file tree browser (/files) is another takeover. It re-renders from ITS OWN state
   // every frame, so a directory opened with the arrows is reflected immediately.
   if (state.fileTree) {
@@ -4304,8 +4332,11 @@ const takeover = state.editor || state.panel || null;
     : 0;
   // The notice no longer reserves a row: it is drawn ON the context row (see the
   // bottom of this function), so `noticeH` only selects the colour there.
-  const noticeH = state.notice ? 1 : 0;
-  const confirmH = state.confirmExit ? 1 : 0;
+const noticeH = state.notice ? 1 : 0;
+  // The confirm prompt now works the way the notice above it does: drawn ON the context row,
+  // in the tip row's left half. It took a row of its own before, which pushed the bar and
+  // the composer down every time Ctrl+C was pressed — for a prompt that lasts three seconds.
+  const confirmH = 0;
   const workingH = (!takeover && state.running) ? 1 : 0;
   // The todo and queue panels sit directly above the composer, so they stay visible
 // under a picker for the same reason the composer does — a popup covers the
@@ -4331,7 +4362,7 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
   const mentionItems = (state.mentionOpen && state.mentionList.length && !takeover)
     ? Math.min(state.mentionList.length, MAX_MENU) + 1
     : 0;
-  const chromeH = todoH + queueH + btwH + workingH + composerBoxH + menuItems + mentionItems + STATUS_H + confirmH + CTX_H;
+  const chromeH = todoH + queueH + btwH + workingH + composerBoxH + menuItems + mentionItems + STATUS_H + CTX_H;
   // NOTE the extra `- 1`: `bodyH` below is clamped to a MINIMUM of 1 row, so that
   // row has to be reserved here too. Without it the total came out one over and
   // the top trim ate the box's `╭` border.
@@ -4462,7 +4493,18 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     // overlay step turns it into the box's inner width once that is known.
     const RULE = { __rule: true };
     const fields = f.fields || [];
-    const body = [col(f.title || '', C.cyan + C.bold), RULE, ''];
+    // An optional DESCRIPTION under the title, wrapped to the box. /settings uses it: the
+    // list row carries only the key and its value, so this is where the setting says what it
+    // actually does — and it is the moment the user is about to change it.
+    const body = [col(f.title || '', C.cyan + C.bold)];
+    if (f.note) {
+      // `cols`, not `innerW`: the card's own width is decided later, in the overlay step, and
+      // `innerW` does not exist in this scope — naming it killed the process the moment any
+      // setting was opened. Wrapped to the terminal minus the card's margins; the overlay
+      // step trims whatever still does not fit.
+      for (const l of wrapWords(f.note, Math.max(20, cols - 8))) body.push(col(l, C.gray));
+    }
+    body.push(RULE, '');
     const fieldBodyRows = [];
     fields.forEach((field, i) => {
       const active = i === f.fieldIdx;
@@ -4590,8 +4632,32 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       // The "current" marker sits right after the name (not right-aligned at the far
       // edge), with a wider gap so it does not crowd the label.
       const cur = item.current ? col('   ← current', C.green) : '';
+      // `valueTag` is the setting's CURRENT VALUE. It goes after the description, not
+      // right-aligned: the card sizes itself to its widest row, so padding a value out to
+      // the terminal width made every row full-width and the card filled the screen.
+      //
+      // The value is capped at 40 columns INDEPENDENTLY of the room left on the row. A
+      // value pasted into `system_prompt` can be a paragraph, and letting its length decide
+      // meant one row set the width for all 50 — which is the same full-screen problem by
+      // another route. `displayValue` already shortens long values for this reason; the cap
+      // here is the picker's own, because it is what decides the card.
+      let tag = '';
+      if (item.valueTag != null && item.valueTag !== '') {
+        const raw = String(item.valueTag);
+        const room = Math.min(40, Math.max(8, cols - visualCol(ptr + label + sub + cur) - 6));
+        const text = visualCol(raw) > room ? `${raw.slice(0, Math.max(1, room - 1))}…` : raw;
+        tag = col(
+          `  ${text}`,
+          // Grey for the default, and colour ONLY for a value the user has actually changed.
+          // A settings list is mostly defaults, so painting all of them drew the eye nowhere;
+          // what stands out should be what is NOT the default. Orange rather than cyan:
+          // cyan is the accent the rest of the chrome already uses (the pointer, the tab,
+          // the selection), so a changed value in it read as "selected" rather than "edited".
+          item.valueTagChanged ? C.orange : C.gray,
+        );
+      }
       itemBodyRows.push(body.length);
-      body.push(col(ptr + label + sub + cur, C.white));
+      body.push(col(ptr + label + sub + cur + tag, C.white));
     });
     if (list.length > maxItems) body.push(col(`▼ ${list.length - (first + shown.length)} more`, C.gray));
     let footerBodyRow = -1;
@@ -5540,8 +5606,6 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
   // generic hover tint (any hitbox is tinted unless it is a composerRow).
   for (const h of slHits) addHit(statusRow, h.col0, h.col1, { kind: h.kind });
 
-  if (confirmH) lines.push(col(fitAnsi('Press Ctrl+C again to exit the hncode', w), C.yellow));
-
   // The context row is now a BAR: the window's composition as colour, with the same
   // `context: 12% (11.7k/97.7k)` text set into the free segment's right edge. The wording
   // is unchanged from the string this replaces — only its carrier changed from a line of
@@ -5582,9 +5646,15 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     ? segmentCaption(barHover.data, ctxSegs[barHover.data] || 0)
     : '';
   const tipText = (state.slTips !== false && state.tip) ? col(state.tip, C.gray) : '';
-  const leftText = segCaption
-    ? col(segCaption, C.white)
-    : (noticeH ? col(state.notice, state.noticeKind === 'error' ? C.red : C.gray) : '');
+  // The confirm prompt takes this slot ahead of the hover caption and the notice. It is the
+  // one thing on screen that must not be missed, and a slot already exists: the left of the
+  // tip row. Giving it a row of its own pushed the bar up and moved the notice out of the
+  // place the eye already looks for it.
+  const leftText = state.confirmExit
+    ? col(fitAnsi('Press Ctrl+C again to exit', w - visualCol(tipText) - 2), C.yellow)
+    : (segCaption
+      ? col(segCaption, C.white)
+      : (noticeH ? col(state.notice, state.noticeKind === 'error' ? C.red : C.gray) : ''));
   lines.push(justify(leftText, tipText, w));
 
 
@@ -5676,7 +5746,9 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     // layout budget above.
     const mentionH = (state.mentionOpen && state.mentionList.length && !dialog)
       ? Math.min(state.mentionList.length, MAX_MENU) + 1 : 0;
-    const bottomChrome = STATUS_H + (state.confirmExit ? 1 : 0) + CTX_H + menuH + mentionH;
+    // The confirm prompt is NOT a term here: it shares the tip row, which is already inside
+    // STATUS_H, so counting it made the caret jump up a line every time Ctrl+C was pressed.
+    const bottomChrome = STATUS_H + CTX_H + menuH + mentionH;
     const caretScreenRow = h - bottomChrome - 2 - (composer.rows.length - 1 - composer.caretRow);
     cursor = {
       row: Math.max(0, Math.min(caretScreenRow, h - 1)),
@@ -6563,6 +6635,76 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
     });
     addChat({ role: 'rich', text: out.join('\n') });
   };
+
+  /**
+   * Write one setting, through the single validation point in the schema.
+   *
+   * Every surface lands here — `/set`, the /settings browser, and the web's setConfig — so
+   * they cannot disagree about what a value means or which keys exist.
+   */
+  function applySetting(key, value) {
+    const def = SETTING_BY_KEY.get(key);
+    if (!def) { appErr(`Unknown setting: ${key}. Try /settings.`); return false; }
+    const coerced = coerceSetting(key, value);
+    if (!coerced.ok) { appErr(coerced.error); return false; }
+
+    try {
+      if (def.kind === 'bool') setConfigBool(key, coerced.value === 'true');
+      else setConfigString(key, coerced.value);
+    } catch (e) { appErr(`Could not write config.toml: ${e.message}`); return false; }
+
+    // Live-apply: mutate `cfg` AND `cfg.raw`, because some readers look at one and some at
+    // the other, and a change that only reaches one of them appears to work until the next
+    // frame reads the other.
+    const raw = coerced.value;
+    if (def.kind === 'bool') {
+      const v = raw === 'true';
+      cfg[key] = v; cfg.raw[key] = v;
+      // The names the rest of the code actually reads, where they differ from the key.
+      if (key === 'auto_compact') cfg.autoCompact = v;
+      if (key === 'auto_trim') cfg.autoTrim = v;
+      if (key === 'auto_update') cfg.autoUpdate = v;
+      if (key === 'calm_mode') cfg.calmMode = v;
+      if (key === 'swarm_mode') cfg.swarm = v;
+      if (key === 'tool_allow_external_paths') cfg.allowExternal = v;
+    } else {
+      cfg[key] = raw; cfg.raw[key] = raw;
+      if (key === 'compact_threshold') cfg.compactThreshold = Number(raw) / 100;
+      if (key === 'compact_keep_ratio') cfg.compactKeepRatio = Number(raw) / 100;
+      if (key === 'trim_threshold') cfg.trimThreshold = Number(raw) / 100;
+      if (key === 'trim_keep_ratio') cfg.trimKeepRatio = Number(raw) / 100;
+      if (key === 'max_context_tokens') cfg.maxContextTokens = Number(raw) || cfg.maxContextTokens;
+      if (key === 'provider') cfg.provider = raw;
+      if (key === 'model') { cfg.model = raw; state.modelLabel = raw; }
+      if (key === 'effort') { cfg.effort = raw; state.effort = raw; }
+      if (key === 'secondary_model') cfg.secondaryModel = raw;
+      if (key === 'subagent_model') cfg.subagentModel = raw;
+      if (key === 'tool_result_max_bytes') cfg.toolResultMaxBytes = Number(raw);
+      if (key === 'tool_result_preview_bytes') cfg.toolResultPreviewBytes = Number(raw);
+      if (key === 'probe_timeout_ms') cfg.probeTimeoutMs = Number(raw);
+      if (key === 'log_level') cfg.logLevel = raw;
+      if (key === 'shell') cfg.shell = raw;
+    }
+
+    // Effects that are not a plain field: switching the theme has to repaint every cell,
+    // and a system-prompt change has to reach the next request.
+    //
+    // The repaint is requested through `state`, not by touching `lastFrame`: this function
+    // runs inside `dispatch`, which cannot see startTUI's painter. `lastFrame` is dropped by
+    // the next `paintNow`, which is what forces every cell to be rewritten — a theme change
+    // left to the differential painter emits nothing, because the frame it compares against
+    // already matches.
+    if (key === 'theme') { setTheme(raw); state._forceRepaint = true; }
+    if (key === 'system_prompt') cfg.systemPrompt = raw;
+    if (key === 'append_system_prompt') cfg.appendSystemPrompt = raw;
+    if (key === 'plan_instructions') cfg.planInstructions = raw;
+    if (key === 'focus_instructions') cfg.focusInstructions = raw;
+    if (key === 'swarm_instructions') cfg.swarmInstructions = raw;
+    if (typeof renderFrameArg === 'function') renderFrameArg();
+    return true;
+    return true;
+  }
+
   const raw = (arg || '').trim();
 
   switch (cmd) {
@@ -6621,26 +6763,134 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       return;
     }
 
-    case 'settings':
+    case 'settings': {
+      // A PICKER, not a screen takeover. Every other chooser in hncode is a picker — /model,
+      // /theme, /permissions — and they share a look, a key set and the mouse. A settings
+      // screen that owned the whole terminal looked like a different program and, because
+      // the takeover path has its own click handling, could not be clicked at all.
+      //
+      // The tabs are the picker's own `categories`, which already render as a clickable,
+      // hoverable strip with per-tab counts. Nothing new had to be invented for them.
+      //
+      // The SETTINGS_SCHEMA order drives the rows, and every row edits exactly as it does
+      // elsewhere: a bool flips, anything else opens the value prompt.
+      const arg = raw.trim().toLowerCase();
+      const tabs = populatedTabs();
+      const argTab = tabs.find((t) => t.id === arg);
+      const items = [];
+      for (const t of tabs) {
+        for (const d of settingsForTab(t.id)) {
+          const value = displayValue(cfg, d.key);
+          // The row carries the NAME and the VALUE, nothing else. A description here made
+          // every row four times longer than the information it conveys, squeezed the
+          // value into whatever space was left, and let the longest description set the
+          // width of the whole card. The description is not lost — it is what the edit
+          // form shows, which is where the user is about to change the value anyway.
+          const changed = isSet(cfg, d.key) && value !== d.default;
+          items.push({
+            label: d.ui.label || d.key,
+            valueTag: value,
+            valueTagChanged: changed,
+            // Which tab this row belongs to, for the category filter.
+            category: t.id,
+            // Carried through to onPick: the key, its kind, and the description the form
+            // needs — none of it belongs on the row.
+            setKey: d.key,
+            setKind: d.kind,
+            setHint: d.ui ? d.ui.hint : '',
+          });
+        }
+      }
+      const catLabels = ['All', ...tabs.map((t) => t.id)];
       openPicker({
         title: 'Settings',
-        items: [
-          { label: 'model', sub: 'switch LLM model' },
-          { label: 'effort', sub: 'switch thinking effort' },
-          { label: 'permission', sub: 'select permission mode' },
-          { label: 'provider', sub: 'manage AI providers' },
-          { label: 'statusline', sub: 'configure status line items' },
-          { label: 'add-dir', sub: 'add an additional workspace directory' },
-          { label: 'auto-update', sub: `check npm for updates at startup + every 30 min — currently ${cfg.autoUpdate ? 'on' : 'off'}` },
-          // The thresholds are CONFIGURABLE (/auto-compact threshold <n>), so show the
-          // live value rather than a hardcoded "85%"/"50%" that lied after an edit.
-          { label: 'auto-compact', sub: `summarize older history at ${Math.round((cfg.compactThreshold ?? 0.85) * 100)}% of the window — currently ${cfg.autoCompact === false ? 'off' : 'on'}` },
-          { label: 'auto-trim', sub: `elide old tool results at ${Math.round((cfg.trimThreshold ?? 0.5) * 100)}% of the window — currently ${cfg.autoTrim === false ? 'off' : 'on'}` },
-          { label: 'trim', sub: `elide old tool results now — /trim [${cfg.trimKeepRatio ?? 0.3}] sets how much to keep` },
-        ],
-        onPick: (it) => { dispatch(it.label, '', state, cfg, session, h, submit, stdout); return true; },
+        items,
+        categories: catLabels.length > 1 ? catLabels : null,
+        category: argTab ? argTab.id : null,
+        // Open on the tab named on the command line, else on the first row.
+        sel: 0,
+        hint: '↑↓ navigate · Enter change · Tab category · /search · Esc close',
+        onPick: (it) => {
+          if (!it || !it.setKey) return true;
+          const key = it.setKey;
+          const def = SETTING_BY_KEY.get(key);
+          // A bool flips IN PLACE: a toggle with a confirm step is a worse toggle.
+          if (def.kind === 'bool') {
+            applySetting(key, effectiveValue(cfg, key) === 'true' ? 'false' : 'true');
+            // Re-open so the list shows the new value — the picker closed on the pick, and
+            // a settings screen that closes after every change is unusable for a second one.
+            void dispatch('/settings', raw.trim(), state, cfg, session, h, submit, stdout);
+            return true;
+          }
+          // Everything else opens a one-line prompt, pre-filled with the value in force.
+          openForm({
+            title: def.ui ? def.ui.label : key,
+            fields: [{
+              key: 'value',
+              label: def.kind === 'text' ? 'Value (blank clears)' : 'Value',
+              value: String(effectiveValue(cfg, key)),
+            }],
+            type: null,
+            hideType: true,
+            labelW: 18,
+            // The description left the list row, so the form is where it appears.
+            note: it.setHint || (def.ui ? def.ui.hint : ''),
+            hint: def.values
+              ? `one of: ${def.values.join(', ')} · Enter save · Esc cancel`
+              : 'Enter save · Esc cancel',
+            onSubmit: (values) => {
+              applySetting(key, values && values.value);
+              // Back to the list, so the next setting is one keystroke away.
+              void dispatch('/settings', raw.trim(), state, cfg, session, h, submit, stdout);
+            },
+          });
+          return true;
+        },
       });
       return;
+    }
+
+
+    case 'set': {
+      // `/set <key> <value>` — the direct path, so any setting is reachable without
+      // remembering which command owns it. `/set` alone lists what is changed.
+      const parts = raw.trim().split(/\s+/).filter(Boolean);
+      if (!parts.length) {
+        const changed = changedSettings(cfg);
+        if (!changed.length) {
+          sayPanel(['Nothing is set away from its default.', '', 'Browse everything with /settings,',
+            'or set one directly: /set <key> <value>'].join('\n'));
+          return;
+        }
+        const lines = [`${changed.length} setting(s) differ from the default:`, ''];
+        for (const d of changed) {
+          lines.push(`  ${d.key.padEnd(28)} ${displayValue(cfg, d.key)}   (default ${d.default})`);
+        }
+        sayPanel(lines.join('\n'));
+        return;
+      }
+      const key = parts[0];
+      if (!SETTING_BY_KEY.has(key)) {
+        appErr(`Unknown setting: ${key}. Run /settings to browse, or /set to list what is changed.`);
+        return;
+      }
+      if (parts.length === 1) {
+        const d = SETTING_BY_KEY.get(key);
+        sayPanel([
+          `  ${d.key}`,
+          `  value     ${displayValue(cfg, key)}`,
+          `  default   ${d.default}`,
+          `  type      ${d.kind}${d.values ? ` (${d.values.join(', ')})` : ''}`,
+          d.ui ? `  where     ${d.ui.tab} › ${d.ui.group}` : '  (no settings row; set by /set only)',
+          '',
+          d.ui ? `  ${d.ui.hint}` : '',
+        ].join('\n'));
+        return;
+      }
+      applySetting(key, parts.slice(1).join(' '));
+      return;
+    }
+
 
     case 'model': {
       const models = (cfg.raw && cfg.raw.models) || {};
@@ -7039,7 +7289,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
                       return true;
                     },
                   });
-                });
+                  });
                 return true;
               },
             });
@@ -8844,6 +9094,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         else { cfg.trimKeepRatio = v; cfg.raw.trim_keep_ratio = v; }
         app(sub === 'threshold'
           ? `Auto-trim now fires at ${Math.round(v * 100)}% of the context window`
+          // Both knobs are shares of the SAME thing — what the model is sent — so the
+          // denominator is named here. It was "of the tool-result text", which read as a
+          // different scale from the line above and is no longer what the code does.
           : `Auto-trim now keeps ~${Math.round(v * 100)}% of the tool-result text after trimming`);
         return;
       }
@@ -8963,18 +9216,52 @@ case 'trim': {
     case 'doctor': {
       // Diagnose the environment. Read-only: nothing here repairs or writes, so it is
       // safe to run on a machine whose state matters.
+      //
+      // Async because one of the checks profiles the largest session, which loads and
+      // parses it. A synchronous report could not answer "where did the memory go".
       const cfgMcp = loadMcpConfig(state.workspace || cfg.workspace);
-      const results = runDoctor({
+      // Terminal size comes from the `stdout` PARAMETER, not from `dims()`. `dims` is a
+      // closure inside startTUI and this switch runs in the module-level `dispatch`, which
+      // cannot see it — referencing it threw `dims is not defined` for anyone who ran
+      // /doctor. `stdout` is already a dispatch parameter, and the fallback matches dims'.
+      let termDims = { cols: 80, rows: 24 };
+      try {
+        const [c, r] = stdout.getWindowSize();
+        termDims = { cols: c || 80, rows: r || 24 };
+      } catch { /* not a TTY: the default stands */ }
+      const args = {
         cfg,
         workspace: state.workspace || cfg.workspace || state.cwd,
         sessionsDir: sess.sessionsDir(),
         mcpServers: cfgMcp.servers,
         mcpConnections: getLiveConnections(),
-        dims: dims(),
+        dims: termDims,
+      };
+      const flags = String(raw || '').trim().split(/\s+/).filter(Boolean);
+      const showAll = flags.includes('--all') || flags.includes('-a');
+      // `--probe` makes a real request, so it is opt-in and announced: the user is about to
+      // spend a few tokens, and a report that silently did that would be worse than one that
+      // did not.
+      const probe = flags.includes('--probe');
+      if (probe) {
+        args.probe = true;
+        args.childProcess = cp;
+        h.notice('Probing the provider with one real request…', 'info');
+      }
+      Promise.resolve(runDoctor(args)).then((results) => {
+        h.openPanel('hncode — doctor', formatDoctor(results, { showOk: showAll, version: VERSION }));
+      }).catch((e) => {
+        appErr(`doctor failed: ${(e && e.message) || e}`);
       });
-      const showAll = ['--all', '-a'].includes(String(raw || '').trim());
-      const lines = formatDoctor(results, { showOk: showAll, version: VERSION });
-      h.openPanel('hncode — doctor', lines);
+      return;
+    }
+    case 'memory-profile': {
+      // Where this session's memory actually goes. A file size or a row count says nothing
+      // actionable: on a real 2.6 MB session the tool ARGUMENTS were 0.66 MB — more than the
+      // text and the tool results combined — and no count hints at that.
+      const verbose = /--verbose|-v\b/.test(String(raw || '').trim());
+      const profile = profileMemory({ session, state, convRowFor: sess.convRowFor });
+      h.openPanel('hncode — memory', renderMemoryProfile(profile, { verbose }));
       return;
     }
     case 'mcp-config': {
@@ -9115,24 +9402,24 @@ case 'trim': {
     }
 
     case 'theme': {
-      // The theme system already existed (colors.js THEMES + setTheme) but nothing could
-      // REACH it: no command, and no config key, so `light` only ever applied when a light
-      // terminal happened to be detected. This is the missing entry point.
       const arg = raw.trim().toLowerCase();
+      // ONE write path, shared with /settings and /set. Writing the config HERE by hand is
+      // how the theme ended up half-applied: `setConfigString` reached the file but not
+      // `cfg.raw`, so anything that re-read the setting - reopening this picker, a frame
+      // composed later - saw the old value while the screen showed the new one.
       const apply = (name) => {
-        if (!hasTheme(name)) { appErr(`Unknown theme "${name}". Known: ${THEME_NAMES.join(', ')}`); return false; }
+        if (!hasTheme(name)) {
+          appErr(`Unknown theme "${name}". Known: ${THEME_NAMES.join(', ')}`);
+          return false;
+        }
+        // `applySetting` writes config.toml, updates `cfg` AND `cfg.raw`, applies the
+        // palette, and requests the full repaint a colour change needs.
+        applySetting('theme', name);
         state.theme = name;
-        setTheme(name);
-        try { setConfigString('theme', name); } catch { /* not fatal: the session still uses it */ }
         return true;
       };
       if (THEME_NAMES.includes(arg)) {
         if (!apply(arg)) return;
-        // A FULL repaint, not a diff. `setTheme` mutates `C` in place, and the differential
-        // painter compares against the frame it believes it painted — so every row already
-        // on screen would keep its old escapes and a diff would emit nothing. Dropping the
-        // cached frame is what makes the next paint rewrite every cell.
-        lastFrame = null;
         app(`Theme: ${arg}`);
         return;
       }
@@ -9140,16 +9427,22 @@ case 'trim': {
       openPicker({
         title: 'Theme',
         items: THEME_NAMES.map((n) => ({
-          label: n + (state.theme === n ? '  ← current' : ''),
+          label: n,
           sub: THEME_LABELS[n] || '',
+          // `current` is the picker's own marker: a green `← current` AFTER the
+          // description. Folding it into `label` put a grey arrow beside the name.
+          current: state.theme === n,
           value: n,
         })),
         onPick: (it) => {
-          if (apply(it.value)) { lastFrame = null; app(`Theme: ${it.value}`); }
+          if (apply(it.value)) app(`Theme: ${it.value}`);
           return true;
         },
       });
       return;
+    }
+
+    case 'keybindings': {
     }
     case 'keybindings': {
       // Bindings live in ~/.hncode/keybindings.json; this is the editing entry point.
@@ -10848,8 +11141,10 @@ export async function startTUI(opts) {
     const fromEnv = enabledExperiments({ raw: {} }, process.env);
     if (fromEnv.length) app(`Experiments from environment: ${fromEnv.join(', ')}`);
   }
-  // Force dark theme (theme removed from state)
-  setTheme('dark');
+  // The startup palette: what config says, else `auto` — the brand palette, and the theme
+  // schema's own default. Hard-coding 'dark' here meant a saved theme was ignored on the
+  // next start, so `/theme gruvbox` looked like it had not stuck.
+  setTheme(cfg.raw && hasTheme(cfg.raw.theme) ? cfg.raw.theme : 'auto');
 
   // Live argument completions for the composer menu. /effort completes from the
   // CURRENT model's thinking levels (models.dev data), which the static hint
@@ -11084,7 +11379,7 @@ todos: [...(state.todos || [])],
   // candidates that can replace it. Every entry maps to a `dispatch` invocation,
   // so the browser never needs a code path of its own — it posts the same command
   // the terminal would run. That is what makes /model work in the browser.
-function optionsForWeb() {
+  function optionsForWeb() {
     const models = (cfg.raw && cfg.raw.models) || {};
     const modelItems = Object.keys(models).map((key) => {
       // Each model carries its OWN thinking levels. The browser draws them next
@@ -11176,7 +11471,7 @@ return {
     return toolsCache;
   }
 
-function commandsForWeb() {
+  function commandsForWeb() {
     if (commandsCache) return commandsCache;
     try {
       const cmds = allCommands().map((c) => ({
@@ -11233,7 +11528,45 @@ function commandsForWeb() {
         placeholder: '',
       };
     }
+    // The PLAN under review in Plan mode. Same channel as the other two modals, so the
+    // browser needs no new plumbing — only a third `kind` to render. Without it a plan
+    // arrived in the web UI as a blocking turn with nothing on screen to answer it, and
+    // the only way out was Esc in a terminal that might not be open.
+    if (state.planPending) {
+      return {
+        kind: 'plan',
+        id: 'plan',
+        // The plan text as the model wrote it. `detail` is what the browser's modal body
+        // already renders, so it is filled here too rather than only in `plan`.
+        detail: String(state.planPending.plan || ''),
+        plan: String(state.planPending.plan || ''),
+        // The four outcomes the terminal's key handler can produce (see the planPending
+        // branch in handleKey: enter -> approve, e -> edit, esc -> keep, and 'auto' which
+        // skips the prompt entirely). Each is offered so the browser is not a dead end.
+        outcomes: ['approve', 'edit', 'keep'],
+      };
+    }
+    // The full-screen EDITOR (`openEditor`), reached by /memory, /personal, /permissions,
+    // /output-style, /keybindings and /set-system-prompt. Without a web form for it, all
+    // six commands run to the point of opening the editor and then do nothing visible —
+    // the browser had no way to show one, so the command looked broken rather than
+    // unsupported. It rides the same `pending` channel as the other modals.
+    if (state.editor) {
+      const ed = state.editor;
+      return {
+        kind: 'editor',
+        id: 'editor',
+        title: String(ed.title || 'Edit'),
+        hint: String(ed.hint || ''),
+        text: String(ed.text == null ? '' : ed.text),
+        // Whether saving writes anything back. `onSave` is what the TUI calls; an editor
+        // without one is read-only, and the browser should say so rather than offer a Save
+        // that silently discards.
+        savable: typeof ed.onSave === 'function',
+      };
+    }
     return null;
+
   }
 
   // Roles that exist only on screen, so `session.messages` cannot carry them: that array
@@ -11316,7 +11649,14 @@ function commandsForWeb() {
     const { cols, rows } = dims();
     const frame = composeFrame(state, cols, rows);
     const now = Date.now();
-    const forceFull = (now - lastFullPaint) >= FULL_REPAINT_MS;
+    // `state._forceRepaint` is set by anything that changed what EVERY cell should say
+    // without changing the frame's text — a theme switch is the case that matters. The
+    // differential painter compares against the frame it believes it painted, so a new
+    // palette alone emits no bytes and the screen keeps the old colours. Set through the
+    // state because the setter lives in `dispatch`, which cannot see this closure.
+    const forcePaint = state._forceRepaint === true;
+    if (forcePaint) state._forceRepaint = false;
+    const forceFull = forcePaint || (now - lastFullPaint) >= FULL_REPAINT_MS;
     const out = diffFrame(forceFull ? null : lastFrame, frame);
     if (forceFull) lastFullPaint = now;
     lastFrame = frame;
@@ -11553,6 +11893,7 @@ function commandsForWeb() {
       types: Array.isArray(spec.types) && spec.types.length ? spec.types : PROTOCOL_TYPES,
       hideType: !!spec.hideType,
       labelW,
+      note: spec.note || '',
       hint: spec.hint || 'Tab next field · ←/→ type · Enter submit · Esc cancel',
       // Opt-in: a CLICK on a Type option submits the form, the same as Enter. Off by
       // default so a form where the type is one of several decisions keeps the click
@@ -12054,23 +12395,24 @@ function commandsForWeb() {
   const probe = await probeTerminal({ stdin, stdout });
   const caps = terminalCaps();
   if (caps.bg) state.termBg = caps.bg;
-  // An EXPLICIT theme (config `theme =`, or /theme) wins over the probe: the probe is
-  // guessing from a background colour, and a user who named a theme has told us. Only
-  // when nothing is configured does a light terminal force the light theme — the frame
-  // pads its rows with plain spaces and paints no background, so the terminal's shows
-  // through, and the dark theme's normal text is WHITE, i.e. white on white.
-  const configuredTheme = cfg.raw && cfg.raw.theme;
-  if (configuredTheme && hasTheme(configuredTheme)) {
-    state.theme = configuredTheme;
-    setTheme(configuredTheme);
-  } else if (isLightBg(caps.bg)) {
-    state.theme = 'light';
-    setTheme('light');
-  } else {
-    state.theme = state.theme || 'dark';
-  }
+  // Tell the palette resolver which way the terminal goes. `auto` needs this and nothing
+  // else: on a light background it becomes the light theme, otherwise the dark one. The
+  // answer is handed in because colors.js is a leaf module with no probe of its own.
+  const lightBg = isLightBg(caps.bg);
+  setLightBackground(lightBg);
+  state.lightBg = lightBg;
+  // An EXPLICIT theme wins over the probe: a user who named one has told us. `auto` is the
+  // default and asks the probe, which is how the setting named "follow the terminal" ends
+  // up following it — the old code special-cased a light background here instead, so the
+  // setting and the code disagreed about what auto meant.
+  const configuredTheme = (cfg.raw && cfg.raw.theme) || 'auto';
+  state.theme = hasTheme(configuredTheme) ? configuredTheme : 'auto';
+  setTheme(state.theme);
 
-  stdout.write(alternateScreen(true));
+  // ONLY NOW may the alternate screen be entered. Everything above is a query whose reply
+  // arrives on stdin, and the probe owns stdin while it waits — entering the alternate
+  // screen first would paint a frame in the wrong palette before the answer came back, which
+  // is the flash this ordering exists to prevent.
   stdout.write(alternateScreen(true));
   stdout.write(clearScreen());
   // Kitty keyboard protocol. Great when supported (finer key reporting), but a
@@ -12268,8 +12610,16 @@ function commandsForWeb() {
   const replyFilterUntil = probe.complete ? 0 : Date.now() + 2000;
 
   stdin.on('data', (chunk) => {
+    // `HNCODE_TRACE_KEYS` makes every inbound chunk and every key it produced visible in
+    // ~/.hncode/keys.log. It exists because a keystroke that is silently swallowed looks
+    // identical from the outside to one that was never delivered — the terminal may send
+    // raw 0x03, a kitty CSI-u sequence, or nothing at all, and only the bytes say which.
+    // Off unless the variable is set; nothing here runs in the normal path beyond the test.
+    const traceKeys = process.env.HNCODE_TRACE_KEYS === '1';
+    if (traceKeys) traceKey('chunk', chunk);
     if (Date.now() < replyFilterUntil) {
       chunk = stripProbeReplies(chunk);
+      if (traceKeys) traceKey('after-probe-filter', chunk);
       if (!chunk) return;
     }
     keyBuf += chunk;
@@ -12277,7 +12627,10 @@ function commandsForWeb() {
     if (escTimer) clearTimeout(escTimer);
     const { tokens, rest } = tokenize(keyBuf);
     keyBuf = rest;
-    for (const t of tokens) handleKey(t);
+    for (const t of tokens) {
+      if (traceKeys) traceKey('key', t);
+      handleKey(t);
+    }
     if (keyBuf) {
       escTimer = setTimeout(flushEsc, 40);
     }
@@ -13226,6 +13579,19 @@ function commandsForWeb() {
       if (t.key === 'escape') { settle('keep'); return; }
       if (t.ch === 'e' || t.ch === 'E') { settle('edit'); return; }
       if (t.key === 'c-c') return;   // do not exit while a plan is under review
+      // The wheel and the page keys SCROLL. They do not change the review's state, so
+      // swallowing them bought nothing and cost the one thing a long plan needs: a way to
+      // read past the fold. Everything else still belongs to the review.
+      if (t.key === 'wheelup' || t.key === 'wheeldown') {
+        scrollChat(state, t.key === 'wheelup' ? 3 : -3);
+        renderFrame();
+        return;
+      }
+      if (t.key === 'pageup' || t.key === 'pagedown') {
+        scrollChat(state, t.key === 'pageup' ? 10 : -10);
+        renderFrame();
+        return;
+      }
       return;                        // swallow other keys while reviewing
     }
     if (t.key === 'c-c') {
@@ -13398,10 +13764,24 @@ function commandsForWeb() {
         advance();
         return;
       }
+      // The wheel and the page keys SCROLL the transcript behind the dialog. They carry no
+      // answer, so "own ALL input" does not need them — and without this a long question
+      // with an option list taller than the screen could not be read past at all.
+      if (t.key === 'wheelup' || t.key === 'wheeldown') {
+        scrollChat(state, t.key === 'wheelup' ? 3 : -3);
+        renderFrame();
+        return;
+      }
+      if (t.key === 'pageup' || t.key === 'pagedown') {
+        scrollChat(state, t.key === 'pageup' ? 10 : -10);
+        renderFrame();
+        return;
+      }
       return;
     }
 
     if (state.confirmExit) { state.confirmExit = false; if (confirmTimer) clearTimeout(confirmTimer); }
+
 
     // Ctrl+Up / Ctrl+Down — scroll the AI output area, ALWAYS (independent of the
     // composer, unlike the plain arrows which first move the caret / walk history).
@@ -14470,10 +14850,10 @@ function commandsForWeb() {
   }
 
   function statusExtra(state) {
-    // No `notice` term: the notice shares the context row instead of taking a
-    // row of its own, so it must not shrink the calculated chat viewport either.
-    return (state.confirmExit ? 1 : 0)
-      + (state.running ? 1 : 0)
+    // Neither the notice nor the confirm prompt appears here: both are drawn ON the
+    // context row rather than taking one of their own, so neither may shrink the
+    // calculated chat viewport either.
+    return (state.running ? 1 : 0)
       + ((state.menuOpen && state.menuList.length) ? Math.min(state.menuList.length, MAX_MENU) + 1 : 0);
   }
 
@@ -14730,17 +15110,36 @@ function commandsForWeb() {
     const basePrompt = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
     let sysText = basePrompt;
 
+    // APPEND rather than replace — the safer of the two prompt knobs, and the one to reach
+    // for when the built-in prompt already does most of what you want.
+    if (cfg.appendSystemPrompt && String(cfg.appendSystemPrompt).trim()) {
+      sysText += '\n\n' + String(cfg.appendSystemPrompt).trim();
+    }
+
     if (cfg.calmMode) {
       sysText += '\n\n' + CALM_MODE_INSTRUCTION;
     }
     // PLAN MODE (/plan): tell the model what to PRODUCE. The tool filter alone
-    // only removed its write tools — this is what makes it emit a plan block.
+    // only removed its write tools — this is what makes it emit a plan block. A user's own
+    // `plan_instructions` is APPENDED, never substituted: replacing this would silently
+    // switch Plan mode back to the behaviour the instruction exists to fix.
     if (state.plan) {
       sysText += '\n\n' + PLAN_MODE_INSTRUCTION;
+      if (cfg.planInstructions && String(cfg.planInstructions).trim()) {
+        sysText += '\n\n' + String(cfg.planInstructions).trim();
+      }
     }
     // SWARM MODE (/swarm): push the model toward parallel decomposition.
     if (state.swarm) {
       sysText += '\n\n' + SWARM_MODE_INSTRUCTION;
+      if (cfg.swarmInstructions && String(cfg.swarmInstructions).trim()) {
+        sysText += '\n\n' + String(cfg.swarmInstructions).trim();
+      }
+    }
+    // FOCUS MODE has no built-in instruction — the tool filter IS its behaviour — so this
+    // is the only place to say anything about it.
+    if (state.focus && cfg.focusInstructions && String(cfg.focusInstructions).trim()) {
+      sysText += '\n\n' + String(cfg.focusInstructions).trim();
     }
     const personal = readPersonalPrompt(state.workspace || cfg.workspace);
     if (personal) {
@@ -15699,6 +16098,47 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       ap.resolve(!!ok);
       renderFrame();
     };
+    // The plan under review in Plan mode. Same idea as `approve`: the turn is blocked on a
+    // promise, and a browser has to be able to settle it. Without this, a plan raised in
+    // Plan mode left the web UI stuck on a spinning turn with no way forward except finding
+    // the terminal that raised it.
+    hub.actions.answerPlan = async (id, outcome) => {
+      const pp = state.planPending;
+      if (!pp) throw new Error('no plan is pending');
+      const want = String(outcome || '').toLowerCase();
+      // The terminal produces exactly these three (handleKey: enter -> approve, e -> edit,
+      // esc -> keep). An unknown one is refused rather than coerced, so a stale browser tab
+      // cannot settle a review with a meaning nobody chose.
+      if (!['approve', 'edit', 'keep'].includes(want)) {
+        throw new Error(`unknown plan outcome: ${outcome} (expected approve, edit or keep)`);
+      }
+      state.planPending = null;
+      pp.resolve(want);
+      renderFrame();
+    };
+    // The full-screen editor's Save and Cancel, so the six commands that open one
+    // (/memory, /personal, /permissions, /output-style, /keybindings, /set-system-prompt)
+    // are usable from a browser. They call the SAME `onSave` the terminal's Ctrl+S calls,
+    // so a value written from the web takes the identical path — including the validation
+    // the command puts in its own onSave.
+    hub.actions.saveEditor = async (id, text) => {
+      const ed = state.editor;
+      if (!ed) throw new Error('no editor is open');
+      if (typeof ed.onSave !== 'function') {
+        throw new Error('this editor is read-only: no onSave handler');
+      }
+      const value = String(text == null ? '' : text);
+      // Close first, then save: onSave may itself open a picker or write a notice, and it
+      // must not be overwritten by a stale editor still being on screen.
+      state.editor = null;
+      renderFrame();
+      ed.onSave(value);
+    };
+    hub.actions.cancelEditor = async (id) => {
+      if (!state.editor) throw new Error('no editor is open');
+      state.editor = null;
+      renderFrame();
+    };
     hub.actions.answerQuestion = async (id, answers, extra, note, advance) => {
       const q = state.question;
       if (!q) throw new Error('no question is pending');
@@ -16531,6 +16971,30 @@ function quit() {
 }
   process.on('SIGWINCH', () => renderFrame());
   process.on('SIGINT', () => quit());
+
+  /**
+   * Append one line to ~/.hncode/keys.log. Used only when HNCODE_TRACE_KEYS=1.
+   *
+   * A swallowed keystroke and an undelivered one look identical from the outside: the
+   * screen simply does not react. A terminal may send Ctrl+C as raw 0x03, as a kitty CSI-u
+   * sequence, or as SIGINT with no bytes at all — and each of those needs a different fix.
+   * This records which one actually arrived, so the question is answered by bytes rather
+   * than by guessing. Append-only and best-effort: a failed write must never break input.
+   */
+  function traceKey(kind, value) {
+    try {
+      const dir = process.env.HNCODE_HOME || path.join(os.homedir(), '.hncode');
+      fs.mkdirSync(dir, { recursive: true });
+      const shown = typeof value === 'string'
+        ? [...value].map((c) => {
+          const n = c.charCodeAt(0);
+          return n < 0x20 ? `\\x${n.toString(16).padStart(2, '0')}` : c;
+        }).join('')
+        : JSON.stringify(value);
+      fs.appendFileSync(path.join(dir, 'keys.log'),
+        `${new Date().toISOString()} ${kind} ${shown}\n`);
+    } catch { /* diagnostics must never break the keyboard */ }
+  }
   /**
    * Record WHY the process ended, before it does.
    *

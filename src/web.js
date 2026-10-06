@@ -33,8 +33,10 @@ const LOGIN_DELAY_MS = 400;        // slows online guessing; costs a human nothi
 // own to expose it, and neither transport can drift from the other.
 const ALLOWED_ACTIONS = [
   // conversation
-  'submit', 'dispatch', 'interrupt', 'approve', 'answerQuestion', 'stopTask',
+  'submit', 'dispatch', 'interrupt', 'approve', 'answerPlan', 'answerQuestion', 'stopTask',
   'setMode', 'shell', 'steer', 'editQueued', 'dropQueued',
+  // files
+  'readFile', 'writeFile',
   // session settings
   'setTitle', 'getConfig', 'setConfig',
   // providers and models

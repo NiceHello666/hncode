@@ -81,7 +81,24 @@ test('text containing the separator cannot collide with another message', () => 
   // And the separator really is a control character, not a printable one that text can
   // plausibly contain by accident.
   const k = key({ id: 'a\x1fb', text: 'c' });
-  assert.equal(k, 'a\x1fb\x1fc\x1f80\x1fx\x1fy\x1f0\x1f0\x1f0\x1f0\x1f0');
+  // The trailing separator plus an empty theme: `theme` is the last part, so an
+  // unspecified one contributes nothing but its separator.
+  assert.equal(k, 'a\x1fb\x1fc\x1f80\x1fx\x1fy\x1f0\x1f0\x1f0\x1f0\x1f0\x1f');
+});
+
+test('the palette is part of the row key', () => {
+  // Cached rows are finished strings with their escapes already applied, so two palettes
+  // must never share an entry. Without this a theme switch left the transcript text in
+  // the previous colours while the chrome repainted.
+  resetRowCache();
+  const dark = key({ id: 'assistant', text: 'x', theme: 'dark' });
+  const gruvbox = key({ id: 'assistant', text: 'x', theme: 'gruvbox' });
+  assert.notEqual(dark, gruvbox);
+
+  // A miss is what the next render has to see, not a stale hit.
+  rowCacheSet(dark, { rows: ['dark rows'], theme: 'dark' });
+assert.ok(rowCacheGet(gruvbox) == null, 'the old palette must not be served to the new one');
+  assert.deepEqual(rowCacheGet(dark).rows, ['dark rows'], 'and the same palette still hits');
 });
 
 test('the store is bounded', () => {

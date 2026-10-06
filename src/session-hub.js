@@ -168,6 +168,7 @@ export class SessionHub {
       dispatch: null,      // async (cmd, arg) => void      — slash commands
       interrupt: null,     // async () => void
       approve: null,       // async (id, ok) => void        — answer an approval
+      answerPlan: null,    // async (id, outcome) => void   — answer a Plan-mode review
       answerQuestion: null,// async (id, answers) => void   — AskUserQuestion
       stopTask: null,      // async (taskId) => void
       setMode: null,       // async (mode) => void
