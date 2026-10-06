@@ -57,15 +57,19 @@ export const BORDER = rgb(70, 130, 180);
 // terminal's own palette show through for everything else; `dark`/`light` pick
 // accent triples that stay readable on that background.
 const THEMES = {
-  auto: { 
-    fg: [0, 184, 219], bg: [0, 18, 26], 
-    teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180], 
-    hover: [190, 245, 255], selBg: [0, 70, 84],
-    surface: [46, 46, 46],
-  },
+  // `auto` is deliberately NOT a table here: it is a CHOICE, resolved by `setTheme` into
+  // `light` or `dark` from the terminal's background. A table named `auto` shadows that,
+  // and did — it was a fixed dark palette with brand-cyan text, while its own label claimed
+  // it followed the terminal.
   dark: {
     fg: [255, 255, 255], bg: [0, 18, 26], // White foreground for normal text
+    fg: [255, 255, 255], bg: [0, 18, 26], // White foreground for normal text
     teal: [0, 184, 219], cyan: [0, 215, 255], blue: [66, 135, 245], border: [70, 130, 180],
+    // The semantic colours. They were missing, and `setTheme` guards each assignment, so
+    // they kept the previous theme's values — a theme that only looks right after a
+    // particular one was applied.
+    red: [230, 80, 80], green: [120, 200, 120], yellow: [230, 200, 100], orange: [240, 160, 80],
+    white: [255, 255, 255], gray: [130, 140, 150],
     hover: [190, 245, 255], selBg: [0, 70, 84],
     surface: [46, 46, 46],
   },
@@ -120,27 +124,81 @@ const THEMES = {
     white: [240, 240, 240], gray: [130, 130, 130],
     surface: [42, 42, 42],
   },
+  catppuccin: {
+    // Mocha: a warm-tinted dark with pastel accents. Every accent is desaturated toward
+    // the background so long replies do not glare, which is the whole point of the palette.
+    fg: [205, 214, 244], bg: [30, 30, 46],
+    teal: [137, 180, 250], cyan: [137, 220, 235], blue: [137, 180, 250], border: [108, 112, 134],
+    hover: [203, 166, 247], selBg: [49, 50, 68],
+    red: [243, 139, 168], green: [166, 227, 161], yellow: [249, 226, 175], orange: [250, 179, 135],
+    white: [205, 214, 244], gray: [127, 132, 156],
+    surface: [49, 50, 68],
+  },
+  tokyo: {
+    // Night: a blue-black with high-contrast accents. Distinct from nord, which is greyed
+    // out; this keeps the blue in the background and lets the cyan carry the structure.
+    fg: [192, 202, 245], bg: [26, 27, 38],
+    teal: [125, 207, 255], cyan: [125, 207, 255], blue: [122, 162, 247], border: [86, 95, 137],
+    hover: [187, 154, 247], selBg: [41, 46, 66],
+    red: [247, 118, 142], green: [158, 206, 106], yellow: [224, 175, 104], orange: [255, 158, 100],
+    white: [192, 202, 245], gray: [86, 95, 137],
+    surface: [41, 46, 66],
+  },
+  solar: {
+    // Solarized LIGHT. Included because `light` is a plain neutral and solarized's even
+    // hue ramp is the best-tested light palette in the terminal world. The dark variant is
+    // `solar-dark`, so both exist; the light one is the one worth having.
+    fg: [101, 123, 131], bg: [253, 246, 227],
+    teal: [38, 139, 210], cyan: [38, 139, 210], blue: [108, 113, 196], border: [147, 161, 161],
+    hover: [211, 54, 130], selBg: [238, 232, 213],
+    red: [220, 50, 47], green: [133, 153, 0], yellow: [181, 137, 0], orange: [203, 75, 22],
+    white: [253, 246, 227], gray: [147, 161, 161],
+    surface: [238, 232, 213],
+  },
+  rose: {
+    // Pine: a muted mauve dark, between dracula's saturation and nord's restraint.
+    fg: [224, 222, 244], bg: [25, 23, 36],
+    teal: [196, 167, 231], cyan: [137, 180, 250], blue: [137, 180, 250], border: [110, 106, 134],
+    hover: [196, 167, 231], selBg: [31, 29, 46],
+    red: [215, 130, 126], green: [156, 207, 216], yellow: [234, 157, 173], orange: [235, 188, 186],
+    white: [224, 222, 244], gray: [110, 106, 134],
+    surface: [31, 29, 46],
+  },
 };
 /** Theme name -> one-line description, for the /theme picker. */
 export const THEME_LABELS = {
-  auto: 'brand cyan-blue on the terminal’s own palette',
-  dark: 'dark teal background, brand accents',
-  light: 'for light terminals; darkened accents',
+  auto: 'follow the terminal: light theme on a light background, dark otherwise',
+  dark: 'dark teal background, white text',
+  light: 'light background, darkened accents',
   nord: 'cool blue-grey',
   dracula: 'high-contrast purple and pink',
   gruvbox: 'warm retro earth tones',
+  catppuccin: 'soft pastel, warm-tinted dark',
+  tokyo: 'blue-black, high-contrast accents',
+  solar: 'even hue ramp, light background',
+  rose: 'muted mauve dark',
   mono: 'greyscale, no hue',
 };
 
-/** True when a theme paints on a light background. `setTheme` uses this too. */
-export function isLightTheme(name) {
-  const t = THEMES[name];
-  return !!(t && Array.isArray(t.bg) && t.bg[0] > 128);
-}
+/** `auto` is a name you can set without being a palette, so it is listed separately from
+ *  the tables — see `setTheme` for how it resolves. */
+export const AUTO_THEME = 'auto';
 
 /** Whether a theme name is one we know. */
-export function hasTheme(name) { return Object.prototype.hasOwnProperty.call(THEMES, name); }
-export const THEME_NAMES = Object.keys(THEMES);
+export function hasTheme(name) {
+  return name === AUTO_THEME || Object.prototype.hasOwnProperty.call(THEMES, name);
+}
+
+/** The names a user may choose, `auto` first because it is the default. */
+export const THEME_NAMES = [AUTO_THEME, ...Object.keys(THEMES)];
+
+/** True when a theme paints on a light background. Resolves `auto` first, so a caller
+ *  asking about the CURRENT theme gets the answer for what is actually on screen. */
+export function isLightTheme(name) {
+  const resolved = name === AUTO_THEME ? (autoIsLight ? 'light' : 'dark') : name;
+  const t = THEMES[resolved];
+  return !!(t && Array.isArray(t.bg) && t.bg[0] > 128);
+}
 
 export const C = {
   reset: '\x1b[0m',
@@ -270,12 +328,45 @@ export function lerpColor(r1, g1, b1, r2, g2, b2, t) {
   return rgb(r, g, b);
 }
 
+// Which concrete theme `auto` resolves to right now. `setTheme` keeps it so a repaint or a
+// `/theme auto` after a terminal probe lands on the same answer.
+let autoIsLight = false;
+
+// The theme `setTheme` last applied, resolved (so `auto` reports the concrete name it
+// became). Read by the render cache: a cached row holds finished escapes, so a palette
+// change has to invalidate them or the old colours survive the switch.
+let appliedTheme = '';
+
+/** The concrete theme in force, or `''` before the first `setTheme`. */
+export function currentTheme() { return appliedTheme; }
+
+/**
+ * Tell `setTheme` whether the terminal has a light background.
+ *
+ * The probe lives in term-caps.js and this module is a leaf that imports nothing, so the
+ * answer has to be handed in. Called once after the probe and again if the terminal is
+ * resized on a different display.
+ */
+export function setLightBackground(light) {
+  autoIsLight = !!light;
+}
+
 // Apply a named theme IN PLACE. `C` is a module-level object and ESM imports are
 // live bindings, so mutating its properties here changes the colours everywhere
 // without re-importing. Returns true when the name was recognised.
+//
+// `auto` is a CHOICE, not a palette: it resolves to `light` on a light terminal and to
+// `dark` otherwise, and then applies that theme's colours. It used to be a fixed table —
+// a dark background with brand-cyan text — which is not what "auto" means and not what its
+// own label claimed ("on the terminal's own palette"). The user asking for auto is asking
+// not to have to think about it.
 export function setTheme(name) {
-  const t = THEMES[name];
+  const resolved = name === 'auto' ? (autoIsLight ? 'light' : 'dark') : name;
+  const t = THEMES[resolved];
   if (!t) return false;
+  appliedTheme = resolved;
+
+
   
   // Update foreground colors
   C.teal = rgb(...t.teal);

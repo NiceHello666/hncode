@@ -60,6 +60,11 @@ export function makeRowKey(parts) {
     parts.pending ? 1 : 0,
     parts.failed ? 1 : 0,
     parts.spin,
+    // The palette. Cached rows are finished strings with their escapes already applied, so
+    // a theme switch has to miss every entry or the old colours come back. Without this a
+    // switched theme repainted the chrome (composed per frame) and left the transcript's
+    // own text in the previous palette — white words sitting in a gruvbox.
+    parts.theme || '',
   ].join('\x1f');
 }
 

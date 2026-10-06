@@ -70,6 +70,7 @@ export const PATCH_TARGETS = [
   "clipboard.js#readText",
   "clipboard.js#warmClipboard",
   "colors.js#alternateScreen",
+  "colors.js#AUTO_THEME",
   "colors.js#barCursor",
   "colors.js#BG",
   "colors.js#bgRgb",
@@ -79,6 +80,7 @@ export const PATCH_TARGETS = [
   "colors.js#C",
   "colors.js#clearAndSetBg",
   "colors.js#clearScreen",
+  "colors.js#currentTheme",
   "colors.js#cursorDown",
   "colors.js#cursorForward",
   "colors.js#cursorLeft",
@@ -94,6 +96,7 @@ export const PATCH_TARGETS = [
   "colors.js#moveTo",
   "colors.js#resetScrollRegion",
   "colors.js#setBracketed",
+  "colors.js#setLightBackground",
   "colors.js#setScrollRegion",
   "colors.js#setTheme",
   "colors.js#showCursor",
@@ -300,6 +303,9 @@ export const PATCH_TARGETS = [
   "mcp.js#request",
   "mcp.js#setLiveConnections",
   "mcp.js#toHncodeSpec",
+  "memory-profile.js#memoryHeadline",
+  "memory-profile.js#profileMemory",
+  "memory-profile.js#renderMemoryProfile",
   "notebook.js#cellSource",
   "notebook.js#checkIndex",
   "notebook.js#deleteCell",
@@ -438,6 +444,18 @@ export const PATCH_TARGETS = [
   "session.js#saveSession",
   "session.js#sessionFile",
   "session.js#sessionsDir",
+  "settings-schema.js#changedSettings",
+  "settings-schema.js#coerceSetting",
+  "settings-schema.js#displayValue",
+  "settings-schema.js#effectiveValue",
+  "settings-schema.js#isSet",
+  "settings-schema.js#KIND_LABEL",
+  "settings-schema.js#populatedTabs",
+  "settings-schema.js#settableKeys",
+  "settings-schema.js#SETTING_BY_KEY",
+  "settings-schema.js#SETTINGS_SCHEMA",
+  "settings-schema.js#SETTINGS_TABS",
+  "settings-schema.js#settingsForTab",
   "shell-safety.js#isDestructiveCommand",
   "shell-safety.js#isReadOnlyCommand",
   "shell-safety.js#splitSegments",
@@ -716,4 +734,4 @@ export const PATCH_TARGET_SET = new Set(PATCH_TARGETS);
 /** True when `target` names a real, patchable symbol. */
 export function isPatchTarget(target) { return PATCH_TARGET_SET.has(String(target)); }
 
-export const GENERATED_FROM = "hncode src/ (64 files, 703 symbols)";
+export const GENERATED_FROM = "hncode src/ (66 files, 721 symbols)";

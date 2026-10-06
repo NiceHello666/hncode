@@ -38,20 +38,24 @@ const findAll = (results, re) => results.filter((r) => re.test(r.name));
 // doctor: the checks that matter
 // ---------------------------------------------------------------------------
 
-test('a healthy environment reports no errors', () => {
+test('a healthy environment reports no errors', async () => {
   const home = fakeHome();
   try {
     const cfg = { provider: 'p', model: 'm', endpoint: 'https://api.example.com/v1', apiKey: 'k' };
-    const results = runDoctor({ cfg, env: { HOME: home, TERM: 'xterm-256color' }, workspace: home });
-    const { error } = summarize(results);
-    assert.equal(error, 0, `unexpected errors: ${JSON.stringify(results.filter((r) => r.severity === 'error'))}`);
+    const results = await runDoctor({ cfg, env: { HOME: home, TERM: 'xterm-256color' }, workspace: home });
+    // The DISK check reads the real volume, so a machine that is genuinely low on space
+    // fails this test through no fault of the code — which is exactly what happened. The
+    // claim here is about the CONFIGURED environment, so the one check that measures the
+    // host is excluded and has its own test below.
+    const code = results.filter((r) => r.severity === 'error' && r.name !== 'disk space');
+    assert.deepEqual(code, [], `unexpected errors: ${JSON.stringify(code)}`);
   } finally { cleanup(home); }
 });
 
-test('a missing provider and model are errors, each with a remedy', () => {
+test('a missing provider and model are errors, each with a remedy', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({ cfg: {}, env: { HOME: home, TERM: 'xterm' }, workspace: home });
+    const results = await runDoctor({ cfg: {}, env: { HOME: home, TERM: 'xterm' }, workspace: home });
     for (const name of ['provider', 'model']) {
       const [hit] = findAll(results, new RegExp(`^${name}$`));
       assert.ok(hit, `${name} is reported`);
@@ -61,12 +65,12 @@ test('a missing provider and model are errors, each with a remedy', () => {
   } finally { cleanup(home); }
 });
 
-test('a local endpoint may legitimately have no API key', () => {
+test('a local endpoint may legitimately have no API key', async () => {
   // ollama and llama.cpp serve without auth; flagging them would train the user to ignore
   // the check.
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'http://localhost:11434/v1' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -76,10 +80,10 @@ test('a local endpoint may legitimately have no API key', () => {
   } finally { cleanup(home); }
 });
 
-test('an endpoint that is not a URL is an error', () => {
+test('an endpoint that is not a URL is an error', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'api.example.com/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -88,7 +92,7 @@ test('an endpoint that is not a URL is an error', () => {
   } finally { cleanup(home); }
 });
 
-test('a session file near the V8 string limit is flagged as an ERROR, with the way out', () => {
+test('a session file near the V8 string limit is flagged as an ERROR, with the way out', async () => {
   // This is the failure that cost real work: past ~512 MB `JSON.stringify` throws, so
   // every save of that session fails while the TUI looks normal.
   const home = fakeHome();
@@ -99,7 +103,7 @@ test('a session file near the V8 string limit is flagged as an ERROR, with the w
     const f = fs.openSync(path.join(dir, 'huge.json'), 'w');
     fs.writeSync(f, 'x', 400 * 1024 * 1024, 'utf8');
     fs.closeSync(f);
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -110,11 +114,11 @@ test('a session file near the V8 string limit is flagged as an ERROR, with the w
   } finally { cleanup(home); }
 });
 
-test('leftover .tmp files from an interrupted save are reported', () => {
+test('leftover .tmp files from an interrupted save are reported', async () => {
   const home = fakeHome();
   try {
     fs.writeFileSync(path.join(home, '.hncode', 'sessions', 'a.json.123.abc.tmp'), 'x');
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -122,10 +126,10 @@ test('leftover .tmp files from an interrupted save are reported', () => {
   } finally { cleanup(home); }
 });
 
-test('the store writability is probed, so a read-only store is an error', () => {
+test('the store writability is probed, so a read-only store is an error', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -134,11 +138,11 @@ test('the store writability is probed, so a read-only store is an error', () => 
   } finally { cleanup(home); }
 });
 
-test('a malformed hooks file is an error, because its hooks silently never run', () => {
+test('a malformed hooks file is an error, because its hooks silently never run', async () => {
   const home = fakeHome();
   try {
     fs.writeFileSync(path.join(home, '.hncode', 'hooks.json'), '{ this is not json', 'utf8');
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });
@@ -147,10 +151,10 @@ test('a malformed hooks file is an error, because its hooks silently never run',
   } finally { cleanup(home); }
 });
 
-test('MCP: configured-but-not-connected and failed are distinguished', () => {
+test('MCP: configured-but-not-connected and failed are distinguished', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
       mcpServers: { a: { command: 'x' }, b: { url: 'http://y' }, c: { command: 'z' } },
@@ -162,10 +166,10 @@ test('MCP: configured-but-not-connected and failed are distinguished', () => {
   } finally { cleanup(home); }
 });
 
-test('a workspace that does not exist is an error', () => {
+test('a workspace that does not exist is an error', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: path.join(home, 'nope'),
     });
@@ -174,10 +178,10 @@ test('a workspace that does not exist is an error', () => {
   } finally { cleanup(home); }
 });
 
-test('a small terminal is a warning, not an error', () => {
+test('a small terminal is a warning, not an error', async () => {
   const home = fakeHome();
   try {
-    const results = runDoctor({
+    const results = await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home, dims: { cols: 40, rows: 10 },
     });
@@ -203,7 +207,7 @@ test('the report sorts worst-first and hides passing checks unless asked', () =>
   assert.ok(full.includes('fine'), '--all includes the passing checks');
 });
 
-test('doctor never writes: it is safe on a machine whose state matters', () => {
+test('doctor never writes: it is safe on a machine whose state matters', async () => {
   // A diagnostic that repairs is one nobody can run on a machine they care about. Asserted
   // by snapshotting the store's contents across a run.
   const home = fakeHome();
@@ -211,7 +215,7 @@ test('doctor never writes: it is safe on a machine whose state matters', () => {
     const dir = path.join(home, '.hncode', 'sessions');
     fs.writeFileSync(path.join(dir, 'keep.json'), '{"id":"keep"}');
     const before = fs.readdirSync(dir).sort();
-    runDoctor({
+    await runDoctor({
       cfg: { provider: 'p', model: 'm', endpoint: 'https://x/v1', apiKey: 'k' },
       env: { HOME: home, TERM: 'xterm' }, workspace: home,
     });

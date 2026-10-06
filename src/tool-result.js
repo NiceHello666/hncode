@@ -41,9 +41,17 @@ export const PREVIEW_BYTES = 2 * 1024;
 export const DEFAULT_TRIM_THRESHOLD = 0.5;
 
 // Fraction of the tool-result TEXT that survives a trim. 30% by default
-// (`trim_keep_ratio` / HNCODE_TRIM_KEEP_RATIO), i.e. the rest is elided. Measured
-// against the tool-result text only, not the whole request, so a trim never eats
-// the conversation itself.
+// (`trim_keep_ratio` / HNCODE_TRIM_KEEP_RATIO); the rest of the eligible tool text is
+// elided.
+//
+// A DIFFERENT denominator from `trim_threshold` above, on purpose. The threshold asks
+// whether the request is too big for the window (a share of the WINDOW); this asks how much
+// of the removable output stays (a share of the TOOL TEXT). Measuring this against the
+// request was tried and reverted — at a 1M window the budget then exceeded all the elidable
+// text, so `/trim 0.6` could not trim anything at all.
+//
+// The conversation is protected by the candidate filter in `planTrim`, not by a ratio:
+// only messages with `role === 'tool'` are ever elided.
 export const DEFAULT_TRIM_KEEP_RATIO = 0.3;
 
 // A tool result shorter than this is never worth eliding: the marker plus the
@@ -130,9 +138,29 @@ export function shapeToolResult(content, { sessionId, toolCallId, maxBytes = MAX
 
 // Which tool results to elide, and by how much.
 //
-// RULE (the user's): keep a FRACTION of the tool-result text, the newest part.
-// Walk the results from newest to oldest accumulating their size; once the total
-// kept exceeds `keepRatio` of ALL tool-result text, everything older is elided.
+// RULE (the user's): keep a FRACTION of the TOOL-RESULT TEXT, the newest part.
+// Walk the results from newest to oldest accumulating their size; once the total kept
+// exceeds `keepRatio` of ALL tool-result text, everything older is elided.
+//
+// THE DENOMINATOR IS THE TOOL TEXT, NOT THE REQUEST, and the two knobs deliberately use
+// different scales because they answer different questions:
+//
+//   * `trimThreshold` asks "is the request too big for the window yet?" — a share of the
+//     WINDOW.
+//   * `keep` asks "of the output we are allowed to remove, how much stays?" — a share of
+//     the TOOL TEXT.
+//
+// Measuring `keep` against the request was tried and reverted: at a 1M window with 270k of
+// tool text, `threshold` fires at 500k while `keep=0.6` asks to retain 300k — MORE than the
+// 270k that could ever be elided. So `/trim 0.6` reported "nothing to trim", and it did so
+// for every request above 450k. A knob whose behaviour depends on a total the user cannot
+// see is a knob nobody can predict; a share of the tool text behaves the same in a short
+// session and a long one.
+//
+// ONLY TOOL RESULTS ARE TOUCHED, whatever the ratio. The `role !== 'tool'` filter below is
+// the real protection for the conversation: user messages, assistant prose and the system
+// prompt are never candidates, so no ratio can reach them. (An earlier comment here claimed
+// the denominator was what protected the conversation. It never was — the filter is.)
 //
 // Walking newest-first is what makes this behave the way a person expects: the
 // results you were just working from are the ones that survive, and the material
