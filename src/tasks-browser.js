@@ -200,11 +200,14 @@ export function renderTasksBrowser(state, cols, rows) {
       // hitbox to aim at — those are recorded in state._taskHits below.
       const hot = state.hoverIndex === i;
       const ptr = selected ? C.cyan + '\u276f ' + C.reset : (hot ? C.hover + '\u276f ' + C.reset : '  ');
+      // A sub-task is drawn under its parent, indented, so a swarm reads as one unit of work with
+      // visible parts rather than as N unrelated rows. `parentTaskId` is set by AgentSwarm.
+      const lead = t.parentTaskId ? C.gray + '  \u2514 ' + C.reset : '';
       const idCol = t.kind === 'agent' ? C.green : t.kind === 'question' ? C.orange : C.blue;
       const idText = selected ? idCol + C.bold + t.taskId + C.reset : idCol + t.taskId + C.reset;
       const pad = ' '.repeat(Math.max(0, 20 - visWidth(t.taskId)));
       const badge = statusColorToken(t.status) + (STATUS_LABEL[t.status] || t.status) + C.reset;
-      const prefix = ptr + idText + pad + ' ' + badge;
+      const prefix = lead + ptr + idText + pad + ' ' + badge;
       const budget = Math.max(0, listInnerW - visWidth(prefix) - 1);
       if (budget < 4) return fitExactly(prefix, listInnerW);
       const desc = singleLine(t.description) || singleLine(t.command) || '(no description)';

@@ -1,40 +1,39 @@
-// WebSearch tool — search the web via Bing's HTML endpoint (no API key needed).
+// WebSearch tool — search the web through puri.li's JSON API.
+//
+// WHY NOT A SCRAPED SEARCH PAGE
+// -----------------------------
+// This used to fetch Bing's HTML and parse `<li class="b_algo">` blocks. That worked until it
+// silently stopped: the request still returned 200 with the query echoed in `<title>`, but the
+// page contained no results — the two or three `b_algo` blocks it did have were
+// `translate.google.cn` and similar chrome, unrelated to the query. Measured over five identical
+// requests for one query: five different first results (Yandex, GitHub, 知乎, PixelOS, Nature),
+// none of them related. Adding a market parameter, warming up cookies, and sending a full set of
+// browser headers all changed nothing.
+//
+// The failure mode is what made this urgent. A scraper that returns junk does not look broken to
+// the model — the results arrive in the normal shape, so they get used and cited. A JSON API that
+// answers with `results: []` can at least be reported honestly.
 
-import { htmlToText } from './fetch-url.js';
-
+const ENDPOINT = 'https://puri.li/api/search';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
-function decodeEntities(s) {
-  return String(s || '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&ensp;/gi, ' ')
-    .replace(/&emsp;/gi, ' ')
-    .replace(/&middot;/gi, '·')
-    .replace(/&hellip;/gi, '…')
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)));
-}
-
-// Parse Bing's HTML into { title, url, snippet } results.
-export function parseBingResults(html, limit = 8) {
+/**
+ * The API's payload, as a list of results.
+ *
+ * Tolerant on purpose: this is a third-party service with no published schema, so a missing or
+ * renamed field must degrade to "fewer results" rather than throw. `description` is the snippet;
+ * an entry without a URL is dropped, because a result the model cannot open is not usable.
+ */
+export function parseSearchResults(json, limit = 8) {
+  const list = json && Array.isArray(json.results) ? json.results : [];
   const out = [];
-  const blocks = String(html).match(/<li class="b_algo"[\s\S]*?<\/li>/g) || [];
-  for (const block of blocks) {
-    const href = (block.match(/<a[^>]+href="(https?:\/\/[^"]+)"/) || [])[1];
-    if (!href) continue;
-    const titleHtml = (block.match(/<h2[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) || [])[1] || '';
-    const title = decodeEntities(titleHtml.replace(/<[^>]+>/g, '')).trim();
-    // Snippet lives in <p> or a caption div; fall back to stripped block text.
-    let snippet = (block.match(/<p[^>]*>([\s\S]*?)<\/p>/) || [])[1]
-      || (block.match(/class="b_caption"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/) || [])[1]
-      || '';
-    snippet = decodeEntities(snippet.replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
-    if (!snippet) snippet = htmlToText(block).replace(/\s+/g, ' ').slice(0, 240);
-    out.push({ title: title || href, url: href, snippet });
+  for (const r of list) {
+    if (!r || typeof r.url !== 'string' || !r.url) continue;
+    out.push({
+      title: String(r.title || r.url).trim(),
+      url: r.url,
+      snippet: String(r.description || r.snippet || '').replace(/\s+/g, ' ').trim(),
+    });
     if (out.length >= limit) break;
   }
   return out;
@@ -47,26 +46,40 @@ export const spec = {
     type: 'object',
     properties: {
       query: { type: 'string', description: 'Search query.' },
+      page: { type: 'integer', description: 'Page number, 1-based. Defaults to 1.' },
     },
     required: ['query'],
   },
   async execute(args, ctx) {
     const query = String(args.query || '').trim();
     if (!query) return 'Error: query must not be empty.';
+    const page = Math.max(1, Math.trunc(Number(args.page)) || 1);
     const signal = (ctx && ctx.signal) || undefined;
-    const url = 'https://www.bing.com/search?q=' + encodeURIComponent(query) + '&setlang=en';
+    const url = `${ENDPOINT}?q=${encodeURIComponent(query)}&page=${page}`;
     try {
       const res = await fetch(url, {
-        headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' },
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
         signal,
       });
       if (!res.ok) return `Error: search failed (${res.status} ${res.statusText}).`;
-      const html = await res.text();
-      const results = parseBingResults(html, 8);
-      if (!results.length) return `No search results found for: ${query}`;
+      // The endpoint answers with JSON. If it ever does not, say so rather than parsing a page.
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); }
+      catch { return `Error: search returned a non-JSON response (${text.length} bytes) for "${query}".`; }
+
+      const results = parseSearchResults(json, 8);
+      if (!results.length) {
+        // A genuine empty result set, NOT an error. The old scraper could not tell the two apart,
+        // which is why a broken page looked like a successful search with odd results.
+        return page > 1
+          ? `No search results found for: ${query} (page ${page}).`
+          : `No search results found for: ${query}`;
+      }
+      const more = json && json.hasNext ? `\n\nMore results available: call WebSearch again with page=${page + 1}.` : '';
       return results
         .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
-        .join('\n\n');
+        .join('\n\n') + more;
     } catch (e) {
       const msg = e && e.name === 'AbortError' ? 'interrupted' : (e.message || String(e));
       return `Error searching "${query}": ${msg}`;

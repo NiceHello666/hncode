@@ -6,6 +6,10 @@
 // and loses the prompt for genuinely dangerous commands too. A rule set lets the
 // routine work through while the rest keeps asking.
 //
+// A `Bash(...)` prefix rule is matched against every segment of the line, not the
+// line as a whole, so allowing one command cannot smuggle in a second one.
+import { splitSegments } from './shell-safety.js';
+
 // Rule syntax (a subset of Claude Code's, chosen to stay readable):
 //   Bash                 — every Bash call
 //   Bash(npm run test)   — that exact command
@@ -76,17 +80,35 @@ export function ruleMatches(parsed, toolName, args) {
   const a = args || {};
   // Bash: the rule names a command. A trailing `*` means "starts with"; otherwise the
   // command must match exactly, so `Bash(rm -rf /)` cannot be widened by an argument.
+  //
+  // A prefix rule applies to EVERY segment, not just the line as a whole. Comparing
+  // the whole string made `Bash(npm test *)` allow `npm test && rm -rf /build`,
+  // because the line does start with the prefix — the second command was never
+  // looked at. `splitSegments` is the same splitter the destructive-command check
+  // uses, so `;`, `|`, `&`, `&&` and `||` all separate here too.
   if (toolName === 'Bash') {
-    const cmd = String(a.command || a.cmd || '').trim();
-    if (parsed.arg.endsWith('*')) {
-      const prefix = parsed.arg.slice(0, -1).trim();
-      return cmd === prefix || cmd.startsWith(prefix + ' ');
+    // A rule compares WORDS, so runs of whitespace collapse before comparing. Shell words are
+    // separated by one or more blanks and the count means nothing, so `git  status` and
+    // `git status` are the same command — but a raw string comparison treated them as different
+    // and silently skipped a rule the user had written, which is the "it still prompts even
+    // though I allowed it" report.
+    const squash = (s) => String(s).replace(/\s+/g, ' ').trim();
+    const cmd = squash(a.command || a.cmd || '');
+    const rule = squash(parsed.arg);
+    if (rule.endsWith('*')) {
+      const prefix = squash(rule.slice(0, -1));
+      const { segments } = splitSegments(cmd);
+      const parts = (segments.length ? segments : [cmd]).map(squash).filter(Boolean);
+      // Every segment must be covered. An empty command still falls back to the whole-string
+      // comparison rather than matching anything.
+      if (!parts.length) return cmd === prefix;
+      return parts.every((p) => p === prefix || p.startsWith(prefix + ' '));
     }
-    return cmd === parsed.arg;
+    return cmd === rule;
   }
 
-  // Path-taking tools: match any of the tool's path-ish arguments against the glob,
-  // so `Read(./src/**)` works whether the model sent `path` or `file_path`.
+  // Path-taking tools: match any of the tool's path-ish arguments against the glob, so
+  // `Read(./src/**)` works whether the model sent `path` or `file_path`.
   const names = PATH_ARGS[toolName] || ['path', 'file_path', 'pattern'];
   for (const n of names) {
     const v = a[n];

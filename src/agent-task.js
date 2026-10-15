@@ -76,7 +76,10 @@ function store(ctx) {
  */
 export function createTask(ctx, kind, options = {}) {
   const tasks = store(ctx);
-  const prefix = kind === 'process' ? 'bash' : kind === 'agent' ? 'agent' : 'question';
+  // A teammate is its own kind rather than falling through to 'question': the id prefix is
+  // what a reader of a task list uses to tell at a glance what kind of work it is.
+  const PREFIX = { process: 'bash', agent: 'agent', teammate: 'mate' };
+  const prefix = PREFIX[kind] || 'question';
   const task = {
     taskId: newTaskId(prefix),
     kind,
@@ -101,10 +104,18 @@ export function createTask(ctx, kind, options = {}) {
     task.subagentType = options.subagentType;
     task.model = options.model;
     task.thinkingEffort = options.thinkingEffort;
+  } else if (kind === 'teammate') {
+    task.teamName = options.teamName;
+    task.memberName = options.memberName;
+    task.agentId = options.agentId;
   } else if (kind === 'question') {
     task.questionCount = options.questionCount || 0;
     task.toolCallId = options.toolCallId;
   }
+  // WHICH TASK THIS ONE BELONGS TO. A swarm's subagents are tasks of their own so /tasks can show
+  // what each is doing, and this is what groups them under the swarm that launched them. Absent
+  // for a top-level task, which is the common case.
+  if (options.parentTaskId) task.parentTaskId = String(options.parentTaskId);
   // Every task exposes its buffered output through `output`. The chunks are
   // stored raw and decoded lazily:
   //   * a process appends Buffer chunks -> decode as UTF-8

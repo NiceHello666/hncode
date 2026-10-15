@@ -140,7 +140,7 @@ test('the bar ends with a reset so the fill does not bleed past its row', () => 
 
 test('the readout steps down as its segment narrows, and never half-prints', () => {
   const wide = formatReadout(11700, 100000, 40);
-  assert.match(wide, /^11\.7k\/100\.0k [\d.]+%$/, 'the full form when there is room');
+  assert.match(wide, /^11\.7k\/100k [\d.]+%$/, 'the full form when there is room');
 
   const narrow = formatReadout(11700, 100000, 12);
   assert.match(narrow, /^[\d.]+%$/, 'the percentage alone when there is not');
@@ -160,11 +160,19 @@ test('the readout and the renderer agree on the room a form needs', () => {
   }
 });
 
-test('token counts compact the way the old readout did', () => {
+test('token counts compact the same way the working row does', () => {
+  // One frame shows both, so they must not disagree about the same quantity. The old rule kept a
+  // trailing `.0` (`97.0k`) and used an upper-case `M` while the working row used `m`.
   assert.equal(compactTokens(999), '999');
   assert.equal(compactTokens(1200), '1.2k');
-  assert.equal(compactTokens(97000), '97.0k');
-  assert.equal(compactTokens(3400000), '3.4M');
+  assert.equal(compactTokens(97000), '97k', 'a trailing .0 says nothing');
+  assert.equal(compactTokens(3400000), '3.4M', 'and the suffix matches the working row');
+  assert.equal(compactTokens(1000000), '1M', 'not 1.0M');
+  assert.equal(compactTokens(1000), '1k', 'not 1.0k');
+
+  // Rounding that reaches the next unit is shown in that unit.
+  assert.equal(compactTokens(999999), '1M', 'not 1000k');
+  assert.equal(compactTokens(999999999), '1B', 'not 1000M');
 });
 
 // ---------------------------------------------------------------------------
@@ -178,9 +186,9 @@ test('a wide segment carries its name AND its value', () => {
   const wide = { system: 40000, prompt: 30000, assistant: 20000, thinking: 0, tools: 0 };
   const r = renderContextBar(wide, 90000, 100000, 120);
   const bar = visible(r.text);
-  assert.match(bar, /system prompt 40\.0k/, 'the name and the count are both on the segment');
-  assert.match(bar, /user messages 30\.0k/);
-  assert.match(bar, /assistant 20\.0k/);
+  assert.match(bar, /system prompt 40k/, 'the name and the count are both on the segment');
+  assert.match(bar, /user messages 30k/);
+  assert.match(bar, /assistant 20k/);
 });
 
 test('a narrow segment drops the value and keeps the name', () => {

@@ -21,7 +21,7 @@ import {
   C, TRUECOLOR, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, setLightBackground, currentTheme, THEME_NAMES, THEME_LABELS, isLightTheme, hasTheme, lerpColor, bgRgb,
 } from './colors.js';
 import { copyText, readText, warmClipboard, readClipboardContentAsync, cleanupPastedImages } from './clipboard.js';
-import { visualWidth, estimateTokens, estimateMessagesTokens, estimateMessageTokens, messageTokens, expandTabs } from './term.js';
+import { visualWidth, estimateTokens, estimateTokensFloat, estimateMessagesTokens, estimateMessageTokens, messageTokens, expandTabs } from './term.js';
 // The picker is composited onto the frame as a cell layer rather than assigned over
 // The picker is composited onto the frame as a cell layer rather than assigned over
 // it (see src/cell-buffer.js), so the transcript BESIDE the card survives.
@@ -57,6 +57,7 @@ import { convRowFor } from './session.js';
 import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, upsertModel, replaceProviderModels, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, effortOptions, effortWire, effortsFromReasoning, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, setConfigBool, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor, readMemory, readMemoryRaw, writeMemoryRaw, memoryFile, ensureWebToken, effectiveSnapshot, costFromCatalog, modelCost, usageCost } from './config.js';
 import { pluginCommands, renderWidgets, runHooks, runPatch, runPatchSync, runKeybindsSync, pluginKeybinds } from './plugin.js';
 import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
+import { render as renderTodos } from './tools/todo.js';
 import { getTool, toolNames } from './tools/index.js';
 import { decideFromRules, describeRules, selfTestRules, describeSelfTest } from './permissions.js';
 import { isDestructiveCommand as shellIsDestructiveCommand, isReadOnlyCommand as shellIsReadOnlyCommand } from './shell-safety.js';
@@ -72,6 +73,15 @@ import { renderBtwPanel, btwPanelHeight } from './btw-panel.js';
 import { SessionHub } from './session-hub.js';
 import { startWebServer } from './web.js';
 import { FAMILIES, TASKS, buildPreset, presetLabel } from './prompt-presets.js';
+import { tuiView } from './session-view.js';
+import { SessionCore } from './session-core.js';
+import { SessionHost } from './session-host.js';
+import * as teamMod from './team/team.js';
+import * as mailMod from './team/mailbox.js';
+import { TEAM_LEAD_NAME } from './team/constants.js';
+import { makeTeamPanel, renderTeamPanel, handleTeamPanelKey, sendFromPanel } from './team-panel.js';
+import { markAllRead } from './team/mailbox.js';
+import { leadTeam, setLeadTeam, clearLeadTeam } from './session-core.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
 import { renderRegistryBrowser, handleRegistryBrowserKey } from './registry-browser.js';
@@ -182,7 +192,7 @@ export const COMMANDS = [
   { name: 'all-sessions', desc: 'Browse sessions from EVERY workspace', priority: 79 },
   { name: 'tasks', aliases: ['task'], desc: 'Browse background tasks (full-screen panel)', priority: 80 },
   { name: 'swarm', desc: 'Toggle swarm mode: decompose work across parallel subagents', priority: 80, argumentHint: '[on|off]' },
-  { name: 'swarm-sub-agent', aliases: ['sub-agent-model'], desc: 'Choose the model subagents run on (default = this session\u2019s model)', priority: 79, argumentHint: '[model|default]' },
+  { name: 'subagent-model', aliases: ['swarm-sub-agent'], desc: 'Which model subagents run on, for both Agent and AgentSwarm (default = this session\u2019s model)', priority: 60, argumentHint: '[<model> | default]' },
   { name: 'compact', desc: 'Compact the conversation context (AI summary + keep last 20%)', priority: 80, argumentHint: '[ratio]' },
   { name: 'goal', aliases: ['objective'], desc: 'Start or manage an autonomous goal', priority: 80, argumentHint: '[status|pause|resume|cancel|replace <text>] | <objective>' },
   { name: 'init', desc: 'Generate or update AGENTS.md from the codebase', priority: 70, argumentHint: '[instructions]' },
@@ -215,6 +225,7 @@ export const COMMANDS = [
   { name: 'theme', desc: 'Switch the colour theme', priority: 60, argumentHint: `[${THEME_NAMES.join('|')}]` },
   { name: 'keybindings', aliases: ['keys'], desc: 'Remap a key to another key or to a slash command', priority: 55, argumentHint: '[list | add <key> <key|/command> | remove <key> | edit]' },
   { name: 'agents', aliases: ['subagents'], desc: 'List running subagents, and message, interrupt or close them', priority: 55, argumentHint: '[list | message <id> <text> | interrupt [id|all] | close <id>]' },
+  { name: 'team', desc: 'Lead a team: watch and message the members, add them, and open a team from an earlier session', priority: 100, argumentHint: '[panel | create <name> | add <name> [model] | msg <name> <text> | list | delete]' },
   { name: 'files', aliases: ['tree'], desc: 'Browse the workspace as a tree; Enter inserts the path', priority: 60, argumentHint: '[path-filter]' },
   { name: 'checkpoints', aliases: ['cp'], desc: 'List per-file checkpoints and restore one file on its own', priority: 55, argumentHint: '[list | restore <n> | diff <n>]' },
   { name: 'save-history', desc: 'Keep the display-only transcript (notices, warnings, compaction, plan cards, reasoning) in the saved session', priority: 60, argumentHint: '[on|off|thinking|nothinking]' },
@@ -494,7 +505,7 @@ const CTX_H = 2;                 // context bar + the notice/tip row beneath it
 const STATUS_H = 1;              // status line (above the context bar)
 const INPUT_BASE_H = 3;          // input box: top border + input line + bottom border
 const MAX_MENU = 6;              // menu rows shown (matches the ~6 you see)
-const MAX_PICKER = 12;            // max picker list rows shown at once
+const MAX_PICKER = 200;            // max picker list rows shown at once
 // How many of the MOST RECENT messages keep their wrapped-row cache. The cache
 // makes a re-render cheap, but it holds a full copy of the message's rows and used
 // to live forever (see the eviction in renderChatLines): 8000 messages held 42000
@@ -973,6 +984,23 @@ export function tailChars(s, max) {
 }
 
 function visualCol(s) { return visualWidth(stripAnsi(String(s))); }
+// The width the category strip wants if it is not wrapped: `Categories: ` plus every label,
+// joined by a space. Used to size the picker card, so a strip that FITS stays on one line.
+function catStripWidth(b) {
+  const prefix = 'Categories: ';
+  let n = visualCol(prefix);
+  for (const s of (b.segments || [])) {
+    const text = s.label === b.active ? `[${s.label} (${s.count})]` : ` ${s.label} (${s.count}) `;
+    // The joining space is added whenever anything is already on the line, INCLUDING before
+    // the first tab — the wrapper starts its cursor at `prefix` length, not at zero. Skipping
+    // it here made this report one column less than the layout, so the card was sized one
+    // short and the strip wrapped even with a whole screen of room.
+    if (n > 0) n += 1;
+    n += visualCol(text);
+  }
+  return n;
+}
+
 function col(text, c) { return c + String(text) + C.reset; }
 
 // A message the USER actually typed, as opposed to one the harness injected with
@@ -1104,10 +1132,63 @@ export function extractJsonString(json, key) {
 //     <n>   unchanged line      (dim)
 //     <n> - removed line
 //     <n> + added line
-// Unchanged lines are kept but trimmed to CONTEXT_LINES on each side of a change
-// (claude-code's rule), so the diff reads as a patch rather than two orphaned
-// blocks — an edit of 5 lines no longer dumps all 5 unchanged rows.
-const DIFF_CONTEXT_LINES = 3;
+//
+// FIVE unchanged lines are kept on each side of a change so the edit can be LOCATED in the file.
+// Three was too few to place a change among near-identical neighbours — several small functions,
+// or two `}` a couple of rows apart, look the same inside a three-row window — and the rows just
+// past the window are exactly what a reader uses to tell one site from another.
+const DIFF_CONTEXT_LINES = 5;
+/**
+ * Rows for an Edit, from the tool's own diff payload.
+ *
+ * The tool KNOWS what it replaced, so there is nothing to infer: the surrounding lines it reports
+ * are context, its `old` is what went, its `new` is what arrived. Running the spliced text through
+ * `lineDiff`'s LCS instead made it MIS-READ them — a context block prepended to the old text and
+ * appended to the new has a different shape on each side, so the LCS paired the wrong lines and
+ * rendered five unchanged context rows as `-`/`+` pairs.
+ *
+ * Rows are numbered from the real file: `before` carries its own line numbers, and the change
+ * starts at `startLine`.
+ */
+export function editDiffRows(diff) {
+  if (!diff || typeof diff.old !== 'string' || typeof diff.new !== 'string') return [];
+  const split = (s) => String(s).replace(/\r\n/g, '\n').split('\n');
+  const ctx = diff.context || {};
+  const before = Array.isArray(ctx.before) ? ctx.before : [];
+  const after = Array.isArray(ctx.after) ? ctx.after : [];
+  const startLine = Number(diff.startLine) > 0 ? Number(diff.startLine) : 1;
+  const out = [];
+  for (const c of before) out.push({ type: 'ctx', text: String(c.text), no: c.n });
+  let n = startLine;
+  for (const l of split(diff.old)) out.push({ type: 'del', text: l, no: n++ });
+  n = startLine;
+  for (const l of split(diff.new)) out.push({ type: 'add', text: l, no: n++ });
+  for (const c of after) out.push({ type: 'ctx', text: String(c.text), no: c.n });
+  return elideContext(out);
+}
+
+/**
+ * Drop context rows further than DIFF_CONTEXT_LINES from any change, one `gap` per run.
+ *
+ * Shared by both diff builders so a change can never be shown with one amount of surrounding
+ * context in the model's tool result and another on screen.
+ */
+function elideContext(raw) {
+  const isChange = (k) => raw[k] && raw[k].type !== 'ctx';
+  const out = [];
+  for (let k = 0; k < raw.length; k++) {
+    if (raw[k].type !== 'ctx') { out.push(raw[k]); continue; }
+    // Distance to the NEAREST change on either side; keep when within the window.
+    let dist = Infinity;
+    for (let t = k - 1; t >= 0 && t >= k - DIFF_CONTEXT_LINES; t--) { if (isChange(t)) { dist = Math.min(dist, k - t); break; } }
+    for (let t = k + 1; t < raw.length && t <= k + DIFF_CONTEXT_LINES; t++) { if (isChange(t)) { dist = Math.min(dist, t - k); break; } }
+    if (dist <= DIFF_CONTEXT_LINES) { out.push(raw[k]); continue; }
+    // Elide this context row, marking the gap once.
+    if (out.length && out[out.length - 1].type !== 'gap') out.push({ type: 'gap' });
+  }
+  return out;
+}
+
 export function lineDiff(oldStr, newStr, startLine = 1) {
   const a = String(oldStr == null ? '' : oldStr).replace(/\r\n/g, '\n').split('\n');
   const b = String(newStr == null ? '' : newStr).replace(/\r\n/g, '\n').split('\n');
@@ -1130,21 +1211,9 @@ export function lineDiff(oldStr, newStr, startLine = 1) {
   }
   while (i < n) { raw.push({ type: 'del', text: a[i], no: oldNo }); i++; oldNo++; }
   while (j < m) { raw.push({ type: 'add', text: b[j], no: newNo }); j++; newNo++; }
-  // Keep at most DIFF_CONTEXT_LINES unchanged rows adjacent to a change; drop the
-  // rest (an elision row is inserted where rows were removed).
-  const out = [];
-  const isChange = (k) => raw[k] && raw[k].type !== 'ctx';
-  for (let k = 0; k < raw.length; k++) {
-    if (raw[k].type !== 'ctx') { out.push(raw[k]); continue; }
-    // Distance to the NEAREST change on either side; keep when within the window.
-    let dist = Infinity;
-    for (let t = k - 1; t >= 0 && t >= k - DIFF_CONTEXT_LINES; t--) { if (isChange(t)) { dist = Math.min(dist, k - t); break; } }
-    for (let t = k + 1; t < raw.length && t <= k + DIFF_CONTEXT_LINES; t++) { if (isChange(t)) { dist = Math.min(dist, t - k); break; } }
-    if (dist <= DIFF_CONTEXT_LINES) { out.push(raw[k]); continue; }
-    // Elide this context row, marking the gap once.
-    if (out.length && out[out.length - 1].type !== 'gap') out.push({ type: 'gap' });
-  }
-  return out;
+  // Same window rule as `editDiffRows`, from the one helper: a change must never be shown with a
+  // different amount of surrounding context on screen and in the model's tool result.
+  return elideContext(raw);
 }
 
 // Word-wrap a string that may contain ANSI colour codes, measuring VISIBLE
@@ -1260,10 +1329,15 @@ export function expandPastes(text, pastes) {
 // Wrap each collapsed-paste marker in the composer row with a selection background
 // so it renders as one block chip (foreground preserved). Non-marker text is left
 // untouched.
+//
+// The chip ends with `C.bgReset` (ESC[49m), NOT `C.reset` (ESC[0m). A bare reset clears EVERY
+// style, so it also wiped the foreground the composer had already applied to the text AFTER the
+// chip — the rest of the line came out in the terminal's default grey instead of the prompt's
+// colour. `highlightSelection` below documents this exact hazard; this function was missing it.
 export function highlightPasteMarkers(row) {
   const s = String(row);
   if (!s.includes('[paste #')) return s;
-  return s.replace(PASTE_MARKER_RE, (m) => C.selBg + m + C.reset);
+  return s.replace(PASTE_MARKER_RE, (m) => C.selBg + m + C.bgReset);
 }
 
 // Apply selection background to the text portion of a composer row.
@@ -1579,16 +1653,29 @@ function keyArgument(name, args, workspace) {
     // long command (a `node -e "…"` one-liner is the usual case) come out `+1`
     // column wider than MAX_ARG — and a trailing ESC cut at the boundary left the
     // row ending in a bare `^` instead of a proper `…`.
-    let text = sanitizeText(v.split('\n')[0]);
-    // Make absolute paths under the workspace relative (shorter + familiar).
-    if ((k === 'path' || k === 'file_path') && path.isAbsolute(text) && workspace) {
-      const rel = path.relative(workspace, text);
-      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) text = rel;
-    }
+    // A multi-line value shows its first line, an ELLIPSIS, and then the count of what was left.
+    //
+    // The ellipsis and the count say different things and both are wanted: the mark shows that the
+    // text was cut at all, and the count says how much is missing. Printing only the count reads as
+    // if the command ended there, and only the mark leaves the reader guessing by how much.
+    const valueLines = sanitizeText(v).replace(/\r\n/g, '\n').split('\n');
+    // A trailing blank line is not extra content: a command ending in a newline — how a heredoc is
+    // usually written — split into a final empty element, and counting it claimed `(+1 line)` for a
+    // command that had no second line at all.
+    while (valueLines.length > 1 && valueLines[valueLines.length - 1].trim() === '') valueLines.pop();
+    let text = valueLines[0];
+    const rest = valueLines.length > 1 ? valueLines.length - 1 : 0;
     if (text.length > MAX_ARG) {
       text = (k === 'path' || k === 'file_path')
           ? '…' + text.slice(text.length - (MAX_ARG - 1))
           : text.slice(0, MAX_ARG - 1) + '…';
+    } else if (rest) {
+      // Make room for the marker before adding it, so the row never overflows: the count is dropped
+      // first because the ellipsis already carries the important half of the message.
+      const withCount = `… (+${rest} line${rest === 1 ? '' : 's'})`;
+      text += text.length + withCount.length <= MAX_ARG
+        ? withCount
+        : '…';
     }
     // Display paths with forward slashes (consistent across platforms).
     if (k === 'path' || k === 'file_path') text = text.replace(/\\/g, '/');
@@ -3087,9 +3174,30 @@ export function renderChatLines(state, w, viewport) {
     // message on every frame allocated one string per message, which profiled at
     // ~1.15ms/frame on an 8000-message transcript — 6x the arithmetic below, and
     // pure garbage for the collector.
-    const countKey = rowWidth * 8 + (expanded ? 1 : 0) + (m.pending ? 2 : 0) + (m.pluginLog && m.expanded ? 4 : 0)
-      + (state.rawMode ? 16 : 0);
-    if (!valid && !cached && m._count && m._count.key === countKey) {
+    //
+    // The FIELDS are packed at fixed shifts, not at values chosen to fit today's
+    // flags. The old form was `rowWidth * 8 + <flags> + (rawMode ? 16 : 0)`: a width
+    // step of 8 is smaller than the rawMode bit it had to carry, so (raw, w) and
+    // (markdown, w+2) produced the SAME key and a message was counted with the row
+    // count of a different width. Each field now owns a field-width-sized slot.
+    const countKey = (rowWidth * 64)
+      + (expanded ? 1 : 0) + (m.pending ? 2 : 0) + (m.pluginLog && m.expanded ? 4 : 0)
+      + (state.rawMode ? 8 : 0);
+    // The count is only reusable if the message's TEXT is the same one it was
+    // counted for. The layout flags above say nothing about content, and an evicted
+    // message has no `_cache` for the reference checks to fall back on — so a
+    // message whose text was REWRITTEN in place (the streaming prose/plan
+    // replacement, a plan card's text) kept a count from its old text. Adding text
+    // of 10 rows to a message counted at 1 left `total` short by 9 and pushed every
+    // later message's row index off by 9, and the new text was never drawn at all
+    // because pass 2 only walks the rows the count promised.
+    //
+    // Length, not a hash: a re-render is only needed when the count was taken for
+    // different text, and equal length is the common case for the edits that do
+    // happen (replacing a word). Those are caught by the `_cache` nulling at the
+    // edit sites, which is what the shared-store path below relies on too.
+    const countLen = typeof m.text === 'string' ? m.text.length : 0;
+    if (!valid && !cached && m._count && m._count.key === countKey && m._count.textLen === countLen) {
       msgLen[mi] = m._count.len + rules;
       cursor += msgLen[mi];
       prevBordered = border;
@@ -3145,7 +3253,7 @@ export function renderChatLines(state, w, viewport) {
         // layout key. Record it separately so an evicted message (below) still has a
         // count and never has to be re-rendered just to be counted — that re-render
         // is what made an idle 2000-message transcript cost 78ms per frame.
-        m._count = { key: countKey, len: wrapped.length };
+        m._count = { key: countKey, textLen: countLen, len: wrapped.length };
         msgLen[mi] = wrapped.length + rules;
       }
     }
@@ -3393,19 +3501,50 @@ function trimDecimal(v) {
   return s.endsWith('.0') ? s.slice(0, -2) : s;
 }
 
-// Token counts use 1024-based units: context sizes are powers of two, so
-// 262144 reads as "256k", not "262.1k". k values at or above 100 are rounded
-// to whole numbers ("977k").
+// Token counts use DECIMAL units, the same ones `fmtTokensShort` uses for the working row.
+//
+// This was 1024-based, on the reasoning that a context size is a power of two, so 262144 would read
+// as "256k" rather than "262.1k". Two things outweighed that:
+//
+//   * TOKENS ARE NOT BYTES. Dividing by 1024 turns a count of 97000 tokens into "94.7k", which is
+//     simply wrong — and the context window is not the only figure here, since /ctx and /usage also
+//     report live counts that are not powers of two.
+//   * IT DISAGREED WITH ITSELF ON SCREEN. The working row divided by 1000 and this divided by 1024,
+//     so one frame showed "97k" for the turn and "94.7k" for the context it was using.
+//
+// A model's window is advertised in decimal terms anyway (200k, 128k), so nothing is lost at the
+// size that matters. Suffixes are K/M/B/T, with only the kilo left lower-case.
 function fmtTokens(n) {
-  n = Number(n);
-  if (!Number.isFinite(n) || n < 0) return '0';
-  if (n >= 1024 * 1024 * 1024) return trimDecimal(n / (1024 * 1024 * 1024)) + 'G';
-  if (n >= 1024 * 1024) return trimDecimal(n / (1024 * 1024)) + 'M';
-  if (n >= 1024) {
-    const k = n / 1024;
-    return (k >= 100 ? Math.round(k) : trimDecimal(k)) + 'k';
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  if (!Number.isFinite(v)) return '0';
+  const units = [
+    { at: 1e12, suffix: 'T' },
+    { at: 1e9, suffix: 'B' },
+    { at: 1e6, suffix: 'M' },
+    { at: 1e3, suffix: 'k' },
+  ];
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (v < u.at) continue;
+    // The SAME scaling rule as `fmtTokensShort`, including the whole-number threshold: a tenth is
+    // information at `1.2k` and noise at `262.1k`. Sharing the rule is what keeps one frame from
+    // showing `262.1k` for the context and `262k` for the turn that filled it.
+    const shown = scaleUnit(v / u.at);
+    // Rounding can reach the next unit (`999999` is `1000k`, which is `1m`).
+    if (Number(shown) >= 1000 && i > 0) return scaleUnit(v / units[i - 1].at) + units[i - 1].suffix;
+    return shown + u.suffix;
   }
-  return String(n);
+  return String(v);
+}
+
+/**
+ * One unit's worth of a count: `1.2`, `97`, `262`.
+ *
+ * One decimal below 100, whole numbers at and above it. Used by every token formatter so the same
+ * quantity cannot read two ways on one screen.
+ */
+function scaleUnit(v) {
+  return v < 100 ? v.toFixed(1).replace(/\.0$/, '') : String(Math.round(v));
 }
 
 // Thousands separators for a plain count. fmtTokens rounds to k/M, which is right
@@ -3550,6 +3689,80 @@ function fmtDuration(ms) {
   // Seconds are always shown (at least "0s").
   parts.push(sec + 's');
   return parts.join(' ');
+}
+
+// The turn's output tokens as `50k`, `1.2k`, `999`, or '' when nothing has arrived yet.
+// Singular only at exactly 1, which is the one count small enough to read as a word.
+function fmtTokensShort(n) {
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  if (v < 1000) return `${v} token${v === 1 ? '' : 's'}`;
+  // The same rule `Intl` compact notation applies, and the same one Claude Code shows, so a figure
+  // read in one tool is not read differently in the other:
+  //
+  //   1200    -> 1.2k     one decimal while it carries information
+  //   9999    -> 10k      compact rounds here, so the decimal falls away on its own
+  //   12400   -> 12.4k    STILL one decimal — whole thousands would lose the 400
+  //   1234567 -> 1.2M     and each thousand-group gets its own unit
+  //
+  // This used to switch to whole thousands at 10k and had no unit above `k`, so 1.2M read as
+  // `1235k`. `m` is not a rounding nicety: `1235k` makes the reader count digits to see the size.
+  const units = [
+    { at: 1e12, suffix: 'T' },
+    { at: 1e9, suffix: 'B' },
+    { at: 1e6, suffix: 'M' },
+    { at: 1e3, suffix: 'k' },
+  ];
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (v < u.at) continue;
+    const scaled = v / u.at;
+    // One decimal, dropped when it is a zero — the shape `Intl` compact gives (`1k`, not `1.0k`),
+    // so 1000 and 1000000 do not read as `1.0k` and `1.0m`.
+    const shown = scaled < 100 ? scaled.toFixed(1).replace(/\.0$/, '') : String(Math.round(scaled));
+    // ROUNDING CAN REACH THE NEXT UNIT. 999999 is 999.999k, which rounds to `1000k`, and `1000k`
+    // is `1m` — showing the first makes the reader convert a unit themselves. Step up once when the
+    // rounded value has hit the next threshold; `units` is ordered largest-first, so `i - 1` is it.
+    if (Number(shown) >= 1000 && i > 0) {
+      const up = units[i - 1];
+      const upScaled = v / up.at;
+      const upShown = upScaled < 100 ? upScaled.toFixed(1).replace(/\.0$/, '') : String(Math.round(upScaled));
+      return `${upShown}${up.suffix} tokens`;
+    }
+    return `${shown}${u.suffix} tokens`;
+  }
+  return `${v} tokens`;
+}
+// The elapsed-and-tokens tail WITHOUT brackets, e.g. `6m 44s | 9.1k tokens`.
+//
+// The brackets belong to the caller, because the two rows want them in different places:
+//   Accelerating... [6m 44s | 9.1k tokens]      the live row wraps the TAIL
+//   [turn took 6m 44s | 9.1k tokens]            the settled row wraps word AND tail
+// Putting them here produced `[turn took [6m 44s | …]` on the settled row.
+//
+// The token count is always present, `0 tokens` included: an absent counter and a zero one
+// look identical to the user, and appearing partway through a turn makes the row jump width
+// under the eye.
+/**
+ * A prose setting as one short cell, for a list that has room for about forty characters.
+ *
+ * A truncated paragraph fills that space with text nobody can read and pushes the label out of
+ * line with every other row; the size is the fact worth showing at a glance.
+ */
+function proseSummary(value) {
+  const text = String(value == null ? '' : value);
+  if (!text.trim()) return '(unset)';
+  if (text === '(unset)') return text;              // already a placeholder, not prose
+  const lines = text.split(/\r?\n/);
+  const first = lines[0].trim();
+  // One short line with no newline fits as-is — that IS the whole value.
+  if (lines.length === 1 && first.length <= 32) return first;
+  return `${lines.length} line${lines.length === 1 ? '' : 's'}, ${text.length} chars`;
+}
+
+function elapsedTail(ms, tokens) {
+  const time = fmtDuration(ms);
+  const tok = fmtTokensShort(tokens);
+  return `${time} | ${tok}`;
 }
 
 // Left/right justify: left text, then padding, then right text flush to `w`.
@@ -4278,6 +4491,11 @@ export function composeFrame(state, cols, rows) {
     // expects, so the generic dispatch works unchanged.
     return takeoverFrame(lines, (state.tasksPanel._taskHits || []).slice());
   }
+  // The team panel: the roster, each member's traffic, and a composer. A full-screen
+  // takeover like the tasks browser, so it follows the same shape.
+  if (state.teamPanel) {
+    return takeoverFrame(renderTeamPanel(state.teamPanel, w, h), []);
+  }
   // The /skills and /plugins manager is a full-screen takeover like the browser above.
   if (state.registryBrowser) {
     const lines = renderRegistryBrowser(state.registryBrowser, w, h);
@@ -4506,13 +4724,15 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     }
     body.push(RULE, '');
     const fieldBodyRows = [];
-    fields.forEach((field, i) => {
-      const active = i === f.fieldIdx;
-      const label = col((field.label + ':').padEnd(f.labelW + 1), active ? C.cyan : C.gray);
-      const shown = active ? renderFieldValue(field, true) : renderFieldValue(field, false);
-      fieldBodyRows.push(body.length);
-      body.push(label + shown);
-      if (i === f.fieldIdx) dialogCaret = { row: body.length - 1, col: visualCol(label) + fieldCaretCol(field, active) };
+    // A form with no fields is a pure chooser. The Type row below is then the whole form, and
+    // the cursor starts there rather than on a field that does not exist.
+    if (!f.hideFields) fields.forEach((field, i) => {
+        const active = i === f.fieldIdx;
+        const label = col((field.label + ':').padEnd(f.labelW + 1), active ? C.cyan : C.gray);
+        const shown = active ? renderFieldValue(field, true) : renderFieldValue(field, false);
+        fieldBodyRows.push(body.length);
+        body.push(label + shown);
+        if (i === f.fieldIdx) dialogCaret = { row: body.length - 1, col: visualCol(label) + fieldCaretCol(field, active) };
     });
     let typeBodyRow = -1;
     let typeOpts = [];
@@ -4523,7 +4743,7 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       // list when present so the drawn options and the keyboard cycle cannot drift.
       const types = (f.types && f.types.length) ? f.types : PROTOCOL_TYPES;
       const typeActive = f.fieldIdx === fields.length;
-      const labelW = visualCol('Type:'.padEnd(f.labelW + 1));
+      const labelW = visualCol(`${f.typeLabel}:`.padEnd(f.labelW + 1));
       let colCursor = labelW;
       typeOpts = types.map((t) => {
         const brick = (typeActive ? '❯ ' : '  ') + t;
@@ -4535,7 +4755,7 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       const typeStr = types.map((t) => t === f.type
         ? col((typeActive ? '❯ ' : '  ') + t, typeActive ? (C.cyan + C.bold) : C.cyan)
         : col('  ' + t, C.gray)).join('  ');
-      const typeLabel = col('Type:'.padEnd(f.labelW + 1), typeActive ? C.cyan : C.gray);
+      const typeLabel = col(`${f.typeLabel}:`.padEnd(f.labelW + 1), typeActive ? C.cyan : C.gray);
       const typeHint = f.type ? '' : col('  ← choose', C.yellow);
       body.push(typeLabel + typeStr + typeHint);
       typeBodyRow = body.length - 1;
@@ -4576,35 +4796,37 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
         pickCaret = { row: body.length - 1, col: visualCol('Search: ') + visualCol(query) };
       }
     }
-    // Category tabs (if the picker defines them): "All" + provider categories.
-    // Each tab records its COLUMN RANGE so a click can select that category and a
-    // hover can highlight it (previously the row was pure text: no hitbox at all).
+    // Category tabs (if the picker defines them): "All" + one per group.
+    //
+    // Declared as a SENTINEL, not as text. The card is sized from its widest row, and a
+    // strip that wrapped itself here would need the width it is meant to help decide. The
+    // overlay steps over non-string entries when measuring, so this contributes no width,
+    // and expands into wrapped rows once the width exists.
+    //
+    // Wrapped rather than horizontally scrolled: the strip has to stay clickable, and a
+    // category you must scroll to is one you cannot click without first finding the scroll.
     let catBodyRow = -1;
     const catTabs = [];
     if (pick.categories && pick.categories.length > 1) {
-      const cats = pick.categories;
-      const active = state.pickerCategory || cats[0];
       const allItems = state.picker.items || [];
-      let catLine = col('Categories: ', C.gray);
-      let catCursor = visualCol('Categories: ');
-      for (let ci = 0; ci < cats.length; ci++) {
-        const label = cats[ci];
-        const active_ = label === active;
-        // Count items in this category (for the tab label).
-        let cnt;
-        if (label === cats[0]) {
-          cnt = allItems.filter((it) => !it.action).length; // "All" = all non-action items
-        } else {
-          cnt = allItems.filter((it) => it.category === label).length;
-        }
-        const text = active_ ? `[${label} (${cnt})]` : ` ${label} (${cnt}) `;
-        const seg = active_ ? col(text, C.cyan + C.bold) : col(text, C.gray);
-        catTabs.push({ label, colStart: catCursor, colEnd: catCursor + visualCol(text) - 1 });
-        catCursor += visualCol(text);
-        catLine += seg;
-      }
-      body.push(catLine);
-      catBodyRow = body.length - 1;
+      const cats = pick.categories;
+      catBodyRow = body.length;
+      body.push({
+        __categories: true,
+        active: state.pickerCategory || cats[0],
+        segments: cats.map((name, ci) => ({
+          label: name,
+          // Item count, so a tab says how much is behind it.
+          count: ci === 0
+            ? allItems.filter((it) => !it.action).length   // "All" = every non-action item
+            : allItems.filter((it) => it.category === name).length,
+        })),
+        // Filled in by the overlay: `{ label, row, colStart, colEnd }` per tab, with `row`
+        // ABSOLUTE in the body (catBodyRow + the line index), because a hitbox carries one
+        // row and a wrapped strip spans several.
+        tabs: catTabs,
+        rows: [],
+      });
     }
     // Overhead: header rows (body.length) + optional footer (empty + footer row).
     const footerRows = pick.footer ? 2 : 0;
@@ -4612,7 +4834,15 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     // The picker is a floating BOX, not the whole body: cap its height so the
     // transcript stays visible around it and the box can never outgrow the
     // screen. The overlay clips defensively anyway.
-    const popBudget = Math.max(4, Math.min(bodyH - 2, 30));
+    // Sized from `h`, the TERMINAL height — not `bodyH`, which is only the transcript area
+    // left after the composer, status bar and context row. Two thirds of `bodyH` on a 24-row
+    // screen is a two-item window; the popup floats over the whole screen, so the whole
+    // screen is what it has to fit in.
+    //
+    // Not all of it: a popup that fills the screen stops reading as a popup, and the
+    // transcript behind it is what tells the user what they are choosing between. Two thirds
+    // leaves a third as context at any size, and the overlay clips if the arithmetic is off.
+    const popBudget = Math.max(4, Math.min(h - 2, Math.floor(h * 0.66)));
     const maxItems = Math.max(1, Math.min(MAX_PICKER, popBudget - overhead - 1)); // -1 reserved for potential "more" line
     let first = Math.max(0, selIdx - Math.floor((maxItems - 1) / 2));
     if (first + maxItems > list.length) first = Math.max(0, list.length - maxItems);
@@ -4817,13 +5047,78 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     const ov = cardSpec;
     // Measure the content first: the box hugs it instead of spanning the screen.
     let contentW = 1;
-    for (const b of ov.body) if (typeof b === 'string') contentW = Math.max(contentW, visualCol(b));
+    for (const b of ov.body) {
+      if (typeof b === 'string') { contentW = Math.max(contentW, visualCol(b)); continue; }
+      // The category strip is a CANDIDATE for the width, not a victim of it. Its natural
+      // single-line width joins the measurement so it does not wrap on a terminal with room
+      // to spare — but `inner` is clamped to `w - 6` below, so a strip wider than the
+      // terminal still wraps rather than widening the card past the screen.
+      if (b && b.__categories) {
+        contentW = Math.max(contentW, catStripWidth(b));
+      }
+    }
     // +2 for one space of padding each side of the content — the same breathing
     // The panel hugs its content, but never so wide that it stops reading as a floating
     // surface: at `w - 2` the margins go to zero and it spans the terminal, which looks
     // like a takeover. Two columns of breathing room each side keeps it visibly centred
     // no matter how long a row is — the row is clipped to fit instead of the panel growing.
     const inner = Math.max(8, Math.min(w - 6, contentW + 2));
+
+    // THE CATEGORY STRIP WRAPS HERE, now that the width exists.
+    //
+    // It was pushed as a sentinel (above) rather than as text, because the card is sized
+    // from `contentW` — the widest string row — and a strip that had already wrapped would
+    // have been measured at whatever width it guessed. Declaring it as an object kept it out
+    // of that measurement entirely; this is where it becomes rows.
+    //
+    // Wrapping rather than scrolling: the tabs are click targets, and a category off the
+    // right edge is one the user cannot click — which is how the third /model category
+    // disappeared on a narrow terminal while "All" stayed visible and suggested nothing
+    // was missing.
+    for (let bi = 0; bi < ov.body.length; bi++) {
+      const b = ov.body[bi];
+      if (!b || !b.__categories) continue;
+      const PREFIX = 'Categories: ';
+      // `inner` IS the content box. The overlay already accounts for the panel's one-column
+      // padding on each side when it pads each row, so subtracting two more made the usable
+      // width narrower than the card — a strip that fitted the card exactly still wrapped.
+      const wrapAt = Math.max(12, inner);
+      const placed = [];
+      let row = 0;
+      let atCol = visualCol(PREFIX);
+      for (const s of b.segments) {
+        const on = s.label === b.active;
+        const text = on ? `[${s.label} (${s.count})]` : ` ${s.label} (${s.count}) `;
+        const tw = visualCol(text);
+        // Break BEFORE placing, so a label is never split across two rows.
+        if (atCol > 0 && atCol + 1 + tw > wrapAt) { row++; atCol = 0; }
+        if (atCol > 0) atCol += 1;                       // the joining space
+        placed.push({ label: s.label, row, colStart: atCol, colEnd: atCol + tw - 1, text, on });
+        atCol += tw;
+      }
+      const out = [];
+      for (let r = 0; r <= row; r++) {
+        let line = r === 0 ? col(PREFIX, C.gray) : '';
+        for (const p of placed) {
+          if (p.row !== r) continue;
+          const have = visualCol(line);
+          if (p.colStart > have) line += ' '.repeat(p.colStart - have);
+          line += p.on ? col(p.text, C.cyan + C.bold) : col(p.text, C.gray);
+        }
+        out.push(line);
+      }
+      // Rows go back into the body in place of the sentinel, so the indices the hitbox step
+      // uses (`catBodyRow`) stay correct.
+      ov.body.splice(bi, 1, ...out);
+      // The tabs, with their row recorded ABSOLUTELY: a hitbox carries one row and the
+      // strip now spans several.
+      if (Array.isArray(b.tabs)) {
+        b.tabs.length = 0;
+        for (const p of placed) b.tabs.push({ label: p.label, row: bi + p.row, colStart: p.colStart, colEnd: p.colEnd });
+      }
+      if (ov.catBodyRow === bi) ov.catBodyRow = bi;
+      break;
+    }
     const boxW = inner + 2;
     // An ANCHORED box opens at the given screen position (the right-click context
     // menu follows the pointer) instead of centred — and is then nudged back INSIDE
@@ -4945,8 +5240,11 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     }
     if (ov.catBodyRow >= 0) {
       ov.catTabs.forEach((tab) => {
+        // `tab.row` is the tab's OWN body row. The strip used to be a single row, so every
+        // tab shared `catBodyRow`; once it wraps, each tab lands on a different one and a
+        // shared row would put half the click targets on the wrong line.
         // +1 = the leading padding space before the content (no border any more).
-        addHit(rowOf(ov.catBodyRow), padLeft + 1 + tab.colStart, padLeft + 1 + tab.colEnd,
+        addHit(rowOf(tab.row), padLeft + 1 + tab.colStart, padLeft + 1 + tab.colEnd,
           { kind: 'pickerCategory', label: tab.label });
       });
     }
@@ -5114,7 +5412,9 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     const ORANGE_RGB = [255, 140, 0];
     const greyEsc = lerpColor(GREY_RGB[0], GREY_RGB[1], GREY_RGB[2], GREY_RGB[0], GREY_RGB[1], GREY_RGB[2], 0);
     const orangeEsc = lerpColor(ORANGE_RGB[0], ORANGE_RGB[1], ORANGE_RGB[2], ORANGE_RGB[0], ORANGE_RGB[1], ORANGE_RGB[2], 0);
-    const elapsed = state.turnStart ? ` ${col('[' + fmtDuration(Date.now() - state.turnStart) + ']', greyEsc)}` : '';
+    const elapsed = state.turnStart
+      ? col(` [${elapsedTail(Date.now() - state.turnStart, state.turnOutputTokens)}]`, greyEsc)
+      : '';
     // The wording was chosen once at turn start; the gradient below loops
     // independently, so the phrase stays put while the colours sweep.
     const workMsg = state.workMsg || WORKING_MESSAGES[0];
@@ -5146,7 +5446,9 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       const phaseT = t < 0.5 ? t * 2 : (t - 0.5) * 2; // 0→1 within each phase
 
       const phrase = workMsg;
-      const tailText = state.turnStart ? ` [${fmtDuration(Date.now() - state.turnStart)}]` : '';
+      const tailText = state.turnStart
+        ? ` [${elapsedTail(Date.now() - state.turnStart, state.turnOutputTokens)}]`
+        : '';
       const totalChars = phrase.length + tailText.length;
       const out = [];
 
@@ -6789,7 +7091,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           const changed = isSet(cfg, d.key) && value !== d.default;
           items.push({
             label: d.ui.label || d.key,
-            valueTag: value,
+            // A prose value is summarised by its SIZE. Printing the paragraph truncated to
+            // forty characters told the user nothing except that it did not fit.
+            valueTag: d.kind === 'text' ? proseSummary(value) : value,
             valueTagChanged: changed,
             // Which tab this row belongs to, for the category filter.
             category: t.id,
@@ -6814,12 +7118,52 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           if (!it || !it.setKey) return true;
           const key = it.setKey;
           const def = SETTING_BY_KEY.get(key);
-          // A bool flips IN PLACE: a toggle with a confirm step is a worse toggle.
+          // A bool opens the SAME chooser every other kind uses, with on/off as its options.
+          // It used to flip on the keypress, which made the row a switch that showed neither
+          // the alternative nor a way back — and the setting had already changed by the time
+          // the user realised they had pressed Enter on the wrong row.
           if (def.kind === 'bool') {
-            applySetting(key, effectiveValue(cfg, key) === 'true' ? 'false' : 'true');
-            // Re-open so the list shows the new value — the picker closed on the pick, and
-            // a settings screen that closes after every change is unusable for a second one.
-            void dispatch('/settings', raw.trim(), state, cfg, session, h, submit, stdout);
+            openForm({
+              title: def.ui ? def.ui.label : key,
+              // NO fields. The chooser is the whole form, and `fieldIdx === fields.length`
+              // is what marks it active — a leftover field made that 0 === 1, so the label
+              // stayed grey and the row did not look focused until a key had been pressed.
+              fields: [],
+              types: ['on', 'off'],
+              // Start ON the value in force. Without this the chooser opened with nothing
+              // selected, and the first arrow key jumped to the top of the list.
+              type: effectiveValue(cfg, key) === 'true' ? 'on' : 'off',
+              hideType: false,
+              // No text field: the chooser is the whole question.
+              hideFields: true,
+              typeLabel: 'Value',
+              labelW: 18,
+              note: it.setHint || (def.ui ? def.ui.hint : ''),
+              hint: '← → choose · Enter save · Esc cancel',
+              onSubmit: (values, chosen) => {
+                // `chosen` is what the chooser landed on; the free-text field is ignored for a
+                // bool, because 'yes' typed by hand and 'on' chosen from the list mean the same
+                // thing and coercion already accepts both.
+                applySetting(key, chosen || (values && values.value));
+                void dispatch('/settings', raw.trim(), state, cfg, session, h, submit, stdout);
+              },
+            });
+            return true;
+          }
+          // A PROSE setting opens the multi-line editor. A paragraph cannot be edited in a
+          // field the size of one line: the text does not wrap, the cursor cannot leave the
+          // row, and every Enter ends the edit. `openEditor` is the same editor
+          // /set-system-prompt uses, and it writes multi-line TOML on save.
+          if (def.kind === 'text') {
+            openEditor({
+              title: def.ui ? def.ui.label : key,
+              text: String(effectiveValue(cfg, key)),
+              caretRow: 0,
+              caretCol: 0,
+              // The description is shown in the editor: this is where the user decides what
+              // the text should say, so it is the moment the description is worth reading.
+              onSave: (value) => { applySetting(key, String(value == null ? '' : value)); },
+            });
             return true;
           }
           // Everything else opens a one-line prompt, pre-filled with the value in force.
@@ -6827,7 +7171,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
             title: def.ui ? def.ui.label : key,
             fields: [{
               key: 'value',
-              label: def.kind === 'text' ? 'Value (blank clears)' : 'Value',
+              label: 'Value',
               value: String(effectiveValue(cfg, key)),
             }],
             type: null,
@@ -6864,7 +7208,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         }
         const lines = [`${changed.length} setting(s) differ from the default:`, ''];
         for (const d of changed) {
-          lines.push(`  ${d.key.padEnd(28)} ${displayValue(cfg, d.key)}   (default ${d.default})`);
+          lines.push(`  ${d.key.padEnd(28)} ${proseSummary(displayValue(cfg, d.key))}   (default ${d.default})`);
         }
         sayPanel(lines.join('\n'));
         return;
@@ -6878,7 +7222,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         const d = SETTING_BY_KEY.get(key);
         sayPanel([
           `  ${d.key}`,
-          `  value     ${displayValue(cfg, key)}`,
+          `  value     ${proseSummary(displayValue(cfg, key))}`,
           `  default   ${d.default}`,
           `  type      ${d.kind}${d.values ? ` (${d.values.join(', ')})` : ''}`,
           d.ui ? `  where     ${d.ui.tab} › ${d.ui.group}` : '  (no settings row; set by /set only)',
@@ -7388,8 +7732,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       // New session starts with empty TODO list
       state.todos = [];
       session.todos = [];
-      // Set terminal window title to default (Untitled)
-      stdout.write('\x1b]0;Untitled\x07');
+      // The fresh session has no title yet, so this restores the default rather than leaving
+      // the previous session's name on the window.
+      writeWindowTitle(session, stdout);
       // A fresh session has no history, so the context gauge must go back to 0
       // (otherwise it kept showing the PREVIOUS session's usage until the next
       // turn reported a new estimate). The window size is a property of the
@@ -7458,6 +7803,10 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
             cfg.model = keepModel;
             cfg.innerModel = keepInner;
             cfg.provider = keepProvider;
+            // The window title follows the session that is now current — `/sessions` swaps the
+            // conversation, so leaving the previous session's name up is the same defect as
+            // never showing one.
+            writeWindowTitle(session, stdout);
             state.chat = reconstructChat(session);
             state.scroll = 0;
             dropScrollPin(state);   // fresh transcript: re-seed the anchor on paint
@@ -7523,7 +7872,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         : 'Swarm mode OFF');
       return;
     }
-    case 'swarm-sub-agent': {
+    case 'subagent-model': {
       // Which model subagents run on. Empty/unset = follow this session's model
       // (the "default"), so a user who never touches this gets the behaviour they
       // already had. Stored in config.toml as `subagent_model`, and mirrored onto
@@ -7545,11 +7894,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         app(v ? `Subagent model → ${v}` : `Subagent model → default (this session's model)`);
       };
 
-      // `/swarm-sub-agent default` (or `none`/`reset`) clears the override.
+      // `/subagent-model default` (or `none`/`reset`) clears the override.
       if (desired) {
         const d = desired.toLowerCase();
         if (d === 'default' || d === 'none' || d === 'reset' || d === 'clear') { setSubagentModel(''); return; }
-        if (!models[desired]) { appErr(`Unknown model alias: ${desired}. Run /swarm-sub-agent to pick one.`); return; }
+        if (!models[desired]) { appErr(`Unknown model alias: ${desired}. Run /subagent-model to pick one.`); return; }
         setSubagentModel(desired);
         return;
       }
@@ -7704,11 +8053,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (raw) {
         session.title = raw.slice(0, 200);
         saveSession(session);
-        // Set terminal window title - use OSC sequence
-        // Only show "Untitled" prefix if user hasn't set a custom title
-        const displayTitle = session.title || 'Untitled';
-        stdout.write(`\x1b]0;${displayTitle}\x07`);
-        app(`Session title set to: "${displayTitle}"`);
+        // The window title follows the session, in ONE place (see writeWindowTitle).
+        writeWindowTitle(session, stdout);
+        app(`Session title set to: "${session.title || 'Untitled'}"`);
       } else {
         app(`Session title: ${session.title || 'not set'}`);
       }
@@ -9115,7 +9462,7 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         : 'Auto-trim OFF — tool results are sent in full (use /trim to elide them once)');
       return;
     }
-case 'trim': {
+    case 'trim': {
       // Manual trim, the counterpart of /auto-trim. Runs the same pass on demand,
       // regardless of the trigger ratio — for when the user knows the history is
       // carrying output they are done with and does not want to wait for the 50%
@@ -9179,13 +9526,21 @@ case 'trim': {
       return;
     }
     case 'update': {
-      // Manual update check. This is the ONLY place an update is ever reported;
-      // the automatic background check stays completely silent.
+      // Manual update check. The automatic background check is silent, so this is where a
+      // pending install is also reported: the install runs detached and its outcome lands in
+      // the stamp file, which is the only thing that can say whether it worked.
       app('Checking for updates...');
+      // A previous install may have failed without anyone seeing it.
+      const prev = upd.readUpdateStamp();
+      if (prev && prev.status === 'error' && prev.error) {
+        appErr(`A previous update to ${prev.version || 'a newer version'} failed: ${String(prev.error).split('\n').pop()}`);
+        upd.clearUpdateStamp();
+      }
       cfg.updateRunning = true;
       try {
         const r = await upd.checkAndUpdate();
-        if (r.status === 'updated') app(r.message);
+        if (r.status === 'installing') app(r.message);
+        else if (r.status === 'busy') app(r.message);
         else if (r.status === 'uptodate') app(r.message);
         else app('Update check: ' + (r.message || 'failed'));
       } catch (e) {
@@ -9383,15 +9738,19 @@ case 'trim': {
         // A settings change must reach disk at once, or a restart silently reverts it.
         session.saveHistory = state.saveHistory;
         session.saveThinking = state.saveThinking;
-        persistState();
+        // `persist` — the local wrapper defined near the top of this function — not the bare
+        // `persistState`. That name lives inside `startTUI`, so calling it from `dispatch` (which
+        // is module level) threw `persistState is not defined`: `/save-history` and its
+        // thinking variants killed the process instead of saving the setting.
+        persist();
       } else if (what === 'thinking') {
         state.saveThinking = true;
         session.saveThinking = true;
-        persistState();
+        persist();
       } else if (what === 'nothinking') {
         state.saveThinking = false;
         session.saveThinking = false;
-        persistState();
+        persist();
       } else if (what) {
         appErr('Usage: /save-history [on|off|thinking|nothinking]');
         return;
@@ -9464,7 +9823,7 @@ case 'trim': {
           onSave: (value) => {
             try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, String(value), 'utf8'); }
             catch (e) { appErr(`Could not write ${file}: ${e.message}`); return; }
-            const now = refreshKeybindings();
+            const now = h.refreshKeybindings();
             app(now.errors.length ? `Saved with ${now.errors.length} problem(s) — /keybindings to see them.` : `Saved. ${now.bindings.size} binding(s) active.`);
           },
         });
@@ -9486,7 +9845,7 @@ case 'trim': {
           doc[src] = dst;
         }
         try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
-        const now = refreshKeybindings();
+        const now = h.refreshKeybindings();
         app(now.errors.length
           ? `Added ${src} → ${to}, but the file now has ${now.errors.length} problem(s).`
           : `Bound ${src} → ${to}`);
@@ -9498,7 +9857,7 @@ case 'trim': {
         if (!(src in doc)) { appErr(`No binding for ${src}.`); return; }
         delete doc[src];
         try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
-        refreshKeybindings();
+        h.refreshKeybindings();
         app(`Unbound ${src}`);
         return;
       }
@@ -9514,7 +9873,7 @@ case 'trim': {
             doc[src] = dst;
           }
           try { writeKeybindings(undefined, doc); } catch (e) { appErr(`Could not write: ${e.message}`); return; }
-          refreshKeybindings();
+          h.refreshKeybindings();
           app(`Bound ${src} → ${to}`);
           return;
         }
@@ -9562,6 +9921,261 @@ case 'trim': {
       appErr('Usage: /agents [list | message <id> <text> | interrupt [id|all] | close <id>]');
       return;
     }
+    case 'team': {
+      // `create` / `add` / `list` / `delete`, or no argument for a menu.
+      //
+      // WHY THIS EXISTS ALONGSIDE THE TOOLS: creating a team is a decision about how the work
+      // will be done, and it is the user's. Making it cost a model turn means asking the model
+      // to ask itself — and the model would be choosing its own teammates' models.
+      const sub = raw.trim();
+      const parts = sub.split(/\s+/).filter(Boolean);
+      const verb = (parts[0] || '').toLowerCase();
+      // Read LIVE at each use, not captured here. The menu creates a team inside this same
+      // invocation, so a value taken at the top would be the `null` from before the create —
+      // and the step right after creating one reported "No team. Create one".
+      const current = () => leadTeam();
+
+      const doAdd = (name, model) => {
+        if (!current()) { appErr('No team. Create one: /team create <name>'); return; }
+        const r = teamMod.addMember(current(), { name, model: model || '' });
+        if (!r.ok) { appErr(r.error); return; }
+        const shown = model
+          || (cfg.subagentModel ? `${cfg.subagentModel} (the subagent model)` : `this session's (${cfg.model || 'unset'})`);
+        app(`Added ${name} to "${current()}" — model: ${shown}.`);
+
+        // Reached through the HOST: `dispatch` is module-level and `spawnTeammates` lives inside
+        // startTUI, so a command cannot name it directly. The host is how everything the
+        // command needs from the running TUI arrives.
+        const spawn = h && h.spawnTeammates;
+
+        // START IT. A member with no agent is a line in a file: nobody reads its inbox, so it
+        // cannot be messaged, given work, or noticed as absent. Same spawn the model's
+        // TeamCreate tool uses, so the two paths cannot produce different teammates.
+        if (typeof spawn !== 'function') {
+          app(`(${name} is on the roster but no agent is running — this build has no spawner.)`);
+          return;
+        }
+        // Not awaited: a teammate works in the background and reports by message, which is the
+        // whole reason a team is more than a batch of subagents.
+        Promise.resolve(spawn(current(), [{ name, model: model || '', agentType: 'general' }]))
+          .then((started) => {
+            const ok = Array.isArray(started) ? started.find((s) => s.name === name) : null;
+            if (ok) app(`${name} is running (${ok.taskId}). Message it: /team msg ${name} <text>`);
+            // `renderFrame`, which is what `dispatch` has: `renderSoon` belongs to startTUI.
+            renderFrame();
+          })
+          .catch((e) => appErr(`Could not start ${name}: ${(e && e.message) || e}`));
+      };
+
+      // The model is the decision most worth making deliberately, so a member added without
+      // one ASKS rather than silently inheriting. The list mirrors /model and
+      // /subagent-model, so the same names appear in all three.
+      const askModel = (name) => {
+        const models = (cfg.raw && cfg.raw.models) || {};
+        const names = Object.keys(models);
+        const items = [{
+          label: 'default',
+          sub: cfg.subagentModel
+            ? `follow the subagent model (${cfg.subagentModel})`
+            : `follow this session's model (${cfg.model || 'unset'})`,
+          action: 'default',
+        }, ...names.map((n) => ({
+          label: n,
+          sub: models[n].provider || cfg.provider || '',
+          category: models[n].provider || '',
+        }))];
+        openPicker({
+          title: `Model for ${name}`,
+          items,
+          categories: ['All', ...Object.keys(cfg.raw.providers || {})],
+          category: null,
+          hint: '↑↓ navigate · Tab category · Enter choose · Esc cancel',
+          onPick: (it) => { doAdd(name, it.action === 'default' ? '' : it.label); return true; },
+        });
+      };
+
+      if (verb === 'create') {
+        const name = parts.slice(1).join(' ').trim();
+        if (!name) { appErr('Usage: /team create <name>'); return; }
+        const r = teamMod.createTeam({
+          teamName: name,
+          leadSessionId: (session && session.id) || '',
+          cwd: state.cwd,
+        });
+        if (!r.ok) { appErr(r.error); return; }
+        setLeadTeam(name);
+        app(`Team "${name}" created — you are team-lead.`);
+        app('Add members with /team add <name>; it asks which model each should run.');
+        return;
+      }
+
+      if (verb === 'add') {
+        const name = parts[1];
+        if (!name) { appErr('Usage: /team add <name> [model]'); return; }
+        if (parts[2]) { doAdd(name, parts.slice(2).join(' ')); return; }
+        askModel(name);
+        return;
+      }
+
+      if (verb === 'msg' || verb === 'message' || verb === 'tell') {
+        const who = parts[1];
+        const body = parts.slice(2).join(' ').trim();
+        if (!current()) { appErr('No team. Create one: /team create <name>'); return; }
+        if (!who || !body) { appErr('Usage: /team msg <name> <text>   -- "*" reaches every member'); return; }
+
+        const roster = teamMod.rosterOf(current());
+        const name = who === '*' ? null : who;
+        // Checked before sending: a message to a name nobody has is a typo, and queueing it
+        // would leave the user waiting for an answer no member can give.
+        if (name && !roster.some((m) => m.name === name)) {
+          appErr(`No member "${name}". On this team: ${roster.map((m) => m.name).join(', ')}`);
+          return;
+        }
+
+        // `from: TEAM_LEAD_NAME` even though the USER typed it. From a member's side the lead
+        // IS the session, and the reply tool it has addresses the lead by name — a sender it
+        // cannot recognise is one it cannot answer.
+        //
+        // `targets` excludes only the wire ALIAS, not the lead's roster name. The alias is not a
+        // member (`addMember` refuses it), while the lead IS one — an agent with its own inbox —
+        // so a message addressed to the lead by name is a normal send and must go through.
+        const targets = name
+          ? [name]
+          : roster.filter((m) => m.name !== TEAM_LEAD_NAME).map((m) => m.name);
+        if (!targets.length) { appErr('There is nobody else on the team.'); return; }
+        for (const t of targets) {
+          mailMod.writeToMailbox(current(), t, { from: TEAM_LEAD_NAME, text: body });
+        }
+        app(targets.length > 1 ? `Sent to ${targets.length} members.` : `Sent to ${targets[0]}.`);
+        return;
+      }
+
+      if (verb === 'panel' || verb === 'ui') {
+        if (!current()) { appErr('No team. Create one: /team create <name>'); return; }
+        state.teamPanel = makeTeamPanel(current());
+        renderFrame();
+        return;
+      }
+
+      if (verb === 'list') {
+        if (!current()) { appErr('No team. Create one: /team create <name>'); return; }
+        sayPanel(teamMod.readRoster(current()));
+        return;
+      }
+
+      if (verb === 'delete' || verb === 'disband') {
+        if (!current()) { appErr('No team to delete.'); return; }
+        // The name is captured BEFORE clearing, which is what the message needs. Reading
+        // `current()` after the clear produced `Team "null" dissolved.` — the lead was gone by
+        // the time it was asked for.
+        const gone = current();
+        const r = teamMod.disbandTeam(gone, { reason: 'the user ended the team' });
+        if (!r.ok) { appErr(r.error); return; }
+        clearLeadTeam();
+        app(`Team "${gone}" dissolved.${r.told ? ` ${r.told} member(s) were told.` : ''}`);
+        return;
+      }
+
+      // No argument: a menu that RUNS each flow rather than pointing at the command.
+      //
+      // WHY THIS IS NOT JUST A HELP LIST: a picker that answers a pick with "go type this
+      // instead" costs a keystroke and a screen and leaves the user where they started.
+      const others = teamMod.knownTeams().filter((t) => t.name !== current());
+
+      // Ask for a name, create the team, then go straight on to the first member. A team of
+      // one is not what anyone opens this for, and sending them back to the menu they just
+      // left is the same dead end in a new place.
+      const askCreate = () => {
+        openForm({
+          title: 'Create a team',
+          fields: [{ key: 'name', label: 'Name' }],
+          type: null,
+          hideType: true,
+          labelW: 8,
+          note: 'A short name, e.g. "auth-refactor". You become its team-lead.',
+          hint: 'Enter create · Esc cancel',
+          onSubmit: (values) => {
+            const name = String((values && values.name) || '').trim();
+            if (!name) { appErr('Cancelled: a team needs a name.'); return; }
+            const r = teamMod.createTeam({
+              teamName: name,
+              leadSessionId: (session && session.id) || '',
+              cwd: state.cwd,
+            });
+            if (!r.ok) { appErr(r.error); return; }
+            setLeadTeam(name);
+            app(`Team "${name}" created — you are team-lead.`);
+            askAdd();
+          },
+        });
+      };
+
+      // Ask who, then which model: two questions, one flow. `askModel` is the same chooser
+      // `/team add <name>` uses, so the two paths cannot offer different models.
+      const askAdd = () => {
+        if (!leadTeam()) { appErr('No team. Create one first.'); return; }
+        openForm({
+          title: 'Add a member',
+          fields: [{ key: 'name', label: 'Name' }],
+          type: null,
+          hideType: true,
+          labelW: 8,
+          note: 'Then pick which model it should run.',
+          hint: 'Enter next · Esc cancel',
+          onSubmit: (values) => {
+            const name = String((values && values.name) || '').trim();
+            if (!name) { appErr('Cancelled: a member needs a name.'); return; }
+            askModel(name);
+          },
+        });
+      };
+
+      openPicker({
+        title: current() ? `Team — leading "${current()}"` : 'Team',
+        items: [
+          { label: 'Create a team…', sub: 'asks for a name, then adds the first member', action: 'create' },
+          ...(current() ? [
+            { label: 'Open the panel…', sub: 'the roster, their messages, and a box to write in', action: 'panel' },
+            { label: 'Add a member…', sub: 'asks for a name, then which model it runs', action: 'add' },
+            { label: 'Show the roster', sub: 'who is on it and what each is doing', action: 'list' },
+            { label: 'Delete the team…', sub: 'dissolve it and tell the members', action: 'delete' },
+          ] : []),
+          ...others.map((t) => ({ label: t.name, sub: `${t.members} member(s) — from an earlier session; open it to lead it again`, action: 'open' })),
+        ],
+        hint: '↑↓ navigate · Enter choose · Esc cancel',
+        onPick: (it) => {
+          if (it.action === 'panel') { state.teamPanel = makeTeamPanel(current()); renderFrame(); }
+          else if (it.action === 'create') askCreate();
+          else if (it.action === 'add') askAdd();
+          else if (it.action === 'list') sayPanel(teamMod.readRoster(current()));
+          else if (it.action === 'open') {
+            // Attach to a team from an earlier session. Its roster, inboxes and task list are
+            // all on disk — only the lead was missing — so becoming its lead is the whole of
+            // what is needed, and the menu then shows its members and their actions.
+            setLeadTeam(it.label);
+            app(`Now leading "${it.label}".`);
+            void dispatch('team', '', state, cfg, session, h, submit, stdout);
+          }
+          else if (it.action === 'delete') {
+            // Confirmed: dissolving tells every member and drops the task list, which is more
+            // than a stray Enter should be able to do.
+            openForm({
+              title: `Delete "${current()}"?`,
+              fields: [],
+              type: null,
+              hideType: true,
+              hideFields: true,
+              note: 'Its members are told; the roster and the task list are removed.',
+              hint: 'Enter confirm · Esc cancel',
+              onSubmit: () => { void dispatch('team', 'delete', state, cfg, session, h, submit, stdout); },
+            });
+          }
+          return true;
+        },
+      });
+      return;
+    }
+
     case 'files': {
       // The walker is tools/ignore.js — the SAME one Grep and Glob use, so the browser can
       // never show a file the tools would refuse to search. Directories come from the flat
@@ -11096,9 +11710,1170 @@ export function csiName(params, fin) {
   return 'escape';
 }
 
+// One turn: from the caller's text to the settled transcript.
+//
+// MODULE-LEVEL on purpose. It used to live inside startTUI, so only the process that drew the
+// terminal could run a turn — which is why the web UI could read a finished session but never
+// continue one. Everything it needs arrives in `deps`:
+//
+//   state    the session state object (the TUI's, or one a headless run built)
+//   cfg      resolved configuration
+//   session  the persisted record
+//   host     SessionHost — the stream buffer, the recorder, the counters
+//   view     the display; HEADLESS_VIEW when there is no terminal
+//
+// `viewArg` overrides `deps.view` for one call, which is how a caller holding both a terminal and
+// a browser reaches the right one per turn.
+async function runTurn(deps, text, opts = {}, viewArg) {
+  const { state, cfg, session, host, spawn } = deps;
+  const sessHost = host;
+  const viewCur = viewArg || deps.view;
+    // Drop any compaction row left dangling by an interrupted turn so the next
+    // auto-compaction starts clean (no ghost 'running' row that blinks with nothing
+    // behind it). The live reference is dropped too.
+    const asSystem = !!opts.asSystem;
+    // `bubbleText` overrides the row drawn in the transcript. A SKILL activation has
+    // already drawn its own card (see dispatch), so it passes the user's args here
+    // only to feed the MODEL — with no args that is '', and a user bubble for an
+    // empty string would show a blank `❯` row under the card.
+    const bubble = opts.bubbleText != null ? opts.bubbleText : text;
+    if (!asSystem && String(bubble).trim()) viewCur.addChat({ role: 'user', text: bubble, _conv: true });
+    // Fresh buffer for this turn's plan-tag split (see appendAssistant).
+    state._planBuf = '';
+    // A message the user JUST SENT should always bring the newest content into
+    // view, even if they were scrolled up reading history. (Queue/steer do NOT
+    // come through here, so they keep the view exactly where the user left it.)
+    state.scroll = 0;
+    dropScrollPin(state);   // jump to the tail: reseed the anchor on paint
+    // Should THIS turn produce the session title? Decided BEFORE the user message
+    // is appended to the history: the old test lived in the system-prompt builder
+    // and checked `session.messages.length === 0`, but by then the message was
+    // already in there, so the injection never fired and no session was ever
+    // auto-titled.
+    //
+    // The `state.titleAttempts` cap is what makes a FAILED naming retryable. The
+    // old test (`session.messages.length === 0`) was true on the first turn only,
+    // so one offline/aborted/empty reply left the session nameless for good — the
+    // comment on generateTitle claimed it "simply tries again" but nothing did.
+    // A few extra attempts cover a transient failure without paying for a naming
+    // request on every turn of a session the user never wanted named.
+    const TITLE_ATTEMPT_LIMIT = 3;
+    if (state.titleAttempts == null) state.titleAttempts = 0;
+    const needsTitle = !!session && !session.title && state.titleAttempts < TITLE_ATTEMPT_LIMIT;
+    state.titleAttempts++;
+    state.running = true;
+    // Pick the Working… wording ONCE for this turn, so it does not change while
+    // the gradient loops. The next turn picks a new one.
+    state.workMsg = WORKING_MESSAGES[Math.floor(Math.random() * WORKING_MESSAGES.length)];
+    state.rounds = (state.rounds || 0) + 1;
+    state._stepsBase = state.steps || 0;
+    state._turnSteps = 0;
+    // Re-base the start animation to THIS instant and paint immediately.
+    // submit() set startAnim before `running` was true, so nothing could render
+    // yet; by the time a frame was actually drawn the 1s animation had already
+    // run out and the type-out was never seen. Stamping it here — the first
+    // moment the row can be painted — makes the animation start on screen.
+    state.startAnim = { start: Date.now() };
+    state.pulseStart = null;
+    viewCur.render();
+    if (session) session.rounds = state.rounds;
+    // The system message is pinned to the front and is NOT persisted to the
+    // session (persisting it would pile up one copy per turn). Any older system
+    // entry in the history is skipped, so the CURRENT prompt is the only one
+    // used:
+    //   * a custom prompt from /set-system-prompt (config.toml `system_prompt`),
+    //     falling back to the built-in SYSTEM_PROMPT;
+    //   * plus the COOL-MODE instruction appended when that mode is ON, so the
+    //     model stops narrating what it is about to do and why.
+    const basePrompt = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
+    let sysText = basePrompt;
+
+    // APPEND rather than replace — the safer of the two prompt knobs, and the one to reach
+    // for when the built-in prompt already does most of what you want.
+    if (cfg.appendSystemPrompt && String(cfg.appendSystemPrompt).trim()) {
+      sysText += '\n\n' + String(cfg.appendSystemPrompt).trim();
+    }
+
+    if (cfg.calmMode) {
+      sysText += '\n\n' + CALM_MODE_INSTRUCTION;
+    }
+    // PLAN MODE (/plan): tell the model what to PRODUCE. The tool filter alone
+    // only removed its write tools — this is what makes it emit a plan block. A user's own
+    // `plan_instructions` is APPENDED, never substituted: replacing this would silently
+    // switch Plan mode back to the behaviour the instruction exists to fix.
+    if (state.plan) {
+      sysText += '\n\n' + PLAN_MODE_INSTRUCTION;
+      if (cfg.planInstructions && String(cfg.planInstructions).trim()) {
+        sysText += '\n\n' + String(cfg.planInstructions).trim();
+      }
+    }
+    // SWARM MODE (/swarm): push the model toward parallel decomposition.
+    if (state.swarm) {
+      sysText += '\n\n' + SWARM_MODE_INSTRUCTION;
+      if (cfg.swarmInstructions && String(cfg.swarmInstructions).trim()) {
+        sysText += '\n\n' + String(cfg.swarmInstructions).trim();
+      }
+    }
+    // FOCUS MODE has no built-in instruction — the tool filter IS its behaviour — so this
+    // is the only place to say anything about it.
+    if (state.focus && cfg.focusInstructions && String(cfg.focusInstructions).trim()) {
+      sysText += '\n\n' + String(cfg.focusInstructions).trim();
+    }
+    const personal = readPersonalPrompt(state.workspace || cfg.workspace);
+    if (personal) {
+      sysText += '\n\n' + personal;
+    }
+    // Agent memory: notes the model wrote for itself in earlier sessions (the
+    // Memory tool). Read fresh each turn like the preferences above, so an edit
+    // lands on the next prompt. Injected AFTER the user's preferences: the user's
+    // standing instructions outrank the model's own earlier notes.
+    const memory = readMemory(state.workspace || cfg.workspace);
+    if (memory) {
+      sysText += '\n\n' + memory;
+    }
+    // OUTPUT STYLE (/output-style): a form-of-reply instruction read from a file,
+    // re-read per turn like the notes above so editing the file takes effect on the
+    // next request. Placed AFTER the preferences and memory but BEFORE AGENTS.md:
+    // the project's own instructions are the most specific thing here and must win.
+    if (state.outputStyle && state.outputStyle.body) {
+      sysText += '\n\n' + styleReminder(state.outputStyle);
+    }
+    // THE TASK LIST — the model's own working state, re-stated each turn.
+    //
+    // It belongs in the SYSTEM PROMPT, not in a user message. The list lives outside the
+    // conversation: the TodoList tool writes `state.todos` and nothing reads it back, so after a
+    // compaction — or simply several turns later — the model works from the tail of the
+    // conversation instead of from the plan it made.
+    //
+    // Injecting it as a `user` message was wrong, and wrong in a way that compounds. It put text
+    // the model never said into the user's own turn, once per turn: the history grew, a compaction
+    // treated those entries as real conversation, and the model could read its own notes as an
+    // instruction from the person. The system prompt is rebuilt every turn and is not part of the
+    // history, so nothing leaks into it and the list is current for free.
+    //
+    // Placed AFTER the user's preferences and memory but BEFORE AGENTS.md: the project's own
+    // instructions are the most specific thing here and must win.
+    //
+    // Only while something is open. An empty list needs no reminder, and a list with nothing left
+    // to do is finished work — repeating it would keep the model circling a job that is over.
+    const openTodos = (state.todos || []).filter((t) => t && t.status !== 'done');
+    if (openTodos.length) {
+      sysText += '\n\n' + '<todo-list>\nYour task list. Keep exactly one item in progress, and '
+        + 'update it with the TodoList tool as you go.\n\n'
+        + renderTodos(openTodos) + '\n</todo-list>';
+    }
+    // AGENTS.md: the PROJECT's own instructions, read fresh each turn like the
+    // personal notes above, so an edit (or a fresh /init) takes effect on the next
+    // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
+    // which is the precedence order codex documents. Previously /init wrote this
+    // file and nothing ever loaded it.
+const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
+    if (agents) {
+      sysText += '\n\n' + agents;
+    }
+    let messages = [{ role: 'system', content: sysText }];
+    // Mixin seam: let plugins rewrite the assembled system prompt before the turn.
+    try { sysText = await runPatch('systemPrompt', { text: sysText }, (c) => c.text); messages = [{ role: 'system', content: sysText }]; } catch (e) { console.error('[hncode-plugin] systemPrompt patch error:', e.message); }
+    // A skill body is injected as its OWN system message so it reaches the model
+    // but never appears (or persists) as the user's words, mirroring kimi's
+    // activation card. It is filtered out of the saved session like sysText.
+    if (opts.skillBody) messages.push({ role: 'system', content: opts.skillBody });
+    if (session.messages && session.messages.length) {
+      for (const m of session.messages) {
+        if (m.role === 'system') continue;
+        // Drop an assistant message carrying neither content nor toolCalls — the
+        // residue of an old bug.
+        if (m.role === 'assistant'
+            && !(typeof m.content === 'string' && m.content.trim())
+            && !(Array.isArray(m.toolCalls) && m.toolCalls.length)) {
+          continue;
+        }
+        messages.push(m);
+      }
+    }
+    // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
+    // from the harness, not something the user typed, and it must not show up as a
+    // user bubble or be persisted as one.
+    //
+    // A SKILL activation's `text` is only the `/skill:<name>` marker. Sending that as
+    // the user turn told the model nothing and DROPPED the user's own instruction
+    // (`/skill:foo make it blue` lost "make it blue"). So:
+    //   * with args  -> the args ARE the user turn (the body rides a system message);
+    //   * without args -> there is no user text at all. Pushing the marker would put
+    //     the literal `/skill:foo` into the conversation, which is worse than an empty
+    //     turn: the model reads it as the user having typed a command. The skill body
+    //     is the whole instruction in that case, so no user message is added.
+    const argsText = opts.bubbleText != null ? String(opts.bubbleText).trim() : '';
+    const isSkill = opts.bubbleText != null;
+    if (asSystem) messages.push({ role: 'system', content: text });
+    else if (isSkill && !argsText) { /* body-only activation: nothing for the user turn */ }
+    else messages.push({ role: 'user', content: opts.modelText != null ? opts.modelText : (argsText || text) });
+
+    // What the TEAM has said to the lead since the last turn.
+    //
+    // The lead is this session, and its inbox is the only channel an agent has for reaching
+    // the person. Nothing drained it before — teammates read their own boxes, the lead had no
+    // reader — so a member asking "what should I work on?" wrote into a file nobody opened and
+    // the user saw only their own messages, which reads exactly like the team being dead.
+    //
+    // Delivered as ONE user message rather than a system message, and marked read only after
+    // the text is built: the model has then genuinely seen it, and a format failure cannot
+    // silently consume the mail.
+    const teamName = leadTeam();
+    if (teamName) {
+      try {
+        const inbox = teamMod.formatLeadInbox(teamName, { mark: true });
+        if (inbox) messages.push({ role: 'user', content: `<team-inbox>\n${inbox}\n</team-inbox>` });
+      } catch { /* a missing roster must not fail the turn */ }
+    }
+
+    // Only the conversation is persisted; the system message does not go into the
+    // session. Saving a turn is left to the end of the turn (after agent.run) —
+    // writing mid-turn would make sending feel sluggish.
+    //
+    // The assembled prompt is parked on `state` instead, for the length of the turn. It
+    // cannot live in `session.messages` (see contextSegments): the array is trimmed to
+    // non-system roles here and again at every step boundary, so with nothing carrying the
+    // text the status bar's `system prompt` segment collapses to zero columns and vanishes
+    // mid-turn, then returns at turn end when the untrimmed request is assigned back.
+    state.turnSystemPrompt = sysText;
+    Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
+    // The user's message is on disk before the agent has done anything. A crash
+    // this early used to lose the entire prompt, because the first save was at
+    // turn end.
+    try { sess.saveSession(session); } catch { }
+
+    // Called at every step boundary. `messages` is the array the agent appends to,
+    // so re-filtering it into the session and writing to disk keeps the saved
+    // transcript within one step of what is on screen. Cheap: saveSession is a
+    // synchronous write of one JSON file, and a step is seconds apart.
+    function persistTurnProgress(list) {
+      if (!session || !Array.isArray(list)) return;
+      session.messages = list.filter((m) => m.role !== 'system');
+      session.rounds = state.rounds || session.rounds;
+      session.steps = state.steps || session.steps;
+      session.todos = state.todos || session.todos;
+      session.mode = state.mode || session.mode;
+      try { sess.saveSession(session); } catch { }
+    }
+
+    // Focus is a ONE-TURN mode: it narrows the toolset for the turn the user set it
+    // on, and turns itself off when that turn ends (see the end of this function).
+    // Remember the value HERE, at the start, so that a /focus the user sets while the
+    // turn is running survives instead of being cancelled by the turn-end cleanup.
+    const focusAtTurnStart = !!state.focus;
+    if (state.plan) {
+      cfg.toolFilter = ['Read', 'Grep', 'Glob'];
+    } else if (state.focus) {
+      cfg.toolFilter = ['Read', 'Write', 'Edit', 'Bash'];
+    } else {
+      cfg.toolFilter = undefined;
+    }
+
+    // Outside-the-workspace access is NO LONGER implied by the permission mode.
+    // Auto and Yolo used to lift the tool-layer workspace check as a
+    // side effect of auto-approving, which meant switching mode silently granted
+    // filesystem-wide reach — and it MUTATED cfg, so one auto turn left
+    // `allowExternal` permanently true even after switching back to Ask.
+    //
+    // It is now an explicit, persisted setting: /external [on|off], stored as
+    // `tool_allow_external_paths` (or HNCODE_ALLOW_EXTERNAL=1 per session). The mode
+    // decides whether a tool needs ASKING; this decides whether the path guard at
+    // the tool layer lets the call through at all.
+    const mode = state.mode || 'ask';
+    cfg.allowExternal = sessHost.externalAllowed();
+    // AskUserQuestion reads this to refuse in auto mode. Set here so the FIRST
+    // tool call of the turn already sees it (onApproval re-syncs it live after).
+    cfg.permissionMode = mode;
+
+
+    // Approval callback: called before every tool execution
+    const onApproval = async (toolName, args) => {
+      // Read the mode LIVE: /permission, /yolo and /auto can change while the
+      // turn runs, and the decision must follow the CURRENT setting.
+      const cur = state.mode || 'ask';
+      // Keep the TOOL LAYER in step with the LIVE state. Agent snapshots cfg into
+      // its own ctx at construction, so mutating cfg alone would not reach a turn
+      // that is already running. Two things depend on this:
+      //   * allowExternal — resolvePath()'s workspace guard. It follows the
+      //     /external SETTING alone; the permission mode must not widen it, or
+      //     switching to Auto would hand out filesystem-wide reach as a side
+      //     effect of a mode change.
+      //   * permissionMode — AskUserQuestion refuses to ask while auto is on
+      if (state.agent && state.agent.ctx) {
+        state.agent.ctx.allowExternal = sessHost.externalAllowed();
+        state.agent.ctx.permissionMode = cur;
+      }
+
+
+
+      // Standing rules come FIRST, before every mode rule, so:
+      //   * a `deny` cannot be escaped by switching to Auto / Yolo;
+      //   * an explicit `ask` still prompts even in a mode that auto-approves;
+      //   * an `allow` spares the user the same prompt on every turn.
+      const rule = decideFromRules(cfg.permissions, toolName, args);
+      if (rule === 'deny') {
+        viewCur.err(`${toolName} is blocked by a permission rule (deny).`);
+        return false;
+      }
+      // A destructive Bash command is never auto-approved, not even by an `allow`
+      // rule — a rule is written for the command the user had in mind, and a line
+      // can carry a second command the rule never described. `ruleMatches` splits
+      // segments for the same reason; this is the second half of that guard, for
+      // commands where no rule matched at all.
+      const destructive = toolName === 'Bash'
+        && isDestructiveCommand(String((args && (args.command || args.cmd)) || ''));
+      if (rule === 'allow' && !destructive) return true;
+      // `ask` falls through to the prompt below, skipping the mode shortcuts.
+
+      // AUTO MODE ANSWERS HERE, and it answers everything.
+      //
+      // The mode means "nothing asks": the user has already said they do not want to be interrupted
+      // for this session. So nothing below may send them a prompt — not a destructive-looking
+      // command, not a heuristic that misfired. Getting this wrong is worse than the risk it guards
+      // against, because a mode that claims to ask nothing and then asks anyway teaches the user to
+      // hold down Enter, which destroys the value of every prompt that follows.
+      //
+      // `deny` above is checked BEFORE this and still wins, which is the one answer that is meant to
+      // hold regardless of mode — the user wrote that rule down deliberately.
+      //
+      // An explicit `ask` rule is checked just above and skips this, because a rule naming a command
+      // to ask about is also deliberate, and it outranks a mode chosen in a menu.
+      if (rule !== 'ask' && cur === 'auto') return true;
+      // Session approvals (Ctrl+A on a prompt) come AFTER the configured rules and BEFORE the mode
+      // shortcuts:
+      //   * after, so a `deny` or an explicit `ask` rule still wins — a transient grant must not
+      //     override a decision the user wrote down;
+      //   * before, so an approval covers the modes that would otherwise ask again.
+      //
+      // `destructive` is passed in because the approval is keyed on it: approving one `rm -rf build`
+      // must not silently cover every later command that looks similar.
+      if (rule !== 'ask' && isApprovedForSession(session.sessionApprovals, toolName, args, destructive)) {
+        return true;
+      }
+      // Read-only tools never need permission in any mode. AskUserQuestion is on
+      // this list because ASKING the user is not a side effect — gating it behind
+      // an approval prompt would mean answering two prompts to ask one question.
+      // (In auto mode the TOOL refuses itself before any UI; see ctx.permissionMode.)
+      const safeTools = ['Read', 'Grep', 'Glob', 'FetchURL', 'WebSearch', 'TaskOutput', 'TaskList', 'TaskStop', 'TaskWait', 'TodoList', 'FileLines', 'AskUserQuestion'];
+      if (rule !== 'ask' && safeTools.includes(toolName)) return true;
+      // A read-only SHELL COMMAND (ls/git status/rg/cat …) is as safe as a
+      // read-only TOOL, so it runs without a prompt in Ask mode too — the user
+      // has no decision to make about `git log`. Only in `ask`; an explicit
+      // `ask` rule above still wins, and YOLO/AUTO never reach here anyway.
+      if (cur === 'ask' && rule !== 'ask' && toolName === 'Bash') {
+        const c = String((args && (args.command || args.cmd)) || '');
+        if (isReadOnlyCommand(c) && !isDestructiveCommand(c)) return true;
+      }
+
+
+      // Yolo: anything that stays INSIDE the workspace runs
+      // without asking — edits, writes and commands alike. Only work that touches
+      // a path OUTSIDE the workspace (or a command whose target we cannot prove is
+      // inside) needs the user.
+      //
+      // BASH is the exception: a shell command's paths cannot be proven either way
+      // (variables, pipes, subshells), so the old path heuristic flagged ordinary
+      // commands like `ls /tmp` and asked about them. In yolo the user has already
+      // said "run routine work", so Bash runs without the workspace test — only an
+      // obviously destructive command still asks.
+      if (cur === 'yolo' && rule !== 'ask') {
+        if (toolName === 'Bash') {
+          const cmd = String((args && (args.command || args.cmd)) || '');
+          if (!isDestructiveCommand(cmd)) return true;
+        } else if (isInsideWorkspace(state, toolName, args)) {
+          return true;
+        }
+      }
+
+
+
+      return new Promise((resolve) => {
+        let desc = '';
+        if (args && typeof args === 'object') {
+          const keyArgs = args.path || args.file_path || args.pattern || args.command || args.url || args.query || '';
+          desc = String(keyArgs).split('\n')[0].slice(0, 120);
+        }
+        
+        // Lines to display. A Bash command (or any long argument) is shown in
+        // FULL — collapsing it hid exactly what the user must review.
+        const detail = [];
+        const rawArg = (args && typeof args === 'object')
+          ? (args.command || args.cmd || args.pattern || args.path || args.file_path || args.url || args.query || null)
+          : null;
+        if (typeof rawArg === 'string' && rawArg.length) {
+          for (const ln of rawArg.replace(/\r\n/g, '\n').split('\n')) detail.push(ln);
+        }
+        // The prompt must NOT touch the composer: the user may already be typing,
+        // and only Enter/Esc belong to the prompt.
+        state.approvalPending = { toolName, args, desc, resolve, detail };
+        viewCur.render();
+      });
+    };
+    
+    // Seed the agent with the persisted list: Agent() otherwise starts from an
+    // empty todoState, which wiped the panel on every new turn.
+    cfg.todoState = state.todos || [];
+    // AskUserQuestion bridge: the tool calls ctx.askQuestion(questions, ctx) and
+    // awaits the answers. Same promise-handshake the approval prompt uses, so the
+    // agent simply blocks while the user reads and chooses.
+    cfg.askQuestion = (questions, ctx) => new Promise((resolve) => {
+      state.question = {
+        items: questions,
+        index: 0,
+        sel: 0,
+        picked: new Set(),
+        answers: {},
+        // Free-text state. `editing` is null | 'other' | 'supplement' and says
+        // WHICH row is open; `editingText` is its live buffer. The committed
+        // values live in `otherText` / `supplement` so an Esc back-out keeps them.
+        editing: null,
+        editingText: '',
+        // Caret position (character index) inside the free-text buffer. Lets
+        // Left/Right move within the field instead of only appending at the end.
+        editingCaret: 0,
+        otherText: '',
+        supplement: '',
+        resolve: (answers) => resolve(answers),
+      };
+      // An aborted turn must not leave the dialog stranded on screen.
+      const sig = ctx && ctx.signal;
+      const onAbort = () => {
+        if (state.question && state.question.resolve === resolve) {
+          state.question = null;
+          resolve({});
+          viewCur.render();
+        }
+      };
+      if (sig) {
+        if (sig.aborted) { onAbort(); return; }
+        sig.addEventListener('abort', onAbort, { once: true });
+      }
+      viewCur.render();
+    });
+    // Open a file-history turn BEFORE the agent can write anything (file-history.js):
+    // the first write to a file in this turn snapshots its pre-turn content, which
+    // is exactly what /undo restores. Recorded even when nothing is written, so the
+    // index stays lined up one-to-one with the user prompts /undo counts.
+    if (session) beginTurn(session.id);
+    const agent = new Agent({
+      // maxSteps omitted: the agent loop is uncapped (see agent.js).
+      // sessionId makes the prompt-cache key stable per session (see cache.js).
+      // `tasks` is handed to the agent so its ctx REUSES the same store: background
+      // bash jobs and background subagents outlive the turn that started them, and
+      // a fresh store per turn made them disappear (while still running).
+      // `swarm` rides the per-turn cfg so the Agent can gate AgentSwarm on it: the
+      // mode is on `state`, but a tool the model is OFFERED is decided in the
+      // constructor, which only ever sees cfg. Read here rather than relying on the
+      // `/swarm` handler writing cfg, so a session resumed with swarm on gets the
+      // tool and a session with it off never does.
+      cfg: {
+        ...cfg,
+        swarm: !!state.swarm,
+        sessionId: (session && session.id) || cfg.sessionId,
+        tasks: (state.tasks = state.tasks || {}),
+        // The team tools reach the rest of the world through `ctx` (see tools/team.js), and
+        // `ctx` IS this object. Spawning is injected here because only the TUI owns the task
+        // registry, the model config and the frame callbacks a teammate needs.
+        // The one definition, so the tool and `/team add` cannot start different things.
+        spawnTeammates: spawn,
+      },
+      messages, onApproval,
+      // Shell hooks are re-read per turn so an edit to hooks.json (or a /hooks
+      // change) takes effect on the next message without restarting.
+      hookConfig: loadHooks(cfg.workspace).hooks,
+      onEvent: (e) => {
+        // Everything the MODEL streams counts toward the tok/s meter: reasoning
+        // chunks carry `text` just like answer chunks do.
+        //
+        // `_tokTimes` is (re)created here rather than assumed. It used to be
+        // initialized only by /new, so a RESTORED session (`hncode --continue`,
+        // /sessions) had it undefined and the very first streamed token threw
+        // "Cannot read properties of undefined (reading 'push')" — killing the TUI
+        // mid-answer with nothing printed, because this runs inside the agent's
+        // onEvent and the exit handler wipes the alternate screen. The tok/s timer
+        // already tolerated a missing array; the producer did not.
+        const tokTimes = state._tokTimes || (state._tokTimes = []);
+        if (e.text) {
+          const now = Date.now();
+          // The meter's unit is "tokens that arrived at this instant", so it wants the same
+          // unrounded measure the counter uses — otherwise the rate and the total disagree.
+          for (let k = 0, t = estimateTokens(e.text); k < t; k++) tokTimes.push(now);
+        }
+        // Tool-call ARGUMENTS are model output too (a Write's content, a long
+        // Bash command) and used to show 0 tok/s while they streamed. Only the
+        // argument stream counts: `tool_output` is the tool RUNNING, and a
+        // tool_result is a later turn's input, not tokens the model produced.
+        if (e.type === 'tool_args' && e.chunk) {
+          const now = Date.now();
+          for (let k = 0, t = estimateTokens(e.chunk); k < t; k++) tokTimes.push(now);
+          // The same chunk already feeds the tok/s meter: a Write's content is model output,
+          // and the counter and the meter must not disagree about that.
+          //
+          // UNROUNDED: a stream delta is usually a few characters, and rounding each one up
+          // billed three characters as a whole token — see `estimateTokensFloat`. Summed over a
+          // step that read about a third high, and the figure visibly FELL when the provider's
+          // exact count replaced it.
+          sessHost.countOutputTokens(estimateTokensFloat(e.chunk));
+        }
+
+        if (e.type === 'step_start') {
+          state._turnSteps = (state._turnSteps || 0) + 1;
+          state.steps = (state._stepsBase || 0) + state._turnSteps;
+          if (session) session.steps = state.steps;
+          // Persist at every step boundary, not only at turn end. `messages` is the
+          // SAME array this Agent appends to, so copying it here captures every
+          // completed step: a crash mid-turn then loses at most the step in flight
+          // instead of the whole turn.
+          persistTurnProgress(messages);
+          viewCur.renderSoon();
+          return;
+        }
+        if (e.type === 'compacting') {
+          // Open a LIVE compaction block (kimi's CompactionComponent): a blinking
+          // bullet while the summary round-trip runs, so the turn does not sit
+          // silent for seconds. The same row is upgraded in place on `compacted`.
+          // If a compaction block from a PREVIOUS (interrupted) turn is still in the
+          // transcript, settle it first so we never leave two blinking rows or let a
+          // stale cancelled block get re-promoted to running.
+          const stale = state.compactionMsg;
+          if (stale && state.chat.indexOf(stale) >= 0 && stale.phase !== 'running') {
+            const idx = state.chat.indexOf(stale); if (idx >= 0) state.chat.splice(idx, 1);
+          } else if (stale && state.chat.indexOf(stale) < 0) {
+            for (let i = state.chat.length - 1; i >= 0; i--) {
+              if (state.chat[i] && state.chat[i].role === 'compaction') state.chat.splice(i, 1);
+            }
+          }
+          state.compactionMsg = {
+            role: 'compaction', phase: 'running', startedAt: Date.now(),
+            instruction: e.instruction || '',
+          };
+          viewCur.addChat(state.compactionMsg);
+          viewCur.renderSoon();
+          return;
+        }
+        if (e.type === 'compacted') {
+          state.ctxTokens = e.after || state.ctxTokens;
+          state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
+          // Settle the live block rather than pushing a second row: the header
+          // becomes "Compaction complete (X → Y tokens)" and the summary stays
+          // hidden behind Ctrl+O.
+          const block = state.compactionMsg;
+          if (block) {
+            block.phase = 'done';
+            block.tokensBefore = e.before;
+            block.tokensAfter = e.after;
+            block.text = e.summary || '';
+            block._cache = null;
+            state.compactionMsg = null;
+          } else {
+            viewCur.addChat({
+              role: 'compaction', phase: 'done',
+              tokensBefore: e.before, tokensAfter: e.after, text: e.summary || '',
+            });
+          }
+          viewCur.renderSoon();
+          return;
+        }
+        if (e.type === 'compaction_cancelled') {
+          // The user interrupted an auto-compaction. Settle the live block so it
+          // stops blinking and reads as cancelled (nothing was trimmed).
+          const block = state.compactionMsg;
+          if (block) { block.phase = 'cancelled'; block._cache = null; state.compactionMsg = null; }
+          else viewCur.addChat({ role: 'compaction', phase: 'cancelled' });
+          viewCur.renderSoon();
+          return;
+        }
+        if (e.type === 'incomplete') {
+          // Orange: this is a warning, not ordinary system output.
+          viewCur.addChat({ role: 'warn', text: `Stopped: ${e.reason}. The task may be unfinished — send another message to continue.` });
+          return;
+        }
+        if (e.type === 'data') {
+          // Feed the answer text into the paced buffer instead of painting it. The
+          // buffer closes any open reasoning region itself, in arrival order, so the
+          // block settles exactly when the provider moved on rather than when the next
+          // render happened to run.
+          //
+          // The push RETURNS the characters that are due right now, and they are
+          // already off the buffer's queue — applying them is what keeps the delta
+          // whole. Dropping the return value silently lost the head of every delta.
+          sessHost.applyStreamOps(sessHost.streamBuf.pushText(e.text));
+          // Every stream of model output counts, through ONE helper so a fourth stream
+          // cannot be left out the way `think` and `tool_args` were. UNROUNDED, so the deltas
+          // of one answer sum to their true total instead of a rounded token each.
+          sessHost.countOutputTokens(estimateTokensFloat(e.text));
+          viewCur.renderSoon(); return;
+        }
+        if (e.type === 'context') {
+          // Live context gauge: the agent reports the estimated request size once
+          // per step, so the header and /usage track the growing history.
+          state.ctxTokens = e.tokens || 0;
+          state.ctxMax = e.max || state.ctxMax;
+          state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
+          // Keep a bounded series of step sizes so /usage can draw the trend.
+          if (!Array.isArray(state.tokenHistory)) state.tokenHistory = [];
+          const h = state.tokenHistory;
+          if (h[h.length - 1] !== state.ctxTokens) h.push(state.ctxTokens);
+          if (h.length > 240) h.splice(0, h.length - 240);
+          // Mirror onto the session so saveSession (which persists the whole
+          // session object) captures it: a --resume restores the trend chart.
+          if (session) {
+            if (!Array.isArray(session.tokenHistory)) session.tokenHistory = [];
+            if (session.tokenHistory[session.tokenHistory.length - 1] !== state.ctxTokens) session.tokenHistory.push(state.ctxTokens);
+            if (session.tokenHistory.length > 240) session.tokenHistory.splice(0, session.tokenHistory.length - 240);
+          }
+          viewCur.renderSoon(); return;
+        }
+        if (e.type === 'usage') {
+          // Real token accounting from the provider. Folded into a session total
+          // that /usage and /cost report, and persisted with the session so a
+          // --resume does not lose what the session has already spent.
+          //
+          // The COST is recomputed from the total rather than accumulated per
+          // event: switching models mid-session would otherwise price every
+          // earlier request at the new model's rates.
+          if (!state.usage) state.usage = {};
+          state.usage = addUsage(state.usage, e.usage);
+          if (session) session.usage = state.usage;
+          state.lastUsage = e.usage;
+          // The provider's exact count for this request. It REPLACES the running estimate
+          // rather than adding to it, because it already covers everything the estimate was
+          // built from — and it also includes reasoning tokens, which the delta stream does
+          // not carry. `settled` accumulates the finished requests of this turn so a turn
+          // that calls tools sums its steps instead of showing only the last one.
+          if (e.usage && Number.isFinite(e.usage.output)) {
+            state.turnOutputSettled = (state.turnOutputSettled || 0) + e.usage.output;
+            state.turnOutputEstimate = 0;
+            state.turnOutputTokens = (state.turnOutputSettled || 0) + state.turnOutputEstimate;
+          }
+          refreshCost(state, cfg);
+          viewCur.renderSoon(); return;
+        }
+        if (e.type === 'think') {
+          state.seenThinking = true;
+          // Reasoning goes through the SAME buffer as the answer, so both are paced
+          // together and reveal in arrival order. Pacing only the answer would let a
+          // reasoning block pop in provider-sized clumps. The push's return value
+          // carries the characters due now — see the `data` handler above.
+          sessHost.applyStreamOps(sessHost.streamBuf.pushReasoning(e.text));
+          // Reasoning is output the model paid for, and it arrives BEFORE the answer —
+          // leaving it out meant the row sat at zero through the longest part of a turn.
+          sessHost.countOutputTokens(estimateTokensFloat(e.text));
+          viewCur.renderSoon(); return;
+        }
+        if (e.type === 'aborted') {
+          // Show whatever the model had actually produced before the interrupt: the
+          // buffer is holding it, and an aborted turn is exactly when the user is
+          // reading to see how far it got.
+          sessHost.flushStream();
+          const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
+          if (t) t.pending = false;
+          // Settle any RUNNING tool rows too. A tool that was mid-flight when the
+          // user hit Esc never gets its tool_result, so its `pending` stayed true
+          // and the `Using <Tool>` name kept pulsing forever. Clearing it drops the
+          // name to plain cyan immediately.
+          for (const m of state.chat) {
+            if (m.role === 'tool' && m.pending) { m.pending = false; m.failed = true; }
+          }
+          // Use a special role that won't show the ✓ icon
+          state.chat.push({ role: 'aborted', text: C.red + 'interrupted' + C.reset });
+          viewCur.render();
+          return;
+        }
+        if (e.type === 'steer') {
+          // The agent injected a steered message into the running turn.
+          const qm = [...state.chat].reverse().find((m) => m.role === 'queued' && m.text === e.text)
+            || [...state.chat].reverse().find((m) => m.role === 'queued');
+          if (qm) qm.role = 'steer';
+          const qi = state.queued.indexOf(e.text);
+          if (qi >= 0) state.queued.splice(qi, 1);
+          // The steered message just left the queue: push the new list to the web
+          // queue pane immediately, or it lags until the next whole-status sync.
+          try { viewCur.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } 
+          viewCur.renderSoon();
+          return;
+        }
+        if (e.type === 'tool_start') {
+          // A tool call means the model finished this step's reasoning and is now
+          // acting on it, so the turn's text has to be fully on screen first: the tool
+          // row is drawn UNDER the reply, and text still trickling in afterwards would
+          // push it back down. Draining the buffer here is what keeps that from
+          // happening, and it settles the pending thinking block as a side effect (the
+          // close marker rides in the same ordered queue).
+          // The NEXT `think` event opens a new block under the tool output.
+          sessHost.flushStream();
+          sessHost.settleThinking();
+          const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
+          if (!dup) {
+            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now(), _conv: true });
+          }
+        } else if (e.type === 'tool_args') {
+          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
+          if (entry) {
+            // Incremental scan: each chunk is parsed ONCE and the parse state
+            // carries forward. Re-parsing the whole accumulated blob per chunk was
+            // O(n²) and froze the UI on a large Write (see createArgStream).
+            if (!entry._argStream) entry._argStream = createArgStream();
+            feedArgStream(entry._argStream, e.chunk);
+            // Track the key argument as it streams so "Using Bash (cmd)" shows
+            // the command DURING the run rather than only once it has finished.
+            entry.toolArgs = { ...(entry.toolArgs || {}), ...entry._argStream.pairs };
+            if (entry.toolName === 'Write') {
+              entry.streamContent = argStreamValue(entry._argStream, 'content');
+              // Incremental line count so the preview's "… N more lines" note is
+              // exact without re-scanning the whole content every frame.
+              entry._streamLineCount = argStreamLineCount(entry._argStream, 'content');
+            }
+          }
+          viewCur.renderSoon(); return;
+        } else if (e.type === 'tool_output') {
+          // Live output from a running tool (Bash): append it to the matching
+          // "Using …" row so the command's output is visible before it finishes.
+          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
+            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending);
+          if (entry) {
+            // Bounded to a TAIL. This string is mirrored into the hub row and
+            // shipped over SSE on every patch, so leaving it unbounded grew the
+            // TUI's row, the hub's row and the browser's copy together, once per
+            // chunk. Only the tail is ever displayed.
+            entry.liveOutput = tailChars(
+              (entry.liveOutput || '') + e.chunk,
+              LIVE_OUTPUT_MAX_CHARS,
+            );
+            // A swarm streams per-agent lines as they land, each NAMING its agent:
+            // `[#i] started` / `[#i] progress <pct>` / `[#i] finished [n/m]`. Drive each cell
+            // from the line about IT. The previous version read only the running total and
+            // assumed the first `n` agents were the finished ones — but the workers pull from
+            // a shared queue and finish out of order, so the grid marked the wrong cells and
+            // only matched reality once every one of them was done.
+            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
+              const lines = String(entry.liveOutput).split('\n');
+              for (const line of lines) {
+                let m = /^\[#(\d+)\] started$/.exec(line);
+                if (m) {
+                  const mem = entry.swarmMembers[Number(m[1]) - 1];
+                  if (mem && mem.phase === 'queued') { mem.phase = 'working'; mem.ratio = 0; }
+                  continue;
+                }
+                m = /^\[#(\d+)\] progress (\d+)$/.exec(line);
+                if (m) {
+                  const mem = entry.swarmMembers[Number(m[1]) - 1];
+                  const pct = Number(m[2]) / 100;
+                  if (mem && mem.phase !== 'completed') {
+                    mem.phase = 'working';
+                    mem.ratio = Math.max(0, Math.min(1, pct));
+                  }
+                  continue;
+                }
+                m = /^\[#(\d+)\] finished(?: \[\d+\/\d+\])?$/.exec(line);
+                if (m) {
+                  const mem = entry.swarmMembers[Number(m[1]) - 1];
+                  if (mem) { mem.phase = 'completed'; mem.ratio = 1; }
+                }
+              }
+            }
+            viewCur.renderSoon();
+          }
+          return;
+        } else if (e.type === 'tool_use') {
+          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
+            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
+          if (entry) {
+            entry.toolArgs = { ...(entry.toolArgs || {}), ...(e.args || {}) };
+            // AgentSwarm: turn the args into a live member list so the progress
+            // block renders from the moment the swarm is announced. Every item
+            // starts "queued" and flips as the tool reports progress.
+            if (e.name === 'AgentSwarm') {
+              const a = entry.toolArgs || {};
+              entry.swarmDescription = a.description || '';
+              entry.swarmModel = a.subagent_type || '';
+              if (!entry.swarmMembers && Array.isArray(a.items)) {
+                entry.swarmMembers = a.items.map(() => ({ phase: 'queued', ratio: 0, latestText: '' }));
+              }
+            }
+            // Edit: build the +/- diff. The tool now reports the text it actually
+            // replaced on the tool_result (`editDiff`), which is the only way a
+            // LINE-RANGE edit (start_line/end_line/new_content) can produce a
+            // diff — it has no `old_string` in its args. Args still seed a
+            // provisional diff so the rows appear while the edit is still running.
+            if (e.name === 'Edit' && e.args && typeof e.args.old_string === 'string') {
+              let startLine = 1;
+              try {
+                const file = path.isAbsolute(e.args.path || '') ? e.args.path : path.resolve(state.cwd, e.args.path || '');
+                const before = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+                const at = before.indexOf(String(e.args.old_string).split(/\r?\n/)[0]);
+                if (at >= 0) startLine = at + 1;
+              } catch { }
+              entry.diff = lineDiff(e.args.old_string, e.args.new_string, startLine);
+            }
+          }
+          // The args just changed: repaint so "Using <Tool> (<arg>)" appears
+          // as soon as they arrive instead of waiting for the next event.
+          viewCur.renderSoon();
+        } else if (e.type === 'tool_result') {
+          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
+            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
+          // A failed run must be visible on the TOOL line too: the status bullet
+          // turns red (see messageLines).
+          const failedRun = isFailureResult(e.content, e.name);
+          if (entry) {
+            entry.pending = false; entry.id = undefined; entry.failed = failedRun;
+            // The AUTHORITATIVE diff comes from the tool itself (`editDiff`): it
+            // knows the text it really replaced, so this is the only source that
+            // covers line-range edits. Fall back to the provisional diff built
+            // from the args for older/other callers.
+            if (e.editDiff && typeof e.editDiff.old === 'string') {
+              // The tool reports the change AND the file's own lines around it, so the rows come
+              // straight from that payload — no LCS inference, which mis-paired the context rows
+              // into `-`/`+` pairs because the two sides had different shapes.
+              entry.diff = editDiffRows(e.editDiff);
+            }
+            // Hand the counts to the TOOL row (which keeps `+N -N` next to its
+            // name) and the diff to the RESULT row (rendered beneath the `↳`).
+            if (entry.diff) entry._diffCounts = entry.diff;
+            // A finished swarm has no `↳` dump: the progress block IS the result.
+            // Settle every member so the grid and the pip bar read as final.
+            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
+              entry.swarmFailed = failedRun;
+              entry.swarmMembers.forEach((mem) => {
+                if (mem.phase === 'queued' || mem.phase === 'working' || mem.phase === 'prompting') {
+                  mem.phase = failedRun ? 'failed' : 'completed';
+                }
+                mem.ratio = mem.phase === 'completed' ? 1 : mem.ratio;
+              });
+            }
+          }
+          // An AgentSwarm is the ONE exception: it has already rendered its own
+          // result as the live progress block above (cells + status pip bar), so a
+          // `↳ Swarm finished: …` dump underneath would print the same thing twice.
+          const isSwarm = e.name === 'AgentSwarm' && entry && Array.isArray(entry.swarmMembers);
+          // No diff for Write. A write REPLACES a file rather than editing a span of
+          // it, so the "before/after" the renderer would show is the whole old
+          // content against the whole new one — a new file turns into every line
+          // being an addition, and the result row fills the screen with `+` lines
+          // that say nothing about what the model did. The receipt line ("File
+          // written: … N bytes") already reports the outcome, and the Write row
+          // itself streams the content while it arrives.
+          const resultMsg = sessHost.normalizeMsg({
+            role: 'tool_result', text: e.content, failed: failedRun,
+            diff: e.name === 'Write' ? undefined : (entry && entry.diff),
+            // `bodyOnToolRow`: the TOOL row already drew this result's body (a Write
+            // streams the file's content there), so the receipt below it must not
+            // open a second `↳` block. Without this flag the renderer could only
+            // guess, and it guessed wrong — a Write showed
+            //     ↳  1 line one
+            //     ↳ File written: a.txt (1372 bytes)
+            // with two markers for one body.
+            bodyOnToolRow: e.name === 'Write' && !!(entry && entry.streamContent),
+            _conv: true,
+});
+          if (entry && !isSwarm) {
+            const at = state.chat.indexOf(entry);
+            // Skip any rows already sitting between the call and the transcript
+            // tail (the result rows of EARLIER calls in this same step), so each
+            // block reads call -> its result -> call -> its result.
+            let ins = at + 1;
+            while (ins < state.chat.length && state.chat[ins].role === 'tool_result') ins++;
+            state.chat.splice(ins, 0, resultMsg);
+            viewCur.render();
+          } else if (!isSwarm) {
+            viewCur.addChat(resultMsg);
+          } else {
+            viewCur.render();
+          }
+          // NOTE: queued input is deliberately NOT drained into the running turn
+          // here. A message typed while the agent works is a NEW turn, so it waits
+          // for this turn to finish (see the drain after `agent.run()`). Ctrl-S
+          // remains the explicit "steer it into the running turn now" escape hatch.
+          // A finished tool result IS a completed step, so the transcript is
+          // persisted here too — the other half of the step-boundary save above.
+          persistTurnProgress(messages);
+        } else if (e.type === 'error') viewCur.addChat({ role: 'tool_result', text: (e.error && e.error.message) || String(e.error) });
+        else if (e.type === 'truncation_recovery') {
+          // The answer hit the output cap mid-way and the agent asked the model to
+          // continue. Without a row here the transcript simply grew a second
+          // assistant bubble with no sign of why, which reads as a glitch.
+          viewCur.addChat({ role: 'system', text: `Output limit reached — the answer continues (attempt ${e.attempt}/3).` });
+        }
+        else if (e.type === 'results_trimmed') {
+          // Old tool result bodies were replaced by a pointer to disk to shrink the
+          // request (agent.js's trim pass). Say so, including that nothing was lost:
+          // without a row the transcript quietly looks like output went missing, and
+          // the user has no way to know the text is still readable.
+          viewCur.addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk. You can modify or disable this feature by using "/auto-trim"` });
+        }
+        else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; try { viewCur.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ } } 
+        viewCur.render();
+      },
+    });
+    state.agent = agent;
+    if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
+    try { viewCur.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } 
+    // A background subagent (Agent {run_in_background:true}, or an AgentSwarm)
+    // finishes AFTER the turn that launched it returned. The tools call
+    // `ctx._onBackgroundTaskDone`, which nothing installed, so the parent was
+    // never told: its result sat in the task store until the user opened /tasks.
+    // Post it into the transcript when it lands (mirroring how a queued message
+    // arrives after the turn), so the parent model sees it on its next turn.
+    if (agent.ctx) {
+      agent.ctx._onBackgroundTaskDone = (task) => {
+        if (!task) return;
+        // kimi-style lifecycle card: bullet colour by phase, a headline naming
+        // the kind (agent / bash / question task) and what happened, and a dim
+        // detail line. The task's conclusion is kept as the expandable body.
+        const card = backgroundTaskCard(task);
+        const body = String(task.output || '').trim();
+        viewCur.addChat({ role: 'bg_task', card, text: body });
+      };
+    }
+    await agent.run();
+    messages = agent.messages;
+    if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
+    state.agent = null;
+    try { viewCur.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } 
+    const liveThink = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
+    if (liveThink) liveThink.pending = false;
+    // The first turn also names the session. It runs HERE — after the answer is
+    // complete — because the old code tried to parse a title out of the streamed
+    // chunks while `state.running` was still true, so the branch never fired. It
+    // is a separate, tiny request rather than an instruction in the system prompt:
+    // a hidden instruction leaked into the answer and a heading-like first chunk
+    // was mistaken for the title.
+    // `sessHost.makeTitle` is the implementation `startTUI` attaches — it owns the one-shot
+    // LLM request, the terminal-title write, the save and the notice. Referenced THROUGH the
+    // host because `runTurn` is a module-level function and the implementation is a nested
+    // function inside `startTUI`: naming it directly here was a ReferenceError at runtime
+    // (`generateTitle is not defined`), which surfaced as an unhandledRejection that killed
+    // the process mid-turn.
+    //
+    // Wrapped because naming a session is COSMETIC. `SessionHost.generateTitle` already
+    // contains a failure, but that only covers a `makeTitle` that rejects; a throw while
+    // BUILDING the arguments — or an implementation that has not been attached — escaped to
+    // the process handler, which saves and exits(1). A missing label must not end a run.
+    if (needsTitle) {
+      try {
+        await sessHost.generateTitle(text, { makeTitle: sessHost.makeTitle });
+      } catch (e) {
+        // Best effort: the session stays unnamed and a later turn retries, because the guard
+        // above is `!session.title`.
+        try { viewCur.note && viewCur.note(`could not name the session: ${(e && e.message) || e}`); } catch { /* the UI itself */ }
+      }
+    }
+
+
+    // ---- PLAN MODE: finalize the plan and ask to proceed --------------------
+    // The plan bubble is ALREADY on screen (appendAssistant streams the text after
+    // the plan tag straight into it), so this only: closes the tags out of the prose,
+    // asks for approval, and clears the streaming buffer.
+    let approvedPlan = null;
+    if (state.plan) {
+      // Clearing the buffer is what makes the rest of this block correct, and it was
+      // the one part the comment above promised and the code never did: the review
+      // prompt and the plan the user approves are read OUT of the bubbles, while the
+      // paced buffer can still be holding the tail of the reply (a burst drains over
+      // seconds). Reading early summarised — and approved — a truncated plan.
+      sessHost.flushStream();
+      const lastAssistant = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
+      // Prefer what arrived on the wire; fall back to scanning the prose for the
+      // case where the tags were split across bubbles.
+      const streamedPlan = [...state.chat].reverse().find((m) => m.role === 'plan');
+      const planText = (streamedPlan && String(streamedPlan.text).trim())
+        || extractPlan(lastAssistant ? lastAssistant.text : '');
+      if (planText) {
+        // Make sure the bubble holds the final, complete text, and drop any
+        // leftover tag remnants from the prose.
+        if (streamedPlan) streamedPlan.text = planText;
+        else viewCur.addChat({ role: 'plan', text: planText });
+        if (lastAssistant) {
+          lastAssistant.text = String(lastAssistant.text).replace(/<\/?plan>/gi, '').trim();
+          // This is a REPLACEMENT, not an append, so the length-based render-cache
+          // fingerprint could coincide with the previous value and leave a stale
+          // frame. Drop the cache explicitly.
+          lastAssistant._cache = null;
+          if (!lastAssistant.text.trim()) {
+            const i = state.chat.indexOf(lastAssistant);
+            if (i >= 0) state.chat.splice(i, 1);
+          }
+        }
+        // ask / yolo -> the user decides; auto -> approved without asking, which
+        // is the whole point of Auto. The review resolves to one of
+        // 'approve' | 'edit' | 'keep':
+        //   approve — execute the plan as written
+        //   edit    — open the plan in the editor, then execute the EDITED text
+        //   keep    — stay in Plan mode, do not execute
+        const cur = state.mode || 'ask';
+        let outcome = cur === 'auto' ? 'approve' : await new Promise((resolve) => {
+          state.planPending = { plan: planText, resolve };
+          viewCur.render();
+        });
+        state.planPending = null;
+        if (outcome === 'edit') {
+          // Let the user revise the plan before it is executed. The editor is
+          // synchronous from the agent's point of view: we wait for save.
+          // Via the host: `openEditor` is nested in startTUI, `runTurn` is module level. The
+          // bare call threw `openEditor is not defined` when the user chose "edit" on a plan.
+          const edited = await new Promise((resolve) => {
+            sessHost.openEditor({
+              title: 'Review plan — edit before executing',
+              text: planText,
+              caretRow: 0,
+              caretCol: 0,
+              onSave: (value) => resolve(String(value || '').trim()),
+              onCancel: () => resolve(null),
+            });
+            viewCur.render();
+          });
+          if (edited) {
+            // Keep the on-screen bubble in sync with the edited text.
+            const bubble = [...state.chat].reverse().find((m) => m.role === 'plan');
+            if (bubble) { bubble.text = edited; bubble._cache = null; }
+            approvedPlan = edited;
+            outcome = 'approve';
+          } else {
+            outcome = 'keep';
+          }
+        }
+        if (outcome === 'approve') {
+          approvedPlan = planText;
+          // Persist the approved plan next to the project so it survives the
+          // session and can be reviewed with the change (or handed to an issue).
+          try {
+            const saved = savePlan(planText, state.workspace || cfg.workspace);
+            if (saved.ok) viewCur.addChat({ role: 'system', text: `Plan saved: ${saved.path}` });
+          } catch { /* persistence is best-effort */ }
+        }
+      }
+    }
+
+    const approx = estimateMessagesTokens(messages, cfg);
+    state.ctxTokens = approx;
+    state.ctxMax = cfg.maxContextTokens || state.ctxMax;
+    state.ctxPercent = usagePercent(approx, state.ctxMax);
+    // `session.messages` now holds the full request, system prompt included, so the bar
+    // reads the real text from here on and the turn-scoped copy must not be counted too.
+    state.turnSystemPrompt = null;
+    session.messages = messages;
+    session.rounds = state.rounds;
+    session.steps = state.steps;
+    session.rounds = state.rounds;
+    session.steps = state.steps;
+    // The todo list is part of the session's visible state: persist it here
+    // too, so resuming (or `hncode -c`) brings the panel back.
+    session.todos = state.todos || [];
+    // Focus is one turn: the turn it was set for has now ended, so it goes off. Done
+    // HERE, before the save below, so `session.focus` is written false and resuming
+    // the session does not bring the narrowed toolset back. `focusAtTurnStart` (not
+    // the current value) decides, so a /focus issued while the turn ran still stands.
+    if (focusAtTurnStart) state.focus = false;
+    session.focus = !!state.focus;
+    session.swarm = !!state.swarm;
+    // The turn's token totals, so a resumed session keeps the running cost rather
+    // than restarting it at zero (the numbers have to sum across the whole
+    // session for a cost readout to mean anything).
+    session.usage = state.usage || {};
+    sess.saveSession(session);
+    const turnMs = state.turnStart ? Date.now() - state.turnStart : 0;
+    // The live row is `<phrase> <gray>[<time> | <tokens>]`. At the end we keep the same row
+    // shape and only rewrite the WORD, so the brackets, the duration and the token count
+    // stay put and neither is ever repeated. `…` is part of the phrase and is preserved.
+    const wordFrom = String(state.workMsg || WORKING_MESSAGES[0]);
+    state.finishAnim = {
+      start: Date.now(),
+      wordFrom,
+      wordTo: 'turn took',
+      // The morph renders `[` + word + tail, so the tail is the space after the word, the
+      // time, the token count and the closing bracket — nothing else.
+      tail: ` ${elapsedTail(turnMs, state.turnOutputTokens)}]`,
+    };
+    const animStart = Date.now();
+    while (Date.now() - animStart < 520) {
+      viewCur.render();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    state.finishAnim = null;
+    // Also clear startAnim if it's still active (should be cleared already by composeFrame)
+    state.startAnim = null;
+    // The turn is over: everything the model said must be on screen NOW. Draining here
+    // is what stops the last of the reply from trickling out behind the "[turn took …]"
+    // row and behind whatever the next turn draws.
+    sessHost.flushStream();
+    state.running = false;
+    // The agent may have written or edited files this turn: refresh the git badge
+    // now so the diff totals reflect it immediately, instead of waiting for the
+    // 15s timer.
+    refreshGitInfo(state, { force: true });
+
+    if (turnMs > 0) {
+      state.lastTurnMs = turnMs;
+      session.lastTurnMs = turnMs;
+      sess.saveSession(session);
+      // The turn is on screen but may NOT be on disk. A save failure was silent apart
+      // from a line in ~/.hncode/session-errors.log, and a session whose transcript had
+      // grown past the string limit failed every save for over an hour without the user
+      // being told — each turn looked saved and was not. Say so where they are looking.
+      const saveErr = sess.lastSaveFailure();
+      if (saveErr && saveErr.id === session.id) {
+        viewCur.addChat({ role: 'warn', text: `This turn could NOT be saved: ${saveErr.detail}. The conversation is on screen only — see ~/.hncode/session-errors.log.` });
+      }
+      // Same shape the sweep animated into, token count and all.
+      // The same tail the morph settled on, so the row does not change when the animation
+      // hands it over to a real transcript entry.
+      viewCur.addChat({ role: 'system', text: `[turn took ${elapsedTail(turnMs, state.turnOutputTokens)}]` });
+    }
+    viewCur.render();
+    if (state.queued.length) {
+      // Anything still queued was never injected (the turn ended first), so it
+      // becomes its own turn. Texts the agent DID consume were removed from
+      // state.queued by the `steer` handler above.
+      const next = state.queued.shift();
+      if (next) { void sessHost.submit(next); }
+      // Queue shrank: push the updated list to the web queue pane immediately.
+      try { viewCur.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } 
+    }
+    // Approved plan: Plan mode OFF (write tools come back), then re-enter the agent
+    // with the plan as a SYSTEM message. Deliberately NOT via submit(): that path
+    // posts a user bubble and re-runs the whole submit flow, which is what produced
+    // a stray user message and an extra turn teardown before the work started.
+    // Done LAST so it cannot race the queue drain above.
+    if (approvedPlan) {
+      state.plan = false;
+      session.plan = false;
+      sessHost.persistState();
+      viewCur.addChat({ role: 'system', text: 'Plan approved — Plan mode is off, executing.' });
+      viewCur.render();
+      // Through the host, for the same reason as `submit` above: `runAgent` is a nested function
+      // of `startTUI` and this is a module-level one. Called bare it threw
+      // `runAgent is not defined` — on the plan-execute path, which is the last step of the
+      // approved-plan flow, so the approval itself killed the process.
+      void sessHost.runAgent(PLAN_EXECUTE_PREFIX, { asSystem: true });
+    }
+}
+
+/**
+ * Put a session's name on the terminal window (OSC 0).
+ *
+ * Module level, taking the session and the stream, because THREE scopes need it and they do
+ * not share one: `dispatch` and `runTurn` are module functions, while the hub actions and the
+ * startup path live inside `startTUI`. Writing the escape at each site is what made the
+ * behaviour inconsistent — `/new` re-set it, `/title` set it, auto-naming set it, and a
+ * RESUMED session never did, so reopening a named session left the shell's own title in place
+ * and the name looked lost.
+ *
+ * The session is the source of truth, so this projects `session.title` rather than accepting
+ * one. A session with no name yet shows `Untitled` instead of leaving the previous title up.
+ *
+ * Never throws: a window title is cosmetic and must not be able to fail a turn.
+ */
+export function writeWindowTitle(session, stdout) {
+  const title = String((session && session.title) || '').trim();
+  try { stdout.write(`\x1b]0;${title || 'Untitled'}\x07`); } catch { /* cosmetic */ }
+}
+
 // ---- TUI entry point ----
 export async function startTUI(opts) {
   const { cfg } = opts;
+  // `let`, and mirrored on `state.session`, because /move REPLACES the session: the command
   // `let`, and mirrored on `state.session`, because /move REPLACES the session: the command
   // hands back a new object, and every later save would otherwise keep writing the old one —
   // which is how /move left the session stamped with the directory it was moved away from.
@@ -11130,7 +12905,7 @@ export async function startTUI(opts) {
   if (cfg.outputStyle) {
     const s = findStyle(cfg.outputStyle, state.cwd);
     if (s) state.outputStyle = s;
-    else appErr(`Output style "${cfg.outputStyle}" no longer exists — /output-style to pick another.`);
+    else notice(`Output style "${cfg.outputStyle}" no longer exists — /output-style to pick another.`);
   }
   // FEATURE FLAGS: resolved once here so the whole session reads a stable set, and
   // so /experiments has something to show. A flag enabled from the ENVIRONMENT is
@@ -11139,7 +12914,7 @@ export async function startTUI(opts) {
   state.experiments = experimentState(cfg);
   {
     const fromEnv = enabledExperiments({ raw: {} }, process.env);
-    if (fromEnv.length) app(`Experiments from environment: ${fromEnv.join(', ')}`);
+    if (fromEnv.length) notice(`Experiments from environment: ${fromEnv.join(', ')}`);
   }
   // The startup palette: what config says, else `auto` — the brand palette, and the theme
   // schema's own default. Hard-coding 'dark' here meant a saved theme was ignored on the
@@ -11271,7 +13046,7 @@ export async function startTUI(opts) {
       provider: cfg.provider || '',
       mode: PERMISSION_LABEL[state.mode] || state.mode || '',
       cwd: state.cwd || '',
-plan: !!state.plan,
+      plan: !!state.plan,
       focus: !!state.focus,
       swarm: !!state.swarm,
       // Live git status mirror, so the web statusline can show branch + diff
@@ -11300,7 +13075,7 @@ plan: !!state.plan,
       rounds: state.rounds || 0,
       steps: state.steps || 0,
       tokRate: state.tokRate || 0,
-todos: [...(state.todos || [])],
+      todos: [...(state.todos || [])],
       queued: [...(state.queued || [])],
       tasks,
       files: fileList,
@@ -11397,7 +13172,7 @@ todos: [...(state.todos || [])],
       };
     });
     const efforts = effortOptions(cfg);
-return {
+    return {
       model: { value: cfg.model || '', items: modelItems },
       effort: {
         value: state.effort || 'off',
@@ -11584,21 +13359,7 @@ return {
   // a second time would double every `!cmd` on resume.
   const PERSISTED_ROLES = new Set(['system', 'warn', 'plan', 'compaction', 'bg_task', 'skill', 'steer', 'thinking']);
 
-  function recordTranscriptRow(msg) {
-    if (!session) return;
-    if (state.saveHistory === false) return;           // the user's switch
-    const row = normalizeMsg(msg);
-    if (!PERSISTED_ROLES.has(row.role)) return;
-    // Reasoning is the one long-text role here and the bulk of the cost, so it has its
-    // own flag: the short notices stay cheap enough to keep on by default.
-    if (row.role === 'thinking' && state.saveThinking === false) return;
-    const list = (session.transcript = session.transcript || []);
-    const anchor = (session.messages || []).length;
-    // `pending` is dropped by normalizeMsg but the extend test needs it, so it is read
-    // off the live message rather than the normalized copy.
-    const pending = !!(msg && msg.pending);
-    appendTranscriptRow(list, anchor, row, pending);
-  }
+  function recordTranscriptRow(msg) { return sessHost.recordTranscriptRow(msg); }
 
 
   const addChat = (msg) => {
@@ -11700,6 +13461,15 @@ return {
   // same tick still coalesce (paintScheduled), so a burst of stream deltas
   // produces one frame per tick at full speed instead of being throttled to
   // ~60fps and having intermediate frames dropped.
+  /**
+   * Add `n` to the turn's output-token estimate and refresh the number the row shows.
+   *
+   * Called for EVERY stream the model produces — answer, reasoning, tool arguments — because
+   * the turn is billed for all three. The provider's exact figure replaces this estimate when
+   * the `usage` event lands, so the estimate only has to be roughly right while it is on screen.
+   */
+  function countOutputTokens(n) { return sessHost.countOutputTokens(n); }
+
   function renderSoon() {
     if (paintScheduled) return;
     paintScheduled = true;
@@ -11886,12 +13656,27 @@ return {
       title: spec.title || '',
       fields,
       fieldIdx: 0,
-      type: spec.type !== undefined ? spec.type : PROTOCOL_TYPES[0],
+      // The first option of THIS form's list, not a hardcoded protocol name. A form that
+      // supplies `types` and no `type` means "start at the top of what I gave you"; falling
+      // back to PROTOCOL_TYPES[0] left a bool form selecting "openai", which is in no list it
+      // drew — so nothing was highlighted and the arrow keys began from index 0 regardless of
+      // the value in force.
+      // `null` and `undefined` BOTH mean "the caller did not pick one", which is why the test
+      // is a nullish check rather than `!== undefined`. A form that passed null selected
+      // nothing, so no option was highlighted, the first arrow jumped to the top of the list,
+      // and Enter was refused by the handler's own `if (!type)` guard.
+      type: spec.type ?? (Array.isArray(spec.types) && spec.types.length ? spec.types[0] : PROTOCOL_TYPES[0]),
+
       // The selectable Type values. Kept on the form so the keyboard cycle uses the
       // SAME list the renderer draws — a 2-item toggle here silently dropped any
       // third option (e.g. "OpenAI Responses").
       types: Array.isArray(spec.types) && spec.types.length ? spec.types : PROTOCOL_TYPES,
       hideType: !!spec.hideType,
+      // The chooser's own word. 'Type' is the provider dialog's; a bool form says 'Value'.
+      typeLabel: spec.typeLabel || 'Type',
+      // A form whose ONLY question is the chooser draws no field. Two controls for one value
+      // is ambiguous rather than flexible: the reader cannot tell which one wins.
+      hideFields: !!spec.hideFields,
       labelW,
       note: spec.note || '',
       hint: spec.hint || 'Tab next field · ←/→ type · Enter submit · Esc cancel',
@@ -11937,6 +13722,106 @@ return {
     state.menuOpen = false; state.menuList = []; state.menuSel = 0;
     renderFrame();
   }
+
+  // The display, as the session sees it. `runAgent` and everything it calls take this
+  // instead of reaching for `state` and `renderFrame` directly, which is what lets the same
+  // code run in the web daemon where there is no terminal to draw on.
+  const view = tuiView({
+    // `hub` is assigned later (startWeb), so it is read through a getter rather than captured
+    // here — a captured copy would be the null we have now, and every web push would no-op.
+    get hub() { return hub; },
+    renderFrame,
+    renderSoon,
+    addChat,
+    notice,
+    syncWeb: (...a) => syncWeb(...a),
+    openEditor,
+    openPicker,
+    openForm,
+    stdout,
+  });
+
+  // The session, as an object rather than a pile of closure variables. It HOLDS `state` — not
+  // a copy — so the 74 references inside runAgent and every reader in composeFrame are
+  // untouched. What this buys is an interface a second front end can call: submit, dispatch,
+  // interrupt, queue, without a terminal on the other end.
+  // The session machinery that is not the display: the stream buffer's pacing, the persisted
+  // display history, the canonical message shape. A daemon builds one of these too, which is
+  // what lets the same turn run with no terminal attached.
+  /**
+   * Start teammates.
+   *
+   * ONE definition, because both the model's TeamCreate tool (through the per-turn cfg) and the
+   * user's `/team add` need it. It was an inline arrow in the cfg literal, so only the agent
+   * could reach it and `/team add` silently started nothing.
+   *
+   * Not awaited by either caller: a teammate works in the background and reports by message,
+   * which is the whole reason a team is more than a batch of subagents.
+   */
+  async function spawnTeammates(teamName, members) {
+    const { spawnMany } = await import('./team/spawn.js');
+    const started = spawnMany(teamName, members, {
+      cfg,
+      cwd: state.cwd || cfg.workspace,
+      onEvent: (ev) => {
+        // Mirrored into the transcript so the lead sees a teammate come up without opening a
+        // panel, and so a failure is not silent.
+        if (ev.type === 'start') notice(`Teammate ${ev.name} started (${ev.taskId}).`);
+        if (ev.type === 'error') notice(`Teammate ${ev.name} failed: ${ev.error}`, 'error');
+        renderSoon();
+      },
+    });
+    for (const f of started.failed) notice(`Teammate ${f.name} did not start: ${f.error}`, 'error');
+    return started.started;
+  }
+
+  const sessHost = new SessionHost({ state, cfg, session, view, onEvent: (e) => core.emit(e) });
+  // The session-naming implementation, reached by `runTurn` THROUGH the host.
+  //
+  // `runTurn` is a module-level function and this is a nested one inside `startTUI`, so a
+  // direct name reference there is a ReferenceError — the two are not in the same scope at
+  // all, which is why it threw on every turn rather than only the first. Attached here
+  // because `generateTitle` is a hoisted declaration in this same scope: it is defined far
+  // below, but the binding exists as soon as this statement runs.
+  sessHost.makeTitle = generateTitle;
+  // The same indirection, for the same reason: `runTurn` drains the queue by re-entering
+  // `submit`, which is a nested function of THIS scope. Referencing it by name from `runTurn`
+  // threw `submit is not defined` and killed the process on the next turn — the identical
+  // mistake `makeTitle` above exists to fix, made a second time in the same function.
+  //
+  // `submit` is a hoisted declaration, so the binding already exists at this point even though
+  // it is defined below.
+  sessHost.submit = (text) => submit(text);
+  // And the two `runTurn` reaches on the plan paths: the plan editor (12545) and the
+  // plan-execute re-entry (12673). Both were bare names in a module-level function and would
+  // have thrown on the very flows they belong to — "edit this plan" and "approve and run it".
+  sessHost.openEditor = (spec) => openEditor(spec);
+  sessHost.runAgent = (text, opts, viewArg) => runAgent(text, opts, viewArg);
+  // The three appenders the stream buffer releases into. They are the real implementation of
+  // the streaming path — `applyStreamOps` below is only a forwarder — and they live here
+  // because `appendAssistant` and `appendThinking` know what a transcript row is.
+  sessHost.appenders = {
+    assistant: (text) => appendAssistant(text),
+    reasoning: (text) => appendThinking(text),
+    settleReasoning: () => settleThinking(),
+  };
+
+  const core = new SessionCore({ state, cfg, session, view, host: sessHost });
+  // Filled in once `host` is declared (the literal is further down this closure). A command
+  // reads `notice`/`openPicker`/`openForm`/`quit` off this object, so a `dispatch` that passes
+  // something else — the view, for instance — throws on every panel-opening command.
+  let commandHost = null;
+  // Bound here rather than in the constructor because these are declarations further down this
+  // same closure; the core would otherwise need them passed at a point where they are still
+  // being defined. `quit` is used only when a command asks for it.
+  //
+  // The `host2` a caller passes wins; `commandHost` is the fallback the core relies on, since
+  // the core has no way to reach the `host` literal assigned further down this closure.
+  core.bind({
+    runAgent: (text, opts, viewArg) => runAgent(text, opts, viewArg),
+    dispatch: (c, a, st, cf, se, host2) => dispatch(c, a, st, cf, se, host2 || commandHost, submit, stdout),
+    quit: () => quit(),
+  });
 
   // ---- /tasks panel (kimi's TASK BROWSER) ----------------------------------
   function refreshTasksPanel() {
@@ -12095,6 +13980,34 @@ return {
     await loadRegistryData(b.kind);
   }
 
+  // Keys for the team panel. The panel module decides WHAT a key means; this does it, which is
+  // what keeps the decision testable without a terminal.
+  function handleTeamPanelKeyPress(t) {
+    const p = state.teamPanel;
+    if (!p) return;
+    const res = handleTeamPanelKey(p, t);
+    if (!res.handled) return;
+
+    if (res.action === 'close') { state.teamPanel = null; renderFrame(); return; }
+    if (res.action === 'send') {
+      // The panel writes to a member's inbox exactly as `/team msg` does. A teammate cannot
+      // tell the two apart, which is the point: the channel is one channel.
+      try {
+        sendFromPanel(p.teamName, res.to, res.text);
+        p.flash = `sent to ${res.to}`;
+        setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 2500);
+      } catch (e) { p.flash = `could not send: ${(e && e.message) || e}`; }
+      renderFrame();
+      return;
+    }
+    if (res.action === 'markRead') {
+      try { markAllRead(p.teamName, res.name); } catch { /* nothing to mark */ }
+      renderFrame();
+      return;
+    }
+    renderFrame();
+  }
+
   // Key handling for the /files tree. A full-screen takeover: it owns every key while open.
   //
   // Arrows navigate and →/← open and close, which is the shape everyone already knows from
@@ -12176,6 +14089,7 @@ return {
   }
 
   function handleRegistryRowKey(t) {
+    const b = state.registryBrowser;
     if (!b) return false;
 
     // MOUSE first: the browser is a full-screen takeover, so it gets the same
@@ -12409,12 +14323,20 @@ return {
   state.theme = hasTheme(configuredTheme) ? configuredTheme : 'auto';
   setTheme(state.theme);
 
+
+
   // ONLY NOW may the alternate screen be entered. Everything above is a query whose reply
   // arrives on stdin, and the probe owns stdin while it waits — entering the alternate
   // screen first would paint a frame in the wrong palette before the answer came back, which
   // is the flash this ordering exists to prevent.
   stdout.write(alternateScreen(true));
   stdout.write(clearScreen());
+  // Adopt the session's title immediately. A RESUMED session already has one, and without
+  // this the terminal kept whatever the shell had put there — the title only appeared once
+  // something CHANGED it (`/title`, or a fresh auto-naming), so reopening a named session
+  // looked like the name had been lost. The write has to come after the alternate screen is
+  // entered: a window title set before it belongs to the previous screen's frame.
+  writeWindowTitle(session, stdout);
   // Kitty keyboard protocol. Great when supported (finer key reporting), but a
   // terminal that does not implement `>1u` reacts badly to it (dropped/mangled
   // input) — so it is enabled only when the probe heard the terminal speak it.
@@ -12512,7 +14434,7 @@ return {
     for (const d of due) {
       notice(`Schedule "${d.id}" is due — queuing its prompt.`, 'info');
       try { sendPrompt(d.prompt, { fromSchedule: d.id }); }
-      catch (e) { appErr(`Schedule "${d.id}" could not queue its prompt: ${e.message}`); }
+      catch (e) { notice(`Schedule "${d.id}" could not queue its prompt: ${e.message}`); }
     }
   }, 30 * 1000);
   void lastScheduleCheck;
@@ -12564,6 +14486,20 @@ return {
   // the explicit /update command (see its dispatch case).
   let autoCheckTimer = null;
   let autoCheckInflight = false;
+  // Report what the LAST background install did, once. An install cannot change the
+  // running process, so without this the user never learns that an update landed — or
+  // that it failed, which is what a silent detached npm used to do.
+  {
+    const stamp = upd.readUpdateStamp();
+    if (stamp && stamp.status === 'installed') {
+      notice(`Updated to ${stamp.version || 'a newer version'} — restart hncode to use it`);
+      upd.clearUpdateStamp();
+    } else if (stamp && stamp.status === 'error') {
+      // Left in place: /update reports it with the full npm output on demand, and the
+      // one-line summary here would be lost in the startup scroll.
+      notice('The last background update failed. Run /update to see why.');
+    }
+  }
   const runAutoCheck = async () => {
     if (!cfg.autoUpdate || autoCheckInflight) return;
     autoCheckInflight = true;
@@ -12830,7 +14766,11 @@ return {
         const layout = composerLayout(state, insideW - 3);
         const t = state._lastMouse;
         const clickCol = t ? (t.col || 1) - 1 : 1;
-        const colInContent = Math.max(0, clickCol - 1);
+        // The column is measured from the row's PREFIX, because `composerTextIndexAt`
+        // subtracts `preWidth` itself. The row is ` 空│❯ text`: 0-based 0 is CPAD, 1 the wall,
+        // 2-3 the `❯ ` prefix, and the text starts at 5. For text[i] the terminal column is
+        // 6 + i (1-based), so `clickCol` is 5 + i and this must pass 2 + i — an offset of 3.
+        const colInContent = Math.max(0, clickCol - 3);
         const idx = composerTextIndexAt(layout, hb.rowIdx, colInContent);
         state.caret = idx;
         // Store mousedown position for potential drag selection in the composer.
@@ -13485,7 +15425,7 @@ return {
     const errs = keybindings.errors.join('|');
     if (errs && errs !== keybindingsErrored) {
       keybindingsErrored = errs;
-      for (const e of keybindings.errors) app(`!keybindings: ${e}`);
+      for (const e of keybindings.errors) notice(`!keybindings: ${e}`);
     } else if (!errs) {
       keybindingsErrored = '';
     }
@@ -13530,6 +15470,7 @@ return {
     if (state.tasksPanel) { handleTasksPanelKey(t); return; }
     if (state.registryBrowser) { handleRegistryRowKey(t); return; }
     if (state.fileTree) { handleFileTreeKey(t); return; }
+    if (state.teamPanel) { handleTeamPanelKeyPress(t); return; }
     if (t.key === 'mousedown' || t.key === 'mousemove' || t.key === 'mouseup' || t.key === 'rightclick' || t.key === 'mousehover') {
       handleMouse(t);
       return;
@@ -13621,6 +15562,21 @@ return {
       renderFrame();
       if (confirmTimer) clearTimeout(confirmTimer);
       confirmTimer = setTimeout(() => { state.confirmExit = false; renderFrame(); }, 3000);
+      return;
+    }
+    if (t.key === 'escape' && state.running && !state.menuOpen && !state.picker && !state.form
+      && !state.panel && !state.question && !state.editor) {
+      // ESC DURING A TURN INTERRUPTS IT.
+      //
+      // This is what the help text has always claimed — `Press Esc to interrupt the current turn`,
+      // and a shortcut list reading `Esc … interrupt the turn` — but only Ctrl+C was wired to it.
+      // Pressing Esc while a tool ran did nothing at all, which is exactly when the user most wants
+      // out: a Bash command that is taking longer than expected, a screen walk over a big tree.
+      //
+      // Esc stops at the TURN, not at the app: unlike Ctrl+C it never arms the "press again to
+      // exit" prompt, because a key whose whole meaning here is "stop this" must not also be able
+      // to quit. An open overlay is excluded so Esc keeps its other job of closing one.
+      if (state.agent) state.agent.interrupt();
       return;
     }
     if (state.question) {
@@ -14862,9 +16818,7 @@ return {
   // imply it, so merely switching mode handed out filesystem-wide reach — and it
   // MUTATED cfg, leaving the grant in place after switching back to Ask.
   // Read live, so a /external flip applies to the very next tool call.
-  function externalAllowed() {
-    return !!cfg.allowExternal;
-  }
+  function externalAllowed() { return sessHost.externalAllowed(); }
 
   function scrollChat(state, delta) {
     const cols = dims().cols, rows = dims().rows;
@@ -14902,6 +16856,11 @@ return {
     if (!text) { renderFrame(); return; }
     if (!state.running) {
       state.turnStart = Date.now();
+      // The turn's own output tokens, summed across its requests. Reset HERE so the
+      // count belongs to this turn rather than to the session.
+      state.turnOutputTokens = 0;                 // shown on the row
+      state.turnOutputSettled = 0;                // exact, from the usage events
+      state.turnOutputEstimate = 0;               // running estimate for the live request
       // Start animation: 0.5s type out + 0.5s fill with orange = 1s total
       state.startAnim = { start: Date.now() };
       // Marks the tick the steady pulse begins on, so the pulse can start its
@@ -15049,1001 +17008,16 @@ return {
   // `asSystem` injects the text as a SYSTEM message instead of a user message and
   // skips the user bubble. Used by the approved-plan handoff: the plan is not
   // something the user typed, so it must not appear (or persist) as their message.
-  async function runAgent(text, opts = {}) {
-    // Drop any compaction row left dangling by an interrupted turn so the next
-    // auto-compaction starts clean (no ghost 'running' row that blinks with nothing
-    // behind it). The live reference is dropped too.
-    const asSystem = !!opts.asSystem;
-    // `bubbleText` overrides the row drawn in the transcript. A SKILL activation has
-    // already drawn its own card (see dispatch), so it passes the user's args here
-    // only to feed the MODEL — with no args that is '', and a user bubble for an
-    // empty string would show a blank `❯` row under the card.
-    const bubble = opts.bubbleText != null ? opts.bubbleText : text;
-    if (!asSystem && String(bubble).trim()) addChat({ role: 'user', text: bubble, _conv: true });
-    // Fresh buffer for this turn's plan-tag split (see appendAssistant).
-    state._planBuf = '';
-    // A message the user JUST SENT should always bring the newest content into
-    // view, even if they were scrolled up reading history. (Queue/steer do NOT
-    // come through here, so they keep the view exactly where the user left it.)
-    state.scroll = 0;
-    dropScrollPin(state);   // jump to the tail: reseed the anchor on paint
-    // Should THIS turn produce the session title? Decided BEFORE the user message
-    // is appended to the history: the old test lived in the system-prompt builder
-    // and checked `session.messages.length === 0`, but by then the message was
-    // already in there, so the injection never fired and no session was ever
-    // auto-titled.
-    //
-    // The `state.titleAttempts` cap is what makes a FAILED naming retryable. The
-    // old test (`session.messages.length === 0`) was true on the first turn only,
-    // so one offline/aborted/empty reply left the session nameless for good — the
-    // comment on generateTitle claimed it "simply tries again" but nothing did.
-    // A few extra attempts cover a transient failure without paying for a naming
-    // request on every turn of a session the user never wanted named.
-    const TITLE_ATTEMPT_LIMIT = 3;
-    if (state.titleAttempts == null) state.titleAttempts = 0;
-    const needsTitle = !!session && !session.title && state.titleAttempts < TITLE_ATTEMPT_LIMIT;
-    state.titleAttempts++;
-    state.running = true;
-    // Pick the Working… wording ONCE for this turn, so it does not change while
-    // the gradient loops. The next turn picks a new one.
-    state.workMsg = WORKING_MESSAGES[Math.floor(Math.random() * WORKING_MESSAGES.length)];
-    state.rounds = (state.rounds || 0) + 1;
-    state._stepsBase = state.steps || 0;
-    state._turnSteps = 0;
-    // Re-base the start animation to THIS instant and paint immediately.
-    // submit() set startAnim before `running` was true, so nothing could render
-    // yet; by the time a frame was actually drawn the 1s animation had already
-    // run out and the type-out was never seen. Stamping it here — the first
-    // moment the row can be painted — makes the animation start on screen.
-    state.startAnim = { start: Date.now() };
-    state.pulseStart = null;
-    renderFrame();
-    if (session) session.rounds = state.rounds;
-    // The system message is pinned to the front and is NOT persisted to the
-    // session (persisting it would pile up one copy per turn). Any older system
-    // entry in the history is skipped, so the CURRENT prompt is the only one
-    // used:
-    //   * a custom prompt from /set-system-prompt (config.toml `system_prompt`),
-    //     falling back to the built-in SYSTEM_PROMPT;
-    //   * plus the COOL-MODE instruction appended when that mode is ON, so the
-    //     model stops narrating what it is about to do and why.
-    const basePrompt = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
-    let sysText = basePrompt;
-
-    // APPEND rather than replace — the safer of the two prompt knobs, and the one to reach
-    // for when the built-in prompt already does most of what you want.
-    if (cfg.appendSystemPrompt && String(cfg.appendSystemPrompt).trim()) {
-      sysText += '\n\n' + String(cfg.appendSystemPrompt).trim();
-    }
-
-    if (cfg.calmMode) {
-      sysText += '\n\n' + CALM_MODE_INSTRUCTION;
-    }
-    // PLAN MODE (/plan): tell the model what to PRODUCE. The tool filter alone
-    // only removed its write tools — this is what makes it emit a plan block. A user's own
-    // `plan_instructions` is APPENDED, never substituted: replacing this would silently
-    // switch Plan mode back to the behaviour the instruction exists to fix.
-    if (state.plan) {
-      sysText += '\n\n' + PLAN_MODE_INSTRUCTION;
-      if (cfg.planInstructions && String(cfg.planInstructions).trim()) {
-        sysText += '\n\n' + String(cfg.planInstructions).trim();
-      }
-    }
-    // SWARM MODE (/swarm): push the model toward parallel decomposition.
-    if (state.swarm) {
-      sysText += '\n\n' + SWARM_MODE_INSTRUCTION;
-      if (cfg.swarmInstructions && String(cfg.swarmInstructions).trim()) {
-        sysText += '\n\n' + String(cfg.swarmInstructions).trim();
-      }
-    }
-    // FOCUS MODE has no built-in instruction — the tool filter IS its behaviour — so this
-    // is the only place to say anything about it.
-    if (state.focus && cfg.focusInstructions && String(cfg.focusInstructions).trim()) {
-      sysText += '\n\n' + String(cfg.focusInstructions).trim();
-    }
-    const personal = readPersonalPrompt(state.workspace || cfg.workspace);
-    if (personal) {
-      sysText += '\n\n' + personal;
-    }
-    // Agent memory: notes the model wrote for itself in earlier sessions (the
-    // Memory tool). Read fresh each turn like the preferences above, so an edit
-    // lands on the next prompt. Injected AFTER the user's preferences: the user's
-    // standing instructions outrank the model's own earlier notes.
-    const memory = readMemory(state.workspace || cfg.workspace);
-    if (memory) {
-      sysText += '\n\n' + memory;
-    }
-    // OUTPUT STYLE (/output-style): a form-of-reply instruction read from a file,
-    // re-read per turn like the notes above so editing the file takes effect on the
-    // next request. Placed AFTER the preferences and memory but BEFORE AGENTS.md:
-    // the project's own instructions are the most specific thing here and must win.
-    if (state.outputStyle && state.outputStyle.body) {
-      sysText += '\n\n' + styleReminder(state.outputStyle);
-    }
-    // AGENTS.md: the PROJECT's own instructions, read fresh each turn like the
-    // personal notes above, so an edit (or a fresh /init) takes effect on the next
-    // prompt. Injected LAST and deepest-last so a nested file outranks the root one,
-    // which is the precedence order codex documents. Previously /init wrote this
-    // file and nothing ever loaded it.
-const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state.workspace || cfg.workspace);
-    if (agents) {
-      sysText += '\n\n' + agents;
-    }
-    let messages = [{ role: 'system', content: sysText }];
-    // Mixin seam: let plugins rewrite the assembled system prompt before the turn.
-    try { sysText = await runPatch('systemPrompt', { text: sysText }, (c) => c.text); messages = [{ role: 'system', content: sysText }]; } catch (e) { console.error('[hncode-plugin] systemPrompt patch error:', e.message); }
-    // A skill body is injected as its OWN system message so it reaches the model
-    // but never appears (or persists) as the user's words, mirroring kimi's
-    // activation card. It is filtered out of the saved session like sysText.
-    if (opts.skillBody) messages.push({ role: 'system', content: opts.skillBody });
-    if (session.messages && session.messages.length) {
-      for (const m of session.messages) {
-        if (m.role === 'system') continue;
-        // Drop an assistant message carrying neither content nor toolCalls — the
-        // residue of an old bug.
-        if (m.role === 'assistant'
-            && !(typeof m.content === 'string' && m.content.trim())
-            && !(Array.isArray(m.toolCalls) && m.toolCalls.length)) {
-          continue;
-        }
-        messages.push(m);
-      }
-    }
-    // The approved-plan handoff arrives as a SYSTEM message: it is an instruction
-    // from the harness, not something the user typed, and it must not show up as a
-    // user bubble or be persisted as one.
-    //
-    // A SKILL activation's `text` is only the `/skill:<name>` marker. Sending that as
-    // the user turn told the model nothing and DROPPED the user's own instruction
-    // (`/skill:foo make it blue` lost "make it blue"). So:
-    //   * with args  -> the args ARE the user turn (the body rides a system message);
-    //   * without args -> there is no user text at all. Pushing the marker would put
-    //     the literal `/skill:foo` into the conversation, which is worse than an empty
-    //     turn: the model reads it as the user having typed a command. The skill body
-    //     is the whole instruction in that case, so no user message is added.
-    const argsText = opts.bubbleText != null ? String(opts.bubbleText).trim() : '';
-    const isSkill = opts.bubbleText != null;
-    if (asSystem) messages.push({ role: 'system', content: text });
-    else if (isSkill && !argsText) { /* body-only activation: nothing for the user turn */ }
-    else messages.push({ role: 'user', content: opts.modelText != null ? opts.modelText : (argsText || text) });
-    // Only the conversation is persisted; the system message does not go into the
-    // session. Saving a turn is left to the end of the turn (after agent.run) —
-    // writing mid-turn would make sending feel sluggish.
-    //
-    // The assembled prompt is parked on `state` instead, for the length of the turn. It
-    // cannot live in `session.messages` (see contextSegments): the array is trimmed to
-    // non-system roles here and again at every step boundary, so with nothing carrying the
-    // text the status bar's `system prompt` segment collapses to zero columns and vanishes
-    // mid-turn, then returns at turn end when the untrimmed request is assigned back.
-    state.turnSystemPrompt = sysText;
-Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
-    // The user's message is on disk before the agent has done anything. A crash
-    // this early used to lose the entire prompt, because the first save was at
-    // turn end.
-    try { sess.saveSession(session); } catch { }
-
-    // Called at every step boundary. `messages` is the array the agent appends to,
-    // so re-filtering it into the session and writing to disk keeps the saved
-    // transcript within one step of what is on screen. Cheap: saveSession is a
-    // synchronous write of one JSON file, and a step is seconds apart.
-    function persistTurnProgress(list) {
-      if (!session || !Array.isArray(list)) return;
-      session.messages = list.filter((m) => m.role !== 'system');
-      session.rounds = state.rounds || session.rounds;
-      session.steps = state.steps || session.steps;
-      session.todos = state.todos || session.todos;
-      session.mode = state.mode || session.mode;
-      try { sess.saveSession(session); } catch { }
-    }
-
-    // Focus is a ONE-TURN mode: it narrows the toolset for the turn the user set it
-    // on, and turns itself off when that turn ends (see the end of this function).
-    // Remember the value HERE, at the start, so that a /focus the user sets while the
-    // turn is running survives instead of being cancelled by the turn-end cleanup.
-    const focusAtTurnStart = !!state.focus;
-    if (state.plan) {
-      cfg.toolFilter = ['Read', 'Grep', 'Glob'];
-    } else if (state.focus) {
-      cfg.toolFilter = ['Read', 'Write', 'Edit', 'Bash'];
-    } else {
-      cfg.toolFilter = undefined;
-    }
-
-    // Outside-the-workspace access is NO LONGER implied by the permission mode.
-    // Auto and Yolo used to lift the tool-layer workspace check as a
-    // side effect of auto-approving, which meant switching mode silently granted
-    // filesystem-wide reach — and it MUTATED cfg, so one auto turn left
-    // `allowExternal` permanently true even after switching back to Ask.
-    //
-    // It is now an explicit, persisted setting: /external [on|off], stored as
-    // `tool_allow_external_paths` (or HNCODE_ALLOW_EXTERNAL=1 per session). The mode
-    // decides whether a tool needs ASKING; this decides whether the path guard at
-    // the tool layer lets the call through at all.
-    const mode = state.mode || 'ask';
-    cfg.allowExternal = externalAllowed();
-    // AskUserQuestion reads this to refuse in auto mode. Set here so the FIRST
-    // tool call of the turn already sees it (onApproval re-syncs it live after).
-    cfg.permissionMode = mode;
-
-
-    // Approval callback: called before every tool execution
-    const onApproval = async (toolName, args) => {
-      // Read the mode LIVE: /permission, /yolo and /auto can change while the
-      // turn runs, and the decision must follow the CURRENT setting.
-      const cur = state.mode || 'ask';
-      // Keep the TOOL LAYER in step with the LIVE state. Agent snapshots cfg into
-      // its own ctx at construction, so mutating cfg alone would not reach a turn
-      // that is already running. Two things depend on this:
-      //   * allowExternal — resolvePath()'s workspace guard. It follows the
-      //     /external SETTING alone; the permission mode must not widen it, or
-      //     switching to Auto would hand out filesystem-wide reach as a side
-      //     effect of a mode change.
-      //   * permissionMode — AskUserQuestion refuses to ask while auto is on
-      if (state.agent && state.agent.ctx) {
-        state.agent.ctx.allowExternal = externalAllowed();
-        state.agent.ctx.permissionMode = cur;
-      }
-
-
-
-      // Standing rules come FIRST, before every mode rule, so:
-      //   * a `deny` cannot be escaped by switching to Auto / Yolo;
-      //   * an explicit `ask` still prompts even in a mode that auto-approves;
-      //   * an `allow` spares the user the same prompt on every turn.
-      const rule = decideFromRules(cfg.permissions, toolName, args);
-      if (rule === 'deny') {
-        appErr(`${toolName} is blocked by a permission rule (deny).`);
-        return false;
-      }
-      if (rule === 'allow') return true;
-      // `ask` falls through to the prompt below, skipping the mode shortcuts.
-
-      if (rule !== 'ask') {
-        if (cur === 'auto') return true;
-      }
-      // Session approvals (Ctrl+A on a prompt) come AFTER the configured rules and
-      // BEFORE the mode shortcuts:
-      //   * after, so a `deny` or an explicit `ask` rule still wins — a transient
-      //     grant must not override a decision the user wrote down;
-      //   * before, so an approval covers the modes that would otherwise ask again.
-      // A destructive command is excluded inside the check, whatever was approved.
-      {
-        const destructive = toolName === 'Bash'
-          && isDestructiveCommand(String((args && (args.command || args.cmd)) || ''));
-        if (rule !== 'ask' && isApprovedForSession(session.sessionApprovals, toolName, args, destructive)) {
-          return true;
-        }
-      }
-      // Read-only tools never need permission in any mode. AskUserQuestion is on
-      // this list because ASKING the user is not a side effect — gating it behind
-      // an approval prompt would mean answering two prompts to ask one question.
-      // (In auto mode the TOOL refuses itself before any UI; see ctx.permissionMode.)
-      const safeTools = ['Read', 'Grep', 'Glob', 'FetchURL', 'WebSearch', 'TaskOutput', 'TaskList', 'TaskStop', 'TaskWait', 'TodoList', 'FileLines', 'AskUserQuestion'];
-      if (rule !== 'ask' && safeTools.includes(toolName)) return true;
-      // A read-only SHELL COMMAND (ls/git status/rg/cat …) is as safe as a
-      // read-only TOOL, so it runs without a prompt in Ask mode too — the user
-      // has no decision to make about `git log`. Only in `ask`; an explicit
-      // `ask` rule above still wins, and YOLO/AUTO never reach here anyway.
-      if (cur === 'ask' && rule !== 'ask' && toolName === 'Bash') {
-        const c = String((args && (args.command || args.cmd)) || '');
-        if (isReadOnlyCommand(c) && !isDestructiveCommand(c)) return true;
-      }
-
-
-      // Yolo: anything that stays INSIDE the workspace runs
-      // without asking — edits, writes and commands alike. Only work that touches
-      // a path OUTSIDE the workspace (or a command whose target we cannot prove is
-      // inside) needs the user.
-      //
-      // BASH is the exception: a shell command's paths cannot be proven either way
-      // (variables, pipes, subshells), so the old path heuristic flagged ordinary
-      // commands like `ls /tmp` and asked about them. In yolo the user has already
-      // said "run routine work", so Bash runs without the workspace test — only an
-      // obviously destructive command still asks.
-      if (cur === 'yolo' && rule !== 'ask') {
-        if (toolName === 'Bash') {
-          const cmd = String((args && (args.command || args.cmd)) || '');
-          if (!isDestructiveCommand(cmd)) return true;
-        } else if (isInsideWorkspace(state, toolName, args)) {
-          return true;
-        }
-      }
-
-
-
-      return new Promise((resolve) => {
-        let desc = '';
-        if (args && typeof args === 'object') {
-          const keyArgs = args.path || args.file_path || args.pattern || args.command || args.url || args.query || '';
-          desc = String(keyArgs).split('\n')[0].slice(0, 120);
-        }
-        
-        // Lines to display. A Bash command (or any long argument) is shown in
-        // FULL — collapsing it hid exactly what the user must review.
-        const detail = [];
-        const rawArg = (args && typeof args === 'object')
-          ? (args.command || args.cmd || args.pattern || args.path || args.file_path || args.url || args.query || null)
-          : null;
-        if (typeof rawArg === 'string' && rawArg.length) {
-          for (const ln of rawArg.replace(/\r\n/g, '\n').split('\n')) detail.push(ln);
-        }
-        // The prompt must NOT touch the composer: the user may already be typing,
-        // and only Enter/Esc belong to the prompt.
-        state.approvalPending = { toolName, args, desc, resolve, detail };
-        renderFrame();
-      });
-    };
-    
-    // Seed the agent with the persisted list: Agent() otherwise starts from an
-    // empty todoState, which wiped the panel on every new turn.
-    cfg.todoState = state.todos || [];
-    // AskUserQuestion bridge: the tool calls ctx.askQuestion(questions, ctx) and
-    // awaits the answers. Same promise-handshake the approval prompt uses, so the
-    // agent simply blocks while the user reads and chooses.
-    cfg.askQuestion = (questions, ctx) => new Promise((resolve) => {
-      state.question = {
-        items: questions,
-        index: 0,
-        sel: 0,
-        picked: new Set(),
-        answers: {},
-        // Free-text state. `editing` is null | 'other' | 'supplement' and says
-        // WHICH row is open; `editingText` is its live buffer. The committed
-        // values live in `otherText` / `supplement` so an Esc back-out keeps them.
-        editing: null,
-        editingText: '',
-        // Caret position (character index) inside the free-text buffer. Lets
-        // Left/Right move within the field instead of only appending at the end.
-        editingCaret: 0,
-        otherText: '',
-        supplement: '',
-        resolve: (answers) => resolve(answers),
-      };
-      // An aborted turn must not leave the dialog stranded on screen.
-      const sig = ctx && ctx.signal;
-      const onAbort = () => {
-        if (state.question && state.question.resolve === resolve) {
-          state.question = null;
-          resolve({});
-          renderFrame();
-        }
-      };
-      if (sig) {
-        if (sig.aborted) { onAbort(); return; }
-        sig.addEventListener('abort', onAbort, { once: true });
-      }
-      renderFrame();
-    });
-    // Open a file-history turn BEFORE the agent can write anything (file-history.js):
-    // the first write to a file in this turn snapshots its pre-turn content, which
-    // is exactly what /undo restores. Recorded even when nothing is written, so the
-    // index stays lined up one-to-one with the user prompts /undo counts.
-    if (session) beginTurn(session.id);
-    const agent = new Agent({
-      // maxSteps omitted: the agent loop is uncapped (see agent.js).
-      // sessionId makes the prompt-cache key stable per session (see cache.js).
-      // `tasks` is handed to the agent so its ctx REUSES the same store: background
-      // bash jobs and background subagents outlive the turn that started them, and
-      // a fresh store per turn made them disappear (while still running).
-      // `swarm` rides the per-turn cfg so the Agent can gate AgentSwarm on it: the
-      // mode is on `state`, but a tool the model is OFFERED is decided in the
-      // constructor, which only ever sees cfg. Read here rather than relying on the
-      // `/swarm` handler writing cfg, so a session resumed with swarm on gets the
-      // tool and a session with it off never does.
-      cfg: { ...cfg, swarm: !!state.swarm, sessionId: (session && session.id) || cfg.sessionId, tasks: (state.tasks = state.tasks || {}) },
-      messages, onApproval,
-      // Shell hooks are re-read per turn so an edit to hooks.json (or a /hooks
-      // change) takes effect on the next message without restarting.
-      hookConfig: loadHooks(cfg.workspace).hooks,
-      onEvent: (e) => {
-        // Everything the MODEL streams counts toward the tok/s meter: reasoning
-        // chunks carry `text` just like answer chunks do.
-        //
-        // `_tokTimes` is (re)created here rather than assumed. It used to be
-        // initialized only by /new, so a RESTORED session (`hncode --continue`,
-        // /sessions) had it undefined and the very first streamed token threw
-        // "Cannot read properties of undefined (reading 'push')" — killing the TUI
-        // mid-answer with nothing printed, because this runs inside the agent's
-        // onEvent and the exit handler wipes the alternate screen. The tok/s timer
-        // already tolerated a missing array; the producer did not.
-        const tokTimes = state._tokTimes || (state._tokTimes = []);
-        if (e.text) {
-          const now = Date.now();
-          for (let k = 0, t = estimateTokens(e.text); k < t; k++) tokTimes.push(now);
-        }
-        // Tool-call ARGUMENTS are model output too (a Write's content, a long
-        // Bash command) and used to show 0 tok/s while they streamed. Only the
-        // argument stream counts: `tool_output` is the tool RUNNING, and a
-        // tool_result is a later turn's input, not tokens the model produced.
-        if (e.type === 'tool_args' && e.chunk) {
-          const now = Date.now();
-          for (let k = 0, t = estimateTokens(e.chunk); k < t; k++) tokTimes.push(now);
-        }
-        if (e.type === 'step_start') {
-          state._turnSteps = (state._turnSteps || 0) + 1;
-          state.steps = (state._stepsBase || 0) + state._turnSteps;
-          if (session) session.steps = state.steps;
-          // Persist at every step boundary, not only at turn end. `messages` is the
-          // SAME array this Agent appends to, so copying it here captures every
-          // completed step: a crash mid-turn then loses at most the step in flight
-          // instead of the whole turn.
-          persistTurnProgress(messages);
-          renderSoon();
-          return;
-        }
-        if (e.type === 'compacting') {
-          // Open a LIVE compaction block (kimi's CompactionComponent): a blinking
-          // bullet while the summary round-trip runs, so the turn does not sit
-          // silent for seconds. The same row is upgraded in place on `compacted`.
-          // If a compaction block from a PREVIOUS (interrupted) turn is still in the
-          // transcript, settle it first so we never leave two blinking rows or let a
-          // stale cancelled block get re-promoted to running.
-          const stale = state.compactionMsg;
-          if (stale && state.chat.indexOf(stale) >= 0 && stale.phase !== 'running') {
-            const idx = state.chat.indexOf(stale); if (idx >= 0) state.chat.splice(idx, 1);
-          } else if (stale && state.chat.indexOf(stale) < 0) {
-            for (let i = state.chat.length - 1; i >= 0; i--) {
-              if (state.chat[i] && state.chat[i].role === 'compaction') state.chat.splice(i, 1);
-            }
-          }
-          state.compactionMsg = {
-            role: 'compaction', phase: 'running', startedAt: Date.now(),
-            instruction: e.instruction || '',
-          };
-          addChat(state.compactionMsg);
-          renderSoon();
-          return;
-        }
-        if (e.type === 'compacted') {
-          state.ctxTokens = e.after || state.ctxTokens;
-          state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
-          // Settle the live block rather than pushing a second row: the header
-          // becomes "Compaction complete (X → Y tokens)" and the summary stays
-          // hidden behind Ctrl+O.
-          const block = state.compactionMsg;
-          if (block) {
-            block.phase = 'done';
-            block.tokensBefore = e.before;
-            block.tokensAfter = e.after;
-            block.text = e.summary || '';
-            block._cache = null;
-            state.compactionMsg = null;
-          } else {
-            addChat({
-              role: 'compaction', phase: 'done',
-              tokensBefore: e.before, tokensAfter: e.after, text: e.summary || '',
-            });
-          }
-          renderSoon();
-          return;
-        }
-        if (e.type === 'compaction_cancelled') {
-          // The user interrupted an auto-compaction. Settle the live block so it
-          // stops blinking and reads as cancelled (nothing was trimmed).
-          const block = state.compactionMsg;
-          if (block) { block.phase = 'cancelled'; block._cache = null; state.compactionMsg = null; }
-          else addChat({ role: 'compaction', phase: 'cancelled' });
-          renderSoon();
-          return;
-        }
-        if (e.type === 'incomplete') {
-          // Orange: this is a warning, not ordinary system output.
-          addChat({ role: 'warn', text: `Stopped: ${e.reason}. The task may be unfinished — send another message to continue.` });
-          return;
-        }
-        if (e.type === 'data') {
-          // Feed the answer text into the paced buffer instead of painting it. The
-          // buffer closes any open reasoning region itself, in arrival order, so the
-          // block settles exactly when the provider moved on rather than when the next
-          // render happened to run.
-          //
-          // The push RETURNS the characters that are due right now, and they are
-          // already off the buffer's queue — applying them is what keeps the delta
-          // whole. Dropping the return value silently lost the head of every delta.
-          applyStreamOps(streamBuf.pushText(e.text));
-          renderSoon(); return;
-        }
-        if (e.type === 'context') {
-          // Live context gauge: the agent reports the estimated request size once
-          // per step, so the header and /usage track the growing history.
-          state.ctxTokens = e.tokens || 0;
-          state.ctxMax = e.max || state.ctxMax;
-          state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
-          // Keep a bounded series of step sizes so /usage can draw the trend.
-          if (!Array.isArray(state.tokenHistory)) state.tokenHistory = [];
-          const h = state.tokenHistory;
-          if (h[h.length - 1] !== state.ctxTokens) h.push(state.ctxTokens);
-          if (h.length > 240) h.splice(0, h.length - 240);
-          // Mirror onto the session so saveSession (which persists the whole
-          // session object) captures it: a --resume restores the trend chart.
-          if (session) {
-            if (!Array.isArray(session.tokenHistory)) session.tokenHistory = [];
-            if (session.tokenHistory[session.tokenHistory.length - 1] !== state.ctxTokens) session.tokenHistory.push(state.ctxTokens);
-            if (session.tokenHistory.length > 240) session.tokenHistory.splice(0, session.tokenHistory.length - 240);
-          }
-          renderSoon(); return;
-        }
-        if (e.type === 'usage') {
-          // Real token accounting from the provider. Folded into a session total
-          // that /usage and /cost report, and persisted with the session so a
-          // --resume does not lose what the session has already spent.
-          //
-          // The COST is recomputed from the total rather than accumulated per
-          // event: switching models mid-session would otherwise price every
-          // earlier request at the new model's rates.
-          if (!state.usage) state.usage = {};
-          state.usage = addUsage(state.usage, e.usage);
-          if (session) session.usage = state.usage;
-          state.lastUsage = e.usage;
-          refreshCost(state, cfg);
-          renderSoon(); return;
-        }
-        if (e.type === 'think') {
-          state.seenThinking = true;
-          // Reasoning goes through the SAME buffer as the answer, so both are paced
-          // together and reveal in arrival order. Pacing only the answer would let a
-          // reasoning block pop in provider-sized clumps. The push's return value
-          // carries the characters due now — see the `data` handler above.
-          applyStreamOps(streamBuf.pushReasoning(e.text));
-          renderSoon(); return;
-        }
-        if (e.type === 'aborted') {
-          // Show whatever the model had actually produced before the interrupt: the
-          // buffer is holding it, and an aborted turn is exactly when the user is
-          // reading to see how far it got.
-          flushStream();
-          const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
-          if (t) t.pending = false;
-          // Settle any RUNNING tool rows too. A tool that was mid-flight when the
-          // user hit Esc never gets its tool_result, so its `pending` stayed true
-          // and the `Using <Tool>` name kept pulsing forever. Clearing it drops the
-          // name to plain cyan immediately.
-          for (const m of state.chat) {
-            if (m.role === 'tool' && m.pending) { m.pending = false; m.failed = true; }
-          }
-          // Use a special role that won't show the ✓ icon
-          state.chat.push({ role: 'aborted', text: C.red + 'interrupted' + C.reset });
-          renderFrame();
-          return;
-        }
-        if (e.type === 'steer') {
-          // The agent injected a steered message into the running turn.
-          const qm = [...state.chat].reverse().find((m) => m.role === 'queued' && m.text === e.text)
-            || [...state.chat].reverse().find((m) => m.role === 'queued');
-          if (qm) qm.role = 'steer';
-          const qi = state.queued.indexOf(e.text);
-          if (qi >= 0) state.queued.splice(qi, 1);
-          // The steered message just left the queue: push the new list to the web
-          // queue pane immediately, or it lags until the next whole-status sync.
-          if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
-          renderSoon();
-          return;
-        }
-        if (e.type === 'tool_start') {
-          // A tool call means the model finished this step's reasoning and is now
-          // acting on it, so the turn's text has to be fully on screen first: the tool
-          // row is drawn UNDER the reply, and text still trickling in afterwards would
-          // push it back down. Draining the buffer here is what keeps that from
-          // happening, and it settles the pending thinking block as a side effect (the
-          // close marker rides in the same ordered queue).
-          // The NEXT `think` event opens a new block under the tool output.
-          flushStream();
-          settleThinking();
-          const dup = state.chat.some((m) => m.role === 'tool' && m.pending && m.id === e.id);
-          if (!dup) {
-            state.chat.push({ role: 'tool', toolName: e.name, toolArgs: {}, pending: true, id: e.id, streamContent: '', startAt: Date.now(), _conv: true });
-          }
-        } else if (e.type === 'tool_args') {
-          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id);
-          if (entry) {
-            // Incremental scan: each chunk is parsed ONCE and the parse state
-            // carries forward. Re-parsing the whole accumulated blob per chunk was
-            // O(n²) and froze the UI on a large Write (see createArgStream).
-            if (!entry._argStream) entry._argStream = createArgStream();
-            feedArgStream(entry._argStream, e.chunk);
-            // Track the key argument as it streams so "Using Bash (cmd)" shows
-            // the command DURING the run rather than only once it has finished.
-            entry.toolArgs = { ...(entry.toolArgs || {}), ...entry._argStream.pairs };
-            if (entry.toolName === 'Write') {
-              entry.streamContent = argStreamValue(entry._argStream, 'content');
-              // Incremental line count so the preview's "… N more lines" note is
-              // exact without re-scanning the whole content every frame.
-              entry._streamLineCount = argStreamLineCount(entry._argStream, 'content');
-            }
-          }
-          renderSoon(); return;
-        } else if (e.type === 'tool_output') {
-          // Live output from a running tool (Bash): append it to the matching
-          // "Using …" row so the command's output is visible before it finishes.
-          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
-            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending);
-          if (entry) {
-            // Bounded to a TAIL. This string is mirrored into the hub row and
-            // shipped over SSE on every patch, so leaving it unbounded grew the
-            // TUI's row, the hub's row and the browser's copy together, once per
-            // chunk. Only the tail is ever displayed.
-            entry.liveOutput = tailChars(
-              (entry.liveOutput || '') + e.chunk,
-              LIVE_OUTPUT_MAX_CHARS,
-            );
-            // A swarm streams `[n/m] finished` lines as subagents land: advance the
-            // matching cells from queued -> completed so the grid fills in live.
-            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
-              const done = (String(entry.liveOutput).match(/^\[\d+\/\d+\] finished$/gm) || []).length;
-              entry.swarmMembers.forEach((mem, i) => {
-                if (i < done) { mem.phase = 'completed'; mem.ratio = 1; }
-                else if (i === done) { mem.phase = 'working'; mem.ratio = 0.5; }
-              });
-            }
-            renderSoon();
-          }
-          return;
-        } else if (e.type === 'tool_use') {
-          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
-            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
-          if (entry) {
-            entry.toolArgs = { ...(entry.toolArgs || {}), ...(e.args || {}) };
-            // AgentSwarm: turn the args into a live member list so the progress
-            // block renders from the moment the swarm is announced. Every item
-            // starts "queued" and flips as the tool reports progress.
-            if (e.name === 'AgentSwarm') {
-              const a = entry.toolArgs || {};
-              entry.swarmDescription = a.description || '';
-              entry.swarmModel = a.subagent_type || '';
-              if (!entry.swarmMembers && Array.isArray(a.items)) {
-                entry.swarmMembers = a.items.map(() => ({ phase: 'queued', ratio: 0, latestText: '' }));
-              }
-            }
-            // Edit: build the +/- diff. The tool now reports the text it actually
-            // replaced on the tool_result (`editDiff`), which is the only way a
-            // LINE-RANGE edit (start_line/end_line/new_content) can produce a
-            // diff — it has no `old_string` in its args. Args still seed a
-            // provisional diff so the rows appear while the edit is still running.
-            if (e.name === 'Edit' && e.args && typeof e.args.old_string === 'string') {
-              let startLine = 1;
-              try {
-                const file = path.isAbsolute(e.args.path || '') ? e.args.path : path.resolve(state.cwd, e.args.path || '');
-                const before = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-                const at = before.indexOf(String(e.args.old_string).split(/\r?\n/)[0]);
-                if (at >= 0) startLine = at + 1;
-              } catch { }
-              entry.diff = lineDiff(e.args.old_string, e.args.new_string, startLine);
-            }
-          }
-          // The args just changed: repaint so "Using <Tool> (<arg>)" appears
-          // as soon as they arrive instead of waiting for the next event.
-          renderSoon();
-        } else if (e.type === 'tool_result') {
-          const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
-            || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
-          // A failed run must be visible on the TOOL line too: the status bullet
-          // turns red (see messageLines).
-          const failedRun = isFailureResult(e.content, e.name);
-          if (entry) {
-            entry.pending = false; entry.id = undefined; entry.failed = failedRun;
-            // The AUTHORITATIVE diff comes from the tool itself (`editDiff`): it
-            // knows the text it really replaced, so this is the only source that
-            // covers line-range edits. Fall back to the provisional diff built
-            // from the args for older/other callers.
-            if (e.editDiff && typeof e.editDiff.old === 'string') {
-              entry.diff = lineDiff(e.editDiff.old, e.editDiff.new, e.editDiff.startLine || 1);
-            }
-            // Hand the counts to the TOOL row (which keeps `+N -N` next to its
-            // name) and the diff to the RESULT row (rendered beneath the `↳`).
-            if (entry.diff) entry._diffCounts = entry.diff;
-            // A finished swarm has no `↳` dump: the progress block IS the result.
-            // Settle every member so the grid and the pip bar read as final.
-            if (entry.toolName === 'AgentSwarm' && Array.isArray(entry.swarmMembers)) {
-              entry.swarmFailed = failedRun;
-              entry.swarmMembers.forEach((mem) => {
-                if (mem.phase === 'queued' || mem.phase === 'working' || mem.phase === 'prompting') {
-                  mem.phase = failedRun ? 'failed' : 'completed';
-                }
-                mem.ratio = mem.phase === 'completed' ? 1 : mem.ratio;
-              });
-            }
-          }
-          // An AgentSwarm is the ONE exception: it has already rendered its own
-          // result as the live progress block above (cells + status pip bar), so a
-          // `↳ Swarm finished: …` dump underneath would print the same thing twice.
-          const isSwarm = e.name === 'AgentSwarm' && entry && Array.isArray(entry.swarmMembers);
-          // No diff for Write. A write REPLACES a file rather than editing a span of
-          // it, so the "before/after" the renderer would show is the whole old
-          // content against the whole new one — a new file turns into every line
-          // being an addition, and the result row fills the screen with `+` lines
-          // that say nothing about what the model did. The receipt line ("File
-          // written: … N bytes") already reports the outcome, and the Write row
-          // itself streams the content while it arrives.
-          const resultMsg = normalizeMsg({
-            role: 'tool_result', text: e.content, failed: failedRun,
-            diff: e.name === 'Write' ? undefined : (entry && entry.diff),
-            // `bodyOnToolRow`: the TOOL row already drew this result's body (a Write
-            // streams the file's content there), so the receipt below it must not
-            // open a second `↳` block. Without this flag the renderer could only
-            // guess, and it guessed wrong — a Write showed
-            //     ↳  1 line one
-            //     ↳ File written: a.txt (1372 bytes)
-            // with two markers for one body.
-            bodyOnToolRow: e.name === 'Write' && !!(entry && entry.streamContent),
-            _conv: true,
-});
-          if (entry && !isSwarm) {
-            const at = state.chat.indexOf(entry);
-            // Skip any rows already sitting between the call and the transcript
-            // tail (the result rows of EARLIER calls in this same step), so each
-            // block reads call -> its result -> call -> its result.
-            let ins = at + 1;
-            while (ins < state.chat.length && state.chat[ins].role === 'tool_result') ins++;
-            state.chat.splice(ins, 0, resultMsg);
-            renderFrame();
-          } else if (!isSwarm) {
-            addChat(resultMsg);
-          } else {
-            renderFrame();
-          }
-          // NOTE: queued input is deliberately NOT drained into the running turn
-          // here. A message typed while the agent works is a NEW turn, so it waits
-          // for this turn to finish (see the drain after `agent.run()`). Ctrl-S
-          // remains the explicit "steer it into the running turn now" escape hatch.
-          // A finished tool result IS a completed step, so the transcript is
-          // persisted here too — the other half of the step-boundary save above.
-          persistTurnProgress(messages);
-        } else if (e.type === 'error') addChat({ role: 'tool_result', text: (e.error && e.error.message) || String(e.error) });
-        else if (e.type === 'truncation_recovery') {
-          // The answer hit the output cap mid-way and the agent asked the model to
-          // continue. Without a row here the transcript simply grew a second
-          // assistant bubble with no sign of why, which reads as a glitch.
-          addChat({ role: 'system', text: `Output limit reached — the answer continues (attempt ${e.attempt}/3).` });
-        }
-        else if (e.type === 'results_trimmed') {
-          // Old tool result bodies were replaced by a pointer to disk to shrink the
-          // request (agent.js's trim pass). Say so, including that nothing was lost:
-          // without a row the transcript quietly looks like output went missing, and
-          // the user has no way to know the text is still readable.
-          addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk. You can modify or disable this feature by using "/auto-trim"` });
-        }
-else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; if (web && hub) { try { hub.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ } } }
-        renderFrame();
-      },
-    });
-    state.agent = agent;
-    if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
-    if (web && hub) { try { hub.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } }
-    // A background subagent (Agent {run_in_background:true}, or an AgentSwarm)
-    // finishes AFTER the turn that launched it returned. The tools call
-    // `ctx._onBackgroundTaskDone`, which nothing installed, so the parent was
-    // never told: its result sat in the task store until the user opened /tasks.
-    // Post it into the transcript when it lands (mirroring how a queued message
-    // arrives after the turn), so the parent model sees it on its next turn.
-    if (agent.ctx) {
-      agent.ctx._onBackgroundTaskDone = (task) => {
-        if (!task) return;
-        // kimi-style lifecycle card: bullet colour by phase, a headline naming
-        // the kind (agent / bash / question task) and what happened, and a dim
-        // detail line. The task's conclusion is kept as the expandable body.
-        const card = backgroundTaskCard(task);
-        const body = String(task.output || '').trim();
-        addChat({ role: 'bg_task', card, text: body });
-      };
-    }
-    await agent.run();
-    messages = agent.messages;
-    if (agent.ctx && agent.ctx.tasks) state.tasks = agent.ctx.tasks;
-    state.agent = null;
-    if (web && hub) { try { hub.pubStatusField('tasks', Object.values(state.tasks || {}).map((t) => ({ id: t.id || t.taskId || '', kind: t.kind || 'bash', status: t.status || 'running', summary: t.summary || t.description || t.prompt || '', startedAt: t.startedAt || t.startAt || 0, agentId: t.agentId || '' }))); } catch { /* best-effort */ } }
-    const liveThink = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
-    if (liveThink) liveThink.pending = false;
-    // The first turn also names the session. It runs HERE — after the answer is
-    // complete — because the old code tried to parse a title out of the streamed
-    // chunks while `state.running` was still true, so the branch never fired. It
-    // is a separate, tiny request rather than an instruction in the system prompt:
-    // a hidden instruction leaked into the answer and a heading-like first chunk
-    // was mistaken for the title.
-    if (needsTitle) await generateTitle(text);
-
-
-    // ---- PLAN MODE: finalize the plan and ask to proceed --------------------
-    // The plan bubble is ALREADY on screen (appendAssistant streams the text after
-    // the plan tag straight into it), so this only: closes the tags out of the prose,
-    // asks for approval, and clears the streaming buffer.
-    let approvedPlan = null;
-    if (state.plan) {
-      // Clearing the buffer is what makes the rest of this block correct, and it was
-      // the one part the comment above promised and the code never did: the review
-      // prompt and the plan the user approves are read OUT of the bubbles, while the
-      // paced buffer can still be holding the tail of the reply (a burst drains over
-      // seconds). Reading early summarised — and approved — a truncated plan.
-      flushStream();
-      const lastAssistant = [...state.chat].reverse().find((m) => m.role === 'assistant' && (m.text || '').trim());
-      // Prefer what arrived on the wire; fall back to scanning the prose for the
-      // case where the tags were split across bubbles.
-      const streamedPlan = [...state.chat].reverse().find((m) => m.role === 'plan');
-      const planText = (streamedPlan && String(streamedPlan.text).trim())
-        || extractPlan(lastAssistant ? lastAssistant.text : '');
-      if (planText) {
-        // Make sure the bubble holds the final, complete text, and drop any
-        // leftover tag remnants from the prose.
-        if (streamedPlan) streamedPlan.text = planText;
-        else addChat({ role: 'plan', text: planText });
-        if (lastAssistant) {
-          lastAssistant.text = String(lastAssistant.text).replace(/<\/?plan>/gi, '').trim();
-          // This is a REPLACEMENT, not an append, so the length-based render-cache
-          // fingerprint could coincide with the previous value and leave a stale
-          // frame. Drop the cache explicitly.
-          lastAssistant._cache = null;
-          if (!lastAssistant.text.trim()) {
-            const i = state.chat.indexOf(lastAssistant);
-            if (i >= 0) state.chat.splice(i, 1);
-          }
-        }
-        // ask / yolo -> the user decides; auto -> approved without asking, which
-        // is the whole point of Auto. The review resolves to one of
-        // 'approve' | 'edit' | 'keep':
-        //   approve — execute the plan as written
-        //   edit    — open the plan in the editor, then execute the EDITED text
-        //   keep    — stay in Plan mode, do not execute
-        const cur = state.mode || 'ask';
-        let outcome = cur === 'auto' ? 'approve' : await new Promise((resolve) => {
-          state.planPending = { plan: planText, resolve };
-          renderFrame();
-        });
-        state.planPending = null;
-        if (outcome === 'edit') {
-          // Let the user revise the plan before it is executed. The editor is
-          // synchronous from the agent's point of view: we wait for save.
-          const edited = await new Promise((resolve) => {
-            openEditor({
-              title: 'Review plan — edit before executing',
-              text: planText,
-              caretRow: 0,
-              caretCol: 0,
-              onSave: (value) => resolve(String(value || '').trim()),
-              onCancel: () => resolve(null),
-            });
-            renderFrame();
-          });
-          if (edited) {
-            // Keep the on-screen bubble in sync with the edited text.
-            const bubble = [...state.chat].reverse().find((m) => m.role === 'plan');
-            if (bubble) { bubble.text = edited; bubble._cache = null; }
-            approvedPlan = edited;
-            outcome = 'approve';
-          } else {
-            outcome = 'keep';
-          }
-        }
-        if (outcome === 'approve') {
-          approvedPlan = planText;
-          // Persist the approved plan next to the project so it survives the
-          // session and can be reviewed with the change (or handed to an issue).
-          try {
-            const saved = savePlan(planText, state.workspace || cfg.workspace);
-            if (saved.ok) addChat({ role: 'system', text: `Plan saved: ${saved.path}` });
-          } catch { /* persistence is best-effort */ }
-        }
-      }
-    }
-
-    const approx = estimateMessagesTokens(messages, cfg);
-    state.ctxTokens = approx;
-    state.ctxMax = cfg.maxContextTokens || state.ctxMax;
-    state.ctxPercent = usagePercent(approx, state.ctxMax);
-    // `session.messages` now holds the full request, system prompt included, so the bar
-    // reads the real text from here on and the turn-scoped copy must not be counted too.
-    state.turnSystemPrompt = null;
-    session.messages = messages;
-    session.rounds = state.rounds;
-    session.steps = state.steps;
-    session.rounds = state.rounds;
-    session.steps = state.steps;
-    // The todo list is part of the session's visible state: persist it here
-    // too, so resuming (or `hncode -c`) brings the panel back.
-    session.todos = state.todos || [];
-    // Focus is one turn: the turn it was set for has now ended, so it goes off. Done
-    // HERE, before the save below, so `session.focus` is written false and resuming
-    // the session does not bring the narrowed toolset back. `focusAtTurnStart` (not
-    // the current value) decides, so a /focus issued while the turn ran still stands.
-    if (focusAtTurnStart) state.focus = false;
-    session.focus = !!state.focus;
-    session.swarm = !!state.swarm;
-    // The turn's token totals, so a resumed session keeps the running cost rather
-    // than restarting it at zero (the numbers have to sum across the whole
-    // session for a cost readout to mean anything).
-    session.usage = state.usage || {};
-    sess.saveSession(session);
-    const turnMs = state.turnStart ? Date.now() - state.turnStart : 0;
-    const dur = fmtDuration(turnMs);
-    // The live row is `<phrase> <gray>[<dur>]`. At the end we keep the same row
-    // shape — `[<word> <dur>]` — and only rewrite the word, so the brackets and
-    // the duration stay put and the time is never repeated. `…` is part of the
-    // phrase and is preserved.
-    const wordFrom = String(state.workMsg || WORKING_MESSAGES[0]);
-    state.finishAnim = {
-      start: Date.now(),
-      wordFrom,
-      wordTo: 'turn took',
-      tail: ` ${dur}]`,   // fixed right-hand side, e.g. " 59s]"
-    };
-    const animStart = Date.now();
-    while (Date.now() - animStart < 520) {
-      renderFrame();
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    state.finishAnim = null;
-    // Also clear startAnim if it's still active (should be cleared already by composeFrame)
-    state.startAnim = null;
-    // The turn is over: everything the model said must be on screen NOW. Draining here
-    // is what stops the last of the reply from trickling out behind the "[turn took …]"
-    // row and behind whatever the next turn draws.
-    flushStream();
-    state.running = false;
-    // The agent may have written or edited files this turn: refresh the git badge
-    // now so the diff totals reflect it immediately, instead of waiting for the
-    // 15s timer.
-    refreshGitInfo(state, { force: true });
-
-    if (turnMs > 0) {
-      state.lastTurnMs = turnMs;
-      session.lastTurnMs = turnMs;
-      sess.saveSession(session);
-      // The turn is on screen but may NOT be on disk. A save failure was silent apart
-      // from a line in ~/.hncode/session-errors.log, and a session whose transcript had
-      // grown past the string limit failed every save for over an hour without the user
-      // being told — each turn looked saved and was not. Say so where they are looking.
-      const saveErr = sess.lastSaveFailure();
-      if (saveErr && saveErr.id === session.id) {
-        addChat({ role: 'warn', text: `This turn could NOT be saved: ${saveErr.detail}. The conversation is on screen only — see ~/.hncode/session-errors.log.` });
-      }
-      // Same shape the sweep animated into: `[turn took <dur>]`.
-      addChat({ role: 'system', text: `[turn took ${dur}]` });
-    }
-    renderFrame();
-    if (state.queued.length) {
-      // Anything still queued was never injected (the turn ended first), so it
-      // becomes its own turn. Texts the agent DID consume were removed from
-      // state.queued by the `steer` handler above.
-      const next = state.queued.shift();
-      if (next) { void submit(next); }
-      // Queue shrank: push the updated list to the web queue pane immediately.
-      if (web && hub) { try { hub.pubStatusField('queued', [...state.queued]); } catch { /* best-effort */ } }
-    }
-    // Approved plan: Plan mode OFF (write tools come back), then re-enter the agent
-    // with the plan as a SYSTEM message. Deliberately NOT via submit(): that path
-    // posts a user bubble and re-runs the whole submit flow, which is what produced
-    // a stray user message and an extra turn teardown before the work started.
-    // Done LAST so it cannot race the queue drain above.
-    if (approvedPlan) {
-      state.plan = false;
-      session.plan = false;
-      persistState();
-      addChat({ role: 'system', text: 'Plan approved — Plan mode is off, executing.' });
-      renderFrame();
-      void runAgent(PLAN_EXECUTE_PREFIX, { asSystem: true });
-    }
+  // The TUI's binding of the turn loop. `runTurn` is module-level so a headless session can
+  // call the same code with its own five objects; this only supplies the terminal's.
+  async function runAgent(text, opts, viewArg) {
+    return runTurn({ state, cfg, session, host: sessHost, view, spawn: spawnTeammates }, text, opts, viewArg);
   }
 
   // Remember the session's working mode (permission / plan / focus / effort)
   // so resuming it comes back the way the user left it. Written immediately:
   // these are settings, not conversation, and must survive an abrupt exit.
-  function persistState() {
-    if (!session) return;
-    session.mode = state.mode;
-    session.plan = !!state.plan;
-    session.planPath = state.planPath || null;
-    session.focus = !!state.focus;
-    session.swarm = !!state.swarm;
-    session.effort = state.effort || '';
-    // Theme removed - forced dark only
-    session.steps = state.steps || 0;
-    session.rounds = state.rounds || 0;
-    if (state.lastTurnMs) session.lastTurnMs = state.lastTurnMs;
-    // How much of the display-only transcript reaches disk. Persisted with the rest of the
-    // session settings, so `/save-history` survives a restart instead of silently reverting
-    // to the default on the next launch.
-    session.saveHistory = state.saveHistory !== false;
-    session.saveThinking = state.saveThinking !== false;
-    try { sess.saveSession(session); } catch {}
-  }
+  function persistState() { return sessHost.persistState(); }
 
   // ---- /web: serve this session to a browser ---------------------------------
   // Started on demand. The browser talks to the SAME session: prompts it sends go
@@ -16055,24 +17029,18 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
     hub = new SessionHub();
     // Actions the browser can take. Each one calls the SAME function the keyboard
     // calls, which is what keeps the two front-ends behaviourally identical.
-    hub.actions.submit = async (text) => {
-      if (typeof text !== 'string' || !text.trim()) throw new Error('empty message');
-      await submit(text);
-    };
+    // Straight through to the core. It validates and throws in the same shape as before, so
+    // the HTTP layer (which maps a throw to 409) is unaffected.
+    hub.actions.submit = (text) => core.submit(text);
     hub.actions.dispatch = async (cmd, arg) => {
-      const name = String(cmd || '').trim();
-      if (!name.startsWith('/')) throw new Error('not a command');
-      const sp = name.indexOf(' ');
-      const c = sp === -1 ? name : name.slice(0, sp);
-      const a = sp === -1 ? String(arg || '') : name.slice(sp + 1).trim();
-      dispatch(c, a, state, cfg, session, host, submit, stdout);
-      if (state._quit) quit();
-      renderFrame();
+      const out = await core.dispatch(cmd, arg);
+      // The core runs the command; the repaint is this front end's business, so it stays
+      // here rather than in the core. A headless run has nothing to repaint and passes a
+      // no-op view.
+      v.render();
+      return out;
     };
-    hub.actions.interrupt = async () => {
-      if (!state.agent || typeof state.agent.interrupt !== 'function') throw new Error('nothing is running');
-      state.agent.interrupt();
-    };
+    hub.actions.interrupt = () => core.interrupt();
     hub.actions.stopTask = async (id) => {
       const ctxLike = state.agent && state.agent.ctx ? state.agent.ctx : { tasks: state.tasks };
       stopTask(ctxLike, String(id || ''));
@@ -16195,7 +17163,7 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       if (!t) throw new Error('title required');
       session.title = t.slice(0, 200);
       try { sess.saveSession(session); } catch { /* the title is cosmetic */ }
-      stdout.write(`\x1b]0;${session.title}\x07`);
+      writeWindowTitle(session, stdout);
       syncWebNow();
     };
 
@@ -16484,6 +17452,9 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
 
 
   const host = {
+    // The one spawner, so the model's TeamCreate tool and the /team command start the same
+    // kind of teammate.
+    spawnTeammates,
     addChat, openPicker, openForm, notice, openPanel, openEditor, openTasksPanel, openRegistryBrowser,
     // While the side-thread box is open, a typed message goes to the SIDE THREAD, not
     // to the agent — this is the half of kimi's design that makes the box usable:
@@ -16499,14 +17470,14 @@ else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session
       void runAgent(text, o);
     },
     quit: () => { state._quit = true; },
-saveSession: (s) => { (async () => { try { const { runHooks } = await import('./plugin.js'); await runHooks('onSessionSave', s || session); } catch {} })(); sess.saveSession(s); },
+    saveSession: (s) => { (async () => { try { const { runHooks } = await import('./plugin.js'); await runHooks('onSessionSave', s || session); } catch {} })(); sess.saveSession(s); },
     // Rebinds the closure's session AND the mirror on `state`. /move replaces it, and without
     // this the caller and the command disagreed about which session was current — every later
     // save wrote the old object, still stamped with the directory it was moved away from.
-    replaceSession: (s) => { if (!s) return; session = s; state.session = s; if (s.workspace) state.workspace = s.workspace; },
+    replaceSession: (s) => { if (!s) return; session = s; state.session = s; if (s.workspace) state.workspace = s.workspace; writeWindowTitle(session, stdout); },
     // Rebinds the closure's session. /move replaces it, and without this the caller and the
     // command disagreed about which session was current — every later save wrote the old one.
-    replaceSession: (s) => { if (s) session = s; },
+    replaceSession: (s) => { if (s) session = s; writeWindowTitle(session, stdout); },
     getMessages: () => (session && session.messages ? session.messages : []),
     clearSession: () => { if (session) session.messages = []; if (state) { state.ctxTokens = 0; state.ctxPercent = 0; } renderFrame(); },
     getConfig: (key) => (cfg && key != null ? cfg[key] : undefined),
@@ -16531,7 +17502,13 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
       return takePluginNotices();
     },
     persistState,
+    // `dispatch` is module-level and reloads the keybinding file after /keybindings edits it.
+    // It cannot call this by name — the function is nested inside `startTUI` — so the same
+    // indirection `renderFrame` below exists for. Without it, `/keybindings` threw
+    // `refreshKeybindings is not defined` and killed the process, exactly as `submit` did.
+    refreshKeybindings,
     startWeb,
+    startWebGlobal: attachGlobalWeb,
     startWebGlobal: attachGlobalWeb,
     stopWeb,
     webInfo: () => web,
@@ -16601,6 +17578,11 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
       return [...out];
     },
   };
+  // The core's `dispatch` needs this object, and it is declared here rather than at the core
+  // because a command's callbacks (`openPicker`, `openPanel`, …) are defined in this same
+  // literal. Until this line runs, a command dispatched THROUGH THE CORE has no UI callbacks;
+  // nothing dispatches before the TUI is fully built, so that window is not reachable.
+  commandHost = host;
 
   // Hand the full host surface to the plugin system so api.* can forward (sendPrompt,
   // openPanel, notice, getMessages, setConfig, ...). Done once, here, after `host` exists.
@@ -16659,7 +17641,9 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
   // The buffer holds BOTH kinds in one ordered queue, so a reasoning block can never
   // overtake the answer text that followed it, and the reasoning region closes at
   // exactly the point the provider closed it.
-  const streamBuf = new StreamBuffer();
+  // One buffer for the whole session: the pacing is about the pipe, not about the turn, and a
+  // fresh one per turn would drop whatever the previous had not yet released.
+  const streamBuf = sessHost.streamBuf;
 
   // Apply revealed ops to the transcript. EVERY producer of ops goes through here.
   //
@@ -16669,15 +17653,9 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
   // therefore loses them for good — that is exactly how the first ~30 characters of
   // every provider delta went missing, and with them the prose (and the `<|plan|>` tag)
   // at the head of a Plan-mode reply.
-  function applyStreamOps(ops) {
-    if (!ops || !ops.length) return false;
-    for (const o of ops) {
-      if (o.op === StreamOp.Text) appendAssistant(o.text);
-      else if (o.op === StreamOp.Reasoning) appendThinking(o.text);
-      else if (o.op === StreamOp.CloseReasoning) settleThinking();
-    }
-    return true;
-  }
+  // Forwarders. The implementation lives on the host so a headless run shares it; the names
+  // stay here because forty call sites inside runAgent use them.
+  function applyStreamOps(ops) { return sessHost.applyStreamOps(ops); }
 
   // Apply whatever the buffer has ready. Called from the paced tick (so a lone burst
   // still drains); the delta handlers reveal through the push return value instead.
@@ -16688,18 +17666,13 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
   // Stop the still-pending reasoning block: the provider moved on to the answer, so the
   // "reasoned, then acted" split has to be visible. Shared by the close marker and the
   // turn-end paths so the block can never be left spinning.
-  function settleThinking() {
-    const t = [...state.chat].reverse().find((m) => m.role === 'thinking' && m.pending);
-    if (t) t.pending = false;
-  }
+  function settleThinking() { return sessHost.settleThinking(); }
 
   // Reveal everything still buffered, RIGHT NOW. Every path that ends the turn (a tool
   // starting, an abort, an error, the turn finishing) must call this: leaving text in
   // the buffer would let the answer keep trickling out after the turn it belonged to
   // had already ended, which reads as the UI lagging behind reality.
-  function flushStream() {
-    return applyStreamOps(streamBuf.flush());
-  }
+  function flushStream() { return sessHost.flushStream(); }
 
   // Live split of the streamed reply into prose vs. plan block.
   // While Plan mode is on and the model is inside the plan tags, the text is routed into
@@ -16830,7 +17803,7 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
     if (!title) return;
     session.title = title;
     try { saveSession(session); } catch { /* the title is cosmetic; never fail a turn over it */ }
-    stdout.write(`\x1b]0;${title}\x07`);
+    writeWindowTitle(session, stdout);
     notice(`Auto-generated title: "${title}"`);
   }
 
@@ -16882,37 +17855,7 @@ saveSession: (s) => { (async () => { try { const { runHooks } = await import('./
     anchorScroll();
   }
 
-  function normalizeMsg(m) {
-    // Keep `failed`: a failed tool result must render in RED. Dropping it here
-    // made every failure look like ordinary gray output.
-    // Keep `diff`: an Edit's diff travels ON the tool_result message so it renders
-    // below the `↳` receipt (see messageLines). Dropping it removed the diff.
-    const out = {
-      role: m && m.role ? m.role : 'system',
-      text: m && m.text != null ? String(m.text) : '',
-      failed: !!(m && m.failed),
-    };
-    if (m && Array.isArray(m.diff)) out.diff = m.diff;
-    // `bodyOnToolRow`: the tool row above already rendered this result's body, so the
-    // receipt must not open a second `↳` marker (see the tool_result branch).
-    if (m && m.bodyOnToolRow) out.bodyOnToolRow = true;
-    // Keep `card`: a background-task lifecycle card carries its phase/headline/detail
-    // here (see the `bg_task` renderer). The comment claimed this while the line itself
-    // was missing, so every card fell back to its placeholder text.
-    if (m && m.card) out.card = m.card;
-    if (m && m._conv) out._conv = true;
-    // Keep the compaction block's live fields: the header is rebuilt from `phase`,
-    // the token pair and the (collapsed) summary every frame, so dropping them left
-    // the row stuck at whatever the first paint happened to show.
-    if (m && m.role === 'compaction') {
-      out.phase = m.phase || 'running';
-      out.tokensBefore = m.tokensBefore;
-      out.tokensAfter = m.tokensAfter;
-      out.startedAt = m.startedAt;
-      out.instruction = m.instruction || '';
-    }
-    return out;
-  }
+  function normalizeMsg(m) { return sessHost.normalizeMsg(m); }
 
   let stopped = false;
   function stop() {

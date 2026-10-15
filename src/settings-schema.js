@@ -278,15 +278,18 @@ export function displayValue(cfg, key) {
   if (!def) return '';
   const v = effectiveValue(cfg, key);
   if (def.kind === 'bool') return v === 'true' ? 'on' : 'off';
-  if (def.kind === 'text') {
-    if (!v) return '(unset)';
-    const first = v.split('\n')[0];
-    return v.includes('\n') || first.length > 40 ? `${first.slice(0, 40)}…` : first;
-  }
-  // An empty value reads as `(unset)` for EVERY kind, not only `string`. `protocol` is an
-  // enum whose default is the empty string, so its row rendered with a blank value column —
-  // indistinguishable from a row whose value failed to render.
-  if (!v) return '(unset)';
+  // `text` is returned WHOLE. It used to be cut to forty characters here, which made the
+  // value useless to a caller that needed to measure or edit it. Abbreviating is the
+  // renderer's job — see `proseSummary`.
+  //
+  // An empty value reads as `(unset)` for EVERY kind, not only `string`: `protocol` is an
+  // enum whose default is the empty string, so its row rendered with a blank value column.
+  //
+  // Whitespace alone is unset too. `!v` only catches the empty string, so '   ' rendered as a
+  // blank cell — the same as a value that failed to render. Tested on the trimmed copy and the
+  // value returned RAW: a trailing newline is part of a prompt, and trimming the value itself
+  // would corrupt it.
+  if (!v || !String(v).trim()) return '(unset)';
   return v;
 }
 

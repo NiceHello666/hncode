@@ -1,0 +1,42 @@
+✔ every tool is registered exactly once, with a name and a description (2.6435ms)
+✔ the tools the plugin promises are all there (2.1501ms)
+✔ a tool that needs an argument says so rather than acting on nothing (1.5211ms)
+✔ a platform without a capability names the mechanism, not just "no" (1.4086ms)
+✔ an empty tree explains itself rather than reading as "nothing here" (1.0434ms)
+✔ a tree is rendered as indexed lines the element tools can consume (0.8905ms)
+✔ a search that finds nothing says how to look instead (0.8117ms)
+✔ Steps runs its steps in order (6036.2172ms)
+✔ Steps stops at the first failure by default (915.7352ms)
+✔ a step can opt out of stopping (896.3472ms)
+✔ stopOnError false runs everything (2361.962ms)
+✔ Steps refuses to call itself (0.7358ms)
+✔ Steps rejects an empty or malformed list (0.2818ms)
+✔ an unknown step name lists what IS available (0.2364ms)
+✔ a very long step result is truncated, with the size stated (5623.6582ms)
+✔ the platform dispatch exposes one surface for every tool (14.0463ms)
+✔ a real screen is reported with a positive size (1825.4258ms)
+✔ a real screenshot is a valid PNG of the size claimed (925.4393ms)
+✔ the walk numbers elements by POSITION, not by a shared sibling count (1.0644ms)
+✖ a rendered tree exposes one distinct index per element (6168.4745ms)
+✔ the real control tree comes back with usable elements (1949.7954ms)
+✔ a real window list comes back with handles (2777.2658ms)
+ℹ tests 22
+ℹ suites 0
+ℹ pass 21
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 29798.254
+
+✖ failing tests:
+
+test at test\computer-use.test.mjs:263:1
+✖ a rendered tree exposes one distinct index per element (6168.4745ms)
+  Error: You cannot call a method on a null-valued expression.
+      at uia (file:///D:/hncode/plugins/computer-use/platform/win-uia.js:54:18)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Module.getTree (file:///D:/hncode/plugins/computer-use/platform/win-uia.js:219:15)
+      at async TestContext.<anonymous> (file:///D:/hncode/test/computer-use.test.mjs:272:16)
+      at async Test.run (node:internal/test_runner/test:1404:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7)

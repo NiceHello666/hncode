@@ -126,6 +126,11 @@ export function renderCells(cells) {
     }
     out += c.ch;
   }
+  // Close the LAST run too. Without this the final style stayed open past the end of the
+  // row, and a caller that concatenates rows — `drawFrameBuffer` does, once per line —
+  // carried it into the next one: a card drawn over a dimmed or highlighted row tinted
+  // every line below it, and the row's own trailing SGR was simply lost.
+  if (cur !== null && cur !== '') out += RESET;
   return out;
 }
 

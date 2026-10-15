@@ -18,6 +18,7 @@ import { spec as agentSpec } from './agent.js';
 import { spec as agentSwarmSpec } from './agent-swarm.js';
 import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec } from './tasks.js';
 import { AgentListSpec, AgentMessageSpec, AgentInterruptSpec, AgentCloseSpec } from './agent-control.js';
+import { TEAM_TOOL_SPECS } from './team.js';
 import { spec as notebookSpec } from './notebook.js';
 import { spec as diagnosticsSpec } from './diagnostics.js';
 import * as memoryMod from './memory.js';
@@ -53,6 +54,7 @@ const builtinTools = [
   notebookSpec,
   diagnosticsSpec,
   memoryMod.spec,
+  ...TEAM_TOOL_SPECS,
 ];
 
 

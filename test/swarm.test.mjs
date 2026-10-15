@@ -20,7 +20,7 @@ import path from 'node:path';
 // A store far away from the real one, in case anything here touches session state.
 process.env.HNCODE_SESSIONS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hncode-swarm-test-'));
 
-const { renderSwarmProgress } = await import('../src/swarm-progress.js');
+const { renderSwarmProgress, membersFromOutput, normalizeMember } = await import('../src/swarm-progress.js');
 
 // ---------------------------------------------------------------------------
 // BUG 1: the live sink receives the progress lines
@@ -28,47 +28,78 @@ const { renderSwarmProgress } = await import('../src/swarm-progress.js');
 
 test('AgentSwarm reports progress to the live sink, not only the task buffer', () => {
   const src = fs.readFileSync(new URL('../src/tools/agent-swarm.js', import.meta.url), 'utf8');
-  // The `[n/m] finished` line must be handed to ctx.onOutput. Asserting on the source is
-  // deliberate: the alternative is spawning a real swarm, and the defect is precisely a
-  // MISSING call, which no amount of unit-testing the surrounding code can observe.
-  const at = src.indexOf("`[${done}/${jobs.length}] finished");
+  // The finish line must reach ctx.onOutput. Asserting on the source is deliberate: the
+  // alternative is spawning a real swarm, and the defect being guarded is a MISSING call,
+  // which no amount of unit-testing the surrounding code can observe.
+  const at = src.indexOf('appendTaskOutput(task, line);');
   assert.ok(at > 0, 'the progress line is built in the worker');
   const around = src.slice(Math.max(0, at - 900), at + 300);
-  assert.match(around, /ctx\.onOutput/,
+  assert.match(around, /ctx\.onOutput\(line\)/,
     'the progress line is also sent to ctx.onOutput (the channel the UI reads)');
   assert.match(around, /appendTaskOutput/,
     'and still to the task buffer, which is what survives a Ctrl+B detach');
 });
 
-test('the progress block advances its cells as [n/m] lines arrive', () => {
-  // The TUI's rule, reproduced: count the matches, mark everything below `done` complete
-  // and the cell AT `done` as working. With the lines arriving, the grid fills in.
-  const liveOutput = '[1/3] finished\n[2/3] finished\n';
-  const members = Array.from({ length: 3 }, () => ({ phase: 'queued', ratio: 0, latestText: '' }));
-  const done = (liveOutput.match(/^\[\d+\/\d+\] finished$/gm) || []).length;
-  members.forEach((mem, i) => {
-    if (i < done) { mem.phase = 'completed'; mem.ratio = 1; }
-    else if (i === done) { mem.phase = 'working'; mem.ratio = 0.5; }
-  });
-  assert.deepEqual(members.map((m) => m.phase), ['completed', 'completed', 'working'],
-    'two landed cells and one in flight');
-
-  // Without them — the bug — nothing progresses past the first cell.
-  const stuck = Array.from({ length: 3 }, () => ({ phase: 'queued', ratio: 0, latestText: '' }));
-  const none = (''.match(/^\[\d+\/\d+\] finished$/gm) || []).length;
-  stuck.forEach((mem, i) => {
-    if (i < none) { mem.phase = 'completed'; mem.ratio = 1; }
-    else if (i === none) { mem.phase = 'working'; mem.ratio = 0.5; }
-  });
-  assert.deepEqual(stuck.map((m) => m.phase), ['working', 'queued', 'queued'],
-    'this is the reported symptom: only #1 was ever working');
+test('AgentSwarm names the agent in each progress line, not just a running total', () => {
+  const src = fs.readFileSync(new URL('../src/tools/agent-swarm.js', import.meta.url), 'utf8');
+  // A bare `[n/m]` count forces the reader to guess WHICH agents are done, and the guess
+  // is wrong whenever they finish out of order — which they do, since the workers pull from
+  // a shared queue.
+  assert.match(src, /\[#\$\{i \+ 1\}\] finished/, 'the finish line names its agent');
+  assert.match(src, /\[#\$\{i \+ 1\}\] progress/, 'and a progress line reports one agent at a time');
+  assert.match(src, /_onSubProgress/, 'fed by the subagent step counter');
+  assert.match(src, /medianSteps\(finishedSteps\)/, 'paced against the swarm\'s own finished agents');
 });
 
-test('a settled swarm shows every cell as done', () => {
-  const liveOutput = '[1/2] finished\n[2/2] finished\n';
-  const done = (liveOutput.match(/^\[\d+\/\d+\] finished$/gm) || []).length;
-  assert.equal(done, 2, 'both cells advance');
+test('membersFromOutput attributes a finish to the agent that reported it', () => {
+  // #2 finishes FIRST, while #1 is still working. The old count-based rule marked #1 done.
+  const out = '[#1] started\n[#2] started\n[#3] started\n'
+    + '[#1] progress 20\n[#2] progress 60\n[#2] finished [1/3]\n';
+  const members = membersFromOutput(out, 3);
+  assert.deepEqual(members.map((m) => m.phase), ['working', 'completed', 'working'],
+    'the cell that finished is #2, not the first one in the list');
 });
+
+test('membersFromOutput reports each agent\'s own ratio', () => {
+  const out = '[#1] started\n[#2] started\n[#1] progress 25\n[#2] progress 80\n';
+  const members = membersFromOutput(out, 2);
+  assert.deepEqual(members.map((m) => m.ratio), [0.25, 0.8],
+    'two agents doing different amounts of work show different bars');
+});
+
+test('an agent that has not started yet reads as queued', () => {
+  const out = '[#1] started\n';
+  const members = membersFromOutput(out, 3);
+  assert.deepEqual(members.map((m) => m.phase), ['working', 'queued', 'queued']);
+});
+
+test('normalizeMember carries the ratio through to the renderer', () => {
+  // Dropping it here is what made every cell fall back to a placeholder no matter what the
+  // agent reported: the wire carried a figure and `renderCell` never received one.
+  const [m] = [normalizeMember({ phase: 'working', ratio: 0.75 }, 0)];
+  assert.equal(m.ratio, 0.75);
+  assert.equal(normalizeMember({ phase: 'working' }, 0).ratio, null, 'absent ratio stays null');
+});
+
+test('a cell with no ratio does not claim to be half done', () => {
+  // The reported symptom: every running agent drew the same half-filled bar for its whole
+  // life, so seven agents showed seven identical 50% bars and then jumped to 100%.
+  const strip = (s) => String(s).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  const grid = renderSwarmProgress({ members: [{ phase: 'working' }] }, 40, { indent: '' });
+  const row = grid.map(strip).find((l) => l.includes('001')) || '';
+  // COUNT the filled cells. The old `!/\[#{5,}\]/` was vacuous: a bar is `#…#---…`, so the
+  // run of `#` is always followed by `-`, and the pattern only matched if EVERY cell was
+  // filled — it stayed green with the 0.5 placeholder restored. It also could not tell
+  // 5% from 50%.
+  const filled = (row.match(/#/g) || []).length;
+  const total = filled + (row.match(/-/g) || []).length;
+  assert.ok(total > 0, `the bar rendered: ${row}`);
+  assert.ok(filled <= 1, `a ratio-less cell is not half full (${filled}/${total}): ${row}`);
+});
+
+// ---------------------------------------------------------------------------
+// BUG 2: swarm mode gates the tool
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // BUG 2: swarm mode gates the tool
@@ -92,10 +123,24 @@ test('a call to AgentSwarm with the mode off is refused, with the fix in the mes
 
 test('the per-turn cfg carries swarm mode from the UI state', () => {
   // The mode lives on `state`, but the tool catalog is decided in the Agent constructor,
-  // which only ever sees cfg — so the flag has to be passed across.
+  // Format-agnostic: the object may be written on one line or spread over several, and
+  // adding a key to it must not break a test about swarm mode.
   const src = fs.readFileSync(new URL('../src/tui.js', import.meta.url), 'utf8');
-  assert.match(src, /cfg: \{ \.\.\.cfg, swarm: !!state\.swarm,/,
-    'the turn passes swarm mode into the Agent cfg');
+  // Extracted by BRACE MATCHING, not by a length-bounded regex: the object grows as keys are
+  // added, and `{0,800}` silently stopped matching once it passed 1271 characters.
+  const start = src.indexOf('cfg: {');
+  assert.ok(start >= 0, 'the per-turn Agent cfg object was not found');
+  let depth = 0;
+  let end = start + 4;
+  for (; end < src.length; end++) {
+    if (src[end] === '{') depth++;
+    else if (src[end] === '}') { depth--; if (depth === 0) break; }
+  }
+  const cfgObj = src.slice(start, end + 1);
+  assert.match(cfgObj, /swarm: !!state\.swarm/,
+    "the turn passes swarm mode into the Agent cfg");
+  assert.match(cfgObj, /tasks: \(state\.tasks = state\.tasks \|\| \{\}\)/,
+    "and reuses the existing task registry rather than a fresh one");
 });
 
 test('the tool description says the mode is required', async () => {

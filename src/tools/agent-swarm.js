@@ -18,9 +18,25 @@ import { createTask, appendTaskOutput, settleTask } from '../agent-task.js';
 
 export const PROMPT_TEMPLATE_PLACEHOLDER = '{{item}}';
 export const MAX_AGENT_SWARM_SUBAGENTS = 128;
-// How many subagents run at once. kimi queues launches automatically; we use a
-// small fixed window so a 128-item swarm cannot stampede the machine.
-const SWARM_CONCURRENCY = 4;
+// How many subagents run at once. Each worker awaits ONE subagent at a time, so this is the
+// number of models generating concurrently — the reason a swarm exists at all, given that
+// `Agent` calls in one message are run in sequence.
+const SWARM_CONCURRENCY = 7;
+
+/**
+ * Median of a list of numbers, or 0 when there is nothing to go on.
+ *
+ * Median rather than mean: one agent that loops for a hundred steps would drag a mean far
+ * above what a typical agent costs, and every other bar would then sit near empty while its
+ * agent was in fact nearly done.
+ */
+function medianSteps(counts) {
+  if (!Array.isArray(counts) || !counts.length) return 0;
+  const sorted = counts.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 
 // Validate and expand the swarm request. Returns { prompts } or { error }.
 export function planSwarm(args) {
@@ -35,6 +51,22 @@ export function planSwarm(args) {
     ? Object.entries(args.resume_agent_ids).map(([id, p]) => [String(id).trim(), String(p).trim()])
     : [];
 
+  // The SHAPE is checked before the counts, so the message names the field that is wrong. An
+  // array of ids used to be silently dropped, and the caller was then told to provide "a
+  // resume_agent_ids map" — which it had given, in the only shape it knew.
+  if (args.resume_agent_ids !== undefined
+      && (typeof args.resume_agent_ids !== 'object' || Array.isArray(args.resume_agent_ids))) {
+    return { error: 'Error: `resume_agent_ids` must be an object mapping agent_id to prompt, such as {"<agent_id>": "continue"}. An array of ids is not accepted.' };
+  }
+  if (args.items !== undefined && !Array.isArray(args.items)) {
+    return { error: 'Error: `items` must be an array of strings.' };
+  }
+  // Blank entries were dropped above. Two blank items is a request the caller THINKS it made, and
+  // "provide at least 2 items" reads as a refusal of something that was provided.
+  const rawCount = Array.isArray(args.items) ? args.items.length : 0;
+  if (rawCount > 0 && items.length < rawCount && items.length + resumeMap.length < 2) {
+    return { error: `Error: ${rawCount} item(s) given but ${rawCount - items.length} were blank, leaving ${items.length}. Each item must be a non-empty string.` };
+  }
   if (items.length === 0 && resumeMap.length === 0) {
     return { error: 'Error: provide at least 2 items, or a resume_agent_ids map.' };
   }
@@ -73,7 +105,7 @@ Use enough subagents to keep the work focused and parallel. AgentSwarm supports 
 When NOT to use AgentSwarm:
 - It only exists while swarm mode is ON (\`/swarm\`). With the mode off the tool is not offered at all and calling it is refused. If a fan-out would genuinely help, say so and ask the user to turn the mode on.
 - Never call this on your own initiative. It requires the same explicit permission as \`Agent\`: the user, or the applicable AGENTS.md / project instructions, must have asked for sub-agents, delegation, or parallel agent work. Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do NOT count as permission.
-- Do not use it for two or three differently-shaped tasks: use separate \`Agent\` calls instead, which can run in parallel in one message.
+- Do not use it for two or three differently-shaped tasks: use separate \`Agent\` calls instead. Note that several \`Agent\` calls in one message run ONE AT A TIME — only read-only tools batch — so a swarm is the only way to overlap subagents, and a 3-item swarm really does run 3 at once.
 - Do not use it to fan out work you could finish yourself in a few steps.
 
 If \`AgentSwarm\` is called, that call must be the only tool call in the response.`,
@@ -122,45 +154,116 @@ If \`AgentSwarm\` is called, that call must be the only tool call in the respons
       detached: false,
     });
 
+    // ONE TASK PER SUBAGENT, parented to this one. A foreground subagent creates no task of
+    // its own, so a 7-item swarm put a single row in /tasks and there was no way to see what
+    // each subagent was doing — the panel is organised by task, so no task meant no window.
+    const subTasks = jobs.map((job, i) => {
+      const t = createTask(ctx, 'agent', {
+        description: `${description} #${i + 1}`,
+        subagentType: type,
+        model: args.model || '',
+        detached: true,
+        parentTaskId: task.taskId,
+      });
+      return t;
+    });
+
     // Run with a bounded window. Each job appends its verdict to the task output
     // as it finishes, so TaskOutput shows partial progress.
     const results = new Array(jobs.length).fill(null);
+    // Tool-call counts of the agents that have FINISHED, so a running agent's bar can be
+    // scaled against what the swarm is actually costing. A running agent does not contribute
+    // here — its own count is still growing and would understate the reference.
+    const finishedSteps = [];
     let next = 0;
     const worker = async () => {
       for (;;) {
         const i = next++;
         if (i >= jobs.length) return;
         const job = jobs[i];
+        const subTask = subTasks[i];
+        // Announce the START, not only the finish. Without this the only signal on the wire
+        // was "[n/m] finished", which says how many are DONE and nothing about which are
+        // running — so the progress block marked everything unfinished as "queued" and a
+        // 7-wide swarm looked like one working cell and six stuck ones.
+        if (typeof ctx.onOutput === 'function') ctx.onOutput(`[#${i + 1}] started\n`);
+        appendTaskOutput(task, `[#${i + 1}] started\n`);
+        // Declared OUTSIDE the try: the catch below still has to report this agent's cost,
+        // and the block that does so runs whether the agent succeeded or threw.
+        const t0 = Date.now();
+        let steps = 0;
         try {
           const subArgs = {
             prompt: job.prompt,
             description: `${description} #${i + 1}`,
             ...(job.kind === 'resume' ? { resume: job.agentId } : { subagent_type: type }),
+            ...(job.kind === 'resume' ? { resume: job.agentId } : { subagent_type: type }),
             ...(args.model ? { model: args.model } : {}),
             ...(args.fork === true && job.kind === 'new' ? { fork: true } : {}),
           };
-          const out = await agentSpec.execute(subArgs, { ...ctx, _progressTag: `#${i + 1}` });
+          // `steps` counts this agent's tool calls so far. There is no "x of y" to show — a
+          // subagent runs with an unbounded step budget — so the bar is paced against the
+          // swarm's OWN observed speed: the median number of steps the agents that have
+          // already FINISHED needed. That is the only estimate available, and it sharpens as
+          // more of them land.
+          //
+          // The reference is never allowed to be 0. An agent that answers straight from the
+          // prompt runs no tools at all, so it finishes with 0 steps — and a median of 0 would
+          // send EVERY other agent down the elapsed-time branch below, where the bar needs a
+          // full minute to reach 40% and a fast agent reports 0% the whole way. One tool-less
+          // agent must not disable the scale for the rest of the swarm.
+          const progressLine = () => {
+            if (typeof ctx.onOutput !== 'function') return;
+            const reference = Math.max(1, medianSteps(finishedSteps));
+            const ratio = finishedSteps.length
+              ? Math.min(0.95, steps / (reference + 1))
+              // Nothing has finished yet, so there is no pace to compare against. Creep
+              // rather than assert a figure: `steps` alone would read as a tiny percentage
+              // next to an unknown total.
+              : Math.min(0.4, steps / 40, 0.1 + ((Date.now() - t0) / 60000) * 0.3);
+            ctx.onOutput(`[#${i + 1}] progress ${Math.round(ratio * 100)}\n`);
+          };
+          const out = await agentSpec.execute(subArgs, {
+            ...ctx,
+            _progressTag: `#${i + 1}`,
+            _subTaskId: subTask.taskId,
+            _onSubProgress: () => { steps++; progressLine(); },
+          });
           // `agentSpec.execute` returns `agent_id: <id>\n\n<handoff>`. The swarm's
           // caller wants the handoff, and the id is only useful for a later
           // `resume`; keep it on one labelled line rather than letting it lead the
           // block, so the reported text is what each subagent actually produced.
           const raw = String(out);
           const m = /^agent_id:\s*(\S+)\s*\n+([\s\S]*)$/.exec(raw);
+          // A subagent that died returns `Error: subagent … failed: …` rather than throwing, so
+          // the catch below never sees it. Without this test the cell was marked a success and
+          // the failure text was buried in a body nobody reads as an error.
+          const died = /^Error: subagent /.test(raw);
           const body = (m ? m[2] : raw).trim();
           const head = `--- #${i + 1}${job.kind === 'resume' ? ` (resumed ${job.agentId})` : ''}${m ? ` [${m[1]}]` : ''} ---`;
           results[i] = `${head}\n${body}`;
+          settleTask(subTask, died ? 'failed' : 'completed', died ? { stopReason: body } : undefined);
         } catch (e) {
           results[i] = `--- #${i + 1} ---\n[error: ${e.message}]`;
+          settleTask(subTask, 'failed', { stopReason: e.message });
         }
+        // Contribute this agent's cost to the reference the running ones scale against. A
+        // Contribute this agent's cost to the reference the running ones scale against. A
+        // failed agent is recorded too: it did that much work, so it says as much about the
+        // pace as a successful one, and excluding it would bias the bar optimistically.
+        finishedSteps.push(steps);
         // Report progress down BOTH channels, and they are not interchangeable:
         //   * the task buffer feeds TaskOutput and survives a detach;
-        //   * `ctx.onOutput` is the LIVE sink. The progress block in the transcript
-        //     reads the cells off it (see the tool_output handler's `[n/m] finished`
-        //     match), so writing only to the task buffer left every cell but the first
-        //     stuck on "Queued…" for the whole run — the TUI was told to expect these
-        //     lines on this channel and never received one.
+        //   * `ctx.onOutput` is the LIVE sink the transcript's progress block reads.
+        //
+        // WHICH agent finished, not just how many. A bare `[n/m]` count left the reader no
+        // choice but to assume the first `n` agents were the finished ones — and with
+        // SWARM_CONCURRENCY workers pulling from a shared queue, they finish in whatever order
+        // they happen to run. The grid then lit up the wrong cells and only agreed with
+        // reality once every one of them was done. `[#i] finished` names the agent; the count
+        // is kept for readers that only track totals.
         const done = results.filter((r) => r !== null).length;
-        const line = `[${done}/${jobs.length}] finished\n`;
+        const line = `[#${i + 1}] finished [${done}/${jobs.length}]\n`;
         appendTaskOutput(task, line);
         if (typeof ctx.onOutput === 'function') ctx.onOutput(line);
       }

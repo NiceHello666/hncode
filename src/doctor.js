@@ -306,8 +306,14 @@ function checkGit(workspace, cp) {
   const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
   out.push(check('git', 'ok', `${branch || '(detached)'} in ${top}`));
 
+  // Because `run` pins cwd to the workspace, `config --get` reports the identity that a
+  // commit HERE would actually use — not one inherited from an unrelated directory.
+  // A value that IS set is reported too: only a row in the report distinguishes
+  // "configured" from "the check never ran", and silence reads as success.
   for (const key of ['user.name', 'user.email']) {
-    if (!run(['config', '--get', key])) {
+    const value = run(['config', '--get', key]);
+    if (value) out.push(check(`git ${key}`, 'ok', value));
+    else {
       out.push(check(`git ${key}`, 'warn', 'not set',
         `Every commit fails without it. Run: git config --global ${key} "…"`));
     }
@@ -323,7 +329,6 @@ function checkGit(workspace, cp) {
       }
     }
   }
-  return out;
   return out;
 }
 

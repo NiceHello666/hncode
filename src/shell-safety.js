@@ -44,6 +44,31 @@
  *   metacharacters — unquoted operator characters seen (for the read-only test)
  *   redirects      — unquoted redirect targets, e.g. ['/dev/null']
  */
+/**
+ * Index of the `)` closing the `(` at `open`, or -1.
+ *
+ * Depth-counted so a nested `$(a $(b))` closes at the right place, and quote-aware so a `)`
+ * inside a string argument does not end the substitution early.
+ */
+function matchingParen(s, open) {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; continue; }
+    if (c === "'" || c === '"') {
+      const quote = c;
+      for (i++; i < s.length; i++) {
+        if (quote === '"' && s[i] === '\\') { i++; continue; }
+        if (s[i] === quote) break;
+      }
+      continue;
+    }
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
 export function splitSegments(cmd) {
   const s = String(cmd == null ? '' : cmd);
   const segments = [];
@@ -91,11 +116,45 @@ export function splitSegments(cmd) {
       i += 1;
       continue;
     }
-    if (c === '<' || c === '`') { metacharacters.add(c); i += 1; continue; }
+    if (c === '<') { metacharacters.add(c); i += 1; continue; }
+    // A backtick substitution is the same hazard as `$(…)`: it runs a command and splices the
+    // result into this one. Handled as a pair so the inner command is judged too.
+    if (c === '`') {
+      metacharacters.add(c);
+      const close = s.indexOf('`', i + 1);
+      if (close > 0) {
+        const inner = s.slice(i + 1, close);
+        if (inner.trim()) { segments.push(current); segments.push(inner); current = ''; }
+        current += s.slice(i, close + 1);
+        i = close + 1;
+        continue;
+      }
+      i += 1; continue;
+    }
     if (c === '$') {
-      // `$(…)` / `${…}` can run a command or expand a path. Record the substitution
-      // so the read-only test rejects the command, but keep the text for tokenizing.
-      if (s[i + 1] === '(') metacharacters.add('$');
+      // `$(…)` runs a command and its OUTPUT is spliced into this one. The text has to stay
+      // in the segment for tokenizing, but the substitution is also a command in its own
+      // right — so it is emitted as a segment of its own. Without that, `npm test $(rm -rf /)`
+      // was a single segment that the `Bash(npm test *)` prefix rule matched, and
+      // isDestructiveCommand never saw `rm` at all.
+      if (s[i + 1] === '(') {
+        metacharacters.add('$');
+        const close = matchingParen(s, i + 1);
+        if (close > 0) {
+          const inner = s.slice(i + 2, close);
+          if (inner.trim()) {
+            // The outer text so far, then the substitution itself as its own command.
+            segments.push(current);
+            segments.push(inner);
+            current = '';
+          }
+          // The outer command continues with the substitution text in place, so what follows
+          // it stays attached to the same command line.
+          current += s.slice(i, close + 1);
+          i = close + 1;
+          continue;
+        }
+      }
       current += c; i += 1; continue;
     }
     if (c === '(' || c === ')') { metacharacters.add(c); current += c; i += 1; continue; }
@@ -296,6 +355,32 @@ function rmIsDestructive(args) {
 /** `mkfs`, `mkfs.ext4`, `mkfs.xfs` — the whole family. */
 function isMkfs(cmd) { return cmd === 'mkfs' || cmd.startsWith('mkfs.'); }
 
+/**
+ * The git SUBCOMMAND from an argv tail.
+ *
+ * The obvious `args.find(a => !a.startsWith('-'))` returns the first non-flag WORD, which
+ * for `git -C /repo push` is `/repo` — the VALUE of `-C`. Every subcommand rule then missed
+ * and `git -C x push`, `git -c core.pager=x reset --hard`, `git -c foo=bar clean` all
+ * passed the destructive check. Three flag shapes have to be stepped over:
+ *
+ *   -C <path> / -c <name=value>   a separate value in the NEXT word
+ *   --git-dir=<path>              the value is inside the SAME word
+ *   -p / --paginate               no value at all
+ *
+ * Only the flags git treats as value-taking are listed, so a bare `-x` is still skipped as
+ * a plain flag and cannot swallow the subcommand beside it.
+ */
+function gitSubcommand(args) {
+  const TAKES_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('-')) return a.toLowerCase();
+    // `--git-dir=/x` carries its own value, so the next word is the subcommand.
+    if (a.includes('=')) continue;
+    if (TAKES_VALUE.has(a)) i++;   // step over the value
+  }
+  return '';
+}
 // Judge ONE already-unwrapped command. Returns a reason string, or null when the
 // command is not destructive.
 function judgeUnwrapped(cmd, args) {
@@ -352,7 +437,7 @@ function judgeUnwrapped(cmd, args) {
       if (args.includes('prune')) return 'docker prune';
       break;
     case 'git': {
-      const sub = (args.find((a) => !a.startsWith('-')) || '').toLowerCase();
+      const sub = gitSubcommand(args);
       // A dry run changes nothing, and flagging it is what made `git push
       // --dry-run` prompt in YOLO mode.
       if (args.some((a) => a === '-n' || a === '--dry-run')) break;
@@ -454,7 +539,11 @@ export function isReadOnlyCommand(cmd) {
   if (!u.cmd) return false;                   // a bare `sh -c "…"` is not provable
   if (!READ_ONLY_BINS.has(u.cmd)) return false;
   if (u.cmd === 'git') {
-    const sub = (u.args.find((a) => !a.startsWith('-')) || '').toLowerCase();
+    // The shared extractor, not `args.find(a => !a.startsWith('-'))`: that form returns the
+    // VALUE of `-C`/`-c` (`git -C /repo status` yielded `/repo`), so the verb was never read
+    // and an ordinary read-only git command was refused. The destructive check learned this
+    // first; the two judged the same command differently until they shared one function.
+    const sub = gitSubcommand(u.args);
     if (!sub || !GIT_READ_SUBCMDS.has(sub)) return false;
     // `tag`/`branch`/`remote`/`config`/`worktree` are read-only only WITHOUT a
     // writing flag, so any of those flags refuses the whole command.

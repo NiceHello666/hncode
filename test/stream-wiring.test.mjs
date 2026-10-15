@@ -24,7 +24,7 @@ test('the answer and reasoning deltas are pushed into the buffer, not painted di
   // The `data` handler is the answer-text path.
   const data = /if \(e\.type === 'data'\) \{([\s\S]*?)\s{8}\}/.exec(src);
   assert.ok(data, "the 'data' handler was not found");
-  assert.ok(/streamBuf\.pushText\(e\.text\)/.test(data[1]),
+  assert.ok(/sessHost\.streamBuf\.pushText\(e\.text\)/.test(data[1]),
     "the 'data' handler must feed the buffer rather than call appendAssistant directly");
   assert.ok(!/appendAssistant\(e\.text\)/.test(data[1]),
     "the 'data' handler still paints the delta directly, bypassing the pacing");
@@ -32,7 +32,7 @@ test('the answer and reasoning deltas are pushed into the buffer, not painted di
   // The `think` handler is the reasoning path.
   const think = /if \(e\.type === 'think'\) \{([\s\S]*?)\s{8}\}/.exec(src);
   assert.ok(think, "the 'think' handler was not found");
-  assert.ok(/streamBuf\.pushReasoning\(e\.text\)/.test(think[1]),
+  assert.ok(/sessHost\.streamBuf\.pushReasoning\(e\.text\)/.test(think[1]),
     "the 'think' handler must feed the buffer so reasoning is paced with the answer");
   assert.ok(!/appendThinking\(e\.text\)/.test(think[1]),
     "the 'think' handler still paints the delta directly");
@@ -74,12 +74,12 @@ test('the delta handlers apply the ops the push hands back', () => {
   // FAST and names the call site.
   const data = /if \(e\.type === 'data'\) \{([\s\S]*?)\s{8}\}/.exec(src);
   assert.ok(data, "the 'data' handler was not found");
-  assert.ok(/applyStreamOps\(streamBuf\.pushText\(e\.text\)\)/.test(data[1]),
+  assert.ok(/applyStreamOps\(sessHost\.streamBuf\.pushText\(e\.text\)\)/.test(data[1]),
     'the returned ops of streamBuf.pushText must be APPLIED, not dropped');
 
   const think = /if \(e\.type === 'think'\) \{([\s\S]*?)\s{8}\}/.exec(src);
   assert.ok(think, "the 'think' handler was not found");
-  assert.ok(/applyStreamOps\(streamBuf\.pushReasoning\(e\.text\)\)/.test(think[1]),
+  assert.ok(/applyStreamOps\(sessHost\.streamBuf\.pushReasoning\(e\.text\)\)/.test(think[1]),
     'the returned ops of streamBuf.pushReasoning must be APPLIED, not dropped');
 });
 
@@ -101,7 +101,16 @@ test('the plan finalize drains the paced buffer before it reads the transcript',
 });
 
 test('the buffer is constructed once, and the tick interval is finer than the spinner', () => {
-  has(/const streamBuf = new StreamBuffer\(\);/, 'the TUI must own exactly one buffer');
+  assert.match(src, /streamBuf = sessHost\.streamBuf|new StreamBuffer\(\)/,
+    'the TUI must reach the one buffer, not build its own');
+
+  // Exactly ONE construction, across the files that could hold it: two buffers would each
+  // release the same characters and the transcript would show them twice.
+  const owners = ['tui.js', 'session-host.js', 'stream-buffer.js']
+    .map((f) => fs.readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'))
+    .join('\n');
+  const builds = owners.match(/new StreamBuffer\(\)/g) || [];
+  assert.equal(builds.length, 1, `expected one buffer construction, found ${builds.length}`);
   const ms = /const STREAM_TICK_MS = (\d+);/.exec(src);
   assert.ok(ms, 'the tick interval constant was not found');
   const tickMs = Number(ms[1]);
