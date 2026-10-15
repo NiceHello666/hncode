@@ -192,22 +192,37 @@ export function planTrim(messages, keepRatio, mustKeep) {
   // A budget of 0 means "elide everything eligible"; a budget of 1 means "keep it
   // all", in which case we still elide the already-marked ones so a repeated call
   // is a no-op rather than a growing patch.
-  const budget = totalBytes * ratio;
+  // The share of the ELIGIBLE text to keep, not of `totalBytes`. `totalBytes` counts the
+  // pointers left by earlier passes, so after a few passes it mostly describes text that can no
+  // longer be elided — and a budget drawn from it stops constraining the loop.
+  const eligibleBytes = candidates.reduce((n, i) => n + messages[i].content.length, 0);
+  const budget = eligibleBytes * ratio;
   const keep = new Set();
   let keepBytes = 0;
   for (let k = candidates.length - 1; k >= 0; k--) {
     const i = candidates[k];
     if (i === mustKeep) { keep.add(i); keepBytes += messages[i].content.length; continue; }
     const size = messages[i].content.length;
-    // Keep this chunk if we are still under budget, but ALWAYS keep the single
-    // newest result: a trim that elides the output the model is currently reading
-    // is how a working turn turns into a confused one.
-    if (keepBytes + size <= budget || keep.size === 0) {
+    // Under budget: keep. Otherwise elide — except for the result the model is reading right
+    // now, which the `mustKeep` branch above has already kept.
+    //
+    // There used to be a `|| keep.size === 0` here, meaning "always keep at least the newest".
+    // `mustKeep` is what actually protects the live result, and the override made a single large
+    // result impossible to trim: it was the only candidate, so it was always "the newest", so
+    // the budget never applied and the trim elided nothing.
+    if (keepBytes + size <= budget) {
       keep.add(i);
       keepBytes += size;
     }
   }
 
+  // THE FLOOR: never elide everything.
+  //
+  // The budget can be smaller than every candidate — one 200k result against a 60k budget is the
+  // ordinary case, because a long turn leaves the history with only the newest result still
+  // un-elided. Without this the trim would replace that result with a pointer, which is worse
+  // than not trimming: the model loses the output it just asked for.
+  if (!keep.size && candidates.length) keep.add(candidates[candidates.length - 1]);
   const elide = [];
   let elideBytes = 0;
   for (const i of candidates) {

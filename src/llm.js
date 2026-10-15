@@ -421,6 +421,12 @@ export class LLM {
 
     for (let attempt = 1; attempt <= RETRIES; attempt++) {
       attempts = attempt;
+      // Reset per attempt. Left holding the PREVIOUS attempt's response, a network error on
+      // this attempt left `res` truthy and `!res.ok` true, so the loop reported the old
+      // status and the old body — `LLM request failed (503)` for a connection that was
+      // actually refused, with `lastError` (the real cause) never reaching the user.
+      res = null;
+      lastError = null;
       // Fresh controller per attempt so an abort aborts this specific request
       // and the retry loop stops.
       this.controller = new AbortController();

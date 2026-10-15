@@ -71,11 +71,17 @@ Use this instead of writing \`git\` shell pipelines. Destructive resets are not 
         a.push('--stat');
         // paths after --
         const paths = Array.isArray(args.paths) ? args.paths.filter(Boolean) : [];
-        const statR = git.runGit(a.concat(paths.length ? ['--', ...paths] : []), cwd);
+        // ASYNC, with the turn's signal: a `git diff` on a large repository is slow enough that a
+        // synchronous call would freeze the TUI — and with the event loop held, Esc could not even
+        // be read, let alone interrupt it.
+        const statR = await git.runGitAsync(a.concat(paths.length ? ['--', ...paths] : []), cwd, { signal: ctx && ctx.signal });
         if (!statR.ok) return `Error: ${statR.stderr.trim() || statR.error}`;
         if (!statR.stdout.trim()) return args.staged ? 'No staged changes.' : 'No changes.';
         // Also include the full diff, bounded so a huge change cannot flood context.
-        const full = git.runGit(['diff'].concat(args.staged ? ['--cached'] : []).concat(paths.length ? ['--', ...paths] : []), cwd);
+        const full = await git.runGitAsync(
+          ['diff'].concat(args.staged ? ['--cached'] : []).concat(paths.length ? ['--', ...paths] : []),
+          cwd, { signal: ctx && ctx.signal },
+        );
         const MAX = 60 * 1024;
         let body = full.stdout || '';
         let note = '';
@@ -115,7 +121,13 @@ Use this instead of writing \`git\` shell pipelines. Destructive resets are not 
 
       case 'log': {
         const n = Math.max(1, Math.min(200, Number(args.count) || 10));
-        const r = git.runGit(['log', `-${n}`, '--pretty=format:%h %ad %s', '--date=short'], cwd);
+        // Async with the signal: `git log` is the slowest call here on a large history, and it is
+        // exactly the one a user presses Esc on.
+        const r = await git.runGitAsync(
+          ['log', `-${n}`, '--pretty=format:%h %ad %s', '--date=short'],
+          cwd, { signal: ctx && ctx.signal },
+        );
+        if (r.error === 'interrupted') return 'Interrupted by user.';
         return r.ok ? (r.stdout.trim() || 'No commits yet.') : `Error: ${r.stderr.trim() || r.error}`;
       }
 

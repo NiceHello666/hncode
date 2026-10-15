@@ -67,9 +67,13 @@ test('a real repository reports its branch, and no missing identity when one is 
   const g = find(r, 'git')[0];
   assert.equal(g.severity, 'ok');
   assert.match(g.detail, / in /, `branch and top level: ${g.detail}`);
+  // `find(...)` returns [] when the row is ABSENT, so `miss[0]` is undefined and
+  // `undefined !== 'warn'` passes — an assertion that cannot fail when the check is
+  // missing entirely. Require the row to exist first, then require it to be ok.
   for (const key of ['git user.name', 'git user.email']) {
     const miss = find(r, key)[0];
-    assert.notEqual(miss && miss.severity, 'warn',
+    assert.ok(miss, `${key} is reported here rather than silently omitted: ${g.detail}`);
+    assert.notEqual(miss.severity, 'warn',
       `${key} is configured here, so it must not be reported missing`);
   }
 });

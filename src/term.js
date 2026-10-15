@@ -379,10 +379,37 @@ const tokCache = new Map();
 const TOK_CACHE_MAX = 20000;
 const TOK_CACHE_MAX_LEN = 4096;   // only memoise strings this short
 
+/**
+ * The same estimate, UNROUNDED — for summing many small chunks.
+ *
+ * `estimateTokens` rounds up, which is right for measuring one finished body: a 5-character
+ * message should not read as 1.25 tokens.
+ *
+ * It is wrong for a STREAM. Deltas arrive a few characters at a time, and each one took
+ * `ceil(ascii / 4)` — `ceil(3/4)` is 1, so three characters were billed as a whole token. Over
+ * hundreds of chunks that inflated the running figure badly: measured at +33% on ordinary
+ * English, and the visible symptom was the output counter DROPPING (3000 -> 2300) the moment the
+ * provider's exact `usage` arrived and replaced the estimate. Nothing was lost; the estimate had
+ * been lying.
+ *
+ * So the running counter accumulates this unrounded value, and rounds once when it displays.
+ * Callers that measure a complete string keep using `estimateTokens`.
+ */
+export function estimateTokensFloat(text) {
+  const s = String(text ?? '');
+  let ascii = 0, nonAscii = 0;
+  for (const ch of s) {
+    if (ch.codePointAt(0) <= 127) ascii++;
+    else nonAscii++;
+  }
+  return ascii / 4 + nonAscii;
+}
+
 export function estimateTokens(text) {
   const s = String(text ?? '');
   if (s.length <= TOK_CACHE_MAX_LEN) {
     const hit = tokCache.get(s);
+    if (hit !== undefined) return hit;
     if (hit !== undefined) return hit;
     let ascii = 0, nonAscii = 0;
     for (const ch of s) {

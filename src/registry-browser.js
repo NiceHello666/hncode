@@ -126,15 +126,30 @@ export function rowsForTab(state, tabId) {
     }));
   }
   if (tabId === 'ondisk') {
-    const loadedNames = new Set((d.loaded || []).map((p) => p.name));
+    // Match on the DIRECTORY a plugin was loaded from, not on the name it reports.
+    //
+    // A plugin declares its own `name`, and it need not match the directory it sits in. Comparing
+    // names meant any plugin where the two differed showed "Need Restart" forever: the name it
+    // reported could never equal the directory it was found under, so restarting never helped.
+    // `computer-use/` declaring `hncode-cu` is the ordinary case, not an oddity.
+    //
+    // `loaded` records each plugin with an `id` of `<dirname>/<entry>` while `onDisk` reports only a
+    // bare `name` (the directory, or the filename for a single-file plugin). The first segment of
+    // the id is therefore the thing to compare, and it covers both layouts: a directory's id starts
+    // with its directory name, and a single file's id IS its filename.
+    const loadedDirs = new Set();
+    const loadedNames = new Set();
+    for (const p of d.loaded || []) {
+      if (p.id) loadedDirs.add(String(p.id).split('/')[0]);
+      if (p.name) loadedNames.add(String(p.name));
+    }
+    const isLoaded = (p) => loadedDirs.has(String(p.name)) || loadedNames.has(String(p.name));
     return (d.onDisk || []).map((p) => ({
       name: p.name,
       label: p.name + (p.kind === 'dir' ? '/' : ''),
-      description: loadedNames.has(p.name)
-        ? 'loaded in this session'
-        : 'not loaded — Need Restart',
-      status: loadedNames.has(p.name) ? 'loaded' : 'Need Restart',
-      statusTone: loadedNames.has(p.name) ? 'ok' : 'warn',
+      description: isLoaded(p) ? 'loaded in this session' : 'not loaded — Need Restart',
+      status: isLoaded(p) ? 'loaded' : 'Need Restart',
+      statusTone: isLoaded(p) ? 'ok' : 'warn',
       action: 'remove-plugin',
     }));
   }

@@ -228,10 +228,51 @@ export function formatReadout(used, window, freeCols) {
   return '';
 }
 
-/** 1200 -> `1.2k`, 97000 -> `97.0k`, 3_400_000 -> `3.4M`. */
+/**
+ * A token count as a compact string: `1200` -> `1.2k`, `97000` -> `97k`, `3400000` -> `3.4M`.
+ *
+ * Deliberately the SAME shape `fmtTokensShort` produces for the working row, because both appear
+ * in one frame — the context bar and the live turn counter would otherwise disagree about the same
+ * quantity. Two rules:
+ *
+ *   * one decimal while it carries information, dropped when it is a zero (`97000` is `97k`, not
+ *     `97.0k` — the trailing `.0` is three characters saying nothing);
+ *   * K/M/B/T suffixes, with only the kilo lower-case, so `3.4M` here and `3.4M` on the working row
+ *     read as one vocabulary.
+ *
+ * The previous version kept `.0` and disagreed with the working row on units entirely: it divided
+ * by 1024 where the row divided by 1000, so a 97k context read `94.7k` beside a `97k` turn.
+ */
 export function compactTokens(n) {
-  const v = Number(n) || 0;
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
-  return String(Math.round(v));
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  const units = [
+    { at: 1e12, suffix: 'T' },
+    { at: 1e9, suffix: 'B' },
+    { at: 1e6, suffix: 'M' },
+    { at: 1e3, suffix: 'k' },
+  ];
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (v < u.at) continue;
+    // The identical scaling rule the working row and the /ctx readout use: one decimal below 100,
+    // whole numbers above. Three formatters render token counts into one frame, so a single rule is
+    // the only way `262k` cannot appear beside `262.1k` for the same quantity.
+    const shown = scaleUnit(v / u.at);
+    // Rounding can reach the next unit (`999999` is `1000k`, which is `1m`), and showing `1000k`
+    // makes the reader convert a unit themselves.
+    if (Number(shown) >= 1000 && i > 0) return `${scaleUnit(v / units[i - 1].at)}${units[i - 1].suffix}`;
+    return `${shown}${u.suffix}`;
+  }
+  return String(v);
+}
+
+/**
+ * One unit's worth of a count: `1.2`, `97`, `262`.
+ *
+ * Duplicated from tui.js rather than imported, because `context-bar.js` must stay a leaf module the
+ * TUI can import without a cycle. The two are pinned together by test/context-bar.test.mjs and
+ * test/working-tokens.test.mjs, which assert the same table of values through both.
+ */
+function scaleUnit(v) {
+  return v < 100 ? v.toFixed(1).replace(/\.0$/, '') : String(Math.round(v));
 }

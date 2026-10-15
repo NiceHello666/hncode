@@ -199,14 +199,19 @@ test('changedSettings names only what differs, string-compared', () => {
   assert.ok(!changed.includes('calm_mode'), 'nor is setting the default explicitly');
 });
 
-test('a long text value is shortened for the row, and says so', () => {
+test('a prose value is returned whole, not pre-truncated', () => {
+  // It used to be cut to forty characters HERE, which made the value unusable downstream:
+  // the settings row summarised what it was handed, so it reported "1 line, 41 chars" for a
+  // four-line paragraph — the size of the truncation, not of the text.
   const long = 'x'.repeat(200);
-  const shown = displayValue({ raw: { system_prompt: long } }, 'system_prompt');
-  assert.ok(shown.length <= 41, `row value is bounded: ${shown.length}`);
-  assert.match(shown, /…/, 'and marked as truncated');
-  // A multi-line value shows its first line, not a newline that would break the row.
-  const multi = displayValue({ raw: { system_prompt: 'first line\nsecond' } }, 'system_prompt');
-  assert.ok(!multi.includes('\n'), 'no newline leaks into a one-line row');
+  assert.equal(displayValue({ raw: { system_prompt: long } }, 'system_prompt'), long);
+
+  const multi = 'first line\nsecond line';
+  assert.equal(displayValue({ raw: { system_prompt: multi } }, 'system_prompt'), multi,
+    "a newline is part of the value, not something to strip");
+
+  assert.equal(displayValue({ raw: { system_prompt: '   ' } }, 'system_prompt'), '(unset)',
+    'whitespace alone is still unset');
 });
 
 test('an unset string reads as (unset) rather than an empty gap', () => {

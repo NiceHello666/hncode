@@ -57,22 +57,58 @@ const ONESHOT_MS = 20000;
 
 function win() { return process.platform === 'win32'; }
 
-// ---------------------------------------------------------------- copy
+/**
+ * Put text on the clipboard.
+ *
+ * WINDOWS: `Set-Clipboard` through PowerShell, NOT `clip.exe`.
+ *
+ * `clip.exe` takes UTF-16LE and needed a byte order mark to be read correctly — without it
+ * non-ASCII arrived as mojibake (`中文测试` came back as `-N噀Km諎`, measured). But the mark is then
+ * part of the clipboard text: every copy began with a zero-width U+FEFF that showed up as a stray
+ * invisible character wherever it was pasted. Measured over six samples, `Set-Clipboard` was better
+ * on every one:
+ *
+ *     copied           clip.exe + BOM             Set-Clipboard
+ *     hello            U+FEFF hello               hello
+ *     中文测试          U+FEFF 中文测试             中文测试
+ *     line1\nline2     U+FEFF line1 CRLF line2    line1\nline2   (line endings untouched)
+ *     emoji 🎉 ok       U+FEFF emoji 🎉 ok         emoji 🎉 ok
+ *
+ * It also needs no escaping: PowerShell receives a .NET string rather than a byte stream, so there
+ * is no console parser to satisfy — which is what the BOM and the quoting were working around.
+ *
+ * `clip.exe` stays as a fallback for a machine with no PowerShell at all, where a copy carrying a
+ * stray BOM beats no copy.
+ */
 export function copyText(text) {
   const s = String(text == null ? '' : text);
   if (!s) return false;
   if (win()) {
-    // clip.exe takes UTF-16LE. (`cmd /c echo "…" | clip` mangled quotes, '%'
-    // and newlines; plain UTF-8 input turned non-ASCII into mojibake.) Prefix the
-    // UTF-16 byte order mark (FF FE) so clip.exe is never left to guess the endian
-    // or treat input as ANSI — without it, non-ASCII on some Windows versions /
-    // code pages came out mojibake.
+    if (setClipboardText(s)) return true;
     cp.execSync('clip', { input: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')]), windowsHide: true, timeout: 5000 });
     return true;
   }
   const cmd = process.platform === 'darwin' ? 'pbcopy' : 'xclip -selection clipboard';
   cp.execSync(cmd, { input: Buffer.from(s, 'utf8'), timeout: 5000 });
   return true;
+}
+
+/** `Set-Clipboard` via PowerShell. False when no PowerShell can be run. */
+function setClipboardText(s) {
+  // The text travels as base64 so nothing in it can end the script or be re-parsed. A quoted
+  // PowerShell literal would need every `'` doubled, and a newline or a backtick in the text would
+  // otherwise change what the script means.
+  const b64 = Buffer.from(s, 'utf16le').toString('base64');
+  const full = 'Add-Type -AssemblyName System.Windows.Forms; '
+    + '[System.Windows.Forms.Clipboard]::SetText('
+    + `[System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${b64}')))`;
+  for (const exe of [_psExe, 'powershell']) {
+    try {
+      cp.execFileSync(exe, ['-NoProfile', '-NonInteractive', '-Command', full], { timeout: 10000, windowsHide: true });
+      return true;
+    } catch { /* try the next exe */ }
+  }
+  return false;
 }
 
 // Which PowerShell the helper runs. `pwsh` (7) starts far faster than the built-in

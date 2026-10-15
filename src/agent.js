@@ -3,7 +3,7 @@
 // model answers without tool calls (or a step/interrupt condition is hit).
 
 import { LLM, setToolsList } from './llm.js';
-import { tools, getTool, llmTools } from './tools/index.js';
+import { tools, combinedTools, getTool, llmTools } from './tools/index.js';
 import { DELEGATION_TOOLS } from './subagent-types.js';
 import { estimateMessagesTokens, estimateRequestOverhead, estimateTokens, messageTokens, TokenLedger, forgetMessageTokens } from './term.js';
 import { runHooks, runPatch, runPatchSync } from './plugin.js';
@@ -140,8 +140,9 @@ function hashKey(s) {
     h = (h * 0x01000193) >>> 0;
   }
   return h.toString(36) + '-' + str.length.toString(36);
-  return h.toString(36) + '-' + str.length.toString(36);
 }
+
+// Render what an Edit actually changed, for the MODEL's tool result.
 
 // Render what an Edit actually changed, for the MODEL's tool result.
 //
@@ -166,10 +167,18 @@ export function formatEditDiffForModel(diff, maxLines = 400) {
   const out = [];
   out.push('');
   out.push('--- diff ---');
+  // Unchanged lines above and below, unmarked, so the change can be LOCATED. Without them this
+  // was a quoted block with no indication of where in the file it landed — and identical-looking
+  // code appears in many places, so neither the model nor the user could confirm the edit hit
+  // the intended one rather than a same-text block further down.
+  const before = (diff.context && Array.isArray(diff.context.before)) ? diff.context.before : [];
+  const after = (diff.context && Array.isArray(diff.context.after)) ? diff.context.after : [];
+  for (const c of before) out.push('  ' + String(c.n).padStart(4) + '   ' + c.text);
   let n = startLine;
   for (const l of oldLines) out.push('  ' + String(n++).padStart(4) + ' - ' + l);
   n = startLine;
   for (const l of newLines) out.push('  ' + String(n++).padStart(4) + ' + ' + l);
+  for (const c of after) out.push('  ' + String(c.n).padStart(4) + '   ' + c.text);
   // A whole-file edit (a Write-sized `new`) must not be echoed back in full.
   if (out.length > maxLines + 3) {
     const hidden = out.length - (maxLines + 3);
@@ -204,6 +213,37 @@ const READ_ONLY_TOOLS = new Set([
 function toolResultLimitsEnabled() {
   return !/^(0|off|false|no)$/i.test(String(process.env.HNCODE_TOOL_RESULT_LIMITS || ''));
 }
+
+/**
+ * A tool's return value, as the STRING the model can be sent.
+ *
+ * Every tool in `src/tools/` returns a plain string except the team tools, which return
+ * `{ content }` / `{ error }`. That object went into the `tool` message verbatim, and a provider
+ * that expects a string rejects the NEXT request with `missing type field in content item at
+ * index 0` — so a teammate's first `SendMessage` worked and then the conversation died, one
+ * message in. The symptom was a team that says hello and then never answers again.
+ *
+ * Returns `null` for the one shape that must stay an OBJECT: `ReadMediaFile` returns
+ * `{ text, media: [...] }`, and the media parts travel as structured blocks the caller builds
+ * from the object. Stringifying that would attach no image at all, so the caller keeps it.
+ *
+ * Normalised here, at the single point every tool result passes through, rather than in the
+ * team tools: a second tool family making the same choice cannot reintroduce the bug.
+ */
+function toolResultText(value) {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  if (typeof value === 'object') {
+    // Leave a media result alone — the caller needs the parts, not a sentence about them.
+    if (Array.isArray(value.media)) return null;
+    if (typeof value.content === 'string') return value.content;
+    if (typeof value.error === 'string') return value.error;
+    if (typeof value.text === 'string') return value.text;
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value);
+}
+
 
 
 export const SYSTEM_PROMPT = `You are hncode, a coding agent in the user's terminal on ${process.platform}.
@@ -280,9 +320,9 @@ export class Agent {
     // even if the filter would have allowed them. The catalog already excludes
     // them from every profile; this is the hard backstop that also covers the
     // `null` (= everything) case, so a subagent can never spawn another agent.
-    const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
-      ? tools.filter((t) => cfg.toolFilter.includes(t.name))
-      : tools
+const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
+      ? combinedTools().filter((t) => cfg.toolFilter.includes(t.name))
+      : combinedTools()
     )
       .filter((t) => !(cfg.noDelegation && DELEGATION_TOOLS.includes(t.name)))
       // AgentSwarm is gated behind swarm mode, like Agent is gated behind the user
@@ -420,9 +460,10 @@ export class Agent {
     const used = this.usedTokens();
     const maxSize = Math.max(1, Math.floor((used || (maxCtx || 512000) * 0.85) * keepRatio));
     const msgs = this.messages || [];
-    // Never cut inside the LEADING system block. `msgs[0]` is the assembled system
-    // prompt, and canSplitAfter() would happily allow a split right after it — which
-    // would drop the prompt itself and leave the request with no instructions.
+    // How far the LEADING system block runs. A cut before `floor` would land inside it,
+    // splitting the assembled system prompt across the drop boundary. The block itself is
+    // carried over by the trim (renamed `leadingSystem` there), because a cut can only
+    // ever land at or after its end.
     let floor = 0;
     while (floor < msgs.length && msgs[floor] && msgs[floor].role === 'system') floor++;
     let recent = 1;
@@ -435,13 +476,66 @@ export class Agent {
       // call. It is also the memoised form, so repeating this walk after a large tool
       // result is a WeakMap hit rather than a re-measure.
       size += messageTokens(msgs[split], null);
-      if (split > floor && canSplitAfter(msgs, split - 1)) bestSplit = split;
+      // The guard the leading system block needs, and the reverse of the `split > floor`
+      // this used to test. A cut at `split` drops `[0..split-1]`, so `split >= floor`
+      // keeps the cut at or after the block's end and never inside it — which is what
+      // the block's comment above asks for, and what `split > floor` inverted.
+      if (split >= floor && canSplitAfter(msgs, split - 1)) bestSplit = split;
       if (size >= maxSize && bestSplit !== undefined) break;
     }
     return bestSplit ?? 0;
   }
 
+  /**
+   * Trim the history at a legal cut and append the summary + continuation note.
+   *
+   * Extracted from `run()` so it can be tested against the REAL implementation. A test that
+   * re-implemented these four lines was green against a duplicated system prompt — the copy
+   * carried its own guard, which is the failure mode of testing a restatement.
+   *
+   * Returns `{ split, dropped }`.
+   *
+   * Shape: `[ ...lead, ...kept, summary, continuation ]`.
+   *
+   * The summary is a USER message wrapped in a `<system-reminder>` (kimi's shape), not a
+   * `system` one. Two reasons:
+   *   * the TUI rebuilds the system prompt from scratch each turn and SKIPS every `system`
+   *     entry in the stored history, so a system summary was dropped before the model saw it;
+   *   * the turn-end save filters `system` out of the session, so it was not persisted either
+   *     — history trimmed AND summary lost at both ends, which made "compaction" pure data loss.
+   * The continuation note goes LAST so the model's next move is "keep going" rather than
+   * "answer the summary".
+   */
+  applyCompactionSplit(maxCtx, summary) {
+    const split = this.computeCompactSplit(maxCtx);
+    const keep = this.messages.slice(split);
+    const dropped = this.messages.length - keep.length;
+    // The LEADING system block is carried over explicitly. It sits at the head of the array
+    // and the cut drops everything before `split`, so it would otherwise be taken by every
+    // compaction — leaving the request with no instructions, which is the loss the `floor`
+    // guard in computeCompactSplit exists to prevent.
+    let leadingSystem = 0;
+    while (leadingSystem < this.messages.length
+      && this.messages[leadingSystem] && this.messages[leadingSystem].role === 'system') leadingSystem++;
+    // Only what the cut actually REMOVED. `keep` is `slice(split)`, so at `split === 0` it
+    // still contains the whole array including the block — prepending the block then sends the
+    // system prompt twice, and `llm.js` concatenates every system message into the request, so
+    // it would stay doubled in every compacted request from then on.
+    const lead = split > 0 ? this.messages.slice(0, leadingSystem) : [];
+    const summaryText = summary
+      ? `${COMPACTION_SUMMARY_PREFIX}\n${summary}`
+      : `${COMPACTION_SUMMARY_PREFIX}\n(no summary available)`;
+    this.messages = [
+      ...lead,
+      ...keep,
+      { role: 'user', _harness: true, content: wrapSystemReminder(summaryText) },
+      { role: 'user', _harness: true, content: wrapSystemReminder(COMPACTION_CONTINUATION_TEXT) },
+    ];
+    return { split, dropped };
+  }
+
   async run() {
+    // Clear any interrupt flag left from a previous (interrupted) turn. This runs at
     // Clear any interrupt flag left from a previous (interrupted) turn. This runs at
     // the start of EVERY turn, so a stalled Esc/Ctrl-C from an earlier compaction can
     // never suppress auto-compaction on the next message. (The constructor also
@@ -655,29 +749,7 @@ export class Agent {
           break;
         }
         // NOW trim, at a split point the boundary rule allows.
-        const split = this.computeCompactSplit(maxCtx);
-        const keep = this.messages.slice(split);
-        const droppedCount = this.messages.length - keep.length;
-        // Shape: [ ...kept, summary, continuation ].
-        //
-        // The summary is a USER message wrapped in a <system-reminder> (kimi's
-        // shape), not a `system` message. Two reasons:
-        //   * the TUI rebuilds the system prompt from scratch each turn and SKIPS
-        //     every `system` entry in the stored history, so a system summary was
-        //     dropped before the model ever saw it;
-        //   * the turn-end save filters `system` out of the session, so it was not
-        //     persisted either — history trimmed AND summary lost at both ends,
-        //     which made "compaction" pure data loss.
-        // The continuation note goes LAST so the model's next move is "keep going"
-        // rather than "answer the summary".
-        const summaryText = summary
-          ? `${COMPACTION_SUMMARY_PREFIX}\n${summary}`
-          : `${COMPACTION_SUMMARY_PREFIX}\n(no summary available)`;
-        this.messages = [
-          ...keep,
-          { role: 'user', _harness: true, content: wrapSystemReminder(summaryText) },
-          { role: 'user', _harness: true, content: wrapSystemReminder(COMPACTION_CONTINUATION_TEXT) },
-        ];
+        const { split, dropped: droppedCount } = this.applyCompactionSplit(maxCtx, summary);
         // The array was REPLACED, so every count the ledger held describes messages
         // that no longer exist. `sync` would notice on its own (the first/last
         // identities no longer match), but resetting here states the intent at the
@@ -931,7 +1003,13 @@ export class Agent {
         let _args = tc.args; let _skip = false;
         try { const out = await runPatch('toolDispatch', { name: tc.name, args: tc.args, ctx: this.ctx }, (c) => c); if (out) { _args = out.args !== undefined ? out.args : tc.args; if (out.skip) _skip = true; } } catch (e) { console.error('[hncode-plugin] toolDispatch error:', e.message); }
         if (_skip) { result = '[skipped by plugin: ' + tc.name + ']'; ok = true; }
-        else result = await tool.execute(_args, this.ctx);
+        else {
+          const raw = await tool.execute(_args, this.ctx);
+          // `null` means the tool returned a structured MEDIA result: keep the object so the
+          // image blocks can be built from it. Only a plain value is stringified.
+          const text = toolResultText(raw);
+          result = text === null ? raw : text;
+        }
         } catch (err) {
           result = `Error running ${tc.name}: ${err.message}`;
           ok = false;

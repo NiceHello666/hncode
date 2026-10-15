@@ -98,6 +98,10 @@ export function normalizeMember(m, i) {
   return {
     index: i + 1,
     phase,
+    // Carried through, not dropped: `renderCell` reads it for the bar, and omitting it
+    // here meant every cell fell back to the placeholder ratio no matter what the agent
+    // reported — the wire carried a real figure and the renderer never saw one.
+    ratio: typeof src.ratio === 'number' && Number.isFinite(src.ratio) ? src.ratio : null,
     latestText: collapseWhitespace(src.latestText || src.text || ''),
     label: src.label || '',
   };
@@ -177,9 +181,13 @@ function renderCell(member, cellWidth) {
   const idx = String(member.index).padStart(3, '0');
   const info = phaseInfo(member.phase);
   const label = info.label;
+  // A working cell with no ratio from its agent shows a near-empty bar, not a confident
+  // half. `0.5` was a fixed placeholder: every running agent drew the same half-filled bar
+  // for its whole life, which read as "halfway done" and was simply untrue — a swarm of
+  // seven showed seven identical 50% bars and then jumped straight to 100%.
   const ratio = member.phase === 'completed' ? 1
     : member.phase === 'queued' ? 0
-    : (member.ratio != null ? Math.max(0, Math.min(1, member.ratio)) : 0.5);
+      : (member.ratio != null ? Math.max(0, Math.min(1, member.ratio)) : 0.05);
   // Budget: "001 [" + bar + "] " + label + optional "  " + text.
   const fixed = 3 + 2 + 2 + visWidth(label);
   const barCells = Math.max(0, Math.min(20, cellWidth - fixed));
@@ -284,10 +292,57 @@ export function renderSwarmProgress(snapshot, width, opts = {}) {
 // richer per-subagent data — e.g. rebuilding the block after a session reload.
 export function membersFromOutput(output, total) {
   const text = String(output || '');
-  const done = (text.match(/^\[\d+\/\d+\] finished$/gm) || []).length;
-  const n = Math.max(total || 0, done);
-  return Array.from({ length: n }, (_, i) => ({
-    phase: i < done ? 'completed' : 'queued',
-    latestText: '',
-  }));
+  // Each line names its agent, and the agent it names is the one it is about:
+  //   `[#i] started`        this agent began
+  //   `[#i] progress <pct>` this agent is pct% through its own work
+  //   `[#i] finished [n/m]` this agent, with a running total for readers that only count
+  //
+  // Reading a bare `[n/m]` as "the first n are done" was the earlier mistake: workers pull
+  // from a shared queue, so agent 3 can finish before agent 1, and the count says nothing
+  // about which. A `[n/m]`-only line is still accepted, for output written before this
+  // named its agent, and is counted but not attributed.
+  const started = new Set();
+  const doneSet = new Set();
+  const ratioOf = new Map();
+  let bareDone = 0;
+  for (const line of text.split('\n').map((l) => l.replace(/\r$/, ''))) {
+    let m = /^\[#(\d+)\] started$/.exec(line);
+    if (m) { started.add(Number(m[1])); continue; }
+    m = /^\[#(\d+)\] progress (\d+)$/.exec(line);
+    if (m) { ratioOf.set(Number(m[1]), Math.max(0, Math.min(100, Number(m[2]))) / 100); continue; }
+    m = /^\[#(\d+)\] finished(?: \[\d+\/\d+\])?$/.exec(line);
+    if (m) { doneSet.add(Number(m[1])); continue; }
+    if (/^\[\d+\/\d+\] finished$/.test(line)) bareDone++;
+  }
+  // A named finish also counts as "an agent started", so a log that lost its `started` lines
+  // still attributes the finish instead of leaving the cell stuck on "working" forever.
+  for (const idx of doneSet) started.add(idx);
+  // Bounded. `highest` comes off the wire, and one malformed line (`[#999999] progress 1`)
+  // would otherwise allocate an array that size and hang the render on every frame.
+  const MAX_MEMBERS = 128;
+  const highest = Math.min(MAX_MEMBERS, Math.max(0, ...started, ...doneSet, ...ratioOf.keys()));
+  const n = Math.min(MAX_MEMBERS, Math.max(total || 0, bareDone, highest));
+  // The lines no name claims are the OLD format's only evidence of who finished, so they are
+  // attributed to the agents that have not spoken for themselves — counting from the front
+  // and skipping any agent that announced itself, rather than refusing to attribute them at
+  // all whenever a single named line is present.
+  let unattributed = Math.max(0, bareDone - doneSet.size);
+  const legacyDone = new Set();
+  for (let idx = 1; idx <= n && unattributed > 0; idx++) {
+    if (started.has(idx) || doneSet.has(idx) || ratioOf.has(idx)) continue;
+    legacyDone.add(idx);
+    unattributed--;
+  }
+  return Array.from({ length: n }, (_, i) => {
+    const idx = i + 1;
+    const completed = doneSet.has(idx) || legacyDone.has(idx);
+    const phase = completed ? 'completed'
+      : started.has(idx) ? 'working'
+        : 'queued';
+    const out = { phase, latestText: '' };
+    // `ratioOf` only ever holds a finite value, so the extra `isFinite` test was dead — and
+    // it turned a genuine 0 into `null`, which the renderer reads as "no figure at all".
+    if (ratioOf.has(idx) && !completed) out.ratio = ratioOf.get(idx);
+    return out;
+  });
 }

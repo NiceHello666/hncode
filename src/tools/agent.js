@@ -54,7 +54,7 @@ function systemPromptFor(type, cfg, systemPrompt) {
 // stream, and each tool it runs) so the TUI can show it under the `Using Agent`
 // row the way Bash's output is shown. `agentId` labels the lines when several
 // subagents run at once (AgentSwarm), so the reader can tell them apart.
-async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProgress, agentId, onAgent }) {
+async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProgress, onStep, agentId, onAgent }) {
   const { Agent, SYSTEM_PROMPT } = await import('../agent.js');
   const subCfg = {
     ...cfg,
@@ -72,6 +72,9 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
     : [{ role: 'user', content: prompt }];
 
   let text = '';
+  // A failure used to leave `text` empty, so a caller could not tell "produced nothing" from
+  // "died". The Agent's only signal on error is an event, so capture it here.
+  let failure = null;
   const agent = new Agent({
     cfg: subCfg,
     messages,
@@ -87,12 +90,19 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
           if (e.text) onProgress(tag + e.text);
         } else if (e.type === 'tool_start') {
           onProgress(`\n${tag}\u25b8 ${e.name}\n`);
+          // One more round of work done. A SUBAGENT has no fixed step budget (agent.js sets
+          // `stepLimit = Infinity` unless the caller bounds it), so "steps remaining" is not
+          // a real quantity and a percentage of it would be invented. Tool calls completed is
+          // the honest measure: it only ever grows, it is what the run is actually doing, and
+          // the swarm turns it into a bar against the pace its other agents have set.
+          if (typeof onStep === 'function') onStep();
         } else if (e.type === 'tool_result') {
           const body = String(e.content == null ? '' : e.content);
           const first = body.split('\n').slice(0, 3).join('\n');
           onProgress(`${tag}${first}${body.split('\n').length > 3 ? '\n\u2026' : ''}\n`);
         } else if (e.type === 'error') {
           onProgress(`\n${tag}[error] ${(e.error && e.error.message) || String(e.error)}\n`);
+          failure = (e.error && e.error.message) || String(e.error);
         }
       }
       if (onEvent) onEvent(e);
@@ -139,7 +149,10 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
   const lastAssistant = [...agent.messages].reverse()
     .find((m) => m.role === 'assistant' && typeof m.content === 'string' && stripThink(m.content));
   const result = (lastAssistant && stripThink(lastAssistant.content)) || stripThink(text) || '(no output)';
-  return { text: result, messages: agent.messages };
+  // The failure travels WITH the text. A run that died and a run that simply produced nothing
+  // both used to arrive as an empty/`(no output)` string, so the caller could not tell them apart
+  // and reported a dead agent as a successful empty answer.
+  return { text: result, messages: agent.messages, failed: failure };
 }
 
 export const spec = {
@@ -206,7 +219,7 @@ ${availableTypes()}`,
 
     // ---- model override ---------------------------------------------------
     // Precedence: the call's own `model` > the user's configured subagent model
-    // (/swarm-sub-agent) > the session's model. 'primary' always means "this
+    // (/subagent-model) > the session's model. 'primary' always means "this
     // session's model", so an explicit primary beats a configured default.
     let subCfg = ctx;
     const wantPrimary = args.model === 'primary';
@@ -214,6 +227,26 @@ ${availableTypes()}`,
       ? args.model : '';
     const configured = ctx.subagentModel && ctx.raw && ctx.raw.models && ctx.raw.models[ctx.subagentModel]
       ? ctx.subagentModel : '';
+    // A NAME THAT DOES NOT EXIST IS AN ERROR, not a fallback. Resolving it to "" ran the
+    // subagent on the session's model while the caller believed it had chosen — a typo, or a
+    // model configured in another session, produced a silently different agent.
+    if (args.model && !wantPrimary && !explicit) {
+      const known = Object.keys((ctx.raw && ctx.raw.models) || {});
+      const list = known.length ? known.join(', ') : 'none';
+      return `Error: unknown model "${args.model}". Configured: ${list}. Use "primary" for the session model.`;
+    }
+
+    // The user's `/subagent-model` setting can go stale when a model is renamed or removed, and
+    // it used to fail the same silent way. Say so, through onOutput so it reaches the transcript.
+    if (ctx.subagentModel && !configured) {
+      const list = Object.keys((ctx.raw && ctx.raw.models) || {}).join(', ') || 'none';
+      try {
+        if (typeof ctx.onOutput === 'function') {
+          ctx.onOutput(`[subagent model] "${ctx.subagentModel}" is no longer configured, so this subagent runs on the session model. Re-pick it with /swarm-sub-agent. Available: ${list}\n`);
+        }
+      } catch { /* a view that cannot be written to is not a reason to fail the call */ }
+    }
+
     const chosen = wantPrimary ? '' : (explicit || configured);
     if (chosen) {
       const { resolveModelArg } = await import('../config.js');
@@ -316,11 +349,23 @@ ${availableTypes()}`,
       // `_progressTag` is set by AgentSwarm to the item index, so a swarm's
       // concurrently-running subagents are distinguishable in the live stream.
       // A plain Agent call has no tag and prints its stream unlabelled.
+      //
+      // `_subTaskId` is also set by AgentSwarm: it names the task THIS subagent owns, so its
+      // stream lands on its own row in /tasks instead of being folded into the swarm's single
+      // buffer. Without it a 7-item swarm had one task and no way to see what any of them was
+      // doing.
       onProgress: (text) => {
+        if (ctx._subTaskId) {
+          const own = ctx.tasks && ctx.tasks[ctx._subTaskId];
+          if (own) appendTaskOutput(own, text);
+        }
         if (typeof ctx.onOutput !== 'function') return;
         const tag = ctx._progressTag ? `[${ctx._progressTag}] ` : '';
         ctx.onOutput(tag ? text.split('\n').map((l) => (l ? tag + l : l)).join('\n') : text);
       },
+      // Each completed tool call is one unit of progress. Only AgentSwarm supplies the sink;
+      // a lone Agent call has no grid to fill and nothing to report to.
+      onStep: () => { if (typeof ctx._onSubProgress === 'function') ctx._onSubProgress(); },
     });
     // Registered here so a foreground subagent is reachable by AgentMessage / AgentInterrupt
     // too — that is precisely the case where a user wants to redirect one: it is the run
@@ -381,6 +426,11 @@ ${availableTypes()}`,
     entry.messages = run.messages;
     entry.type = type;
     subagents.set(agentId, entry);
+
+    // A FAILED subagent returns an error, not an empty string. `run.text` is '' when the Agent
+    // died, which the swarm printed as "(no output)" — so four agents that had all failed on one
+    // error looked like four agents that had found nothing to say.
+    if (run.failed) return `Error: subagent "${agentId}" failed: ${run.failed}`;
 
     return `agent_id: ${agentId}\n\n${run.text}`;
   },

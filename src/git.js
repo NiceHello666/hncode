@@ -33,6 +33,10 @@ const GIT_ENV = [
 
 // Run git with args in `cwd`. Returns { ok, stdout, stderr, code, error }.
 // Never throws: a missing git binary or a non-repo is data, not an exception.
+//
+// SYNCHRONOUS, and therefore only for the queries made at STARTUP (the status bar's branch and
+// sha). It blocks the event loop, so an AbortSignal cannot fire during it — use `runGitAsync` for
+// anything a tool call reaches.
 export function runGit(args, cwd, opts = {}) {
   const timeout = opts.timeoutMs || 30_000;
   try {
@@ -53,7 +57,6 @@ export function runGit(args, cwd, opts = {}) {
     return { ok: false, stdout: '', stderr: '', code: null, error: e.message };
   }
 }
-
 export function isRepo(cwd) {
   const r = runGit(['rev-parse', '--is-inside-work-tree'], cwd);
   return r.ok && r.stdout.trim() === 'true';
@@ -436,10 +439,20 @@ export function rebase(cwd, onto) {
 // The async form below runs the same command off the main thread, so the frame
 // draws immediately and the badge fills in when the data arrives.
 
+/**
+ * Run git without blocking the event loop.
+ *
+ * `opts.signal` makes the command interruptible, which is the whole reason a tool call must use this
+ * rather than `runGit`: a synchronous `spawnSync` holds the event loop, so an AbortSignal can never
+ * fire during it — measured, `spawnSync` accepts a `signal` option and ignores it, waiting out the
+ * full timeout. With Esc interrupting a turn, `git status` or `git log` on a large repository would
+ * otherwise freeze the TUI for up to the timeout with no key able to reach it.
+ */
 export function runGitAsync(args, cwd, opts = {}) {
   return new Promise((resolve) => {
     let child;
     const timeout = opts.timeoutMs || 30_000;
+    const signal = opts.signal;
     try {
       child = cp.spawn('git', [...GIT_ENV, ...args], {
         cwd: cwd || process.cwd(),
@@ -453,11 +466,29 @@ export function runGitAsync(args, cwd, opts = {}) {
     let stdout = '';
     let stderr = '';
     let done = false;
-    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve(r);
+    };
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
-      finish({ ok: false, stdout: '', stderr: '', code: null, error: 'git timed out' });
+      try { child.kill(); } catch { /* already gone */ }
+      // The partial output is returned rather than dropped: it is often still useful, and an empty
+      // string would look like "git had nothing to say" instead of "git was cut short".
+      finish({ ok: false, stdout, stderr, code: null, error: 'git timed out' });
     }, timeout);
+    // `interrupted` is a distinct error from a timeout, so the caller can tell a user's Esc from a
+    // command that hung.
+    const onAbort = () => {
+      try { child.kill(); } catch { /* already gone */ }
+      finish({ ok: false, stdout, stderr, code: null, error: 'interrupted' });
+    };
+    if (signal) {
+      if (signal.aborted) { clearTimeout(timer); onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
     if (child.stdout) child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
     if (child.stderr) child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
     child.on('error', (e) => finish({ ok: false, stdout: '', stderr: '', code: null, error: e.message }));

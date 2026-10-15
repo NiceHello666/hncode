@@ -28,21 +28,23 @@ import { hashRegion as hashLines } from './read.js';
 
 export const spec = {
   name: 'Edit',
-  description: 'Edit a file. THE TWO MODES ARE MUTUALLY EXCLUSIVE — NEVER combine them:\n- LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string.\nPREFERRED — use it whenever you have Read the file and know the line numbers.\n- EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use ONLY when the exact text is known and a line range is not convenient.\nLEADING WHITESPACE — SPELL IT OUT ON EVERY LINE, INCLUDING THE FIRST. new_string is written VERBATIM in both modes: nothing is re-indented, auto-indented, or trimmed, and there is no tolerance for a missing first-line indent. Reproduce the indentation the code SHOULD have; it need not match the surrounding block. Copy it from the Read output, after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`).\nWRONG — nothing between the quote and `return`, so the line lands at column 0 inside an indented block. Look at the SHAPE as well: the quote touches the first character, and spaces only turn up after the first newline.\nnew_string: "return total;\n    total += 1;"\nRIGHT — four spaces, then `return`. The opening quote is followed by the indent as well, so every line carries its own indentation INCLUDING the first:\nnew_string: "    return total;\n    total += 1;"\nSame call, same words. The only difference is the spaces at the START of the first line, and that is the whole point — in the RIGHT form the indent sits between the quote and the code, exactly where it sits in the file you copied it from.\nThe same applies to tabs, and to a line whose indentation changes partway through.\nRANGE HYGIENE — WRITE ONLY THE LINES YOU ARE REPLACING. Lines [start_line, end_line] are deleted and new_string is inserted in their place, so a line you leave OUTSIDE that range survives — and if you also restated it inside new_string you get TWO copies. Check what sits on end_line + 1 before deciding where the range ends.\nWRONG — end_line: 3 deletes lines 2-3, but line 4 is repeated because its content was also written into new_string:\nnew_string: "const a = 1;\\nconst b = 20;\\nconst c = 3;"\nRIGHT — the range covers exactly what is being replaced, and nothing beyond it is restated:\nnew_string: "const a = 1;\\nconst b = 20;"\nTo touch line 4 as well, set end_line: 4 and include its new content in new_string.\nIn SUBSTRING mode old_string is matched EXACTLY, including the indentation of its own first line.\nDo NOT pass start_line/end_line together with old_string/new_string in one call, and do NOT pass any of these four keys when you are not using that mode. Omitting new_string is an error, not an empty replacement (in line-range mode pass new_string; in substring mode pass old_string + new_string).\nMis-indented lines often still parse, so a green test run is not proof that an edit landed correctly — re-Read the region before editing it again.\',',
+  description: 'Edit a file. THREE shapes:\n- LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string.\nPREFERRED — use it whenever you have Read the file and know the line numbers.\n- EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use when the exact text is known and a line range is not convenient.\n- RANGED SUBSTRING mode: path + start_line + end_line + old_string + new_string. Searches for old_string ONLY inside [start_line, end_line], and replaces only what it finds there. Use this when the same snippet appears several times and you need exactly one of them: replace_all changes every copy, while plain substring mode refuses an ambiguous match. The range says WHERE to look, old_string says WHAT to replace.\nLEADING WHITESPACE — SPELL IT OUT ON EVERY LINE, INCLUDING THE FIRST. new_string is written VERBATIM in both modes: nothing is re-indented, auto-indented, or trimmed, and there is no tolerance for a missing first-line indent. Reproduce the indentation the code SHOULD have; it need not match the surrounding block. Copy it from the Read output, after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`).\nWRONG — nothing between the quote and `return`, so the line lands at column 0 inside an indented block. Look at the SHAPE as well: the quote touches the first character, and spaces only turn up after the first newline.\nnew_string: "return total;\n    total += 1;"\nRIGHT — four spaces, then `return`. The opening quote is followed by the indent as well, so every line carries its own indentation INCLUDING the first:\nnew_string: "    return total;\n    total += 1;"\nSame call, same words. The only difference is the spaces at the START of the first line, and that is the whole point — in the RIGHT form the indent sits between the quote and the code, exactly where it sits in the file you copied it from.\nThe same applies to tabs, and to a line whose indentation changes partway through.\nRANGE HYGIENE — WRITE ONLY THE LINES YOU ARE REPLACING. Lines [start_line, end_line] are deleted and new_string is inserted in their place, so a line you leave OUTSIDE that range survives — and if you also restated it inside new_string you get TWO copies. Check what sits on end_line + 1 before deciding where the range ends. In RANGED SUBSTRING mode this does not apply: only the snippet is replaced, not the whole range.\nWRONG — end_line: 3 deletes lines 2-3, but line 4 is repeated because its content was also written into new_string:\nnew_string: "const a = 1;\\nconst b = 20;\\nconst c = 3;"\nRIGHT — the range covers exactly what is being replaced, and nothing beyond it is restated:\nnew_string: "const a = 1;\\nconst b = 20;"\nTo touch line 4 as well, set end_line: 4 and include its new content in new_string.\nIn SUBSTRING and RANGED SUBSTRING modes old_string is matched EXACTLY, including the indentation of its own first line.\nOmitting new_string is an error, not an empty replacement.\nMis-indented lines often still parse, so a green test run is not proof that an edit landed correctly — re-Read the region before editing it again.\',',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Path to the file to edit.' },
-      old_string: { type: 'string', description: 'Exact text to replace, including whitespace and newlines. Omit when using start_line/end_line.' },
+      old_string: { type: 'string', description: 'Exact text to replace, including whitespace and newlines. Omit for pure line-range mode. COMBINE it with start_line/end_line to replace only the occurrence inside that range.' },
       new_string: { type: 'string', description: 'Replacement text, written VERBATIM in BOTH modes — no indentation is added, removed, or re-derived. Write the leading spaces on EVERY line yourself, including the FIRST one, copying them from the Read output after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`). In LINE-RANGE mode it must contain EXACTLY the lines being replaced: a line that sits outside [start_line, end_line] is not deleted, so restating it here leaves a duplicate. In SUBSTRING mode it replaces old_string, which is itself matched exactly including its own indentation.' },
 
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
-      start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_string). Use this line-range mode first.' },
-      end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line).' },
+      start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_string). With old_string too, it is the first line to SEARCH for it in.' },
+      end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line). With old_string too, it is the last line to search in.' },
     },
-    // Either line-range mode (start_line+end_line+new_string) OR exact-substring
-    // mode (old_string+new_string).
-    // Line-range is the preferred route.
+    // Three accepted shapes:
+    //   line-range        start_line + end_line + new_string
+    //   exact-substring   old_string + new_string
+    //   rangedToWindow-substring  start_line + end_line + old_string + new_string
+    // Line-range is the preferred route; the third exists for "one of several copies".
     anyOf: [
       { required: ['path', 'start_line', 'end_line', 'new_string'] },
       { required: ['path', 'old_string', 'new_string'] },
@@ -77,28 +79,85 @@ export const spec = {
       return `Error reading ${args.path}: ${e.message}`;
     }
     const { start_line, end_line } = args;
-    // The two modes are MUTUALLY EXCLUSIVE: sending line-range AND substring
-    // parameters together is ambiguous — reject it rather than guessing which
-    // one the caller meant. Only one family may be present in `args`.
+    // THREE shapes, not two.
+    //
+    //   line-range  start_line + end_line + new_string
+    //   substring   old_string + new_string
+    //   RANGED SUB   start_line + end_line + old_string + new_string
+    //
+    // The third is what the first two cannot express: replace ONE occurrence of a snippet that
+    // appears several times, without `replace_all` (which would hit every copy) and without
+    // counting lines by hand. The range narrows WHERE to look; `old_string` says WHAT to replace
+    // inside it. Rejecting the combination sent callers to `replace_all` as their only option,
+    // which is how the wrong copy gets edited.
+    //
+    // `old_string` alongside a range is therefore not a mistake — but a range with NEITHER
+    // old_string nor new_string still is, and is reported below.
     const hasRangeKeys = args.start_line != null || args.end_line != null;
     const hasSubKeys = args.old_string != null;
-    if (hasRangeKeys && hasSubKeys) {
-      return `Error: do not mix line-range mode and substring mode. Use EITHER (start_line/end_line/new_string) OR (old_string/new_string), never both.`;
+    const hasNewString = (args.new_string != null) || (args.new_content != null);
+    if (hasRangeKeys && hasSubKeys && !hasNewString) {
+      return 'Error: a rangedToWindow edit needs new_string as well as old_string.';
+    }
+
+    // ---- RANGED SUBSTRING ---------------------------------------------------
+    // A range AND an old_string: search for the snippet only INSIDE the range. Handled here,
+    // before the pure line-range path, because that path replaces whole lines and would ignore
+    // the snippet entirely — the very ambiguity the old mutual-exclusion check was avoiding.
+    //
+    // The range is validated, then the substring path below does the matching with the search
+    // window clamped to it. Splitting the work this way keeps ONE implementation of matching
+    // (quote-normalized retry, staleness, whitespace tolerance) instead of a second, weaker copy.
+    // A HALF-GIVEN RANGE with an old_string is not a reason to refuse: the snippet locates the
+    // edit by itself, and the single bound is a hint that failed to pair. Callers add `start_line`
+    // from the schema's own wording ("1-based first line to replace") expecting it to help, so
+    // refusing rejected a request that was already complete.
+    //
+    // `rangedToWindow` is set even though no window is applied. It means "the range question has been
+    // settled", which is what the line-range guard below tests — leaving it false made that guard
+    // see the same unpaired bound and reject the call one block later.
+    let searchFrom = 0;
+    let searchTo = 0;      // 0,0 = the whole file
+    // A real window was validated, so the search below is confined to it. Distinct from
+    // `rangeHandled`: this one means "clamp", and setting it for a snippet with no window made
+    // every search run inside 0..0 and find nothing.
+    let rangedToWindow = false;
+    // The range question is answered — either a window was applied, or the caller gave an
+    // `old_string` that locates the edit on its own and a half-given bound was ignored.
+    let rangeHandled = hasSubKeys;
+    if (hasRangeKeys && hasSubKeys && hasNewString) {
+      if ((start_line != null) !== (end_line != null)) {
+        // Ignore the unpaired bound; `searchFrom`/`searchTo` stay at the whole file and `rangedToWindow`
+        // was already set above.
+        searchFrom = 0;
+        searchTo = 0;
+      } else {
+        // The range was given in full: validate it, then confine the search to it.
+        const start = Number(start_line) | 0, end = Number(end_line) | 0;
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) {
+          return `Error: invalid line range ${start_line}-${end_line} (expected 1-based, start <= end).`;
+        }
+        {
+          const all = content.split(/\r\n|\r|\n/);
+          if (end > all.length) {
+            return `Error: end_line ${end_line} exceeds file length (${all.length} lines).`;
+          }
+        }
+        rangedToWindow = true;
+        rangeHandled = true;
+        searchFrom = start;
+        searchTo = end;
+      }
     }
 
     // ---- LINE-RANGE mode ---------------------------------------------------
     // `start_line`..`end_line` replace the lines at those 1-based positions,
     // with NO old_string involved at all. This is the path for "change line 12"
-    // where spelling out the exact current text is awkward. It is fully
-    // self-contained: validate -> check the Read cache -> splice -> write ->
-    // refresh the cache -> return.
-    // ONE bound without the other is its own mistake and an easy one to make: the
-    // call then falls past this block and reports a missing old_string, which
-    // sends the model looking in the wrong place.
-    if ((start_line != null) !== (end_line != null)) {
+    // where spelling out the exact current text is awkward.
+    if (!rangeHandled && (start_line != null) !== (end_line != null)) {
       return 'Error: line-range mode needs BOTH start_line and end_line.';
     }
-    if (start_line != null && end_line != null) {
+    if (!rangeHandled && start_line != null && end_line != null) {
       // Accept both spellings so old new_content callers keep working.
       const new_string = args.new_string != null ? args.new_string : args.new_content;
       // new_string is required — a missing one would put the literal string
@@ -144,7 +203,9 @@ export const spec = {
       // line-range edit shows the same +/- rows and +N/-N counts as a substring
       // edit instead of nothing. `ctx.lastEditDiff` is consumed (and cleared) by
       // the agent loop right after this tool returns.
-      if (ctx) ctx.lastEditDiff = { old: replacedText, new: normalizeText(new_string), startLine: start };
+      //
+      // `lines` is the pre-edit content, which is what `start` indexes into.
+      if (ctx) ctx.lastEditDiff = buildEditDiff({ fileLines: lines, oldText: replacedText, newText: new_string, startLine: start });
       return `Edited ${args.path}: replaced lines ${start}-${end} (${removed} line${removed === 1 ? '' : 's'}) with ${inserted.length} line${inserted.length === 1 ? '' : 's'}.`;
     }
 
@@ -171,13 +232,38 @@ export const spec = {
     const normOld = normalizeText(old_string);
     const normNew = normalizeText(new_string);
 
+    // A RANGED edit searches only inside the given lines. `windowStart` is the character offset of
+    // the range's first line in `normContent`, and `windowEnd` the end of its last line; the whole
+    // file is the window when no range was given. Every match, count and replacement below uses
+    // this window, so a snippet that appears elsewhere in the file is neither found nor touched —
+    // which is the entire point, and what `replace_all` cannot express.
+    let windowStart = 0;
+    let windowEnd = normContent.length;
+    if (rangedToWindow) {
+      const allLines = normContent.split('\n');
+      // Offset of line N's first character: the sum of the lengths of lines 1..N-1 plus their
+      // newlines. Computed by walking, because a single `indexOf` would find the wrong copy of a
+      // line that also occurs earlier in the file.
+      const offsetOfLine = (n) => {
+        let at = 0;
+        for (let i = 0; i < n - 1 && i < allLines.length; i++) at += allLines[i].length + 1;
+        return at;
+      };
+      windowStart = offsetOfLine(searchFrom);
+      const lastLineStart = offsetOfLine(searchTo);
+      windowEnd = Math.min(normContent.length, lastLineStart + (allLines[searchTo - 1] || '').length);
+    }
+    /** Occurrences of `needle` inside the window. */
+    const countInWindow = (needle) => {
+      if (!needle) return 0;
+      const seg = normContent.slice(windowStart, windowEnd);
+      return seg.split(needle).length - 1;
+    };
+
     let matchOld = normOld;    // the string that will actually be matched/replaced
     let matchNew = normNew;
-    let count = normContent.split(matchOld).length - 1;
+    let count = countInWindow(matchOld);
     if (count === 0) {
-      // Quote-normalized retry: the file may use curly quotes while the model sent
-      // straight ones. Match on the normalized forms, then replace the ACTUAL
-      // substring found in the file so typography is preserved.
       // Quote-normalized retry: the file may use curly quotes while the model sent
       // straight ones. Match on the normalized forms, then replace the ACTUAL
       // substring found in the file so typography is preserved. normalizeQuotes is
@@ -185,22 +271,35 @@ export const spec = {
       const normFileQ = normalizeQuotes(normContent);
       if (normFileQ !== normContent) {
         const normOldQ = normalizeQuotes(normOld);
-        const idx = normFileQ.indexOf(normOldQ);
-        if (idx >= 0) {
+        // Search the NORMALIZED window for the normalized snippet, then take the real text at
+        // that place so the replacement keeps the file's own typography.
+        const idx = normFileQ.indexOf(normOldQ, windowStart);
+        if (idx >= 0 && idx + normOldQ.length <= windowEnd) {
           matchOld = normContent.slice(idx, idx + normOldQ.length);
           matchNew = normNew;   // keep the model's new_string as written
-          count = normContent.split(matchOld).length - 1;
+          count = countInWindow(matchOld);
         }
       }
     }
     if (count === 0) {
+      if (rangedToWindow) {
+        // Say WHERE it was looked for, so a snippet that exists elsewhere is not reported as
+        // missing outright — that sends the caller hunting for a typo that is not there.
+        const elsewhere = normContent.split(normOld).length - 1;
+        const hint = elsewhere
+          ? ` It appears ${elsewhere} time(s) elsewhere in the file, outside lines ${searchFrom}-${searchTo}. Broaden the range, or correct the range.`
+          : '';
+        return `Error: old_string not found within lines ${searchFrom}-${searchTo} of ${args.path}.${hint}`;
+      }
       const near = nearestLineHint(normContent, normOld);
       return `Error: old_string not found in ${args.path}.${near}`;
     }
     if (count > 1 && !replace_all) {
+      if (rangedToWindow) {
+        return `Error: old_string matched ${count} occurrences within lines ${searchFrom}-${searchTo} of ${args.path}. Narrow the range, or use replace_all=true to change all of them.`;
+      }
       return `Error: old_string matched ${count} occurrences in ${args.path}. Use replace_all=true or make old_string unique.`;
     }
-
     // --- Staleness guard: the AI must edit against content it actually Read.
     // We stored per-region + whole-file hashes in ctx.readPool when Read ran.
     // If the file changed on disk since (external edit, stream, Ctrl-C side
@@ -208,9 +307,15 @@ export const spec = {
     const stale = checkStale(p, normContent, matchOld, ctx);
     if (stale) return stale;
 
-    const normUpdated = replace_all
-      ? normContent.replaceAll(matchOld, matchNew)
-      : normContent.replace(matchOld, matchNew);
+    // Replace INSIDE the window only. A rangedToWindow edit must not touch an identical snippet sitting
+    // before or after the range — replacing across the whole file is the failure the range exists
+    // to prevent. With no range the window IS the whole file, so non-rangedToWindow callers are unchanged.
+    const normUpdated = (() => {
+      const head = normContent.slice(0, windowStart);
+      const body = normContent.slice(windowStart, windowEnd);
+      const tail = normContent.slice(windowEnd);
+      return head + (replace_all ? body.replaceAll(matchOld, matchNew) : body.replace(matchOld, matchNew)) + tail;
+    })();
     const updated = eol === '\r\n' ? normUpdated.split('\n').join('\r\n') : normUpdated;
     // Checkpoint the pre-edit content so /undo can put it back (file-history.js).
     checkpointBeforeWrite(p, ctx);
@@ -253,15 +358,56 @@ export const spec = {
     const occurrences = replace_all ? count : 1;
     // Publish the diff for the UI (same contract as the line-range path above).
     if (ctx) {
-      const startLine = (() => {
-        const at = normContent.split('\n').indexOf(String(normOld).split('\n')[0]);
-        return at >= 0 ? at + 1 : 1;
-      })();
-      ctx.lastEditDiff = { old: normalizeText(old_string), new: normalizeText(new_string), startLine };
+      const at = normContent.split('\n').indexOf(String(normOld).split('\n')[0]);
+      const startLine = at >= 0 ? at + 1 : 1;
+      ctx.lastEditDiff = buildEditDiff({
+        fileLines: normContent.split('\n'),
+        oldText: old_string,
+        newText: new_string,
+        startLine,
+      });
     }
     return `Edited ${args.path}: replaced ${occurrences} occurrence(s).`;
   },
 };
+
+/** How many unchanged lines to show on each side of a changed region. */
+
+/** How many unchanged lines to show on each side of a changed region. */
+const DIFF_CONTEXT = 5;
+
+/**
+ * Build the diff payload, including the unchanged lines around the change.
+ *
+ * The replaced lines alone do not tell a reader WHERE the edit landed: a four-line block quoted
+ * with no surroundings could be anywhere in a 500-line file, so neither the model nor the user
+ * could tell a correct edit from one applied at the right text in the wrong place — and with
+ * repeated code (several similar blocks, two `}` in a row) the same text appears in many places.
+ * `context` carries the file's own lines so the renderer can draw them unmarked, above and below.
+ *
+ * `fileLines` is the content BEFORE the edit for the replaced region's START LINE to be
+ * meaningful: `startLine` is a line number in that same file.
+ */
+function buildEditDiff({ fileLines, oldText, newText, startLine }) {
+  const lines = Array.isArray(fileLines) ? fileLines : [];
+  const before = [];
+  const after = [];
+  const replacedCount = normalizeText(oldText).split('\n').length;
+  // `startLine` is 1-based; the replaced block occupies [startLine, startLine + n - 1].
+  const lastReplaced = startLine + replacedCount - 1;
+  for (let n = startLine - DIFF_CONTEXT; n < startLine; n++) {
+    if (n >= 1 && n <= lines.length) before.push({ n, text: lines[n - 1] });
+  }
+  for (let n = lastReplaced + 1; n <= lastReplaced + DIFF_CONTEXT; n++) {
+    if (n >= 1 && n <= lines.length) after.push({ n, text: lines[n - 1] });
+  }
+  return {
+    old: normalizeText(oldText),
+    new: normalizeText(newText),
+    startLine,
+    context: { before, after },
+  };
+}
 
 // Suggest a near-miss filename when a path does not exist: same directory, an
 // exact case-insensitive match, same stem with a different extension, or a
@@ -340,8 +486,17 @@ function checkStale(p, normContent, normOld, ctx) {
   const curFileHash = hashStr(normContent);
 
   // Locate the edit target's first line in the CURRENT file (1-based).
+  //
+  // An EXACT line match first, then a line that merely CONTAINS it. The exact match alone
+  // missed every edit whose `old_string` begins mid-line — `old_string: "return 1;"` against
+  // a line `  return 1;` found nothing, so `editLine` was -1 and step (1) below was skipped
+  // entirely: the edit was then reported as stale (branch 2) or, with the whole-file hash
+  // also differing, rejected as though the file had changed. Two-line `old_string`s are the
+  // common case for a range edit, and their first line usually IS whole, which is why this
+  // only showed up on single-line and indented-prefix edits.
   const firstLine = String(normOld).split('\n')[0];
-  const idx = curLines.indexOf(firstLine);
+  let idx = curLines.indexOf(firstLine);
+  if (idx < 0 && firstLine) idx = curLines.findIndex((l) => l.includes(firstLine));
   const editLine = idx >= 0 ? idx + 1 : -1;
 
   // (1) The edit target must sit inside a region the AI actually Read, and that
