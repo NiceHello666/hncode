@@ -76,19 +76,46 @@ export function listTeams() {
   return out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
-/** The roster, or null. Never throws. */
+/** The roster, or null. Never throws.
+ *
+ *  Cached by (mtimeMs, size): the team panel renders this on EVERY frame, and a
+ *  readFileSync + JSON.parse per frame sat in the hottest path there is. A stat
+ *  per frame replaces the full read; any write (tmp+rename) changes the mtime,
+ *  so nothing stale survives. */
+let _teamCache = { key: '', team: null };
 export function readTeamFile(teamName) {
+  const file = teamFilePath(teamName);
+  let st = null;
+  try { st = fs.statSync(file); } catch { /* absent */ }
+  if (!st) return null;
+  const key = `${file}:${st.mtimeMs}:${st.size}`;
+  if (_teamCache.key === key) return _teamCache.team;
   try {
-    return JSON.parse(fs.readFileSync(teamFilePath(teamName), 'utf8'));
+    const team = JSON.parse(fs.readFileSync(file, 'utf8'));
+    _teamCache = { key, team };
+    return team;
   } catch {
+    _teamCache = { key: '', team: null };
     return null;
   }
 }
 
-/** Write the roster, creating the directory. Throws only on a real IO failure. */
+/** Write the roster, creating the directory. Throws only on a real IO failure.
+ *
+ *  Atomic (tmp + rename), like every other team write: a plain writeFileSync
+ *  dying mid-write left a truncated config.json, and readTeamFile then returned
+ *  null — the whole team silently disappeared. */
 export function writeTeamFile(teamName, teamFile) {
   fs.mkdirSync(teamDir(teamName), { recursive: true });
-  fs.writeFileSync(teamFilePath(teamName), JSON.stringify(teamFile, null, 2), 'utf8');
+  const target = teamFilePath(teamName);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(teamFile, null, 2), 'utf8');
+  try {
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing more to do */ }
+    throw e;
+  }
   return teamFile;
 }
 

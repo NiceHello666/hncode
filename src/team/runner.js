@@ -186,12 +186,19 @@ export function teammateSystemPrompt(team, member) {
 export async function waitForMail(teamName, agentName, { timeoutMs = 0, pollMs = 250, shouldStop } = {}) {
   const forever = !(timeoutMs > 0);
   const deadline = forever ? Infinity : Date.now() + timeoutMs;
+  // Back off while the box stays empty: 250ms -> 2s. Every poll is a readFileSync
+  // plus a JSON.parse of the whole inbox, so an idle eight-member team burned
+  // 32 sync file reads a second, forever. Delivery is still prompt — a message
+  // lands at most one backoff step (~2s) late, which is imperceptible for a
+  // person typing the next instruction.
+  let wait = pollMs;
   for (;;) {
     if (shouldStop && shouldStop()) return null;
     const unread = readUnread(teamName, agentName);
     if (unread.length) return unread;
     if (Date.now() >= deadline) return null;
-    await new Promise((r) => setTimeout(r, pollMs));
+    await new Promise((r) => setTimeout(r, wait));
+    wait = Math.min(wait * 2, 2000);
   }
 }
 
@@ -215,6 +222,18 @@ export async function runTeammate({
   makeAgent,
   onStart,
   onFinish,
+  // Live output from this member's turn: `{ kind, text }` / `{ kind: 'tool', name, detail }`.
+  //
+  // Without it a teammate was a black box — the roster said idle→working→idle and nothing about what
+  // it did in between. A person watching a team needs to see the work, not only its conclusion: a
+  // member that spends forty seconds running tests looks identical to one that hung.
+  onStream = () => {},
+  // Ask the person before a tool runs, via the lead's mailbox.
+  // `async (toolName, args) => boolean | { approved, error }`.
+  //
+  // An injected hook rather than a hard-wired call: `runTeammate` is exercised in tests with a fake agent
+  // and no team, and a permission round-trip there would block for the full timeout on every tool.
+  askPermission,
 }) {
   const identity = currentAgent();
   if (!identity || identity.name !== memberName) {
@@ -243,18 +262,22 @@ export async function runTeammate({
   // The system entry goes FIRST and the task text after it. The Agent has no `systemPrompt`
   // option — the prompt is an ordinary system message the caller supplies, which is how the
   // TUI builds one per turn.
+  //
+  // THE FIRST PROMPT MUST NOT BE EMPTY. An empty user turn gives the model nothing to answer, so the
+  // round produces no reply and the member looks dead. That happened whenever `firstPrompt` had nothing
+  // to say — no task, no assignment, and no lead to report to — which is the NORMAL start for the first
+  // member of a team, because `addMember` makes the first member the lead and "report to the lead" then
+  // resolves to itself and returns ''.
+  const opening = firstPrompt({
+    team,
+    member,
+    task,
+    taskList: taskList.length ? taskList.map((t) => `${t.id} ${t.status} ${t.subject}`).join('\n') : '',
+    assignment: member.prompt || '',
+  }) || 'You are on the team and have no task yet. Read the messages in your next input, answer the lead, and use SendMessage to reply.';
   const messages = [
     { role: 'system', content: teammateSystemPrompt(team, member) },
-    {
-      role: 'user',
-      content: firstPrompt({
-        team,
-        member,
-        task,
-        taskList: taskList.length ? taskList.map((t) => `${t.id} ${t.status} ${t.subject}`).join('\n') : '',
-        assignment: member.prompt || '',
-      }),
-    },
+    { role: 'user', content: opening },
   ];
 
   onStart && onStart({ member, task });
@@ -272,21 +295,113 @@ export async function runTeammate({
     // One round of the teammate's work. `makeAgent` is injectable so the loop can be tested
     // without a model; production passes nothing and gets a real Agent.
     const build = makeAgent || ((opts) => new Agent(opts));
+    // Whether THIS round invoked SendMessage. Reset per round because the fallback below only applies
+    // to a round that stayed silent — a member that answered with the tool has already been delivered.
+    let sentThisRound = false;
     const agent = build({
       cfg,
       messages,
       maxSteps: TEAMMATE_MAX_STEPS,
+      // ASK THE PERSON, THROUGH THE LEAD, BEFORE ANY TOOL RUNS.
+      //
+      // A teammate can write files and run commands, and until this existed it had exactly two options:
+      // do anything, or be unable to ask. This forwards the question to the lead's mailbox and BLOCKS
+      // here until the answer comes back — the runner is synchronous per round, so a refusal has to
+      // arrive as a value, not as a later event.
+      //
+      // `askPermission` is undefined for a team whose lead has no panel; the call then resolves to a
+      // refusal with a reason, which the model can act on.
+      onApproval: askPermission,
       onEvent: (e) => {
+        if (e.type === 'tool_start' && /^SendMessage$/.test(String(e.name || ''))) sentThisRound = true;
         if (e.type === 'tool_start') toolNote(memberName, e.name, e.args);
         // The one moment a member is unambiguously working, as opposed to blocked on the
         // model — which is what most of a round is.
         updateMember(teamName, memberName, { isActive: true, phase: 'working' });
+
+        // LIVE OUTPUT — as TRANSCRIPT ENTRIES, not status blips.
+        //
+        // Claude Code renders a teammate by feeding `viewedAgentTask.messages` to the SAME <Messages>
+        // component the main transcript uses (REPL.tsx: `displayedMessages = viewedAgentTask.messages`),
+        // so its answer, its tool calls and their results read as one conversation. Relaying bare
+        // strings meant the panel had nothing to show but a single activity line — which is exactly the
+        // complaint: "I switch to a member and see no messages, though it is working."
+        try {
+          if (e.type === 'data' && e.text) {
+            onStream({ kind: 'text', name: memberName, text: String(e.text) });
+          } else if (e.type === 'think' && e.text) {
+            onStream({ kind: 'think', name: memberName, text: String(e.text) });
+          } else if (e.type === 'tool_start') {
+            onStream({ kind: 'tool', name: memberName, tool: String(e.name || ''), id: e.id || '' });
+          } else if (e.type === 'tool_result') {
+            // The WHOLE result. The panel wraps and clips at render time, where the available height is
+            // known; trimming to the first line here threw away the body a reader came for.
+            onStream({
+              kind: 'tool_result',
+              name: memberName,
+              tool: String(e.name || ''),
+              id: e.id || '',
+              detail: String(e.content || ''),
+              editDiff: e.editDiff || null,
+            });
+          }
+        } catch { /* a display hook must never fail a member's turn */ }
       },
     });
-    await agent.run();
+    // A ROUND THAT THROWS MUST BE REPORTED, not swallowed.
+    //
+    // `agent.run()` reaches the model, so it fails for every reason the network and the provider can
+    // produce: no model configured, a bad key, a 429, a dropped connection. Without this the error left
+    // `runTeammate` entirely — no reply, no log the user could see, and the member simply looked
+    // unresponsive. That is indistinguishable from "the team is ignoring me", which is exactly how it was
+    // reported.
+    //
+    // The message goes to the lead's inbox, which reaches the TUI through the same onLeadMail path as an
+    // ordinary reply, so a failure is visible where a reply would have been.
+    try {
+      await agent.run();
+    } catch (e) {
+      const why = (e && e.message) || String(e);
+      writeToMailbox(teamName, TEAM_LEAD_NAME, {
+        from: memberName,
+        text: `I could not complete this round: ${why}`,
+        summary: 'round failed',
+        color: member.color,
+      });
+      result.failed = (result.failed || 0) + 1;
+      result.lastError = why;
+      updateMember(teamName, memberName, { isActive: false, phase: 'idle' });
+      onFinish && onFinish({ member, task });
+      result.ok = false;
+      // Back to waiting rather than exiting: a transient failure (a rate limit) must not end the member.
+      // `waitForMail` below decides whether it stops, on the same terms as a successful round.
+      const mail = await waitForMail(teamName, memberName, { timeoutMs: idleTimeoutMs, shouldStop });
+      if (!mail) { idle = true; break; }
+      continue;
+    }
 
     // The Agent kept the SAME array and appended to it, so the transcript already carries
     // this round. Nothing to copy — `messages` IS `agent.messages`.
+    // A round that answered in TEXT instead of calling SendMessage must still reach the lead.
+    //
+    // The tool is how a member is TOLD to reply, and most rounds use it. A model that answers
+    // conversationally instead — "I'm here, got your message" — produces the same words and sends them
+    // nowhere, so the person who asked gets silence while the member considers itself done. From outside
+    // that is indistinguishable from being ignored, which is how it was reported.
+    //
+    // The guard: only when `SendMessage` did NOT run this round. `sentThisRound` is set by the agent's
+    // tool events, so a round that replied properly is not answered twice.
+    if (!sentThisRound) {
+      const text = lastAssistantText(agent);
+      if (text) {
+        writeToMailbox(teamName, TEAM_LEAD_NAME, {
+          from: memberName,
+          text,
+          summary: 'reply',
+          color: member.color,
+        });
+      }
+    }
 
     // A tool named SendMessage already delivered its message (see the tool's own handler), so
     // here we only report completion to the lead if the agent did not.

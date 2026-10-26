@@ -16,13 +16,13 @@ import * as gitMod from './git.js';
 import * as askUserQuestionMod from './ask-user-question.js';
 import { spec as agentSpec } from './agent.js';
 import { spec as agentSwarmSpec } from './agent-swarm.js';
-import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec } from './tasks.js';
+import { TaskListSpec, TaskOutputSpec, TaskStopSpec, TaskWaitSpec, TaskInputSpec } from './tasks.js';
 import { AgentListSpec, AgentMessageSpec, AgentInterruptSpec, AgentCloseSpec } from './agent-control.js';
 import { TEAM_TOOL_SPECS } from './team.js';
 import { spec as notebookSpec } from './notebook.js';
 import { spec as diagnosticsSpec } from './diagnostics.js';
 import * as memoryMod from './memory.js';
-import { pluginTools } from '../plugin.js';
+import { pluginTools, pluginToolGeneration } from '../plugin.js';
 
 
 
@@ -47,6 +47,7 @@ const builtinTools = [
   TaskOutputSpec,
   TaskStopSpec,
   TaskWaitSpec,
+  TaskInputSpec,
   AgentListSpec,
   AgentMessageSpec,
   AgentInterruptSpec,
@@ -72,11 +73,24 @@ export { builtinTools };
 // tools are resolvable. The previous Map was built from builtinTools only,
 // so `llmTools()` advertised a plugin tool to the model but `getTool(name)`
 // returned undefined and the call failed with `unknown tool`.
+//
+// The map is keyed to a REGISTRATION GENERATION: plugin.js bumps the counter
+// whenever a tool registers or the plugin set is reloaded. Without that, a
+// server connected in the background (MCP connects after first paint) stayed
+// "unknown tool" forever, and /reload served the OLD plugin instances while
+// fresh modules were imported under new spec objects.
 let _byName = null;
+let _byNameGeneration = -1;
+function toolGeneration() {
+  // Read live from plugin.js so any registration source bumps the same counter.
+  return pluginToolGeneration();
+}
 function byNameMap() {
-  if (!_byName) {
+  const gen = toolGeneration();
+  if (!_byName || _byNameGeneration !== gen) {
     _byName = new Map();
     for (const t of combinedTools()) if (!_byName.has(t.name)) _byName.set(t.name, t);
+    _byNameGeneration = gen;
   }
   return _byName;
 }

@@ -53,12 +53,19 @@ export function projectMcpFile(workspace) {
 
 // Merge global + project server definitions (project wins on a name clash).
 // Returns { servers: {name: def}, errors: [string] }. Never throws.
+//
+// Project-scope defs are tagged `_project: true`. They spawn whatever command the
+// REPO's .hncode/mcp.json names, so a cloned repository would otherwise get
+// arbitrary code execution the moment hncode opens the workspace; connectAll
+// refuses them without an explicit approval (see the gate there).
 export function loadMcpConfig(workspace) {
   const out = { servers: {}, errors: [] };
+  const projectFile = workspace ? path.resolve(projectMcpFile(workspace)) : null;
   const files = workspace ? [globalMcpFile(), projectMcpFile(workspace)] : [globalMcpFile()];
   const seen = new Set();
   for (const f of files) {
     const abs = path.resolve(f);
+    const isProject = projectFile != null && abs === projectFile;
     if (seen.has(abs)) continue;
     seen.add(abs);
     let text;
@@ -69,7 +76,7 @@ export function loadMcpConfig(workspace) {
     for (const [name, def] of Object.entries(servers)) {
       if (!def || typeof def !== 'object') { out.errors.push(`${abs}: server "${name}" must be an object`); continue; }
       if (!def.command && !def.url) { out.errors.push(`${abs}: server "${name}" needs "command" or "url"`); continue; }
-      out.servers[name] = { ...def, _source: abs };
+      out.servers[name] = { ...def, _source: abs, ...(isProject ? { _project: true } : {}) };
     }
   }
   return out;
@@ -80,14 +87,26 @@ export function loadMcpConfig(workspace) {
 // A stdio connection: newline-delimited JSON-RPC over the child's stdin/stdout.
 // MCP's stdio transport is line-delimited (NOT Content-Length framed — that is
 // the LSP convention, and mixing them up is the usual way this breaks).
+// Quote one argument for cmd.exe. With `shell: true` the words are re-parsed by
+// cmd, so an argument holding `&`/`|`/`<`/`>`/`^` would run a SECOND command of
+// its own. Wrapping in quotes neutralizes the metacharacters; embedded quotes
+// double, which is cmd's own convention.
+function cmdQuoteArg(a) {
+  const s = String(a);
+  if (s === '') return '""';
+  if (!/[\s&|<>()^"%!]/.test(s)) return s;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
 export function createStdioTransport(command, args, opts = {}) {
-  const child = cp.spawn(command, args || [], {
+  const needsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
+  const child = cp.spawn(command, needsShell ? (args || []).map(cmdQuoteArg) : (args || []), {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...(opts.env || {}) },
     cwd: opts.cwd || process.cwd(),
     windowsHide: true,
     // npm-installed shims are `.cmd` on Windows and need a shell to run.
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(command),
+    shell: needsShell,
   });
   const state = {
     child,
@@ -329,6 +348,22 @@ export async function connectAll(config, registerTool, opts = {}) {
   // servers cost N × timeout before the user saw anything. Runs concurrently, the
   // whole set costs the SLOWEST single server instead of their sum.
   const results = await Promise.all(entries.map(async ([name, def]) => {
+    // PROJECT-SCOPE GATE. A def from the repo's own .hncode/mcp.json spawns an
+    // arbitrary command on open, so it never connects silently: it needs the
+    // HNCODE_ALLOW_PROJECT_MCP=1 escape hatch, or an async approver (the TUI
+    // wires one to its approval prompt). Everything else still connects.
+    if (def && def._project && process.env.HNCODE_ALLOW_PROJECT_MCP !== '1') {
+      if (typeof opts.approveProjectServer !== 'function') {
+        return { name, ok: false, toolCount: 0, skipped: true,
+          error: 'project-scope server needs approval — set HNCODE_ALLOW_PROJECT_MCP=1 to allow it' };
+      }
+      let approved = false;
+      try { approved = await opts.approveProjectServer(name, def); } catch { approved = false; }
+      if (!approved) {
+        return { name, ok: false, toolCount: 0, skipped: true,
+          error: 'not approved — the project-scope server was not started' };
+      }
+    }
     const conn = await connectServer(name, def, opts);
     if (!conn.ok) return { name, ok: false, toolCount: 0, error: conn.error, serverInfo: {} };
     let registered = 0;

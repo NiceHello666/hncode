@@ -107,19 +107,25 @@ test('isRealUserPrompt still recognises the legacy prefix in old sessions', () =
 // Token estimation
 // ---------------------------------------------------------------------------
 
-test('estimateTokens: ASCII is ~4 chars/token, CJK is 1 token/char', () => {
-  assert.equal(estimateTokens('12345678'), 2);       // 8 ASCII / 4
+test('estimateTokens: CJK is 1 token/char, ASCII depends on the character class', () => {
+  // ASCII IS NOT ONE RATE. BPE merges common byte pairs, so English letters cost ~4.2 characters per
+  // token while digits (~3.0) and punctuation (~2.7) merge far worse. The old `ascii / 4` rule
+  // undercounted code and JSON by up to 35% — see the table on `estimateBpe` in src/term.js.
+  assert.equal(estimateTokens('abcd'), 1);          // 4 letters / 4.2, rounded up
+  assert.equal(estimateTokens('aaaaaaaa'), 2);      // 8 letters / 4.2
+  assert.equal(estimateTokens('12345678'), 3);      // 8 digits / 3.0
   assert.equal(estimateTokens(''), 0);
   assert.equal(estimateTokens(null), 0);
   assert.equal(estimateTokens('中文测试'), 4);        // 4 wide chars, 1 each
-  assert.equal(estimateTokens('ab中文'), 3);          // ceil(2/4)=1 + 2
+  assert.equal(estimateTokens('ab中文'), 3);          // letters + 2 wide chars
 });
 
 test('estimateTokens is exact for a long string (the memo must not round)', () => {
   // The value cache only memoises short strings; a long one is walked directly, and
   // both paths must agree, or the context gauge drifts as text grows.
   const long = 'y'.repeat(10000);
-  assert.equal(estimateTokens(long), Math.ceil(10000 / 4));
+  // 10000 letters at the 4.2 chars/token rate of the letters class.
+  assert.equal(estimateTokens(long), Math.ceil(10000 / 4.2));
   // And it is stable on a second call (memo or not).
   assert.equal(estimateTokens(long), estimateTokens(long));
 });
@@ -134,6 +140,7 @@ test('estimateTokens is stable across many growing strings', () => {
     assert.equal(estimateTokens(acc), once, 'the second measurement must agree');
   }
 });
+
 
 test('per-message estimates sum to the whole-transcript estimate', () => {
   // planCompaction prices each message individually; that must equal pricing the

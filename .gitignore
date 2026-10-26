@@ -25,3 +25,10 @@ npm-debug.log*
 # Build output (if we add build steps later)
 dist/
 build/
+
+# Local debug scratch (dumps, probes, ad-hoc test output — never ship)
+t.txt
+tui_diff.txt
+test-out.txt
+test-run.txt
+probe-*.mjs

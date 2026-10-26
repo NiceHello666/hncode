@@ -28,7 +28,7 @@ import { hashRegion as hashLines } from './read.js';
 
 export const spec = {
   name: 'Edit',
-  description: 'Edit a file. THREE shapes:\n- LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string.\nPREFERRED — use it whenever you have Read the file and know the line numbers.\n- EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use when the exact text is known and a line range is not convenient.\n- RANGED SUBSTRING mode: path + start_line + end_line + old_string + new_string. Searches for old_string ONLY inside [start_line, end_line], and replaces only what it finds there. Use this when the same snippet appears several times and you need exactly one of them: replace_all changes every copy, while plain substring mode refuses an ambiguous match. The range says WHERE to look, old_string says WHAT to replace.\nLEADING WHITESPACE — SPELL IT OUT ON EVERY LINE, INCLUDING THE FIRST. new_string is written VERBATIM in both modes: nothing is re-indented, auto-indented, or trimmed, and there is no tolerance for a missing first-line indent. Reproduce the indentation the code SHOULD have; it need not match the surrounding block. Copy it from the Read output, after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`).\nWRONG — nothing between the quote and `return`, so the line lands at column 0 inside an indented block. Look at the SHAPE as well: the quote touches the first character, and spaces only turn up after the first newline.\nnew_string: "return total;\n    total += 1;"\nRIGHT — four spaces, then `return`. The opening quote is followed by the indent as well, so every line carries its own indentation INCLUDING the first:\nnew_string: "    return total;\n    total += 1;"\nSame call, same words. The only difference is the spaces at the START of the first line, and that is the whole point — in the RIGHT form the indent sits between the quote and the code, exactly where it sits in the file you copied it from.\nThe same applies to tabs, and to a line whose indentation changes partway through.\nRANGE HYGIENE — WRITE ONLY THE LINES YOU ARE REPLACING. Lines [start_line, end_line] are deleted and new_string is inserted in their place, so a line you leave OUTSIDE that range survives — and if you also restated it inside new_string you get TWO copies. Check what sits on end_line + 1 before deciding where the range ends. In RANGED SUBSTRING mode this does not apply: only the snippet is replaced, not the whole range.\nWRONG — end_line: 3 deletes lines 2-3, but line 4 is repeated because its content was also written into new_string:\nnew_string: "const a = 1;\\nconst b = 20;\\nconst c = 3;"\nRIGHT — the range covers exactly what is being replaced, and nothing beyond it is restated:\nnew_string: "const a = 1;\\nconst b = 20;"\nTo touch line 4 as well, set end_line: 4 and include its new content in new_string.\nIn SUBSTRING and RANGED SUBSTRING modes old_string is matched EXACTLY, including the indentation of its own first line.\nOmitting new_string is an error, not an empty replacement.\nMis-indented lines often still parse, so a green test run is not proof that an edit landed correctly — re-Read the region before editing it again.\',',
+  description: 'Edit a file. THREE shapes:\n- LINE-RANGE mode: path + start_line + end_line + new_string. Replaces lines [start_line, end_line] with new_string.\nPREFERRED — use it whenever you have Read the file and know the line numbers.\n- EXACT-SUBSTRING mode: path + old_string + new_string. Replaces text exactly matching old_string. Use when the exact text is known and a line range is not convenient.\n- RANGED SUBSTRING mode: path + start_line + end_line + old_string + new_string. Searches for old_string ONLY inside [start_line, end_line], and replaces only what it finds there. Use this when the same snippet appears several times and you need exactly one of them: replace_all changes every copy, while plain substring mode refuses an ambiguous match. The range says WHERE to look, old_string says WHAT to replace.\nLEADING WHITESPACE — SPELL IT OUT ON EVERY LINE, INCLUDING THE FIRST. new_string is written VERBATIM in both modes: nothing is re-indented, auto-indented, or trimmed, and there is no tolerance for a missing first-line indent. Reproduce the indentation the code SHOULD have; it need not match the surrounding block. Copy it from the Read output, after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`).\nWRONG — nothing between the quote and `return`, so the line lands at column 0 inside an indented block. Look at the SHAPE as well: the quote touches the first character, and spaces only turn up after the first newline.\nnew_string: "return total;\n    total += 1;"\nRIGHT — four spaces, then `return`. The opening quote is followed by the indent as well, so every line carries its own indentation INCLUDING the first:\nnew_string: "    return total;\n    total += 1;"\nSame call, same words. The only difference is the spaces at the START of the first line, and that is the whole point — in the RIGHT form the indent sits between the quote and the code, exactly where it sits in the file you copied it from.\nThe same applies to tabs, and to a line whose indentation changes partway through.\nRANGE HYGIENE — COUNT THE LINES BEFORE YOU SEND. Lines [start_line, end_line] are deleted and new_string is inserted in their place. The rule that follows from that is arithmetic, not judgement:\n    new_string must have EXACTLY (end_line - start_line + 1) lines.\nCount them. If you wrote three lines for a two-line range, one of them already exists past end_line — it was not deleted, so it is now duplicated. Do not reason about which line "looks related"; count. A range that should grow is a WRONG RANGE, so widen end_line rather than adding the extra line by hand.\nThe mistake looks like this — end_line: 3 for lines 2-3 is a TWO-line range, given three lines:\nnew_string: "const a = 1;\nconst b = 20;\nconst c = 3;"   (3 lines for a 2-line range: c is now duplicated)\nAnd correct — two lines for a two-line range:\nnew_string: "const a = 1;\nconst b = 20;"\nTo replace line 4 as well, set end_line: 4 — then three lines are correct and the count agrees.\nIN A DIFF, A DUPLICATE SHOWS AS THE SAME LINE NUMBER TWICE: a "-" row and a "+" row numbered alike, or the same number on two rows. That is the signature of this mistake, not of a tool fault. Read the diff before continuing; it costs one look.\nA DUPLICATED SEAM IS REMOVED FOR YOU. If the last line of new_string is the same text as the line at\nend_line + 1 — the line just past the range, which is never deleted — that last line is dropped, because\nit would otherwise appear twice. The reply says what was dropped. Pass allow_dup: true when two\nidentical adjacent lines are what you actually want.\nIn SUBSTRING and RANGED SUBSTRING modes old_string is matched EXACTLY, including the indentation of its own first line.\nOmitting new_string is an error, not an empty replacement.\nMis-indented lines often still parse, so a green test run is not proof that an edit landed correctly — re-Read the region before editing it again.\',',
   parameters: {
     type: 'object',
     properties: {
@@ -37,6 +37,7 @@ export const spec = {
       new_string: { type: 'string', description: 'Replacement text, written VERBATIM in BOTH modes — no indentation is added, removed, or re-derived. Write the leading spaces on EVERY line yourself, including the FIRST one, copying them from the Read output after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`). In LINE-RANGE mode it must contain EXACTLY the lines being replaced: a line that sits outside [start_line, end_line] is not deleted, so restating it here leaves a duplicate. In SUBSTRING mode it replaces old_string, which is itself matched exactly including its own indentation.' },
 
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
+      allow_dup: { type: 'boolean', default: false, description: 'Permit an edit that leaves two adjacent identical lines. OFF by default, so an edit that restates the line just past end_line is refused — that line is outside the replaced range and was never deleted, so the file would end up holding it twice. Set true only when the duplicate IS the intent.' },
       start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_string). With old_string too, it is the first line to SEARCH for it in.' },
       end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line). With old_string too, it is the last line to search in.' },
     },
@@ -188,16 +189,82 @@ export const spec = {
       // drew NO diff at all (no +/- rows, no +N/-N counts). Reporting them lets
       // the caller diff the replaced region -> `new_string`.
       const replacedText = lines.slice(start - 1, end).join('\n');
-      const out = [...lines.slice(0, start - 1), ...inserted, ...lines.slice(end)];
+
+      // AUTO-DEDUPE THE SEAM — unless `allow_dup` says the duplicate is wanted.
+      //
+      // The recurring mistake: `new_string`'s last line is the same text as the line at `end_line + 1`.
+      // That line is OUTSIDE the replaced range, so it is never deleted — the copy inside `new_string`
+      // lands directly above it and the file holds the text twice. Every line number below then shifts.
+      //
+      // REFUSING was the first attempt and it was wrong twice over. It rejected legitimate edits — a
+      // one-line `new_string` against a six-line range matched the following line by coincidence and the
+      // edit was blocked — and it put the burden on the caller to work out whose line it was.
+      //
+      // DROPPING THE DUPLICATE is what the caller meant either way. If they restated a line they did not
+      // intend to replace, removing the restatement produces exactly the file they described; if they DID
+      // want it changed, the range was wrong — but silently producing a duplicate helps no one, so the
+      // reply says what was dropped and how to keep it.
+      //
+      // `allow_dup: true` keeps the duplicate, for the real case where two identical lines are the point.
+      // DEDUPE REPEATEDLY, not once.
+      //
+      // One pass was not enough: `new_string` can carry the SAME line twice in a row on its own — a
+      // pasted block whose first line got duplicated — and removing one copy leaves the other against
+      // the file's own line. Each removal shortens `inserted`, so the scan has to run again on what is
+      // left. Bounded by the block's own length, so it always terminates.
+      let insertedFinal = inserted;
+      const drops = [];
+      if (args.allow_dup !== true) {
+        for (let guard = 0; guard <= inserted.length; guard++) {
+          const hit = findRestatedLine(lines, insertedFinal, start, end);
+          if (!hit || hit.index < 0 || hit.index >= insertedFinal.length) break;
+          drops.push(hit);
+          // REMOVE THE DUPLICATE AND ANY BLANK LINE THAT WAS PART OF THE SAME FRAGMENT.
+          //
+          // `new_string` often carries a trailing blank line — a copy that ended with one, or a block
+          // pasted with its closing newline. When the line above that blank is the duplicate, removing only
+          // the line leaves the blank stranded: the file keeps a whitespace-only row the caller never
+          // meant to add, and it sits exactly where the duplicate used to be.
+          //
+          // Blanks DIRECTLY adjacent to the removed line go with it, on both sides. A blank line elsewhere
+          // in the block is untouched — it is not this fragment's.
+          let lo = hit.index;
+          let hi = hit.index + 1;
+          while (lo > 0 && String(insertedFinal[lo - 1]).trim() === '') lo--;
+          while (hi < insertedFinal.length && String(insertedFinal[hi]).trim() === '') hi++;
+          insertedFinal = [...insertedFinal.slice(0, lo), ...insertedFinal.slice(hi)];
+        }
+      }
+      const seamDrop = drops.length ? drops[0] : null;
+
+      // LAST CHANCE: if a duplicate SURVIVED the removal, do not write the file.
+      //
+      // The dedupe above tries repeatedly, but every rule it applies is a heuristic about which line is
+      // the caller's — and a wrong guess leaves the duplicate in place with a confident "dropped" note in
+      // the reply. That is worse than refusing: the message says the problem was handled.
+      //
+      // So the result is checked ONCE MORE with the same test, and if it still finds a pair the write is
+      // abandoned. `allow_dup` skips this too — a deliberate duplicate must not be refused at the door.
+      const out = [...lines.slice(0, start - 1), ...insertedFinal, ...lines.slice(end)];
+      if (args.allow_dup !== true) {
+        const leftover = findRestatedLine(lines, insertedFinal, start, end);
+        if (leftover) {
+          return `Error: the edit would leave "${leftover.text}" twice in a row (result lines `
+            + `${leftover.a} and ${leftover.b}), and automatic removal could not settle it.\n`
+            + 'Nothing was written. Narrow the range so it covers only the lines you mean to replace, '
+            + 'or pass allow_dup: true if the duplicate is intentional.';
+        }
+      }
       const normUpdated = out.join('\n');
       const updated = eol === '\r\n' ? normUpdated.split('\n').join('\r\n') : normUpdated;
+
       // Checkpoint the pre-edit content so /undo can put it back (file-history.js).
       checkpointBeforeWrite(p, ctx);
       try {
         ensureDir(p);
         fs.writeFileSync(p, updated, 'utf8');
       } catch (e) { return `Error writing ${args.path}: ${e.message}`; }
-      refreshReadPool(p, normUpdated, { start, end: start + inserted.length - 1 }, ctx);
+      refreshReadPool(p, normUpdated, { start, end: start + insertedFinal.length - 1 }, ctx);
       const removed = end - start + 1;
       // Publish the diff for the UI. The Edit line is drawn from these, so a
       // line-range edit shows the same +/- rows and +N/-N counts as a substring
@@ -205,13 +272,29 @@ export const spec = {
       // the agent loop right after this tool returns.
       //
       // `lines` is the pre-edit content, which is what `start` indexes into.
-      if (ctx) ctx.lastEditDiff = buildEditDiff({ fileLines: lines, oldText: replacedText, newText: new_string, startLine: start });
-      return `Edited ${args.path}: replaced lines ${start}-${end} (${removed} line${removed === 1 ? '' : 's'}) with ${inserted.length} line${inserted.length === 1 ? '' : 's'}.`;
+      // The diff's NEW text is `insertedFinal` — what the file now holds — not the
+      // raw `new_string`: when the seam-drop removed a line, the raw text showed a
+      // `+` row that is not in the file and shifted every after-context line
+      // number by the dropped count.
+      if (ctx) ctx.lastEditDiff = buildEditDiff({ fileLines: lines, oldText: replacedText, newText: insertedFinal.join('\n'), startLine: start });
+      // Say what the seam did, whichever way it went: a silent drop and a silent keep are both
+      // indistinguishable from an edit that never had the ambiguity. The dropped line is named
+      // with its ACTUAL pair (the two result lines that would have been identical) — it is not
+      // always "the last line of new_string against end_line + 1": a block can carry the repeat
+      // inside itself, with blank lines between the copies.
+      const seamNote = seamDrop
+        ? ` Dropped a duplicated line: "${seamDrop.text}" would have appeared twice in a row`
+          + ` (result lines ${seamDrop.a} and ${seamDrop.b}). Pass allow_dup: true to keep it.`
+        : (args.allow_dup === true ? ' Duplicate kept (allow_dup: true).' : '');
+      return `Edited ${args.path}: replaced lines ${start}-${end} (${removed} line${removed === 1 ? '' : 's'}) with ${insertedFinal.length} line${insertedFinal.length === 1 ? '' : 's'}.${seamNote}`;
     }
 
-
     // ---- SUBSTRING mode (old_string -> new_string) --------------------------
+    // `new_content` is accepted as an alias of `new_string` — the validation above
+    // already counts it, so refusing it here sent a confusing "new_string is
+    // required" for an argument the mode's own checks accepted.
     let { old_string, new_string, replace_all = false } = args;
+    if (new_string == null && args.new_content != null) new_string = args.new_content;
     // Reaching here means neither mode was usable: line-range needs
     // start_line+end_line (handled above) and substring needs old_string. When
     // BOTH are absent, say so — "old_string must not be empty" sends the model
@@ -310,12 +393,25 @@ export const spec = {
     // Replace INSIDE the window only. A rangedToWindow edit must not touch an identical snippet sitting
     // before or after the range — replacing across the whole file is the failure the range exists
     // to prevent. With no range the window IS the whole file, so non-rangedToWindow callers are unchanged.
+    //
+    // The replacement is passed as a FUNCTION: a string second argument makes JS interpret
+    // `$&`, `` $` ``, `$'` and `$$` in the NEW text, so an edit whose new_string contains them
+    // (regex examples, Makefile `$$`, shell code) silently wrote the wrong file.
     const normUpdated = (() => {
       const head = normContent.slice(0, windowStart);
       const body = normContent.slice(windowStart, windowEnd);
       const tail = normContent.slice(windowEnd);
-      return head + (replace_all ? body.replaceAll(matchOld, matchNew) : body.replace(matchOld, matchNew)) + tail;
+      const literal = () => matchNew;
+      return head + (replace_all ? body.replaceAll(matchOld, literal) : body.replace(matchOld, literal)) + tail;
     })();
+    // The replaced text's actual character offset in normContent (first occurrence
+    // inside the window — guaranteed >= 0, the count above found it). Everything
+    // before the match is unchanged, so this one offset anchors BOTH the diff and
+    // the Read-pool re-arm below to the real edit site. Locating the site by
+    // matching its first LINE (the old approach) collapsed to line 1 when
+    // old_string starts mid-line, and pointed at an earlier copy when the file
+    // repeats that line — the diff then drew context from the top of the file.
+    const matchAt = normContent.indexOf(matchOld, windowStart);
     const updated = eol === '\r\n' ? normUpdated.split('\n').join('\r\n') : normUpdated;
     // Checkpoint the pre-edit content so /undo can put it back (file-history.js).
     checkpointBeforeWrite(p, ctx);
@@ -334,15 +430,16 @@ export const spec = {
         const newLines = normUpdated.split('\n');
         entry.fileHash = hashStr(normUpdated);
         entry.lines = newLines.length;
-        // Locate the edit site in the NEW content: the first line of the new
-        // text if present, else fall back to the old target's location.
-        const anchor = String(matchNew).split('\n')[0];
-        let at = newLines.indexOf(anchor);
-        if (at < 0) at = newLines.indexOf(String(matchOld).split('\n')[0]);
-        if (at >= 0) {
-          const newSpan = String(matchNew).split('\n').length;
+        // Locate the edit site in the NEW content: same character offset as the
+        // match in the old one, because the text before the match is untouched.
+        // An anchor taken from the NEW text's first line found the first copy of
+        // that line ANYWHERE in the file (and `indexOf('')` returned 0 for a
+        // deletion), recording the re-armed region at a line the model never edited.
+        if (matchAt >= 0) {
+          const at = normUpdated.slice(0, matchAt).split('\n').length - 1; // 0-based
+          const newSpan = Math.max(1, String(matchNew).split('\n').length);
           const start = at + 1;
-          const end = Math.min(newLines.length, at + Math.max(1, newSpan));
+          const end = Math.min(newLines.length, at + newSpan);
           // Re-hash every surviving old region against the new content, and add
           // the freshly-edited span. Regions that no longer match are dropped.
           const kept = entry.regions.filter((r) => hashLines(newLines, r.start, r.end) === r.hash);
@@ -357,9 +454,11 @@ export const spec = {
     }
     const occurrences = replace_all ? count : 1;
     // Publish the diff for the UI (same contract as the line-range path above).
+    // `startLine` comes from the actual match offset, so a snippet that starts
+    // mid-line or a file with repeated lines still anchors the context rows at
+    // the place that was really edited.
     if (ctx) {
-      const at = normContent.split('\n').indexOf(String(normOld).split('\n')[0]);
-      const startLine = at >= 0 ? at + 1 : 1;
+      const startLine = matchAt >= 0 ? normContent.slice(0, matchAt).split('\n').length : 1;
       ctx.lastEditDiff = buildEditDiff({
         fileLines: normContent.split('\n'),
         oldText: old_string,
@@ -372,21 +471,135 @@ export const spec = {
 };
 
 /** How many unchanged lines to show on each side of a changed region. */
-
-/** How many unchanged lines to show on each side of a changed region. */
 const DIFF_CONTEXT = 5;
+
+
+
+/** The line's leading whitespace, for the same-indent closer rule. */
+function leadingWs(s) {
+  const m = /^\s*/.exec(String(s == null ? '' : s));
+  return m ? m[0] : '';
+}
+
+/**
+ * Did THIS edit restate a line it did not replace?
+ *
+ * The exact shape of the recurring mistake: `new_string` ends with the same text as the line at
+ * `end_line + 1`. That line is outside the replaced range, so it survives — and the copy inside
+ * `new_string` lands directly above it, leaving the file holding it twice.
+ *
+ * Detected DIRECTLY rather than by scanning the result for any adjacent pair. A scan cannot tell "the
+ * caller fumbled the range" from "the file always had two of these", so it either misses the case or cries
+ * wolf on legitimate code. Comparing the last inserted line against the first untouched line is exact: it
+ * fires only when the edit itself created the repetition, and never on one that was already there.
+ *
+ * `lines` is the content BEFORE the edit; `inserted` is the new lines; `start`/`end` are the range.
+ * Returns the 1-based line numbers of the pair, or null.
+ */
+function findRestatedLine(lines, inserted, start, end) {
+  // ASK THE RESULT, NOT THE SHAPE.
+  //
+  // Every earlier version tried to predict the duplicate from the arguments — "the last line of
+  // new_string equals the line at end_line + 1", gated on the replacement growing, or on that line
+  // differing from the one it replaced. Each rule missed a real case:
+  //
+  //   replacing line N with the same text, when line N+1 already held it — nothing in the arguments
+  //   distinguishes that from an ordinary rewrite, and the file ended up with the text twice.
+  //
+  // Building the result and looking at it cannot miss a case, because it is the thing being asked about.
+  const result = [...lines.slice(0, start - 1), ...inserted, ...lines.slice(end)];
+  // Scan from the start of the replaced region to a few lines PAST the inserted block.
+  //
+  // The old bound was `start - 1 + inserted.length`, which stops at the first untouched line. That is one
+  // line short whenever blank lines sit between the inserted block and the file's own copy — and exactly
+  // one line short in the shape that shipped a duplicate: `new_string` ending in `*/` while the file's own
+  // `*/` followed a blank. The pair straddled the bound and neither half was compared.
+  //
+  // A few extra lines is enough and still narrow: a duplicate further away is not this edit's doing.
+  const from = Math.max(0, start - 1);
+  const to = Math.min(result.length - 1, start - 1 + inserted.length + 4);
+  // TWO COMPARISON CHAINS, not one.
+  //
+  // `prevText` follows the last line with content; `prevPunct` follows the last line that is only
+  // punctuation. A closer is compared with the previous closer, a sentence with the previous sentence.
+  //
+  // One chain was wrong: a block ending `/** * note */` followed by `* note` `*/` repeats the `*/`, but the
+  // `* note` line overwrote the comparison base, so the second `*/` was compared against text and the
+  // duplicate went through. Measured on the reported file.
+  let prevText = '';
+  let prevTextAt = 0;
+  let prevPunct = '';
+  let prevPunctAt = 0;
+  // HOW MANY BLANK LINES SEPARATE the previous content line from this one. A blank line between two
+  // identical lines used to reset the comparison, so `A / <blank> / A` went through as though it were not
+  // a duplicate — and it is one: the caller's `new_string` carried an extra blank line, and the file ended
+  // up with the text twice with a gap in it.
+  let blanksSince = 0;
+  for (let i = from; i <= to; i++) {
+    const t = String(result[i] == null ? '' : result[i]).trim();
+    // A blank line is not content, but it does not erase the line above it either. A line made
+    // ENTIRELY of punctuation (`}`, `)`, `});` — closers) is compared too, but ONLY when the two
+    // copies carry the SAME leading whitespace, checked below. Trim-equal closers at DIFFERENT
+    // indentation are the nested closers of legitimate code (`    )` above `)` in Python, an
+    // inner `  }` above the outer `}`) — treating those as a restated duplicate deleted working
+    // syntax. Same indentation, though, is the signature of a RESTATED closer: a model rewriting
+    // a block's ending copies the closers that already exist just past the range, and two
+    // same-indent identical closers in a row close the same scope twice.
+    // PUNCTUATION IS COMPARED AGAINST THE PREVIOUS PUNCTUATION, not against whatever line came last.
+    //
+    // `* xxx` sits between the two `*/` that repeat, and treating the text line as the comparison base
+    // meant the second `*/` was compared with the text and never with the first `*/`. Measured on the
+    // reported file: `/** * 注释 */` … `* 注释` `*/` went through with the closer duplicated.
+    //
+    // So two chains are kept: the last CONTENT line, and the last PUNCTUATION line. A closer is compared
+    // with the previous closer; a text line with the previous text line.
+    if (!t) { blanksSince++; continue; }
+    const isPunct = !/[a-zA-Z0-9_\u0080-\uFFFF]/.test(t);
+    // A LONE CLOSER IS NOT A DUPLICATE. `}`, `)`, `});`, `]` each close one scope and appear at every
+    // nesting level, so two in a row is ordinary code rather than a restatement. `*/` is deliberately
+    // NOT in this list: a doc block has exactly one closer, so two means the block was written twice —
+    // which is the case this whole check exists for.
+    if (t === '{' || t === '}' || t === ')' || t === '});' || t === '};' || t === ']' || t === '];') {
+      prevPunct = ''; prevPunctAt = 0; blanksSince = 0; continue;
+    }
+    const base = isPunct ? prevPunct : prevText;
+    const baseAt = isPunct ? prevPunctAt : prevTextAt;
+    if (base && t === base) {
+      const sameIndent = leadingWs(result[i]) === leadingWs(result[baseAt]);
+      if (sameIndent) {
+        // WHICH LINE IS OURS — the one INSIDE `new_string`, since the file's own copy must survive.
+        //
+        // `i` is the later of the pair and `baseAt` the earlier. Preferring `i` is what handles
+        // `A / <blank> / A`: both copies came from `new_string`, and deleting the later one leaves the
+        // earlier in place with no gap after it.
+        //
+        // Falls back to `baseAt` when `i` lies past the inserted block: that is the ordinary seam case,
+        // where the duplicate's second half is the file's own line and must not be touched.
+        let idx = i - (start - 1);
+        if (idx < 0 || idx >= inserted.length) idx = baseAt - (start - 1);
+        idx = Math.max(0, Math.min(inserted.length - 1, idx));
+        return { a: baseAt + 1, b: i + 1, text: t, index: idx, blanksBetween: blanksSince };
+      }
+    }
+    if (isPunct) { prevPunct = t; prevPunctAt = i; }
+    else { prevText = t; prevTextAt = i; }
+    blanksSince = 0;
+  }
+  return null;
+}
 
 /**
  * Build the diff payload, including the unchanged lines around the change.
  *
- * The replaced lines alone do not tell a reader WHERE the edit landed: a four-line block quoted
- * with no surroundings could be anywhere in a 500-line file, so neither the model nor the user
- * could tell a correct edit from one applied at the right text in the wrong place — and with
- * repeated code (several similar blocks, two `}` in a row) the same text appears in many places.
+ * The replaced lines alone do not tell a reader WHERE the edit landed: a four-line block quoted with no
+ * surroundings could be anywhere in a 500-line file, so neither the model nor the user could tell a
+ * correct edit from one applied at the right text in the wrong place — and with repeated code (several
+ * similar blocks, two `}` in a row) the same text appears in many places.
+ *
  * `context` carries the file's own lines so the renderer can draw them unmarked, above and below.
  *
- * `fileLines` is the content BEFORE the edit for the replaced region's START LINE to be
- * meaningful: `startLine` is a line number in that same file.
+ * `fileLines` is the content BEFORE the edit, for the replaced region's START LINE to be meaningful:
+ * `startLine` is a line number in that same file.
  */
 function buildEditDiff({ fileLines, oldText, newText, startLine }) {
   const lines = Array.isArray(fileLines) ? fileLines : [];
@@ -398,8 +611,18 @@ function buildEditDiff({ fileLines, oldText, newText, startLine }) {
   for (let n = startLine - DIFF_CONTEXT; n < startLine; n++) {
     if (n >= 1 && n <= lines.length) before.push({ n, text: lines[n - 1] });
   }
+  // The AFTER context is drawn from the file BEFORE the edit, but its line numbers must describe the file
+  // AFTER it — that is the file a reader has open when they read the diff.
+  //
+  // Using the pre-edit numbers looked right for a same-size replacement and drifted by one per added line
+  // otherwise: an edit that grew the file by three shifted every context row, so the diff showed line
+  // numbers that did not exist where it claimed, or repeated ones that did.
+  //
+  // `net` is the number of lines the edit added (negative when it shrank the file), so every line below
+  // the replaced block moves by exactly that much.
+  const net = normalizeText(newText).split('\n').length - replacedCount;
   for (let n = lastReplaced + 1; n <= lastReplaced + DIFF_CONTEXT; n++) {
-    if (n >= 1 && n <= lines.length) after.push({ n, text: lines[n - 1] });
+    if (n >= 1 && n <= lines.length) after.push({ n: n + net, text: lines[n - 1] });
   }
   return {
     old: normalizeText(oldText),

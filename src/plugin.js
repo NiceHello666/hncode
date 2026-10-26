@@ -146,13 +146,68 @@ function makeLogger(sink) {
   fn.error = (...a) => sink.error(...a);
   return fn;
 }
+/**
+ * Where a plugin's `log`/`warn`/`error` goes.
+ *
+ * TWO DESTINATIONS, NEVER BOTH AT ONCE.
+ *
+ * The notice queue is what the TUI drains onto its own transcript, so in the TUI those are the messages the
+ * user sees. `console.*` was called ALONGSIDE it, and that is wrong whenever the TUI is running: the TUI
+ * owns stdout and paints the whole screen itself, so a raw `console.log` lands wherever the cursor happens
+ * to be — mid-frame, on top of the composer, wherever. It showed up most visibly after `/reload`, because
+ * that is when every plugin re-runs its load-time logging in one burst.
+ *
+ * Outside the TUI there is no screen to paint and no queue being drained, so the console IS the right
+ * destination — headless runs and tests rely on it.
+ *
+ * `tuiActive` is set by the TUI once it takes over the screen, and cleared on exit.
+ */
+let tuiActive = false;
+
+/** Tell the plugin logger whether the TUI currently owns stdout. */
+export function setPluginLoggerTui(active) {
+  tuiActive = !!active;
+}
+
+/**
+ * Route `console.*` to the notice queue for the duration of a function, and restore it afterwards.
+ *
+ * Plugin code runs inside `import()` and `install(api)`, where `console.log` is the natural thing to write.
+ * While the TUI owns stdout those writes land on the painted frame, so they are captured and re-emitted as
+ * notices instead — the same channel plugin errors already use.
+ *
+ * Returns the restore function; it MUST be called (a `finally` in every caller), or every later console
+ * write in the process would be swallowed.
+ */
+function capturePluginConsole() {
+  const saved = { log: console.log, info: console.info, warn: console.warn, error: console.error };
+  const route = (level) => (...a) => notice(level, fmtArgs(a));
+  console.log = route('info');
+  console.info = route('info');
+  console.warn = route('warn');
+  console.error = route('error');
+  return () => {
+    console.log = saved.log;
+    console.info = saved.info;
+    console.warn = saved.warn;
+    console.error = saved.error;
+  };
+}
 
 export const pluginLogger = makeLogger({
-  log: (...a) => { notice('info', fmtArgs(a)); console.log('[hncode-plugin]', ...a); },
-  info: (...a) => { notice('info', fmtArgs(a)); console.log('[hncode-plugin]', ...a); },
-  warn: (...a) => { notice('warn', fmtArgs(a)); console.warn('[hncode-plugin]', ...a); },
-  error: (...a) => { notice('error', fmtArgs(a)); console.error('[hncode-plugin]', ...a); },
+  log: (...a) => { notice('info', fmtArgs(a)); if (!tuiActive) console.log('[hncode-plugin]', ...a); },
+  info: (...a) => { notice('info', fmtArgs(a)); if (!tuiActive) console.log('[hncode-plugin]', ...a); },
+  warn: (...a) => { notice('warn', fmtArgs(a)); if (!tuiActive) console.warn('[hncode-plugin]', ...a); },
+  error: (...a) => { notice('error', fmtArgs(a)); if (!tuiActive) console.error('[hncode-plugin]', ...a); },
 });
+
+// Registration GENERATION: bumped whenever the tool surface changes (a tool
+// registers or unregisters, plugins unload). The toolbelt's by-name map in
+// tools/index.js keys off this, so a background MCP connect or a /reload is
+// visible to `getTool` immediately instead of serving stale entries forever.
+let _toolGeneration = 0;
+function bumpToolGeneration() { _toolGeneration++; }
+export function pluginToolGeneration() { return _toolGeneration; }
 
 const API = {
   // Register a new tool (same shape as built-in tool specs).
@@ -165,9 +220,11 @@ const API = {
       throw new Error(`registerTool: tool "${spec.name}" is already registered`);
     }
     registeredTools.push(spec);
+    bumpToolGeneration();
     return track(() => {
       const i = registeredTools.findIndex((t) => t.name === spec.name);
       if (i >= 0) registeredTools.splice(i, 1);
+      bumpToolGeneration();
     });
   },
 
@@ -545,6 +602,7 @@ export async function unloadPlugins() {
   // keybinds/widgets, which a reload used to leave behind forever.
   registeredTools.length = 0;
   registeredCommands.length = 0;
+  bumpToolGeneration();
   for (const k of Object.keys(registeredHooks)) delete registeredHooks[k];
   for (const k of Object.keys(registeredConfig)) delete registeredConfig[k];
   for (const k in registeredPatches) delete registeredPatches[k];
@@ -568,7 +626,10 @@ export function listPluginServices() { return [...services.keys()]; }
 // takes effect without restarting the process — the ESM cache would otherwise hand
 // back the module instance loaded last time. Used by the reload path only.
 export async function loadPlugins(dir, opts = {}) {
-  const pluginDir = dir || PLUGIN_DIR;
+  // Falls back to the user's plugin directory. `PLUGIN_DIR` was referenced here
+  // but never defined — any loadPlugins() without a dir (the /reload path when
+  // no pluginDir is configured) died with a ReferenceError.
+  const pluginDir = dir || pluginsDir();
   if (!fs.existsSync(pluginDir)) return [];
 
   // Node decides a .js file's module type from the NEAREST package.json, searching
@@ -630,7 +691,23 @@ export async function loadPlugins(dir, opts = {}) {
       // a hot reload wants. Only on a fresh load: the startup path keeps the plain
       // URL so nothing else can see two instances of a plugin.
       const url = pathToFileURL(full).href + (opts.fresh ? `?v=${++loadSeq}` : '');
-      const mod = await import(url);
+      // A PLUGIN'S OWN console.log MUST NOT REACH THE SCREEN.
+      //
+      // The import below runs the plugin's top-level code, and `install(api)` runs more of it. Both are
+      // plugin author territory, where `console.log` is the first thing anyone reaches for — and while the
+      // TUI owns stdout, that write lands wherever the cursor happens to be, on top of the frame. It was
+      // most visible after `/reload`, which re-runs every plugin's load-time logging in one burst.
+      //
+      // Redirected to `pluginLogger`, which queues a notice the TUI already renders in its own transcript.
+      // The real console is restored immediately afterwards, so this covers exactly the window where
+      // plugin code runs and nothing else.
+      const restoreConsole = capturePluginConsole();
+      let mod;
+      try {
+        mod = await import(url);
+      } finally {
+        restoreConsole();
+      }
       // `install(api)` may be the named export or live on the default export.
       let installFn;
       if (mod && typeof mod.install === 'function') installFn = mod.install;
@@ -704,10 +781,17 @@ if (typeof installFn !== 'function') {
     // registrations recorded against this one.
     currentUnit = unit;
     try {
-      // AWAITED: an async install that registers after an await would otherwise race
-      // the next plugin's install, which would break the ordering this function
-      // exists to provide — and its registrations would land after the load ended.
-      await c.installFn(API);
+      // AWAITED: an async install that registers after an await would otherwise race the next plugin's
+      // install, which would break the ordering this function exists to provide.
+      //
+      // The console is redirected for the duration: `install(api)` is plugin code, and it is where most
+      // plugins do their logging.
+      const restoreInstallConsole = capturePluginConsole();
+      try {
+        await c.installFn(API);
+      } finally {
+        restoreInstallConsole();
+      }
       pluginUnits.push(unit);
       // install(api) FIRST, then record it. Pushing before the call reported a plugin as
       // loaded even when its install() threw — /plugins would list it under Loaded while
@@ -849,6 +933,7 @@ export { registeredConfig as pluginConfigDefaults };
 export function _resetPlugins() {
   registeredTools.length = 0;
   registeredCommands.length = 0;
+  bumpToolGeneration();
   for (const k of Object.keys(registeredHooks)) delete registeredHooks[k];
   for (const k of Object.keys(registeredConfig)) delete registeredConfig[k];
   loadedPlugins.length = 0;

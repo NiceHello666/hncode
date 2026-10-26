@@ -31,8 +31,13 @@ export function truncateBuf(buf) {
 export function normalizeInput(p) {
   let s = String(p);
   if (s.startsWith('~')) s = path.join(os.homedir(), s.slice(1));
-  const m = s.match(/^\/([a-zA-Z])\/(.*)$/);
-  if (m) return path.join(`${m[1].toUpperCase()}:\\`, ...m[2].split('/'));
+  // Windows only: under Git Bash an agent writes `/d/hncode/src` for `D:\hncode\src`.
+  // Gated on the platform because on Linux `/c/x` is a perfectly ordinary absolute
+  // path, and rewriting it to `C:\x` turned it into a relative garbage filename.
+  if (process.platform === 'win32') {
+    const m = s.match(/^\/([a-zA-Z])\/(.*)$/);
+    if (m) return path.join(`${m[1].toUpperCase()}:\\`, ...m[2].split('/'));
+  }
   return s;
 }
 
@@ -44,7 +49,11 @@ export function resolvePath(input, ctx) {
   if (!ctx.allowExternal) {
     let rel = path.relative(ws, p);
     if (rel === '') return p;
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    // ESCAPE check, not a prefix check: the first path segment must not be `..`.
+    // A plain startsWith('..') also rejected files INSIDE the workspace whose
+    // names merely begin with dots — `..notes.md` — while `...` / `..a` are
+    // legitimate relative names that stay below the root.
+    if (rel.split(path.sep)[0] === '..' || path.isAbsolute(rel)) {
       throw new Error(`Path outside workspace: ${input}. Run hncode from that directory or set HNCODE_ALLOW_EXTERNAL=1.`);
     }
   }

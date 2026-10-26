@@ -110,6 +110,22 @@ export function splitSegments(cmd) {
       i += 1;
       continue;
     }
+    // Process substitution `<(…)` / `>(…)`: the shell RUNS the inner command with
+    // its output/input on a file descriptor. Like `$(…)`, the inner command is
+    // judged as a segment of its own — otherwise `cat <(rm -rf /)` was one
+    // segment whose first word is `cat`.
+    if ((c === '<' || c === '>') && s[i + 1] === '(') {
+      metacharacters.add(c);
+      const close = matchingParen(s, i + 1);
+      if (close > 0) {
+        const inner = s.slice(i + 2, close);
+        if (inner.trim()) { segments.push(current); segments.push(inner); current = ''; }
+        current += s.slice(i, close + 1);
+        i = close + 1;
+        continue;
+      }
+      // Unclosed: falls through to the plain operator handling below.
+    }
     if (c === '>') {
       metacharacters.add('>');
       redirects.push(readRedirect(s, i + 1));
@@ -242,8 +258,10 @@ const WRAPPER_VALUE_OPTIONS = new Set([
 // Shells. `sh -c "…"` hands the rest of the line to a NEW shell, so its argument
 // is a nested program that needs the same analysis.
 const NESTED_SHELLS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell']);
-// The flags that make a shell's next word a command string.
-const SHELL_COMMAND_FLAGS = new Set(['-c', '-command', '/c', '-cmd']);
+// The flags that make a shell's next word a command string. `/k` runs the string
+// exactly like `/c` — it only keeps the shell open afterwards — so leaving it out
+// made `cmd /k <anything>` invisible to every nested-shell rule.
+const SHELL_COMMAND_FLAGS = new Set(['-c', '-command', '/c', '/k', '-cmd']);
 
 function basename(word) {
   return String(word || '').replace(/^.*[\\/]/, '').replace(/\.(exe|cmd|bat|com|ps1)$/i, '').toLowerCase();
@@ -450,15 +468,30 @@ function judgeUnwrapped(cmd, args) {
     case 'npm': case 'yarn': case 'pnpm':
       if (args.includes('publish') && !args.includes('--dry-run')) return 'publishing a package';
       break;
+    case 'pwsh': case 'powershell':
+      // PowerShell abbreviates parameter names, so `-EncodedCommand` arrives as any
+      // prefix of itself (-e, -ec, -enc, -encoded…). The payload is base64 code this
+      // module cannot decode or judge — a "harmless script run" verdict on it would
+      // be a guess, so it asks.
+      if (args.some((a) => /^-(?:e|ec|enc|encoded\w*)$/i.test(a))) {
+        return 'an EncodedCommand payload cannot be analyzed';
+      }
+      break;
     case 'sh': case 'bash': case 'dash': case 'zsh': case 'ksh': case 'ash':
-    case 'pwsh': case 'powershell': case 'cmd':
+    case 'cmd':
       // Only reachable as `sh script.sh` (the `-c` form is unwrapped into a nested
       // command). Nothing to judge without reading the script.
       break;
   }
 
   if (CODE_INTERPRETERS.has(cmd)) {
-    const code = args.filter((a) => !a.startsWith('-')).join(' ');
+    // `--eval=code` bundles the payload INTO the flag word, so dropping every
+    // `-…` argument dropped exactly the code this scan exists to see. The value
+    // of a bundled flag is split back out before the filter.
+    const code = args
+      .map((a) => (a.startsWith('-') && a.includes('=') ? a.slice(a.indexOf('=') + 1) : a))
+      .filter((a) => !a.startsWith('-'))
+      .join(' ');
     if (CODE_DESTRUCTIVE_RE.test(code)) return `${cmd} running a delete`;
   }
   return null;
@@ -519,6 +552,15 @@ const GIT_WRITE_FLAGS = new Set([
   '--amend', '--force', '-f', '--global', '--local', '--system', 'add', 'remove',
 ]);
 
+// Environment assignments that may prefix a read-only command. Locale/display
+// variables only — they change FORMATTING, not what the program is. Anything
+// else refuses: `LD_PRELOAD=/tmp/x.so ls` executes code before `ls` even starts,
+// and `PATH=`/`BASH_ENV=`/`NODE_OPTIONS=` swap or inject into the program itself.
+const READ_ONLY_ENV = new Set([
+  'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES', 'LC_NUMERIC', 'LC_TIME',
+  'NO_COLOR', 'COLUMNS', 'LINES', 'PAGER', 'GIT_PAGER', 'TERM',
+]);
+
 /** Is this command read-only, i.e. safe to run without a prompt in Ask mode? */
 export function isReadOnlyCommand(cmd) {
   const text = String(cmd == null ? '' : cmd).trim();
@@ -531,6 +573,12 @@ export function isReadOnlyCommand(cmd) {
   const words = [];
   for (const seg of segments) words.push(...tokenizeWords(seg));
   if (!words.length) return false;
+  // `VAR=value cmd` — the wrapper peel strips assignments happily, so they must
+  // be vetted BEFORE the peel, against the whitelist above.
+  for (const w of words) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) break;
+    if (!READ_ONLY_ENV.has(w.slice(0, w.indexOf('=')))) return false;
+  }
   // Privilege escalation is never "read-only": `sudo cat` reads one file and can
   // also read every file, so it asks. Checked on the RAW first word, because
   // peeling the wrapper would turn `sudo ls` into a plain `ls`.

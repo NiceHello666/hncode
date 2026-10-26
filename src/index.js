@@ -5,9 +5,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { resolveConfig, effectiveSnapshot, saveConfig, resolveModelArg, readPersonalPrompt } from './config.js';
 import * as sess from './session.js';
-import { Agent, SYSTEM_PROMPT } from './agent.js';
+import { Agent, SYSTEM_PROMPT, canSplitAfter } from './agent.js';
 import { llmTools } from './tools/index.js';
-import { setToolsList } from './llm.js';
 import { localVersion } from './version.js';
 import { EXIT, FORMATS, isValidFormat, buildResult, exitCodeFor, resultLine, createRunTracker, trackEvent, finalReply } from './ci.js';
 
@@ -301,13 +300,31 @@ async function runPrompt({ cfg, prompt, format, session, modelArg, timeoutSecond
     return EXIT.CONFIG;
   }
   const messages = [];
-  if (session && session.messages) for (const m of session.messages.slice(-30)) messages.push(m);
   // Same layering as the TUI: built-in prompt first, then the user's own
   // system_prompt override if any, then the /personal notes, then calm mode.
   let sysText = (cfg.systemPrompt && String(cfg.systemPrompt).trim()) || SYSTEM_PROMPT;
   const personal = readPersonalPrompt(cfg.workspace);
   if (personal) sysText += '\n\n' + personal;
   messages.push({ role: 'system', content: sysText });
+  if (session && session.messages) {
+    // Resume on a TOOL-EXCHANGE BOUNDARY: a cut that separates an assistant
+    // message from its tool results (or leaves orphaned tool results) is a 400
+    // from the provider, not just a shorter history. `canSplitAfter` is the same
+    // rule the compaction logic uses. System messages are dropped — the fresh
+    // one above is authoritative.
+    const hist = session.messages.filter((m) => m && m.role !== 'system');
+    // A session persisted mid-step can end with an assistant message whose tool
+    // results were never appended; sending it before the user message is a 400.
+    while (hist.length && hist[hist.length - 1].role === 'assistant'
+      && Array.isArray(hist[hist.length - 1].toolCalls) && hist[hist.length - 1].toolCalls.length) hist.pop();
+    let start = Math.max(0, hist.length - 30);
+    while (start > 0 && !canSplitAfter(hist, start - 1)) start++;
+    for (let i = start; i < hist.length; i++) messages.push(hist[i]);
+  }
+  // THE PROMPT ITSELF. This used to never be pushed: -p sent only the resumed
+  // history and the system message, so a fresh session answered nothing the
+  // user asked and a resumed one answered nothing new.
+  messages.push({ role: 'user', content: prompt });
   const saved = session || { id: sess.newId(), title: prompt.slice(0, 60), workspace: path.resolve(process.cwd()), model: cfg.model, createdAt: Date.now(), messages: [] };
   const tracker = createRunTracker();
   const startedAt = Date.now();
@@ -355,6 +372,13 @@ async function runPrompt({ cfg, prompt, format, session, modelArg, timeoutSecond
     await agent.run();
   } finally {
     if (timer) clearTimeout(timer);
+    // MCP stdio children were spawned for this run; most die on stdin EOF at
+    // process exit, but one that ignores EOF would linger. Kill them outright —
+    // best-effort, the result has already been produced.
+    try {
+      const mcp = await import('./mcp.js');
+      mcp.disconnectAll(mcp.getLiveConnections());
+    } catch { /* best-effort */ }
   }
   sess.saveSession(saved);
 
@@ -505,14 +529,14 @@ export async function main(argv) {
   //     starts this in the background and reports the result as a notice.
   // Failures are reported but never fatal: an unreachable server must not stop
   // the session from starting.
-  const connectMcp = async () => {
+  const connectMcp = async (mcpOpts = {}) => {
     if (cfg.mcp === false) return { servers: [], toolCount: 0 };
     try {
       const mcp = await import('./mcp.js');
       const { API } = await import('./plugin.js');
       const mcpCfg = mcp.loadMcpConfig(cfg.workspace);
       if (!Object.keys(mcpCfg.servers).length) return { servers: [], toolCount: 0 };
-      const res = await mcp.connectAll(mcpCfg, (spec) => API.registerTool(spec));
+      const res = await mcp.connectAll(mcpCfg, (spec) => API.registerTool(spec), mcpOpts);
       mcp.setLiveConnections(res.servers);
       if (process.env.HNCODE_MCP_VERBOSE === '1') {
         for (const s of res.servers) {

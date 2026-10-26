@@ -23,7 +23,20 @@ import { runShellHooks } from '../hooks.js';
 
 // Live subagent registry, keyed by agent id. A resumed agent keeps its own
 // message list here, which is what makes `resume` work.
+//
+// Bounded: a 128-item swarm made 128 entries holding FULL transcripts, kept for
+// the process lifetime. The oldest entry is evicted past the cap — resuming a
+// very old subagent then reports it as unknown instead of silently holding every
+// transcript forever.
+const SUBAGENTS_MAX = 64;
 const subagents = new Map();
+function rememberSubagent(id, entry) {
+  subagents.delete(id);          // re-insertion moves the entry to the newest slot
+  subagents.set(id, entry);
+  while (subagents.size > SUBAGENTS_MAX) {
+    subagents.delete(subagents.keys().next().value);
+  }
+}
 let agentSeq = 0;
 
 
@@ -55,6 +68,8 @@ function systemPromptFor(type, cfg, systemPrompt) {
 // row the way Bash's output is shown. `agentId` labels the lines when several
 // subagents run at once (AgentSwarm), so the reader can tell them apart.
 async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProgress, onStep, agentId, onAgent }) {
+  // The parent-signal listener (registered below, removed when the run settles).
+  let onSubagentAbort = null;
   const { Agent, SYSTEM_PROMPT } = await import('../agent.js');
   const subCfg = {
     ...cfg,
@@ -114,13 +129,21 @@ async function runSubagent({ cfg, type, prompt, history, signal, onEvent, onProg
   });
   if (signal) {
     if (signal.aborted) throw new Error('Interrupted by user');
-    signal.addEventListener('abort', () => agent.interrupt(), { once: true });
+    onSubagentAbort = () => agent.interrupt();
+    signal.addEventListener('abort', onSubagentAbort, { once: true });
   }
   // Hand the LIVE agent back to the caller so a control tool can steer or interrupt it
   // while it runs. `subagents` only learns about this run when it finishes, so without
   // this the only way to reach a running subagent would be to interrupt the whole turn.
   if (typeof onAgent === 'function') onAgent(agent);
-  await agent.run();
+  // The abort listener is removed when the run settles. `{once:true}` only makes it
+  // fire once — it stays REGISTERED until then, so every completed subagent left
+  // one closure (holding the whole subagent) pinned on the parent's signal.
+  try {
+    await agent.run();
+  } finally {
+    if (onSubagentAbort) signal.removeEventListener('abort', onSubagentAbort);
+  }
   // SHELL HOOK: SubagentStop. The subagent finished (or was interrupted); the
   // parent-side hook can log/archive it. Never blocks.
   // `hookConfig` may be the raw `{event:[…]}` map or a `{hooks:{…}}` wrapper
@@ -295,7 +318,7 @@ ${availableTypes()}`,
           const entry = existing || { id: agentId, type, messages: [] };
           entry.messages = run.messages;
           entry.type = type;
-          subagents.set(agentId, entry);
+          rememberSubagent(agentId, entry);
           appendTaskOutput(task, `\n\n${run.text}`);
           settleTask(task, 'completed');
           if (typeof ctx._onBackgroundTaskDone === 'function') ctx._onBackgroundTaskDone(task);
@@ -330,7 +353,7 @@ ${availableTypes()}`,
     }
     const agentId = existing ? existing.id : newAgentId();
     const entry = existing || { id: agentId, type, messages: [] };
-    subagents.set(agentId, entry);
+    rememberSubagent(agentId, entry);
 
     let detachedId = null;
     const resetForeground = () => { if (ctx && ctx._foreground && ctx._foreground.detach) ctx._foreground = null; };
@@ -394,7 +417,7 @@ ${availableTypes()}`,
             try {
               const r = await runPromise;
               entry.messages = r.messages; entry.type = type;
-              subagents.set(agentId, entry);
+              rememberSubagent(agentId, entry);
               appendTaskOutput(task, r.text);
               settleTask(task, 'completed');
               if (typeof ctx._onBackgroundTaskDone === 'function') ctx._onBackgroundTaskDone(task);
@@ -403,6 +426,10 @@ ${availableTypes()}`,
               settleTask(task, stopped ? 'killed' : 'failed', { stopReason: stopped ? 'Stopped by user' : e.message });
               appendTaskOutput(task, `\n[error: ${e.message}]`);
               if (typeof ctx._onBackgroundTaskDone === 'function') ctx._onBackgroundTaskDone(task);
+            } finally {
+              // The detached run kept the parent-abort link alive on purpose (an
+              // aborted turn kills it); once it settles the link goes too.
+              if (ctx.signal) ctx.signal.removeEventListener('abort', onParentAbort);
             }
           })();
           return task.taskId;
@@ -414,6 +441,7 @@ ${availableTypes()}`,
       run = await runPromise;
     } catch (e) {
       resetForeground();
+      if (ctx.signal) ctx.signal.removeEventListener('abort', onParentAbort);
       // Detached: the background task owns the error now, not this call.
       if (detachedId) return `Moved to background as task #${detachedId}. It keeps running; inspect with TaskList / TaskOutput {task_id: "${detachedId}"}.`;
       return `Error: subagent failed: ${e.message}`;
@@ -425,7 +453,7 @@ ${availableTypes()}`,
     }
     entry.messages = run.messages;
     entry.type = type;
-    subagents.set(agentId, entry);
+    rememberSubagent(agentId, entry);
 
     // A FAILED subagent returns an error, not an empty string. `run.text` is '' when the Agent
     // died, which the swarm printed as "(no output)" — so four agents that had all failed on one

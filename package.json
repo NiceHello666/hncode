@@ -1,6 +1,6 @@
 {
   "name": "@hncode/hncode",
-  "version": "0.5.2",
+  "version": "0.5.4",
   "description": "hncode — A cyan-blue TUI AI coding agent with zero runtime dependencies.",
   "type": "module",
   "main": "src/index.js",
@@ -20,7 +20,7 @@
     "install": "node bin/install.cjs",
     "i18n": "node tools/sync-i18n.mjs",
     "i18n:check": "node tools/sync-i18n.mjs --check",
-    "test": "node --test"
+    "test": "node --test \"test/**/*.test.mjs\""
   },
   "engines": {
     "node": ">=20"

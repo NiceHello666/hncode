@@ -109,9 +109,9 @@ test('a teammate\'s mail is read whichever name it was addressed under', () => {
 });
 
 test('the user\'s own message to the lead is NOT read back as team mail', () => {
-  // The reported symptom: the user typed 你好 to the lead from the panel and was handed
-  // `<team-inbox>team-lead: 你好</team-inbox>` on the next turn — their own instruction presented
-  // to the model as though a teammate had sent it.
+  // The reported symptom: the user sent a short greeting to the lead from the panel and was handed
+  // `<team-inbox>team-lead: <their own words></team-inbox>` on the next turn — their own instruction
+  // presented to the model as though a teammate had sent it.
   //
   // Every send from the panel or `/team msg` is stamped `from: TEAM_LEAD_NAME`, so the alias on a
   // message means THE USER WROTE IT. That is the filter — not "the lead is the user", which is the

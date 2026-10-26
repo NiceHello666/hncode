@@ -20,7 +20,7 @@ import cp from 'node:child_process';
 import {
   C, TRUECOLOR, blockCursor, showCursor, hideCursor, alternateScreen, clearScreen, clearAndSetBg, setTheme, setLightBackground, currentTheme, THEME_NAMES, THEME_LABELS, isLightTheme, hasTheme, lerpColor, bgRgb,
 } from './colors.js';
-import { copyText, readText, warmClipboard, readClipboardContentAsync, cleanupPastedImages } from './clipboard.js';
+import { copyText, readText, warmClipboard, readClipboardContentAsync, cleanupPastedImages, stopClipboardHelper } from './clipboard.js';
 import { visualWidth, estimateTokens, estimateTokensFloat, estimateMessagesTokens, estimateMessageTokens, messageTokens, expandTabs } from './term.js';
 // The picker is composited onto the frame as a cell layer rather than assigned over
 // The picker is composited onto the frame as a cell layer rather than assigned over
@@ -55,7 +55,7 @@ import { LLM } from './llm.js';
 import * as sess from './session.js';
 import { convRowFor } from './session.js';
 import { resolveProvider, resolveModelArg, addProvider, removeProvider, addModel, upsertModel, replaceProviderModels, fetchModels, fetchCatalog, modelKey, modelLabel, bareModelId, effortOptions, effortWire, effortsFromReasoning, rememberModel, hncodeConfigFile, resolveConfig, setConfigString, setConfigBool, readPersonalPrompt, readPersonalPromptRaw, writePersonalPrompt, personalPromptFile, readAgentsMd, agentsFilesFor, readMemory, readMemoryRaw, writeMemoryRaw, memoryFile, ensureWebToken, effectiveSnapshot, costFromCatalog, modelCost, usageCost } from './config.js';
-import { pluginCommands, renderWidgets, runHooks, runPatch, runPatchSync, runKeybindsSync, pluginKeybinds } from './plugin.js';
+import { pluginCommands, renderWidgets, runHooks, runPatch, runPatchSync, runKeybindsSync, pluginKeybinds, setPluginLoggerTui } from './plugin.js';
 import { OTHER_LABEL, SUPPLEMENT_LABEL } from './tools/ask-user-question.js';
 import { render as renderTodos } from './tools/todo.js';
 import { getTool, toolNames } from './tools/index.js';
@@ -77,10 +77,13 @@ import { tuiView } from './session-view.js';
 import { SessionCore } from './session-core.js';
 import { SessionHost } from './session-host.js';
 import * as teamMod from './team/team.js';
+import * as protocolMod from './team/protocol.js';
+import { stopTeammate } from './team/spawn.js';
 import * as mailMod from './team/mailbox.js';
 import { TEAM_LEAD_NAME } from './team/constants.js';
-import { makeTeamPanel, renderTeamPanel, handleTeamPanelKey, sendFromPanel } from './team-panel.js';
+import { makeTeamPanel, renderTeamPanel, handleTeamPanelKey, sendFromPanel, noteActivity } from './team-panel.js';
 import { markAllRead } from './team/mailbox.js';
+import { answerPermission, asPermissionRequest } from './team/permission.js';
 import { leadTeam, setLeadTeam, clearLeadTeam } from './session-core.js';
 import * as upd from './update.js';
 import { renderTasksBrowser, handleTasksBrowserKey, visibleTasks } from './tasks-browser.js';
@@ -100,6 +103,7 @@ import { trimToolResults } from './tool-result.js';
 import * as gitmod from './git.js';
 import { reviewLines, savePlan, filesReferenced, planStats, listPlans, plansDir } from './plan.js';
 import { loadMcpConfig, describeServers, getLiveConnections } from './mcp.js';
+import { killLspClientsSync } from './tools/diagnostics.js';
 import { startControlServer } from './ci.js';
 import { attachToDaemon } from './web-daemon-client.js';
 
@@ -588,6 +592,352 @@ export function sweepSettle(dist, half, edge = 'cosine') {
   return edge === 'linear' ? x : 0.5 * (1 - Math.cos(Math.PI * x));
 }
 
+/**
+ * A sweep that PASSES: a character lights up under the band and returns to 0 after it.
+ *
+ * The counterpart to `sweepSettle`, and the difference is the whole point:
+ *
+ *   sweepSettle  a character the band has passed STAYS at 1 — paint being laid down
+ *   sweepPulse   a character returns to 0 once the band leaves — a light moving over
+ *
+ * `half` is the HALF-width of the light, so `2 * half` is its full width, and `flat` is the half-width
+ * of its FULLY LIT CORE. The shape is:
+ *
+ *   |dist| <= flat   the core, at 1
+ *   flat < |dist| < half   a shoulder, falling from 1 to 0
+ *
+ * Both outer ends reach 0, which is what makes the light arrive and leave without a seam. `flat = 0`
+ * ramps across the whole width and leaves a single bright point in the middle; `flat = half` is a solid
+ * block with no fade at all.
+ *
+ * `dist` is `head - position`, the same convention `sweepSettle` uses.
+ */
+export function sweepPulse(dist, half, edge = 'cosine', flat = 0) {
+  const h = Math.max(1e-6, half);
+  if (dist <= -h || dist >= h) return 0;   // outside the light
+  // A FLAT CORE: the middle `2 * flat` of the light is fully lit, and the cosine shapes only the
+  // shoulders either side of it. `flat` is a half-width, so `flat = h` is the old behaviour — a ramp
+  // across the whole light with a single bright point in the middle.
+  const core = Math.max(0, Math.min(h, flat));
+  const a = Math.abs(dist);
+  if (a <= core) return 1;
+  const x = (a - core) / (h - core);       // 0 where the core ends, 1 at the outer edge
+  if (edge === 'linear') return 1 - x;
+  return 0.5 * (1 + Math.cos(Math.PI * x)); // raised cosine from 1 down to 0
+}
+
+/**
+ * The geometry of a passing light, shared by the Working row and the Using row.
+ *
+ * Both rows show the same gesture — a light running left to right, then a pause — so the numbers live
+ * here rather than being repeated at each row and drifting apart.
+ *
+ * The light is a QUARTER OF THE ROW at full brightness, with a cosine fade either side, and it scales
+ * with the text: `Working...` is ten characters, so its core is two; a 60-character line gets fifteen.
+ *
+ * It crosses in a fixed `CROSS_MS` whatever the row, so a long line is swept faster — see that constant
+ * for why, and for what it costs.
+ */
+
+/**
+ * The light's CORE width as a fraction of the row, floored to one character.
+ *
+ * Claude Code's shimmer has no core at all — a single index is bright. The floor of 1 is the same idea: a
+ * glint is a point travelling along the row, not a wash sweeping over it. It stops at one rather than
+ * shrinking to zero because a two-character row still needs something to see.
+ */
+export const LIGHT_FRACTION = 1 / 4;
+
+/**
+ * Milliseconds per unit of `state.spin`.
+ *
+ * The spinner advances `spin` every 80ms (see the spinTimer in startTUI). The light's geometry is in
+ * real time, so a caller holding only a tick count needs this to convert — named here so the two
+ * cannot drift apart silently: the timer and this constant describe the same interval.
+ */
+export const SPIN_TICK_MS = 80;
+
+/**
+ * The light's FULLY LIT CORE, in characters: a quarter of the row, rounded down.
+ *
+ * Rounding down is deliberate: `Working...` is ten characters, so its core is two. Rounding up would make
+ * it grow on rows where it should not, and a fractional width is something no terminal draws.
+ *
+ * The floor of 2 keeps a short row visible — a three-character row would otherwise round to one, and a
+ * one-character core with a fade either side is a lit cell that barely registers.
+ *
+ * This is the core, NOT the total extent: `TAIL_CHARS` of cosine fade is added either side of it.
+ */
+export function lightWidth(n) {
+  return Math.max(2, Math.floor(n * LIGHT_FRACTION));
+}
+/**
+ * The fade either side of the core, in characters.
+ * TWO, not one: a band of one character is wide enough in truecolor but vanishes under 256 colours, where
+ * the light has only two indices and a single lit cell is a blink. Two keeps the sweep legible in both
+ * palettes: the peak moves one letter at a time, and the row reads as a lamp travelling rather than as a
+ * single pixel flashing.
+ */
+export const TAIL_CHARS = 2;
+
+
+/**
+ * The light's half-width, INCLUDING the fade. This is the extent `lightAt` sweeps.
+ *
+ * THE TAILS ARE CAPPED so the light stays narrower than the row: the total is held to `n - 1`, which
+ * keeps at least one dark column at each end. Those dark columns are what make the light read as an
+ * object with edges instead of as a row that brightens and dims.
+ *
+ * The CORE gives way first — `coreHalf` shrinks with the cap — because the fade is what makes the light
+ * arrive and leave smoothly, and a short row needs that more than it needs a wide middle.
+ */
+function totalHalf(n) {
+  const want = lightWidth(n) + 2 * TAIL_CHARS;
+  const capped = Math.min(want, Math.max(2, n - 1));
+  return capped / 2;
+}
+
+/** The half-width of the fully lit core, for `sweepPulse`'s `flat` parameter. */
+function coreHalf(n) {
+  // Never wider than the light itself, and never more than half the total: `sweepPulse` requires it.
+  return Math.min(lightWidth(n), totalHalf(n) * 2) / 2;
+}
+
+/**
+ * The animation's frame rate: 30fps, the whole program's rate for animated rows.
+ *
+ * Rendering one frame measures 0.17ms, so a much higher rate is physically possible — the earlier tick
+ * ran at 60fps — but the light's smoothness is not the only cost: every animated row redraws, and the
+ * rate is a choice about the whole UI rather than about this one light.
+ *
+ * At 30fps a frame is 33ms, which is what makes the crossing in `CROSS_MS` six frames long.
+ */
+export const ANIM_FPS = 30;
+export const FRAME_MS = 1000 / ANIM_FPS;
+
+/**
+ * How long one step of the light lasts, in milliseconds.
+ *
+ * Claude Code runs two rates — `glimmerSpeed` is 50ms while a request is in flight and 200ms otherwise —
+ * but only ONE of them is ever used here: both animated rows (Working, and a pending tool's name) are
+ * shown while something is happening, so both take the fast rate. A second, unused rate was carried for a
+ * while "for parity"; it was dead weight, and it made every timing assertion twice as long.
+ */
+export const STEP_MS = 50;
+
+
+
+
+/**
+ * How far outside the row the light starts and ends, in characters.
+ *
+ * TEN, exactly as Claude Code's `messageWidth + 20` splits into ten either side. This is what sets the
+ * pace of a round: a 10-character row travels 30 cells, so a round is 1500ms — the same as Claude Code.
+ *
+ * A shorter margin made the sweep finish sooner and read as a twitch. It must not be shorter than the
+ * light's own half-width either, or the light would still be lighting the last characters when the round
+ * ended; `lightMargin` takes the larger of the two.
+ */
+const ENTRY_EXIT_CHARS = 10;
+
+/**
+ * The margin for a row of `n` characters: the target ten, or the light's half-width if that is larger.
+ *
+ * One function so `lightAt` and `crossMs` cannot disagree about how far the light travels. When they did,
+ * the sweep finished before the light had left the row and the tail stayed lit through the rest.
+ */
+function lightMargin(n) {
+  return Math.max(ENTRY_EXIT_CHARS, totalHalf(Math.max(1, n)));
+}
+
+/**
+ * The crossing time for a row of `count` characters — ONE FULL ROUND, entry and exit included.
+ *
+ * `(count + 2 * lightMargin(count)) * stepMs`. The light is over the visible text for only `count * stepMs`
+ * of it; the rest is the entry and exit runs, which is what keeps the sweep from snapping on and off.
+ */
+export function crossMs(count) {
+  const cells = Math.max(1, count) + 2 * lightMargin(count);
+  return cells * STEP_MS;
+}
+
+/**
+ * The rest between rounds, in milliseconds.
+ *
+ * NOT zero. With `REST_MS = 0` the sweep wrapped straight back to the start the instant it left the right
+ * edge, so the row went from "light on the last letter" to "light on nothing" to "light on the first
+ * letter" within two frames — which reads as the animation resetting rather than restarting.
+ *
+ * Claude Code can use zero because its entry run is ten cells: the light is already off the row for a
+ * second before it comes back. Ours enters from three cells away, too short to cover the wrap.
+ */
+export const REST_MS = 250;
+
+/**
+ * The full cycle for a row: one crossing, then the rest.
+ *
+ * `count` enters into it: a longer row has more characters to light, so its cycle is longer. It used to be
+ * constant, because a fixed-time crossing spread itself over however many cells there happened to be.
+ */
+export function cycleMs(count) {
+  return crossMs(count) + REST_MS;
+}
+
+/**
+ * The wall-clock time the light's animation began, for a row anchored at this tick.
+ *
+ * `spin` advances every SPIN_TICK_MS while the render path redraws far more often, so a phase taken
+ * straight from the tick count steps in 80ms jumps. Converting the anchor ONCE to a wall-clock origin
+ * lets every later frame measure real elapsed time instead.
+ *
+ * The store is MODULE-LEVEL, and deliberately not a field on `state`. The caller for a pending tool
+ * row is `formatToolLine`, a module-level function with no access to `state` — reading it there threw
+ * "state is not defined" and took the whole TUI down through the unhandledRejection handler. The key
+ * is the anchor tick, so a new turn gets a new origin.
+ */
+const lightOrigins = new Map();
+/**
+ * @param {string} key     identifies the animation — `tool:12`, `work:12` — so two rows anchored on
+ *                         the same tick keep separate origins.
+ * @param {number} anchor  the tick the animation began on.
+ * @param {number} now     the tick it is being drawn at.
+ *
+ * `key` and `anchor` are separate arguments on purpose. An earlier version took only the anchor and
+ * derived the key from it, so a caller passing an already-prefixed `tool:0` produced
+ * `(0 - 'tool:0') * 80` — arithmetic on a string, which is NaN. The origin then became NaN, every
+ * colour became `38;5;NaN`, and the terminal drew the row in the default colour: a silent failure
+ * that looked like the animation simply not running.
+ */
+function lightOrigin(key, anchor, now) {
+  let origin = lightOrigins.get(key);
+  if (origin === undefined) {
+    // THE ORIGIN IS "NOW", NOT BACK-DATED FROM THE TICK COUNT.
+    //
+    // This used to be `Date.now() - (now - anchor) * SPIN_TICK_MS`, so a row that began mid-animation
+    // picked up the phase its anchor implied. That is wrong for this row: the first frame it is DRAWN is
+    // not the tick its anchor was set on — the start animation runs first, several ticks earlier. Back-
+    // dating by that gap made the sweep begin part-way across, so the light appeared to jump forward and
+    // then restart from the left.
+    //
+    // Starting at "now" means a new animation always begins at the left edge.
+    //
+    // `anchor` and `now` stay in the signature because callers pass them and the shape is part of the
+    // contract; the phase no longer depends on their difference.
+    void anchor;
+    void now;
+    origin = Date.now();
+    if (!Number.isFinite(origin)) origin = Date.now();
+    // EVICT THE OLDEST, never clear the map.
+    //
+    // This used to be `if (size > 32) clear()`. The anchor changes every turn and for every restored tool
+    // row, so the map filled quickly — and clearing it dropped the origin of the row currently on screen,
+    // which was then recreated with a FRESH timestamp. The light restarted from the left edge whenever the
+    // table filled, roughly once a second: the sweep looked cut off mid-stroke rather than moving.
+    //
+    // A Map iterates in insertion order, so the first key is the least recently added — exactly the entry
+    // no row is asking about any more.
+    if (lightOrigins.size > 64) {
+      const oldest = lightOrigins.keys().next().value;
+      lightOrigins.delete(oldest);
+    }
+    lightOrigins.set(key, origin);
+  }
+  return origin;
+}
+
+/**
+ * How lit one character is, given its index and the row length.
+ *
+ * Returns 0..1. The position arrives as an INDEX and the row length rather than a pre-divided
+ * fraction, because the light's width is itself a fraction of the row — both are then in the same
+ * unit of "characters", so the light cannot be scaled twice by accident.
+ *
+ * `phaseMs` is MILLISECONDS within the cycle, not a tick count.
+ *
+ * Time is the right unit because the light's smoothness depends on how far it moves per RENDERED
+ * frame, and the frame rate is not the caller's 80ms spinner tick. Stepping by that tick means the
+ * crossing has to finish in a whole number of 80ms frames, so keeping each step small enough to look
+ * smooth forced a many-second crossing on a long row — measured, 12 seconds for 60 characters, and
+ * 1.9 seconds for `Working...`. Taking milliseconds decouples the two: the caller may redraw as often
+ * as it likes, and the light's speed is stated directly rather than implied by a frame count.
+ */
+export function lightAt(phaseMs, index, count, edge = 'cosine') {
+  const n = Math.max(1, count);
+  // Two widths, and the distinction is the shape of the light: `half` is the OUTER edge (core plus the
+  // fade either side) and `core` is the part that stays at full brightness.
+  const half = totalHalf(n);
+  const core = coreHalf(n);
+  // The character's centre, in characters from the start of the row. Measuring against the left edge
+  // would make the light peak BETWEEN characters, so each would flash at less than full strength.
+  const centre = index + 0.5;
+  // The centre crosses from fully off the left of the row to fully off its right, so the light slides
+  // in and out rather than popping into existence on the first character.
+  //
+  // THE REST HALF NEEDS NO SPECIAL CASE. Past the crossing the progress exceeds 1 and the head travels
+  // further past the row's right edge — where `sweepPulse` is already 0 — so the light is dark by the
+  // same arithmetic that makes it leave. A guard was written for this and then removed after 9450
+  // (phase, character) combinations showed it never once changed a value.
+  // THE HEAD IS CLAUDE CODE'S `glimmerIndex`, cell for cell, and the run matches its `messageWidth + 20`.
+  //
+  // Ten cells of margin at each end is what makes the timing match: a 10-character row takes 30 steps, so
+  // 1500ms a round — the same as Claude Code. An earlier version used the light's own half-width as the
+  // margin, which was tighter and faster, and read as a twitch rather than a sweep.
+  //
+  // The margin is `max(10, half)`: ten is the target, but the light must clear its own width or it would
+  // still be lighting the last characters when the round ended — the failure the half-width version was
+  // written to fix, and which a flat ten reintroduces on a wide band.
+  const margin = Math.max(ENTRY_EXIT_CHARS, half);
+  const travel = n + 2 * margin;
+  const steps = Math.floor((phaseMs / crossMs(n)) * travel);
+  const head = Math.floor((-margin + steps) / STEP_CHARS) * STEP_CHARS;
+  // `edge` shapes the shoulder: a raised cosine leaves its outer end gentle, a linear one is sharpest
+  // where it meets the core. It arrives as a PARAMETER rather than being read from config, because this
+  // is a module-level function and the TUI state lives inside startTUI's closure — the trap that once
+  // made a pending tool row throw a ReferenceError and take the whole TUI down with it.
+  return sweepPulse(head - centre, half, edge, core);
+}
+
+/**
+ * Paint `text` with the travelling light already mixed into each glyph.
+ *
+ * ONE FUNCTION FOR BOTH ANIMATED ROWS — the Working row and a pending tool's "Using <Tool>" — because they
+ * were two hand-written copies of the same loop. That is how they drifted: the Working row passed `busy` to
+ * `lightAt` and the tool row did not, so one stepped at 50ms/cell inside a 1050ms cycle while the other
+ * stepped at 200ms/cell inside a 4050ms cycle. The slow row could not finish before its own modulus
+ * wrapped, which is why its light only ever reached the fourth letter before restarting.
+ *
+ * Everything about the light is decided here — the rate, the shoulder shape, the band width — so a change to
+ * the animation lands on both rows at once.
+ *
+ * @param {string}   text     the row's text
+ * @param {number}   phaseMs  milliseconds into the cycle
+ * @param {number[]} base     resting colour, [r, g, b]
+ * @param {number[]} glint    the colour the light lifts the text toward
+ * @param {string}   edge     shoulder shape: 'cosine' (default) or 'linear'
+ * @returns {string}          ANSI, ready to splice into a row
+ */
+function shimmerText(text, phaseMs, base, glint, edge = 'cosine') {
+  const s = String(text == null ? '' : text);
+  const n = s.length;
+  if (!n) return '';
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t = Math.max(0, Math.min(1, lightAt(phaseMs, i, n, edge, true)));
+    const r = Math.round(base[0] + (glint[0] - base[0]) * t);
+    const g = Math.round(base[1] + (glint[1] - base[1]) * t);
+    const b = Math.round(base[2] + (glint[2] - base[2]) * t);
+    out.push(col(s[i], lerpColor(r, g, b, r, g, b, 0)));
+  }
+  return out.join('');
+}
+// How far the light advances in one step, in characters.
+//
+// One character per step is the most literal reading of "move by letters", and it is the right shape:
+// the light lands on a glyph, lights it and its neighbours, then moves to the next. A larger step would
+// move in pairs, which reads as a coarser crawl without looking any more deliberate.
+export const STEP_CHARS = 1;
+
+
 // ---------------------------------------------------------------------------
 // Sweep parameters — ONE set of numbers for every animated row
 // ---------------------------------------------------------------------------
@@ -636,291 +986,254 @@ export function framesPerChar(n, ticks = SWEEP_TICKS) {
 const DETACH_HINT_DELAY_MS = 10_000;
 const DETACH_HINT_TEXT = 'Press Ctrl+B to run in background';
 
+// The phrase the Working row shows while a compaction is running, in place of a
+// rotating "Working..." one.
+// Compaction belongs on the Working row rather than in the transcript because it is a
+// STATE OF THE TURN, not something that happened in it: the agent is busy, it is doing
+// this one thing, and the row above the composer is where "busy" is already shown. A
+// separate transcript block duplicated that, and left a row behind that scrolls away
+// while the turn carries on.
+//
+// The ellipsis matches the rotating phrases, so the row does not change shape mid-word.
+export const COMPACTING_MSG = 'Compacting Context...';
+
 // Rotating status messages for the "Working..." line — all mean "the agent is
 // thinking / working", but vary the wording so it doesn't look stuck.
 const WORKING_MESSAGES = [
   // ---- A (100) ----
-  'Accelerating...', 'Accessing...', 'Acclaiming...', 'Acclimating...', 'Accommodating...', 'Accompanying...', 'Accomplishing...', 'Accounting...', 'Accrediting...', 'Accruing...',
-  'Accumulating...', 'Achieving...', 'Acknowledging...', 'Acquainting...', 'Acquiring...', 'Acting...', 'Activating...', 'Actualizing...', 'Adapting...', 'Adding...',
-  'Addressing...', 'Adhering...', 'Adjusting...', 'Administering...', 'Admiring...', 'Adopting...', 'Adorning...', 'Advancing...', 'Advocating...', 'Affirming...',
-  'Affording...', 'Aggregating...', 'Agreeing...', 'Aiding...', 'Aiming...', 'Aligning...', 'Alleviating...', 'Allocating...', 'Allowing...', 'Alluring...',
-  'Altering...', 'Amalgamating...', 'Amassing...', 'Amending...', 'Amplifying...', 'Analyzing...', 'Anchoring...', 'Animating...', 'Annotating...', 'Announcing...',
-  'Answering...', 'Anticipating...', 'Appealing...', 'Applauding...', 'Applying...', 'Appointing...', 'Appraising...', 'Appreciating...', 'Approaching...', 'Approving...',
-  'Architecting...', 'Archiving...', 'Arranging...', 'Articulating...', 'Ascending...', 'Ascertaining...', 'Aspiring...', 'Assembling...', 'Asserting...', 'Assessing...',
-  'Assigning...', 'Assimilating...', 'Assisting...', 'Assuring...', 'Astonishing...', 'Attaining...', 'Attempting...', 'Attending...', 'Attracting...', 'Auditing...',
-  'Augmenting...', 'Authenticating...', 'Authoring...', 'Authorizing...', 'Automating...', 'Awakening...', 'Awarding...', 'Attuning...', 'Absorbing...', 'Accenting...',
-  'Acquiescing...', 'Adjudicating...', 'Adventuring...', 'Alerting...', 'Ameliorating...', 'Allying...', 'Annexing...', 'Aping...', 'Availing...', 'Averaging...',
+  'Accelerating', 'Accessing', 'Acclaiming', 'Acclimating', 'Accommodating', 'Accompanying', 'Accomplishing', 'Accounting', 'Accrediting', 'Accruing',
+  'Accumulating', 'Achieving', 'Acknowledging', 'Acquainting', 'Acquiring', 'Acting', 'Activating', 'Actualizing', 'Adapting', 'Adding',
+  'Addressing', 'Adhering', 'Adjusting', 'Administering', 'Admiring', 'Adopting', 'Adorning', 'Advancing', 'Advocating', 'Affirming',
+  'Affording', 'Aggregating', 'Agreeing', 'Aiding', 'Aiming', 'Aligning', 'Alleviating', 'Allocating', 'Allowing', 'Alluring',
+  'Altering', 'Amalgamating', 'Amassing', 'Amending', 'Amplifying', 'Analyzing', 'Anchoring', 'Animating', 'Annotating', 'Announcing',
+  'Answering', 'Anticipating', 'Appealing', 'Applauding', 'Applying', 'Appointing', 'Appraising', 'Appreciating', 'Approaching', 'Approving',
+  'Architecting', 'Archiving', 'Arranging', 'Articulating', 'Ascending', 'Ascertaining', 'Aspiring', 'Assembling', 'Asserting', 'Assessing',
+  'Assigning', 'Assimilating', 'Assisting', 'Assuring', 'Astonishing', 'Attaining', 'Attempting', 'Attending', 'Attracting', 'Auditing',
+  'Augmenting', 'Authenticating', 'Authoring', 'Authorizing', 'Automating', 'Awakening', 'Awarding', 'Attuning', 'Absorbing', 'Accenting',
+  'Acquiescing', 'Adjudicating', 'Adventuring', 'Alerting', 'Ameliorating', 'Allying', 'Annexing', 'Aping', 'Availing', 'Averaging',
   // ---- B (100) ----
-  'Babbling...', 'Backing...', 'Backtracking...', 'Balancing...', 'Ballooning...', 'Banking...', 'Bargaining...', 'Bartering...', 'Basing...', 'Basking...',
-  'Batching...', 'Bathing...', 'Battling...', 'Beaching...', 'Beaming...', 'Bearing...', 'Beating...', 'Beautifying...', 'Beckoning...', 'Becoming...',
-  'Bedazzling...', 'Befriending...', 'Beginning...', 'Behaving...', 'Beholding...', 'Believing...', 'Belonging...', 'Benchmarking...', 'Bending...', 'Benefiting...',
-  'Bequeathing...', 'Beseeching...', 'Bestowing...', 'Bettering...', 'Bidding...', 'Biding...', 'Billowing...', 'Binding...', 'Birthing...', 'Biting...',
-  'Blasting...', 'Blazing...', 'Bleaching...', 'Bleeding...', 'Blending...', 'Blessing...', 'Blinking...', 'Blooming...', 'Blossoming...', 'Blowing...',
-  'Blurring...', 'Blushing...', 'Boarding...', 'Boasting...', 'Boiling...', 'Bolstering...', 'Bonding...', 'Booking...', 'Booming...', 'Boosting...',
-  'Bootstrapping...', 'Borrowing...', 'Bottling...', 'Bouncing...', 'Bounding...', 'Bowing...', 'Bowling...', 'Boxing...', 'Bracing...', 'Brainstorming...',
-  'Braiding...', 'Branching...', 'Branding...', 'Braving...', 'Breaking...', 'Breathing...', 'Breeding...', 'Breezing...', 'Brewing...', 'Bridging...',
-  'Briefing...', 'Brightening...', 'Bringing...', 'Broadcasting...', 'Broadening...', 'Bronzing...', 'Browsing...', 'Brushing...', 'Bubbling...', 'Budding...',
-  'Budgeting...', 'Buffering...', 'Building...', 'Bulking...', 'Bundling...', 'Buoying...', 'Burnishing...', 'Bustling...', 'Buying...', 'Buzzing...',
+  'Babbling', 'Backing', 'Backtracking', 'Balancing', 'Ballooning', 'Banking', 'Bargaining', 'Bartering', 'Basing', 'Basking',
+  'Batching', 'Bathing', 'Battling', 'Beaching', 'Beaming', 'Bearing', 'Beating', 'Beautifying', 'Beckoning', 'Becoming',
+  'Bedazzling', 'Befriending', 'Beginning', 'Behaving', 'Beholding', 'Believing', 'Belonging', 'Benchmarking', 'Bending', 'Benefiting',
+  'Bequeathing', 'Beseeching', 'Bestowing', 'Bettering', 'Bidding', 'Biding', 'Billowing', 'Binding', 'Birthing', 'Biting',
+  'Blasting', 'Blazing', 'Bleaching', 'Bleeding', 'Blending', 'Blessing', 'Blinking', 'Blooming', 'Blossoming', 'Blowing',
+  'Blurring', 'Blushing', 'Boarding', 'Boasting', 'Boiling', 'Bolstering', 'Bonding', 'Booking', 'Booming', 'Boosting',
+  'Bootstrapping', 'Borrowing', 'Bottling', 'Bouncing', 'Bounding', 'Bowing', 'Bowling', 'Boxing', 'Bracing', 'Brainstorming',
+  'Braiding', 'Branching', 'Branding', 'Braving', 'Breaking', 'Breathing', 'Breeding', 'Breezing', 'Brewing', 'Bridging',
+  'Briefing', 'Brightening', 'Bringing', 'Broadcasting', 'Broadening', 'Bronzing', 'Browsing', 'Brushing', 'Bubbling', 'Budding',
+  'Budgeting', 'Buffering', 'Building', 'Bulking', 'Bundling', 'Buoying', 'Burnishing', 'Bustling', 'Buying', 'Buzzing',
   // ---- C (100) ----
-  'Caching...', 'Cajoling...', 'Caking...', 'Calibrating...', 'Calling...', 'Calming...', 'Campaigning...', 'Camping...', 'Canceling...', 'Canoodling...',
-  'Canvasing...', 'Capitalizing...', 'Captioning...', 'Captivating...', 'Capturing...', 'Caring...', 'Carving...', 'Cascading...', 'Cashing...', 'Casting...',
-  'Cataloging...', 'Catapulting...', 'Catching...', 'Categorizing...', 'Catering...', 'Cautioning...', 'Ceasing...', 'Celebrating...', 'Cementing...', 'Centralizing...',
-  'Certifying...', 'Chaining...', 'Chairing...', 'Chalking...', 'Challenging...', 'Championing...', 'Channeling...', 'Chanting...', 'Chaperoning...', 'Charging...',
-  'Charting...', 'Chasing...', 'Chatting...', 'Cheering...', 'Cherishing...', 'Chewing...', 'Chilling...', 'Chiming...', 'Chipping...', 'Chirping...',
-  'Chiseling...', 'Choosing...', 'Chopping...', 'Choreographing...', 'Chronicling...', 'Chugging...', 'Ciphering...', 'Circling...', 'Circulating...', 'Citing...',
-  'Civilizing...', 'Clamping...', 'Clanging...', 'Clapping...', 'Clarifying...', 'Clashing...', 'Classifying...', 'Clawing...', 'Cleaning...', 'Cleansing...',
-  'Clearing...', 'Cleaving...', 'Climbing...', 'Clinching...', 'Clipping...', 'Cloaking...', 'Clocking...', 'Cloning...', 'Closing...', 'Clouding...',
-  'Clustering...', 'Clutching...', 'Coaching...', 'Coalescing...', 'Coating...', 'Coaxing...', 'Cocooning...', 'Codifying...', 'Coexisting...', 'Cogitating...',
-  'Cohering...', 'Coiling...', 'Coinciding...', 'Collaborating...', 'Collapsing...', 'Collating...', 'Collecting...', 'Coloring...', 'Combining...', 'Comforting...',
+  'Caching', 'Cajoling', 'Caking', 'Calibrating', 'Calling', 'Calming', 'Campaigning', 'Camping', 'Canoodling', 'Canvasing',
+  'Capitalizing', 'Captioning', 'Captivating', 'Capturing', 'Caring', 'Carving', 'Cascading', 'Cashing', 'Casting', 'Cataloging',
+  'Catapulting', 'Catching', 'Categorizing', 'Catering', 'Cautioning', 'Ceasing', 'Celebrating', 'Cementing', 'Centralizing', 'Certifying',
+  'Chaining', 'Chairing', 'Chalking', 'Challenging', 'Championing', 'Channeling', 'Chanting', 'Chaperoning', 'Charging', 'Charting',
+  'Chasing', 'Chatting', 'Cheering', 'Cherishing', 'Chewing', 'Chilling', 'Chiming', 'Chipping', 'Chirping', 'Chiseling',
+  'Choosing', 'Chopping', 'Choreographing', 'Chronicling', 'Chugging', 'Ciphering', 'Circling', 'Circulating', 'Citing', 'Civilizing',
+  'Clamping', 'Clanging', 'Clapping', 'Clarifying', 'Clashing', 'Classifying', 'Clawing', 'Cleaning', 'Cleansing', 'Clearing',
+  'Cleaving', 'Climbing', 'Clinching', 'Clipping', 'Cloaking', 'Clocking', 'Cloning', 'Closing', 'Clouding', 'Clustering',
+  'Clutching', 'Coaching', 'Coalescing', 'Coating', 'Coaxing', 'Cocooning', 'Codifying', 'Coexisting', 'Cogitating', 'Cohering',
+  'Coiling', 'Coinciding', 'Collaborating', 'Collapsing', 'Collating', 'Collecting', 'Coloring', 'Combining', 'Comforting', 'Dabbling',
   // ---- D (100) ----
-  'Dabbling...', 'Dampening...', 'Dancing...', 'Daring...', 'Darting...', 'Dashing...', 'Dating...', 'Dawdling...', 'Dazzling...', 'Deactivating...',
-  'Debugging...', 'Debuting...', 'Decanting...', 'Decelerating...', 'Decentralizing...', 'Deciding...', 'Deciphering...', 'Decking...', 'Declaring...', 'Decoding...',
-  'Decomposing...', 'Decorating...', 'Decoupling...', 'Dedicating...', 'Deducing...', 'Deepening...', 'Defeating...', 'Defending...', 'Deferring...', 'Defining...',
-  'Deflecting...', 'Defragmenting...', 'Defusing...', 'Degreasing...', 'Dehydrating...', 'Delegating...', 'Deliberating...', 'Delighting...', 'Delivering...', 'Delving...',
-  'Demanding...', 'Demarcating...', 'Demonstrating...', 'Demystifying...', 'Denoting...', 'Densifying...', 'Departing...', 'Depending...', 'Deploying...', 'Depicting...',
-  'Depositing...', 'Depressurizing...', 'Deriving...', 'Descending...', 'Describing...', 'Desiring...', 'Despatching...', 'Detailing...', 'Detecting...', 'Deterring...',
-  'Determining...', 'Detoxing...', 'Devaluing...', 'Developing...', 'Deviating...', 'Devising...', 'Devoting...', 'Diagnosing...', 'Diagramming...', 'Dialing...',
-  'Digesting...', 'Digging...', 'Digitizing...', 'Diluting...', 'Dimensioning...', 'Directing...', 'Disarming...', 'Disbursing...', 'Discarding...', 'Discerning...',
-  'Discharging...', 'Disciplining...', 'Disclosing...', 'Disconnecting...', 'Discounting...', 'Discovering...', 'Discrediting...', 'Discussing...', 'Disentangling...', 'Disguising...',
-  'Disinfecting...', 'Dislodging...', 'Dismantling...', 'Dismissing...', 'Dispatching...', 'Dispensing...', 'Dispersing...', 'Displaying...', 'Disposing...', 'Disproving...',
-  'Dissecting...', 'Disseminating...', 'Dissipating...', 'Dissolving...', 'Distilling...', 'Distinguishing...', 'Distributing...', 'Diversifying...', 'Diverting...', 'Dividing...',
-  'Divining...', 'Divulging...', 'Docking...', 'Documenting...', 'Dodging...', 'Domesticating...', 'Dominating...', 'Donating...', 'Doodling...', 'Dosing...',
-  'Doubling...', 'Dovetailing...', 'Downloading...', 'Drafting...', 'Draining...', 'Dramatizing...', 'Drawing...', 'Dreaming...', 'Dredging...', 'Dressing...',
-  'Drifting...', 'Drilling...', 'Driving...', 'Dropping...', 'Drumming...', 'Drying...', 'Ducking...', 'Dusting...', 'Dwelling...', 'Dyeing...',
+  'Dampening', 'Dancing', 'Daring', 'Darting', 'Dashing', 'Dating', 'Dawdling', 'Dazzling', 'Deactivating', 'Debugging',
+  'Debuting', 'Decanting', 'Decelerating', 'Decentralizing', 'Deciding', 'Deciphering', 'Decking', 'Declaring', 'Decoding', 'Decomposing',
+  'Decorating', 'Decoupling', 'Dedicating', 'Deducing', 'Deepening', 'Defeating', 'Defending', 'Defining', 'Deflecting', 'Defragmenting',
+  'Defusing', 'Degreasing', 'Dehydrating', 'Delegating', 'Deliberating', 'Delighting', 'Delivering', 'Delving', 'Demanding', 'Demarcating',
+  'Demonstrating', 'Demystifying', 'Denoting', 'Densifying', 'Departing', 'Depending', 'Deploying', 'Depicting', 'Depositing', 'Depressurizing',
+  'Deriving', 'Descending', 'Describing', 'Desiring', 'Despatching', 'Detailing', 'Detecting', 'Deterring', 'Determining', 'Detoxing',
+  'Devaluing', 'Developing', 'Deviating', 'Devising', 'Devoting', 'Diagnosing', 'Diagramming', 'Dialing', 'Digesting', 'Digging',
+  'Digitizing', 'Diluting', 'Dimensioning', 'Directing', 'Disarming', 'Disbursing', 'Discarding', 'Discerning', 'Discharging', 'Disciplining',
+  'Disclosing', 'Disconnecting', 'Discounting', 'Discovering', 'Discrediting', 'Discussing', 'Disentangling', 'Disguising', 'Disinfecting', 'Dislodging',
+  'Dismantling', 'Dismissing', 'Dispatching', 'Dispensing', 'Dispersing', 'Displaying', 'Disposing', 'Disproving', 'Dissecting', 'Disseminating',
+  'Dissipating', 'Dissolving', 'Distilling', 'Distinguishing', 'Distributing', 'Diversifying', 'Diverting', 'Dividing', 'Divining', 'Divulging',
+  'Docking', 'Documenting', 'Dodging', 'Domesticating', 'Dominating', 'Donating', 'Doodling', 'Dosing', 'Doubling', 'Dovetailing',
+  'Downloading', 'Drafting', 'Draining', 'Dramatizing', 'Drawing', 'Dreaming', 'Dredging', 'Dressing', 'Drifting', 'Drilling',
+  'Driving', 'Dropping', 'Drumming', 'Drying', 'Ducking', 'Dusting', 'Dwelling', 'Dyeing', 'Earning', 'Easing',
   // ---- E (100) ----
-  'Earning...', 'Easing...', 'Echoing...', 'Eclipsing...', 'Economizing...', 'Edging...', 'Editing...', 'Educating...', 'Effecting...', 'Effervescing...',
-  'Elaborating...', 'Elating...', 'Electing...', 'Electrifying...', 'Elevating...', 'Eliciting...', 'Eliminating...', 'Elucidating...', 'Emancipating...', 'Embarking...',
-  'Embedding...', 'Embellishing...', 'Embodying...', 'Embracing...', 'Embroidering...', 'Emerging...', 'Emitting...', 'Empathizing...', 'Emphasizing...', 'Empowering...',
-  'Emulating...', 'Enabling...', 'Enacting...', 'Encapsulating...', 'Enchanting...', 'Encircling...', 'Enclosing...', 'Encoding...', 'Encouraging...', 'Encrypting...',
-  'Endearing...', 'Endeavoring...', 'Endorsing...', 'Endowing...', 'Enduring...', 'Energizing...', 'Enforcing...', 'Engaging...', 'Engineering...', 'Engraving...',
-  'Enhancing...', 'Enjoying...', 'Enlarging...', 'Enlightening...', 'Enlisting...', 'Enlivening...', 'Enriching...', 'Enrolling...', 'Ensuring...', 'Entering...',
-  'Entertaining...', 'Enthralling...', 'Enthusing...', 'Enticing...', 'Entitling...', 'Enumerating...', 'Enveloping...', 'Envisioning...', 'Equipping...', 'Equalizing...',
-  'Erecting...', 'Erasing...', 'Escalating...', 'Escaping...', 'Escorting...', 'Establishing...', 'Esteeming...', 'Estimating...', 'Eulogizing...', 'Evaluating...',
-  'Evaporating...', 'Evolving...', 'Examining...', 'Exceeding...', 'Excelling...', 'Exchanging...', 'Exciting...', 'Excluding...', 'Executing...', 'Exercising...',
-  'Exhaling...', 'Exhibiting...', 'Exhilarating...', 'Existing...', 'Expanding...', 'Expecting...', 'Expediting...', 'Experiencing...', 'Experimenting...', 'Explaining...',
-  'Exploring...', 'Exporting...', 'Exposing...', 'Expressing...', 'Extending...', 'Externalizing...', 'Extracting...', 'Extrapolating...', 'Eyeing...',
-  // ---- F (100) ----
-  'Fabricating...', 'Facilitating...', 'Facing...', 'Factoring...', 'Fading...', 'Farming...', 'Fascinating...', 'Fashioning...', 'Fastening...', 'Fathoming...',
-  'Favoring...', 'Feathering...', 'Featuring...', 'Feeding...', 'Feeling...', 'Fencing...', 'Fermenting...', 'Ferrying...', 'Fertilizing...', 'Fetching...',
-  'Fiddling...', 'Fielding...', 'Figuring...', 'Filing...', 'Filling...', 'Filtering...', 'Financing...', 'Finding...', 'Fingerprinting...', 'Finishing...',
-  'Firing...', 'Firming...', 'Fishing...', 'Fitting...', 'Fixing...', 'Flagging...', 'Flanking...', 'Flashing...', 'Flattening...', 'Flattering...',
-  'Flavoring...', 'Fleshing...', 'Flexing...', 'Flicking...', 'Flinging...', 'Flipping...', 'Floating...', 'Flooding...', 'Flooring...', 'Flourishing...',
-  'Flowing...', 'Flushing...', 'Fluttering...', 'Flying...', 'Foaming...', 'Focusing...', 'Folding...', 'Following...', 'Forging...', 'Forgiving...',
-  'Formalizing...', 'Forming...', 'Formulating...', 'Fortifying...', 'Forwarding...', 'Fostering...', 'Founding...', 'Fragmenting...', 'Framing...', 'Freeing...',
-  'Freezing...', 'Freshening...', 'Frosting...', 'Frying...', 'Fueling...', 'Fulfilling...', 'Functioning...', 'Funding...', 'Furnishing...', 'Furthering...',
-  'Fusing...', 'Fussing...', 'Factorizing...', 'Fantasizing...', 'Faultfinding...', 'Federating...', 'Fending...', 'Ferreting...', 'Filming...', 'Finalizing...',
-  'Finessing...', 'Fireproofing...', 'Fizzing...', 'Flameproofing...', 'Fleecing...', 'Flickering...', 'Flitting...', 'Fluctuating...', 'Fluorescing...', 'Freewheeling...',
-  // ---- G (100) ----
-  'Gaining...', 'Galloping...', 'Galvanizing...', 'Gaming...', 'Gardening...', 'Garlanding...', 'Garnering...', 'Gathering...', 'Gauging...', 'Gazing...',
-  'Gearing...', 'Generalizing...', 'Generating...', 'Gesticulating...', 'Gesturing...', 'Getting...', 'Gifting...', 'Giggling...', 'Gilding...', 'Girding...',
-  'Giving...', 'Glancing...', 'Glazing...', 'Gleaming...', 'Gleaning...', 'Glimmering...', 'Glimpsing...', 'Gliding...', 'Glistening...', 'Glittering...',
-  'Glowing...', 'Glueing...', 'Goading...', 'Gobbling...', 'Golfing...', 'Governing...', 'Grabbing...', 'Graduating...', 'Grafting...', 'Granting...',
-  'Graphing...', 'Grasping...', 'Gratifying...', 'Grating...', 'Greasing...', 'Greeting...', 'Gridding...', 'Grilling...', 'Grinding...', 'Gripping...',
-  'Grooving...', 'Grooming...', 'Grounding...', 'Grouping...', 'Growing...', 'Guaranteeing...', 'Guarding...', 'Guessing...', 'Guiding...', 'Gushing...',
-  'Gusting...', 'Gutting...', 'Guzzling...', 'Gamboling...', 'Gating...', 'Gazetting...', 'Gelling...', 'Gentrifying...', 'Germinating...', 'Gestating...',
-  'Ghosting...', 'Glaciating...', 'Gladdening...', 'Globalizing...', 'Glorifying...', 'Glossing...', 'Gonging...', 'Gouging...', 'Grandstanding...', 'Granulating...',
-  'Gravitating...', 'Grazing...', 'Greening...', 'Grimacing...', 'Grubbing...', 'Gurgling...', 'Gyrating...', 'Gabbing...', 'Gaffing...', 'Gallivanting...',
-  'Galumphing...', 'Garbling...', 'Garrisoning...', 'Gasping...', 'Gentling...', 'Geotagging...', 'Gimballing...', 'Glinting...', 'Gorging...', 'Grinning...',
-  // ---- H (100) ----
-  'Habilitating...', 'Hacking...', 'Haggling...', 'Hailing...', 'Halting...', 'Hammering...', 'Handcrafting...', 'Handing...', 'Handling...', 'Hanging...',
-  'Happening...', 'Harboring...', 'Hardening...', 'Harmonizing...', 'Harnessing...', 'Harvesting...', 'Hashing...', 'Hastening...', 'Hatching...', 'Hauling...',
-  'Having...', 'Heading...', 'Healing...', 'Heaping...', 'Hearing...', 'Heartening...', 'Heating...', 'Heaving...', 'Hedging...', 'Heeding...',
-  'Helping...', 'Heralding...', 'Herding...', 'Hesitating...', 'Hibernating...', 'Hiding...', 'Highlighting...', 'Hiking...', 'Hinging...', 'Hinting...',
-  'Hiring...', 'Hitting...', 'Hoarding...', 'Hoisting...', 'Holding...', 'Hollowing...', 'Homing...', 'Honing...', 'Honoring...', 'Hooking...',
-  'Hopping...', 'Hoping...', 'Horsing...', 'Hosting...', 'Hotfixing...', 'Hovering...', 'Howling...', 'Huddling...', 'Hugging...', 'Hulling...',
-  'Humanizing...', 'Humbling...', 'Humming...', 'Hunting...', 'Hurling...', 'Hurrying...', 'Hushing...', 'Hustling...', 'Hybridizing...', 'Hydrating...',
-  'Hydroplaning...', 'Hymning...', 'Hyping...', 'Hypothesizing...', 'Habituating...', 'Hairdressing...', 'Hallowing...', 'Halving...', 'Handholding...', 'Handpicking...',
-  'Handwriting...', 'Hankering...', 'Hardcoding...', 'Harkening...', 'Hawking...', 'Haymaking...', 'Headhunting...', 'Headlining...', 'Heartwarming...', 'Heightening...',
-  'Heehawing...', 'Homesteading...', 'Homeschooling...', 'Honeying...', 'Hooping...', 'Hornswoggling...', 'Hosing...', 'Hounding...', 'Huckstering...', 'Humoring...',
-  // ---- I (100) ----
-  'Idealizing...', 'Identifying...', 'Igniting...', 'Ignoring...', 'Illuminating...', 'Illustrating...', 'Imagining...', 'Imitating...', 'Immersing...', 'Immortalizing...',
-  'Impacting...', 'Imparting...', 'Impersonating...', 'Implementing...', 'Implicating...', 'Importing...', 'Imposing...', 'Impressing...', 'Imprinting...', 'Improving...',
-  'Improvising...', 'Inaugurating...', 'Incentivizing...', 'Inching...', 'Including...', 'Incorporating...', 'Increasing...', 'Incrementing...', 'Incubating...', 'Incurring...',
-  'Indenting...', 'Indexing...', 'Indicating...', 'Inducting...', 'Indulging...', 'Industrializing...', 'Inferring...', 'Infiltrating...', 'Inflating...', 'Influencing...',
-  'Informing...', 'Infusing...', 'Ingesting...', 'Inhabiting...', 'Inhaling...', 'Inheriting...', 'Inhibiting...', 'Initializing...', 'Initiating...', 'Injecting...',
-  'Injuring...', 'Inking...', 'Innovating...', 'Inoculating...', 'Inquiring...', 'Inscribing...', 'Inserting...', 'Insisting...', 'Inspecting...', 'Inspiring...',
-  'Installing...', 'Instantiating...', 'Instigating...', 'Instilling...', 'Instituting...', 'Instructing...', 'Insulating...', 'Insuring...', 'Integrating...', 'Intending...',
-  'Intensifying...', 'Interacting...', 'Intercepting...', 'Interfacing...', 'Interleaving...', 'Interlinking...', 'Interlacing...', 'Interlocking...', 'Interning...', 'Interpolating...',
-  'Interpreting...', 'Interrogating...', 'Interrupting...', 'Intersecting...', 'Intervening...', 'Interviewing...', 'Interweaving...', 'Intoning...', 'Introducing...', 'Intuiting...',
-  'Inventing...', 'Inventorying...', 'Inverting...', 'Investing...', 'Investigating...', 'Invigorating...', 'Inviting...', 'Involving...', 'Ionizing...', 'Iterating...',
-  // ---- J ----
-  'Jabbing...', 'Jacketing...', 'Jailing...', 'Jamming...', 'Jangling...', 'Jarring...', 'Jaunting...', 'Jazzing...',
-  'Jeering...', 'Jelling...', 'Jeopardizing...', 'Jerking...', 'Jesting...', 'Jettisoning...', 'Jeweling...', 'Jibing...',
-  'Jiggling...', 'Jigsawing...', 'Jilting...', 'Jingling...', 'Jiving...', 'Jobbing...', 'Jockeying...', 'Jogging...',
-  'Joining...', 'Joking...', 'Jollying...', 'Jolting...', 'Jostling...', 'Jotting...', 'Journeying...', 'Jousting...',
-  'Joyriding...', 'Judging...', 'Juggling...', 'Julienning...', 'Jumping...', 'Junketing...', 'Justifying...', 'Jutting...',
-  'Juxtaposing...', 'Jabbering...', 'Jading...', 'Jalousing...', 'Japing...', 'Jargonizing...', 'Jauncing...', 'Jawboning...',
-  'Jawing...', 'Jeopardying...', 'Jellifying...', 'Jemmying...', 'Jettying...', 'Jewelling...', 'Jibbing...', 'Jigging...',
-  'Jitterbugging...', 'Jinxing...', 'Jittering...', 'Jobhunting...', 'Joggling...', 'Joisting...', 'Jokifying...', 'Jollifying...',
-  'Jonesing...', 'Joshing...', 'Jouking...', 'Journalling...', 'Jovializing...', 'Jowing...', 'Joying...', 'Joypopping...',
-  'Jubilating...', 'Juddering...', 'Judoing...', 'Juking...', 'Jumbling...', 'Jumpstarting...', 'Junking...', 'Jurifying...',
-  'Jurying...', 'Justling...', 'Juicing...', 'Jouncing...', 'Javelining...', 'Jocundizing...', 'Japering...', 'Japonicaing...',
-  'Jasperizing...', 'Jazzercising...', 'Jellyfishing...', 'Jerrybuilding...', 'Jerseying...', 'Jessying...', 'Jobseeking...', 'Jointing...',
-  'Junketeering...', 'Jawbreaking...', 'Jaywalking...',
-  // ---- K ----
-  'Keeling...', 'Keening...', 'Keeping...', 'Kenning...', 'Kerbing...', 'Kerneling...', 'Kettling...', 'Keyboarding...',
-  'Keying...', 'Keynoting...', 'Kibitzing...', 'Kicking...', 'Kidding...', 'Kidnapping...', 'Kilning...', 'Kindling...',
-  'Kinging...', 'Kinking...', 'Kissing...', 'Kitting...', 'Kneading...', 'Kneeling...', 'Knifing...', 'Knighting...',
-  'Knitting...', 'Knocking...', 'Knotting...', 'Knowing...', 'Knuckling...', 'Koshering...', 'Kowtowing...', 'Kvetching...',
-  'Karaoking...', 'Kayoing...', 'Kecking...', 'Kedging...', 'Keeking...', 'Kelping...', 'Kenneling...', 'Keratinizing...',
-  'Kerfing...', 'Kernelling...', 'Kibbutzing...', 'Kiboshing...', 'Kickboxing...', 'Kickstarting...', 'Kiddying...', 'Kiltering...',
-  'Kippering...', 'Kiting...', 'Kittening...', 'Klaxoning...', 'Knapping...', 'Kneecapping...', 'Knelling...', 'Knobbling...',
-  'Knolling...', 'Kodaking...', 'Konking...', 'Kooking...', 'Koreanizing...', 'Kremlining...', 'Krumping...', 'Kudosing...',
-  'Kurbling...', 'Kvelling...', 'Kingmaking...', 'Kyanising...', 'Kyboshing...', 'Kything...', 'Kaolinizing...', 'Kaputing...',
-  'Katalysing...', 'Kathoding...', 'Keshing...', 'Keypunching...', 'Khediving...', 'Kalsomining...', 'Kamiing...', 'Kantianing...',
-  'Karaokeing...', 'Karateing...', 'Karstifying...', 'Katabolizing...', 'Kathing...', 'Kazaching...', 'Kebabbing...', 'Kebobbing...',
-  'Keeving...', 'Keelhauling...', 'Keenlying...', 'Keepnetting...', 'Keltering...', 'Kerseying...', 'Ketling...', 'Keyframing...',
-  'Keyseating...', 'Kibbling...', 'Kickboarding...', 'Kickflipping...', 'Kidneystoning...', 'Kieving...', 'Kimchifying...', 'Kimmering...',
-  'Kindergartening...', 'Kinescoping...', 'Kingfishing...', 'Kirkifying...', 'Kirshening...', 'Kitbagging...', 'Kitchening...', 'Kitesurfing...',
-  'Klondiking...', 'Kludging...', 'Knackering...', 'Kneippering...', 'Knobkerrying...', 'Knowledging...', 'Kohlrabiing...', 'Koorifying...',
-  'Kotowing...', 'Kronaing...', 'Krytroning...', 'Kugelhopfing...', 'Kumquating...', 'Kurrajonging...', 'Kyanizing...',
-  // ---- L (100) ----
-  'Labeling...', 'Laboring...', 'Lacing...', 'Laddering...', 'Lading...', 'Lagging...', 'Lambasting...', 'Laminating...', 'Landing...', 'Languishing...',
-  'Lapping...', 'Lapsing...', 'Larding...', 'Lashing...', 'Lasting...', 'Latching...', 'Lathering...', 'Lauding...', 'Laughing...', 'Launching...',
-  'Laundering...', 'Lavishing...', 'Laying...', 'Lazing...', 'Leaching...', 'Leading...', 'Leafing...', 'Leaking...', 'Leaning...', 'Leaping...',
-  'Learning...', 'Leasing...', 'Leathering...', 'Leaving...', 'Lecturing...', 'Ledgering...', 'Leeching...', 'Leering...', 'Legitimizing...', 'Lending...',
-  'Lengthening...', 'Lessening...', 'Letting...', 'Leveling...', 'Leveraging...', 'Levying...', 'Liberating...', 'Licensing...', 'Licking...', 'Lifting...',
-  'Lightening...', 'Lighting...', 'Liking...', 'Limbering...', 'Limiting...', 'Lining...', 'Linking...', 'Lionizing...', 'Liquidating...', 'Lisping...',
-  'Listening...', 'Litigating...', 'Littering...', 'Living...', 'Loading...', 'Loafing...', 'Loaning...', 'Lobbying...', 'Lobing...', 'Localizing...',
-  'Locating...', 'Locking...', 'Lodging...', 'Lofting...', 'Logging...', 'Longing...', 'Looking...', 'Looping...', 'Loosening...', 'Looting...',
-  'Loping...', 'Losing...', 'Lounging...', 'Loving...', 'Lowering...', 'Lubricating...', 'Lugging...', 'Lulling...', 'Lumbering...', 'Lumping...',
-  'Lunching...', 'Lunging...', 'Luring...', 'Lurking...', 'Lustering...', 'Lustrating...', 'Luxuriating...', 'Lying...', 'Lynching...', 'Lyricizing...',
-  // ---- M (100) ----
-  'Machining...', 'Magnetizing...', 'Magnifying...', 'Maintaining...', 'Mainstreaming...', 'Making...', 'Managing...', 'Mandating...',
-  'Maneuvering...', 'Mangling...', 'Manifesting...', 'Manipulating...', 'Manning...', 'Manufacturing...', 'Mapping...', 'Marching...',
-  'Marketing...', 'Marking...', 'Marrying...', 'Marshaling...', 'Marveling...', 'Mashing...', 'Masking...', 'Massaging...',
-  'Massing...', 'Mastering...', 'Matching...', 'Materializing...', 'Matriculating...', 'Mattering...', 'Maximizing...', 'Meaning...',
-  'Measuring...', 'Mediating...', 'Meditating...', 'Meeting...', 'Melding...', 'Mellowing...', 'Melting...', 'Memorizing...',
-  'Mending...', 'Mentioning...', 'Mentoring...', 'Merging...', 'Meriting...', 'Meshing...', 'Mesmerizing...', 'Messaging...',
-  'Metabolizing...', 'Metalworking...', 'Metamorphosing...', 'Metering...', 'Microblogging...', 'Microchipping...', 'Microfilming...', 'Micromanaging...',
-  'Migrating...', 'Milking...', 'Milling...', 'Mimicking...', 'Mincing...', 'Minding...', 'Mingling...', 'Miniaturizing...',
-  'Minimizing...', 'Mining...', 'Ministering...', 'Minting...', 'Mirroring...', 'Misaligning...', 'Miscalculating...', 'Misdiagnosing...',
-  'Misfiring...', 'Misjudging...', 'Mislaying...', 'Mismatching...', 'Misplacing...', 'Misquoting...', 'Misreading...', 'Missing...',
-  'Misspelling...', 'Mistaking...', 'Misting...', 'Misunderstanding...', 'Mitigating...', 'Mixing...', 'Moaning...', 'Mobilizing...',
-  'Mocking...', 'Modeling...', 'Moderating...', 'Modernizing...', 'Modifying...', 'Modularizing...', 'Modulating...', 'Moistening...',
-  'Moisturizing...', 'Molding...', 'Mollifying...', 'Monitoring...', 'Monetizing...', 'Monogramming...', 'Monologuing...', 'Monopolizing...',
-  'Mooring...', 'Moralizing...', 'Morphing...', 'Mortgaging...', 'Moseying...', 'Motivating...', 'Motoring...', 'Mottling...',
-  'Moulding...', 'Mounting...', 'Mountaineering...', 'Mourning...', 'Mousetrapping...', 'Mouthing...', 'Moving...', 'Mowing...',
-  'Muckraking...', 'Muddling...', 'Mudslinging...', 'Muffling...', 'Mulching...', 'Multiplying...', 'Multiplexing...', 'Multitasking...',
-  'Mumbling...', 'Mummifying...', 'Munching...', 'Murmuring...', 'Muscling...', 'Musicalizing...', 'Musing...', 'Musseling...',
-  'Mustering...', 'Mutating...', 'Muting...', 'Mutinying...', 'Muttering...', 'Mutualizing...', 'Muzzling...', 'Mystifying...',
-  'Mailing...', 'Mamboing...', 'Manacling...', 'Manhandling...', 'Manicuring...', 'Mansplaining...', 'Mantling...', 'Marinating...',
-  'Marooning...', 'Marring...', 'Masquerading...', 'Masterminding...', 'Masticating...', 'Mauling...', 'Meandering...', 'Mechanizing...',
-  'Meddling...', 'Meliorating...', 'Melodizing...', 'Memorializing...', 'Menacing...', 'Mercerizing...', 'Merchandising...', 'Metallizing...',
-  'Mildewing...', 'Militating...', 'Mimeographing...', 'Mindmapping...', 'Minesweeping...', 'Misappropriating...', 'Misconstruing...', 'Misrepresenting...',
-  // ---- N (100) ----
-  'Nabbing...', 'Nailing...', 'Naming...', 'Nanosizing...', 'Napping...', 'Narrating...', 'Narrowing...', 'Nattering...',
-  'Naturalizing...', 'Navigating...', 'Neatening...', 'Nebulizing...', 'Necessitating...', 'Necking...', 'Necropsying...', 'Needling...',
-  'Negating...', 'Negotiating...', 'Nerving...', 'Nesting...', 'Nestling...', 'Netting...', 'Nettling...', 'Networking...',
-  'Neutralizing...', 'Newscasting...', 'Nibbling...', 'Nicking...', 'Nicknaming...', 'Nictitating...', 'Niggling...', 'Nipping...',
-  'Nitpicking...', 'Nobbling...', 'Nocking...', 'Nodding...', 'Noising...', 'Nominating...', 'Nonplussing...', 'Noodling...',
-  'Normalizing...', 'Nosediving...', 'Nosing...', 'Notarizing...', 'Notating...', 'Notching...', 'Noticing...', 'Notifying...',
-  'Noting...', 'Nourishing...', 'Novelizing...', 'Nucleating...', 'Nudging...', 'Nuggetting...', 'Nuking...', 'Nullifying...',
-  'Numbering...', 'Numbing...', 'Nursemaiding...', 'Nursing...', 'Nurturing...', 'Nutmegging...', 'Nuzzling...', 'Narrowcasting...',
-  // ---- O (100) ----
-  'Obeying...', 'Objecting...', 'Objectivizing...', 'Obligating...', 'Obliging...', 'Obliterating...', 'Obnubilating...', 'Obscuring...',
-  'Observing...', 'Obsessing...', 'Obsoleting...', 'Obstructing...', 'Obtaining...', 'Obtruding...', 'Obviating...', 'Occasioning...',
-  'Occupying...', 'Occurring...', 'Offering...', 'Officiating...', 'Offloading...', 'Offsetting...', 'Ogling...', 'Oiling...',
-  'Okaying...', 'Ominating...', 'Omitting...', 'Onboarding...', 'Oozing...', 'Opacifying...', 'Opalescing...', 'Opening...',
-  'Operating...', 'Opining...', 'Opposing...', 'Optimizing...', 'Optioning...', 'Orating...', 'Orbiting...', 'Orchestrating...',
-  'Ordaining...', 'Ordering...', 'Organizing...', 'Orienting...', 'Originating...', 'Ornamenting...', 'Orphaning...', 'Oscillating...',
-  'Ossifying...', 'Ostracizing...', 'Outbidding...', 'Outclassing...', 'Outdoing...', 'Outfitting...', 'Outgrowing...', 'Outlasting...',
-  'Outlining...', 'Outmaneuvering...', 'Outpacing...', 'Outperforming...', 'Outreaching...', 'Outsmarting...', 'Outsourcing...', 'Outstripping...',
-  'Outwitting...', 'Overachieving...', 'Overarching...', 'Overbalancing...', 'Overbooking...', 'Overbuilding...', 'Overcoming...', 'Overcompensating...',
-  'Overdelivering...', 'Overdoing...', 'Overeating...', 'Overemphasizing...', 'Overestimating...', 'Overflowing...', 'Overhauling...', 'Overhearing...',
-  'Overheating...', 'Overlaying...', 'Overloading...', 'Overlooking...', 'Overpowering...', 'Overprinting...', 'Overproducing...', 'Overreaching...',
-  'Overriding...', 'Overruling...', 'Overseeing...', 'Overshadowing...', 'Overshooting...', 'Oversimplifying...', 'Oversleeping...', 'Overstating...',
-  'Overstepping...', 'Overstocking...', 'Overstretching...', 'Overtaking...', 'Overthinking...', 'Overthrowing...', 'Overturning...', 'Overvaluing...',
-  'Overwatching...', 'Overwhelming...', 'Owing...', 'Owning...', 'Oxidizing...', 'Oxygenating...', 'Ozonizing...', 'Obolizing...',
-  // ---- P ----
-  'Pacing...', 'Packaging...', 'Packing...', 'Padding...', 'Paddling...', 'Paging...', 'Painting...', 'Pairing...',
-  'Palatalizing...', 'Palling...', 'Palming...', 'Palpating...', 'Pampering...', 'Panelizing...', 'Panicking...', 'Pantomiming...',
-  'Papering...', 'Parachuting...', 'Parading...', 'Paragliding...', 'Paralysing...', 'Paraphrasing...', 'Parceling...', 'Pardoning...',
-  'Parenting...', 'Pariking...', 'Parking...', 'Parleying...', 'Parodying...', 'Paroling...', 'Parrying...', 'Parsing...',
-  'Partaking...', 'Partitioning...', 'Partnering...', 'Partying...', 'Passing...', 'Passivizing...', 'Pasting...', 'Pastoring...',
-  'Patching...', 'Patenting...', 'Patrolling...', 'Patronizing...', 'Patterning...', 'Pausing...', 'Paving...', 'Pawing...',
-  'Paying...', 'Peaking...', 'Pealing...', 'Pecking...', 'Pedaling...', 'Peeking...', 'Peeling...', 'Peering...',
-  'Pegging...', 'Pelting...', 'Penalizing...', 'Penciling...', 'Pending...', 'Penetrating...', 'Pensioning...', 'Peppering...',
-  'Perceiving...', 'Perching...', 'Perfecting...', 'Perforating...', 'Performing...', 'Perfuming...', 'Perishing...', 'Permeating...',
-  'Permitting...', 'Permuting...', 'Perpetuating...', 'Perplexing...', 'Persevering...', 'Persisting...', 'Personalizing...', 'Personifying...',
-  'Persuading...', 'Perving...', 'Pestering...', 'Petitioning...', 'Petrifying...', 'Pettifogging...', 'Phaseing...', 'Philandering...',
-  'Philosophizing...', 'Phoneing...', 'Photocopying...', 'Photographing...', 'Photosynthesizing...', 'Phrasing...', 'Picking...', 'Picnicking...',
-  'Picturing...', 'Piecing...', 'Piercing...', 'Piggybacking...', 'Pilfering...', 'Piloting...', 'Pinching...', 'Pinging...',
-  'Pinning...', 'Pioneering...', 'Piping...', 'Pitching...', 'Pitying...', 'Pivoting...', 'Placating...', 'Placing...',
-  'Plagiarizing...', 'Plaiting...', 'Planning...', 'Planting...', 'Plastering...', 'Plating...', 'Playing...', 'Pleading...',
-  'Pleasuring...', 'Pledging...', 'Plodding...', 'Plotting...', 'Ploughing...', 'Plowing...', 'Plucking...', 'Plugging...',
-  'Plumbing...', 'Plummeting...', 'Plumping...', 'Plundering...', 'Plunging...', 'Pluralizing...', 'Plying...', 'Poaching...',
-  'Pocketing...', 'Podcasting...', 'Poeticizing...', 'Pointing...', 'Poising...', 'Poisoning...', 'Poking...', 'Polarizing...',
-  'Policing...', 'Polishing...', 'Politicizing...', 'Pollinating...', 'Polling...', 'Pondering...', 'Pooling...', 'Popping...',
-  'Popularizing...', 'Populating...', 'Poring...', 'Porting...', 'Portioning...', 'Portraying...', 'Posing...', 'Positioning...',
-  'Positing...', 'Possessing...', 'Posting...', 'Postponing...', 'Postulating...', 'Posturing...', 'Potting...', 'Pouncing...',
-  'Pounding...', 'Pouring...', 'Pouting...', 'Powdering...', 'Powering...', 'Practicing...', 'Praising...', 'Prancing...',
-  'Prattling...', 'Praying...', 'Preaching...', 'Preambleing...', 'Preceding...', 'Precipitating...', 'Precluding...', 'Precooking...',
-  'Predicting...', 'Predisposing...', 'Prefacing...', 'Preferring...', 'Prefiguring...', 'Prefixing...', 'Preheating...', 'Prejudging...',
-  'Preluding...', 'Premising...', 'Preoccupying...', 'Preordaining...', 'Preparing...', 'Prepaving...', 'Prepaying...', 'Preponderating...',
-  'Prerecording...', 'Prescribing...', 'Presenting...', 'Preserving...', 'Presetting...', 'Presiding...', 'Pressuring...', 'Pressurizing...',
-  'Prestressing...', 'Presuming...', 'Pretending...', 'Prettifying...', 'Prevailing...', 'Preventing...', 'Previewing...', 'Preying...',
-  'Pricing...', 'Pricking...', 'Pridiing...', 'Priming...', 'Printing...', 'Prioritizing...', 'Privatizing...', 'Privileging...',
-  'Prizing...', 'Probing...', 'Proceeding...', 'Processing...', 'Proclaiming...', 'Procrastinating...', 'Procuring...', 'Prodding...',
-  'Producing...', 'Profaning...', 'Professing...', 'Profiling...', 'Profiting...', 'Programming...', 'Progressing...', 'Prohibiting...',
-  'Projecting...', 'Proliferating...', 'Prolonging...', 'Promenading...', 'Promising...', 'Promoting...', 'Prompting...', 'Promulgating...',
-  'Pronouncing...', 'Proofing...', 'Proofreading...', 'Propagating...', 'Propelling...', 'Prophesying...', 'Proposing...', 'Propping...',
-  'Proroguing...', 'Prosecuting...', 'Proselytizing...', 'Prospecting...', 'Prospering...', 'Protecting...', 'Protesting...', 'Protruding...',
-  'Proving...', 'Providing...', 'Provisioning...', 'Provoking...', 'Prowling...', 'Pruning...', 'Psyching...', 'Publicizing...',
-  'Publishing...', 'Puckering...', 'Puffing...', 'Pulling...', 'Pulping...', 'Pulsating...', 'Pulverizing...', 'Pummeling...',
-  'Pumping...', 'Punching...', 'Puncturing...', 'Punishing...', 'Punning...', 'Purging...', 'Purifying...', 'Purloining...',
-  'Purporting...', 'Purring...', 'Pursuing...', 'Pushing...', 'Putting...', 'Puzzling...', 'Pyramiding...',
-  // ---- Q ----
-  'Quacking...', 'Quadrupling...', 'Quaffing...', 'Quailing...', 'Qualifying...', 'Quantifying...', 'Quarreling...', 'Quarrying...',
-  'Quartering...', 'Quashing...', 'Quavering...', 'Queening...', 'Quelling...', 'Quenching...', 'Querying...', 'Questing...',
-  'Questioning...', 'Queueing...', 'Quickening...', 'Quieting...', 'Quilting...', 'Quipping...', 'Quivering...', 'Quizzing...',
-  'Quoting...',
-  // ---- R ----
-  'Racing...', 'Racking...', 'Radiating...', 'Raffling...', 'Rafting...', 'Raging...', 'Raining...', 'Raising...',
-  'Rallying...', 'Rambling...', 'Ramifying...', 'Ramping...', 'Ransacking...', 'Ransoming...', 'Ranting...', 'Rapping...',
-  'Rapproching...', 'Rapturing...', 'Raring...', 'Rasping...', 'Ratifying...', 'Rating...', 'Rationalizing...',
-  'Rationing...', 'Rattling...', 'Ravaging...', 'Raving...', 'Reaching...', 'Reacting...', 'Readjusting...', 'Readying...',
-  'Realigning...', 'Realizing...', 'Reallocating...', 'Reanimating...', 'Reaping...', 'Reappearing...', 'Reapplying...', 'Rearranging...',
-  'Reasoning...', 'Reassembling...', 'Reasserting...', 'Reassessing...', 'Reassigning...', 'Reassuring...', 'Rebalancing...', 'Rebating...',
-  'Rebelling...', 'Rebooting...', 'Rebounding...', 'Rebranding...', 'Rebuilding...', 'Rebuking...', 'Recalculating...', 'Recalibrating...',
-  'Recalling...', 'Recanting...', 'Recapping...', 'Recapturing...', 'Receding...', 'Receiving...', 'Recentering...', 'Recharging...',
-  'Rechecking...', 'Rechristening...', 'Recirculating...', 'Reciting...', 'Reclaiming...', 'Reclassifying...', 'Reclining...', 'Recognizing...',
-  'Recoiling...', 'Recollecting...', 'Recommending...', 'Recommissioning...', 'Recompiling...', 'Reconciling...', 'Reconfiguring...', 'Reconnecting...',
-  'Reconsidering...', 'Reconstituting...', 'Reconstructing...', 'Recording...', 'Recounting...', 'Recouping...', 'Recovering...', 'Recreating...',
-  'Recruiting...', 'Rectifying...', 'Recuperating...', 'Recurring...', 'Recycling...', 'Redacting...', 'Redefining...', 'Redeploying...',
-  'Redesigning...', 'Redeveloping...', 'Redialing...', 'Redirecting...', 'Rediscovering...', 'Redistributing...', 'Redoing...', 'Redoubling...',
-  'Redrafting...', 'Reducing...', 'Reeling...', 'Refactoring...', 'Referencing...', 'Referring...', 'Refilling...', 'Refinancing...',
-  'Refining...', 'Refitting...', 'Reflecting...', 'Reformatting...', 'Reforming...', 'Refracting...', 'Refraining...', 'Refreshing...',
-  'Refueling...', 'Refunding...', 'Refurbishing...', 'Refusing...', 'Refuting...', 'Regaining...', 'Regaling...', 'Regarding...',
-  'Regenerating...', 'Registering...', 'Regressing...', 'Regretting...', 'Regrouping...', 'Regulating...', 'Rehabilitating...', 'Rehearsing...',
-  'Reigning...', 'Reimbursing...', 'Reinforcing...', 'Reining...', 'Reinstalling...', 'Reinstating...', 'Reintegrating...', 'Reinterpreting...',
-  'Reintroducing...', 'Reinventing...', 'Reinvesting...', 'Reissuing...', 'Reiterating...', 'Rejecting...', 'Rejoicing...', 'Rejoining...',
-  'Rejuvenating...', 'Rekindling...', 'Relating...', 'Relaxing...', 'Relaying...', 'Releasing...', 'Relegating...', 'Relenting...',
-  'Relieving...', 'Relighting...', 'Relishing...', 'Reliving...', 'Reloading...', 'Relocating...', 'Relying...', 'Remaining...',
-  'Remanding...', 'Remarking...', 'Remarrying...', 'Remastering...', 'Remedying...', 'Remembering...', 'Reminding...', 'Reminiscing...',
-  'Remitting...', 'Remodeling...', 'Remolding...', 'Remonstrating...', 'Removing...', 'Rendering...', 'Rendezvousing...', 'Reneging...',
-  'Renegotiating...', 'Renewing...', 'Renouncing...', 'Renovating...', 'Renting...', 'Reopening...', 'Reorganizing...', 'Repacking...',
-  'Repairing...', 'Repaying...', 'Repealing...', 'Repeating...', 'Repelling...', 'Repenting...', 'Repercussing...', 'Replacing...',
-  'Replaying...', 'Replenishing...', 'Replicating...', 'Replying...', 'Repointing...', 'Reporting...', 'Reposing...', 'Repositioning...',
-  'Representing...', 'Repressing...', 'Reprimanding...', 'Reprinting...', 'Reproaching...', 'Reprocessing...', 'Reproducing...', 'Reprogramming...',
-  'Reproving...', 'Repulsing...', 'Repurposing...', 'Requesting...', 'Requiring...', 'Requisitioning...', 'Requiting...', 'Rescinding...',
-  'Rescuing...', 'Researching...', 'Reselling...', 'Resembling...', 'Resenting...', 'Reserving...', 'Resetting...', 'Resettling...',
-  'Reshaping...', 'Residing...', 'Resigning...', 'Resisting...', 'Reskilling...', 'Resoling...', 'Resolving...', 'Resonating...',
-  'Resorting...', 'Resounding...', 'Respecting...', 'Respiring...', 'Responding...', 'Restarting...', 'Restating...', 'Resting...',
-  'Restocking...', 'Restoring...', 'Restraining...', 'Restricting...', 'Restructuring...', 'Resulting...', 'Resuming...', 'Resurfacing...',
-  'Resurging...', 'Resurrecting...', 'Retailing...', 'Retaining...', 'Retaliating...', 'Retelling...', 'Rethinking...', 'Retiring...',
-  'Retorting...', 'Retouching...', 'Retracing...', 'Retracting...', 'Retraining...', 'Retranslating...', 'Retreating...', 'Retrieving...',
-  'Retrofitting...', 'Retrying...', 'Returning...', 'Reunifying...', 'Reuniting...', 'Reusing...', 'Revealing...', 'Reveling...',
-  'Revenging...', 'Reverberating...', 'Revering...', 'Reversing...', 'Reverting...', 'Reviewing...', 'Reviling...', 'Revising...',
-  'Revisiting...', 'Revitalizing...', 'Reviving...', 'Revoking...', 'Revolting...', 'Revolutionizing...', 'Revolving...', 'Rewarding...',
-  'Rewiring...', 'Rewording...', 'Reworking...', 'Rewriting...', 'Rhapsodizing...', 'Rhyming...', 'Ribbing...', 'Ridding...',
-  'Riding...', 'Riffling...', 'Rifling...', 'Rigging...', 'Righting...', 'Rimming...', 'Ringing...', 'Rinsing...',
-  'Rioting...', 'Ripping...', 'Rippling...', 'Rising...', 'Risking...', 'Rivaling...', 'Riveting...', 'Roaming...',
-  'Roaring...', 'Roasting...', 'Robbing...', 'Robing...', 'Rocking...', 'Rolling...', 'Romancing...', 'Romanticizing...',
-  'Roofing...', 'Rooming...', 'Rooting...', 'Roping...', 'Rorting...', 'Rostering...', 'Rotating...', 'Roting...',
-  'Roughening...', 'Rounding...', 'Rousing...', 'Rousting...', 'Roving...', 'Rowing...', 'Rubbing...', 'Ruining...',
-  'Ruling...', 'Rumbling...', 'Ruminating...', 'Rummaging...', 'Running...', 'Ruptioning...', 'Rushing...', 'Rusticating...',
-  'Rustling...', 'Reticulating...',
+  'Echoing', 'Eclipsing', 'Economizing', 'Edging', 'Editing', 'Educating', 'Effecting', 'Effervescing', 'Elaborating', 'Elating',
+  'Electing', 'Electrifying', 'Elevating', 'Eliciting', 'Eliminating', 'Elucidating', 'Emancipating', 'Embarking', 'Embedding', 'Embellishing',
+  'Embodying', 'Embracing', 'Embroidering', 'Emerging', 'Emitting', 'Empathizing', 'Emphasizing', 'Empowering', 'Emulating', 'Enabling',
+  'Enacting', 'Encapsulating', 'Enchanting', 'Encircling', 'Enclosing', 'Encoding', 'Encouraging', 'Encrypting', 'Endearing', 'Endeavoring',
+  'Endorsing', 'Endowing', 'Enduring', 'Energizing', 'Enforcing', 'Engaging', 'Engineering', 'Engraving', 'Enhancing', 'Enjoying',
+  'Enlarging', 'Enlightening', 'Enlisting', 'Enlivening', 'Enriching', 'Enrolling', 'Ensuring', 'Entering', 'Entertaining', 'Enthralling',
+  'Enthusing', 'Enticing', 'Entitling', 'Enumerating', 'Enveloping', 'Envisioning', 'Equipping', 'Equalizing', 'Erecting', 'Erasing',
+  'Escalating', 'Escaping', 'Escorting', 'Establishing', 'Esteeming', 'Estimating', 'Eulogizing', 'Evaluating', 'Evaporating', 'Evolving',
+  'Examining', 'Exceeding', 'Excelling', 'Exchanging', 'Exciting', 'Excluding', 'Executing', 'Exercising', 'Exhaling', 'Exhibiting',
+  'Exhilarating', 'Existing', 'Expanding', 'Expecting', 'Expediting', 'Experiencing', 'Experimenting', 'Explaining', 'Exploring', 'Exporting',
+  'Exposing', 'Expressing', 'Extending', 'Externalizing', 'Extracting', 'Extrapolating', 'Eyeing', 'Fabricating', 'Facilitating', 'Facing',
+  'Factoring', 'Fading', 'Farming', 'Fascinating', 'Fashioning', 'Fastening', 'Fathoming', 'Favoring', 'Feathering', 'Featuring',
+  'Feeding', 'Feeling', 'Fencing', 'Fermenting', 'Ferrying', 'Fertilizing', 'Fetching', 'Fiddling', 'Fielding', 'Figuring',
+  'Filing', 'Filling', 'Filtering', 'Financing', 'Finding', 'Fingerprinting', 'Finishing', 'Firing', 'Firming', 'Fishing',
+  'Fitting', 'Fixing', 'Flagging', 'Flanking', 'Flashing', 'Flattening', 'Flattering', 'Flavoring', 'Fleshing', 'Flexing',
+  'Flicking', 'Flinging', 'Flipping', 'Floating', 'Flooding', 'Flooring', 'Flourishing', 'Flowing', 'Flushing', 'Fluttering',
+  'Flying', 'Foaming', 'Focusing', 'Folding', 'Following', 'Forging', 'Forgiving', 'Formalizing', 'Forming', 'Formulating',
+  'Fortifying', 'Forwarding', 'Fostering', 'Founding', 'Fragmenting', 'Framing', 'Freeing', 'Freezing', 'Freshening', 'Frosting',
+  'Frying', 'Fueling', 'Fulfilling', 'Functioning', 'Funding', 'Furnishing', 'Furthering', 'Fusing', 'Fussing', 'Factorizing',
+  'Fantasizing', 'Faultfinding', 'Federating', 'Fending', 'Ferreting', 'Filming', 'Finalizing', 'Finessing', 'Fireproofing', 'Fizzing',
+  'Flameproofing', 'Fleecing', 'Flickering', 'Flitting', 'Fluctuating', 'Fluorescing', 'Freewheeling', 'Gaining', 'Galloping', 'Galvanizing',
+  'Gaming', 'Gardening', 'Garlanding', 'Garnering', 'Gathering', 'Gauging', 'Gazing', 'Gearing', 'Generalizing', 'Generating',
+  'Gesticulating', 'Gesturing', 'Getting', 'Gifting', 'Giggling', 'Gilding', 'Girding', 'Giving', 'Glancing', 'Glazing',
+  'Gleaming', 'Gleaning', 'Glimmering', 'Glimpsing', 'Gliding', 'Glistening', 'Glittering', 'Glowing', 'Glueing', 'Goading',
+  'Gobbling', 'Golfing', 'Governing', 'Grabbing', 'Graduating', 'Grafting', 'Granting', 'Graphing', 'Grasping', 'Gratifying',
+  'Grating', 'Greasing', 'Greeting', 'Gridding', 'Grilling', 'Grinding', 'Gripping', 'Grooving', 'Grooming', 'Grounding',
+  'Grouping', 'Growing', 'Guaranteeing', 'Guarding', 'Guessing', 'Guiding', 'Gushing', 'Gusting', 'Gutting', 'Guzzling',
+  'Gamboling', 'Gating', 'Gazetting', 'Gelling', 'Gentrifying', 'Germinating', 'Gestating', 'Ghosting', 'Glaciating', 'Gladdening',
+  'Globalizing', 'Glorifying', 'Glossing', 'Gonging', 'Gouging', 'Grandstanding', 'Granulating', 'Gravitating', 'Grazing', 'Greening',
+  'Grimacing', 'Grubbing', 'Gurgling', 'Gyrating', 'Gabbing', 'Gaffing', 'Gallivanting', 'Galumphing', 'Garbling', 'Garrisoning',
+  'Gasping', 'Gentling', 'Geotagging', 'Gimballing', 'Glinting', 'Gorging', 'Grinning', 'Habilitating', 'Hacking', 'Haggling',
+  'Hailing', 'Hammering', 'Handcrafting', 'Handing', 'Handling', 'Hanging', 'Happening', 'Harboring', 'Hardening', 'Harmonizing',
+  'Harnessing', 'Harvesting', 'Hashing', 'Hastening', 'Hatching', 'Hauling', 'Having', 'Heading', 'Healing', 'Heaping',
+  'Hearing', 'Heartening', 'Heating', 'Heaving', 'Hedging', 'Heeding', 'Helping', 'Heralding', 'Herding', 'Hesitating',
+  'Hibernating', 'Hiding', 'Highlighting', 'Hiking', 'Hinging', 'Hinting', 'Hiring', 'Hitting', 'Hoarding', 'Hoisting',
+  'Hollowing', 'Homing', 'Honing', 'Honoring', 'Hooking', 'Hopping', 'Hoping', 'Horsing', 'Hosting', 'Hotfixing',
+  'Hovering', 'Howling', 'Huddling', 'Hugging', 'Hulling', 'Humanizing', 'Humbling', 'Humming', 'Hunting', 'Hurling',
+  'Hurrying', 'Hushing', 'Hustling', 'Hybridizing', 'Hydrating', 'Hydroplaning', 'Hymning', 'Hyping', 'Hypothesizing', 'Habituating',
+  'Hairdressing', 'Hallowing', 'Halving', 'Handholding', 'Handpicking', 'Handwriting', 'Hankering', 'Hardcoding', 'Harkening', 'Hawking',
+  'Haymaking', 'Headhunting', 'Headlining', 'Heartwarming', 'Heightening', 'Heehawing', 'Homesteading', 'Homeschooling', 'Honeying', 'Hooping',
+  'Hornswoggling', 'Hosing', 'Hounding', 'Huckstering', 'Humoring', 'Idealizing', 'Identifying', 'Igniting', 'Ignoring', 'Illuminating',
+  'Illustrating', 'Imagining', 'Imitating', 'Immersing', 'Immortalizing', 'Impacting', 'Imparting', 'Impersonating', 'Implementing', 'Implicating',
+  'Importing', 'Imposing', 'Impressing', 'Imprinting', 'Improving', 'Improvising', 'Inaugurating', 'Incentivizing', 'Inching', 'Including',
+  'Incorporating', 'Increasing', 'Incrementing', 'Incubating', 'Incurring', 'Indenting', 'Indexing', 'Indicating', 'Inducting', 'Indulging',
+  'Industrializing', 'Inferring', 'Infiltrating', 'Inflating', 'Influencing', 'Informing', 'Infusing', 'Ingesting', 'Inhabiting', 'Inhaling',
+  'Inheriting', 'Inhibiting', 'Initializing', 'Initiating', 'Injecting', 'Injuring', 'Inking', 'Innovating', 'Inoculating', 'Inquiring',
+  'Inscribing', 'Inserting', 'Insisting', 'Inspecting', 'Inspiring', 'Installing', 'Instantiating', 'Instigating', 'Instilling', 'Instituting',
+  'Instructing', 'Insulating', 'Insuring', 'Integrating', 'Intending', 'Intensifying', 'Interacting', 'Intercepting', 'Interfacing', 'Interleaving',
+  'Interlinking', 'Interlacing', 'Interlocking', 'Interning', 'Interpolating', 'Interpreting', 'Interrogating', 'Intersecting', 'Intervening', 'Interviewing',
+  'Interweaving', 'Intoning', 'Introducing', 'Intuiting', 'Inventing', 'Inventorying', 'Inverting', 'Investing', 'Investigating', 'Invigorating',
+  'Inviting', 'Involving', 'Ionizing', 'Iterating', 'Jabbing', 'Jacketing', 'Jailing', 'Jamming', 'Jangling', 'Jarring',
+  'Jaunting', 'Jazzing', 'Jeering', 'Jelling', 'Jeopardizing', 'Jerking', 'Jesting', 'Jettisoning', 'Jeweling', 'Jibing',
+  'Jiggling', 'Jigsawing', 'Jilting', 'Jingling', 'Jiving', 'Jobbing', 'Jockeying', 'Jogging', 'Joining', 'Joking',
+  'Jollying', 'Jolting', 'Jostling', 'Jotting', 'Journeying', 'Jousting', 'Joyriding', 'Judging', 'Juggling', 'Julienning',
+  'Jumping', 'Junketing', 'Justifying', 'Jutting', 'Juxtaposing', 'Jabbering', 'Jading', 'Jalousing', 'Japing', 'Jargonizing',
+  'Jauncing', 'Jawboning', 'Jawing', 'Jeopardying', 'Jellifying', 'Jemmying', 'Jettying', 'Jewelling', 'Jibbing', 'Jigging',
+  'Jitterbugging', 'Jinxing', 'Jittering', 'Jobhunting', 'Joggling', 'Joisting', 'Jokifying', 'Jollifying', 'Jonesing', 'Joshing',
+  'Jouking', 'Journalling', 'Jovializing', 'Jowing', 'Joying', 'Joypopping', 'Jubilating', 'Juddering', 'Judoing', 'Juking',
+  'Jumbling', 'Jumpstarting', 'Junking', 'Jurifying', 'Jurying', 'Justling', 'Juicing', 'Jouncing', 'Javelining', 'Jocundizing',
+  'Japering', 'Japonicaing', 'Jasperizing', 'Jazzercising', 'Jellyfishing', 'Jerrybuilding', 'Jerseying', 'Jessying', 'Jobseeking', 'Jointing',
+  'Junketeering', 'Jawbreaking', 'Jaywalking', 'Keeling', 'Keening', 'Keeping', 'Kenning', 'Kerbing', 'Kerneling', 'Kettling',
+  'Keyboarding', 'Keying', 'Keynoting', 'Kibitzing', 'Kicking', 'Kidding', 'Kidnapping', 'Kilning', 'Kindling', 'Kinging',
+  'Kinking', 'Kissing', 'Kitting', 'Kneading', 'Kneeling', 'Knifing', 'Knighting', 'Knitting', 'Knocking', 'Knotting',
+  'Knowing', 'Knuckling', 'Koshering', 'Kowtowing', 'Kvetching', 'Karaoking', 'Kayoing', 'Kecking', 'Kedging', 'Keeking',
+  'Kelping', 'Kenneling', 'Keratinizing', 'Kerfing', 'Kernelling', 'Kibbutzing', 'Kiboshing', 'Kickboxing', 'Kickstarting', 'Kiddying',
+  'Kiltering', 'Kippering', 'Kiting', 'Kittening', 'Klaxoning', 'Knapping', 'Kneecapping', 'Knelling', 'Knobbling', 'Knolling',
+  'Kodaking', 'Konking', 'Kooking', 'Koreanizing', 'Kremlining', 'Krumping', 'Kudosing', 'Kurbling', 'Kvelling', 'Kingmaking',
+  'Kyanising', 'Kyboshing', 'Kything', 'Kaolinizing', 'Kaputing', 'Katalysing', 'Kathoding', 'Keshing', 'Keypunching', 'Khediving',
+  'Kalsomining', 'Kamiing', 'Kantianing', 'Karaokeing', 'Karateing', 'Karstifying', 'Katabolizing', 'Kathing', 'Kazaching', 'Kebabbing',
+  'Kebobbing', 'Keeving', 'Keelhauling', 'Keenlying', 'Keepnetting', 'Keltering', 'Kerseying', 'Ketling', 'Keyframing', 'Keyseating',
+  'Kibbling', 'Kickboarding', 'Kickflipping', 'Kidneystoning', 'Kieving', 'Kimchifying', 'Kimmering', 'Kindergartening', 'Kinescoping', 'Kingfishing',
+  'Kirkifying', 'Kirshening', 'Kitbagging', 'Kitchening', 'Kitesurfing', 'Klondiking', 'Kludging', 'Knackering', 'Kneippering', 'Knobkerrying',
+  'Knowledging', 'Kohlrabiing', 'Koorifying', 'Kotowing', 'Kronaing', 'Krytroning', 'Kugelhopfing', 'Kumquating', 'Kurrajonging', 'Kyanizing',
+  'Labeling', 'Laboring', 'Lacing', 'Laddering', 'Lading', 'Lagging', 'Lambasting', 'Laminating', 'Landing', 'Languishing',
+  'Lapping', 'Lapsing', 'Larding', 'Lashing', 'Lasting', 'Latching', 'Lathering', 'Lauding', 'Laughing', 'Launching',
+  'Laundering', 'Lavishing', 'Laying', 'Lazing', 'Leaching', 'Leading', 'Leafing', 'Leaking', 'Leaning', 'Leaping',
+  'Learning', 'Leasing', 'Leathering', 'Leaving', 'Lecturing', 'Ledgering', 'Leeching', 'Leering', 'Legitimizing', 'Lending',
+  'Lengthening', 'Lessening', 'Letting', 'Leveling', 'Leveraging', 'Levying', 'Liberating', 'Licensing', 'Licking', 'Lifting',
+  'Lightening', 'Lighting', 'Liking', 'Limbering', 'Lining', 'Linking', 'Lionizing', 'Liquidating', 'Lisping', 'Listening',
+  'Litigating', 'Littering', 'Living', 'Loading', 'Loafing', 'Loaning', 'Lobbying', 'Lobing', 'Localizing', 'Locating',
+  'Locking', 'Lodging', 'Lofting', 'Logging', 'Longing', 'Looking', 'Looping', 'Loosening', 'Looting', 'Loping',
+  'Losing', 'Lounging', 'Loving', 'Lowering', 'Lubricating', 'Lugging', 'Lulling', 'Lumbering', 'Lumping', 'Lunching',
+  'Lunging', 'Luring', 'Lurking', 'Lustering', 'Lustrating', 'Luxuriating', 'Lying', 'Lynching', 'Lyricizing', 'Machining',
+  'Magnetizing', 'Magnifying', 'Maintaining', 'Mainstreaming', 'Making', 'Managing', 'Mandating', 'Maneuvering', 'Mangling', 'Manifesting',
+  'Manipulating', 'Manning', 'Manufacturing', 'Mapping', 'Marching', 'Marketing', 'Marking', 'Marrying', 'Marshaling', 'Marveling',
+  'Mashing', 'Masking', 'Massaging', 'Massing', 'Mastering', 'Matching', 'Materializing', 'Matriculating', 'Mattering', 'Maximizing',
+  'Meaning', 'Measuring', 'Mediating', 'Meditating', 'Meeting', 'Melding', 'Mellowing', 'Melting', 'Memorizing', 'Mending',
+  'Mentioning', 'Mentoring', 'Merging', 'Meriting', 'Meshing', 'Mesmerizing', 'Messaging', 'Metabolizing', 'Metalworking', 'Metamorphosing',
+  'Metering', 'Microblogging', 'Microchipping', 'Microfilming', 'Micromanaging', 'Migrating', 'Milking', 'Milling', 'Mimicking', 'Mincing',
+  'Minding', 'Mingling', 'Miniaturizing', 'Minimizing', 'Mining', 'Ministering', 'Minting', 'Mirroring', 'Misaligning', 'Miscalculating',
+  'Misdiagnosing', 'Misfiring', 'Misjudging', 'Mislaying', 'Mismatching', 'Misplacing', 'Misquoting', 'Misreading', 'Misspelling', 'Mistaking',
+  'Misting', 'Misunderstanding', 'Mitigating', 'Mixing', 'Moaning', 'Mobilizing', 'Mocking', 'Modeling', 'Moderating', 'Modernizing',
+  'Modifying', 'Modularizing', 'Modulating', 'Moistening', 'Moisturizing', 'Molding', 'Mollifying', 'Monitoring', 'Monetizing', 'Monogramming',
+  'Monologuing', 'Monopolizing', 'Mooring', 'Moralizing', 'Morphing', 'Mortgaging', 'Moseying', 'Motivating', 'Motoring', 'Mottling',
+  'Moulding', 'Mounting', 'Mountaineering', 'Mourning', 'Mousetrapping', 'Mouthing', 'Moving', 'Mowing', 'Muckraking', 'Muddling',
+  'Mudslinging', 'Muffling', 'Mulching', 'Multiplying', 'Multiplexing', 'Multitasking', 'Mumbling', 'Mummifying', 'Munching', 'Murmuring',
+  'Muscling', 'Musicalizing', 'Musing', 'Musseling', 'Mustering', 'Mutating', 'Muting', 'Mutinying', 'Muttering', 'Mutualizing',
+  'Muzzling', 'Mystifying', 'Mailing', 'Mamboing', 'Manacling', 'Manhandling', 'Manicuring', 'Mansplaining', 'Mantling', 'Marinating',
+  'Marooning', 'Marring', 'Masquerading', 'Masterminding', 'Masticating', 'Mauling', 'Meandering', 'Mechanizing', 'Meddling', 'Meliorating',
+  'Melodizing', 'Memorializing', 'Menacing', 'Mercerizing', 'Merchandising', 'Metallizing', 'Mildewing', 'Militating', 'Mimeographing', 'Mindmapping',
+  'Minesweeping', 'Misappropriating', 'Misconstruing', 'Misrepresenting', 'Nabbing', 'Nailing', 'Naming', 'Nanosizing', 'Napping', 'Narrating',
+  'Narrowing', 'Nattering', 'Naturalizing', 'Navigating', 'Neatening', 'Nebulizing', 'Necessitating', 'Necking', 'Necropsying', 'Needling',
+  'Negating', 'Negotiating', 'Nerving', 'Nesting', 'Nestling', 'Netting', 'Nettling', 'Networking', 'Neutralizing', 'Newscasting',
+  'Nibbling', 'Nicking', 'Nicknaming', 'Nictitating', 'Niggling', 'Nipping', 'Nitpicking', 'Nobbling', 'Nocking', 'Nodding',
+  'Noising', 'Nominating', 'Nonplussing', 'Noodling', 'Normalizing', 'Nosediving', 'Nosing', 'Notarizing', 'Notating', 'Notching',
+  'Noticing', 'Notifying', 'Noting', 'Nourishing', 'Novelizing', 'Nucleating', 'Nudging', 'Nuggetting', 'Nuking', 'Nullifying',
+  'Numbering', 'Numbing', 'Nursemaiding', 'Nursing', 'Nurturing', 'Nutmegging', 'Nuzzling', 'Narrowcasting', 'Obeying', 'Objecting',
+  'Objectivizing', 'Obligating', 'Obliging', 'Obliterating', 'Obnubilating', 'Obscuring', 'Observing', 'Obsessing', 'Obsoleting', 'Obstructing',
+  'Obtaining', 'Obtruding', 'Obviating', 'Occasioning', 'Occupying', 'Occurring', 'Offering', 'Officiating', 'Offloading', 'Offsetting',
+  'Ogling', 'Oiling', 'Okaying', 'Ominating', 'Omitting', 'Onboarding', 'Oozing', 'Opacifying', 'Opalescing', 'Opening',
+  'Operating', 'Opining', 'Opposing', 'Optimizing', 'Optioning', 'Orating', 'Orbiting', 'Orchestrating', 'Ordaining', 'Ordering',
+  'Organizing', 'Orienting', 'Originating', 'Ornamenting', 'Orphaning', 'Oscillating', 'Ossifying', 'Ostracizing', 'Outbidding', 'Outclassing',
+  'Outdoing', 'Outfitting', 'Outgrowing', 'Outlasting', 'Outlining', 'Outmaneuvering', 'Outpacing', 'Outperforming', 'Outreaching', 'Outsmarting',
+  'Outsourcing', 'Outstripping', 'Outwitting', 'Overachieving', 'Overarching', 'Overbalancing', 'Overbooking', 'Overbuilding', 'Overcoming', 'Overcompensating',
+  'Overdelivering', 'Overdoing', 'Overeating', 'Overemphasizing', 'Overestimating', 'Overflowing', 'Overhauling', 'Overhearing', 'Overheating', 'Overlaying',
+  'Overloading', 'Overlooking', 'Overpowering', 'Overprinting', 'Overproducing', 'Overreaching', 'Overriding', 'Overruling', 'Overseeing', 'Overshadowing',
+  'Overshooting', 'Oversimplifying', 'Oversleeping', 'Overstating', 'Overstepping', 'Overstocking', 'Overstretching', 'Overtaking', 'Overthinking', 'Overthrowing',
+  'Overturning', 'Overvaluing', 'Overwatching', 'Overwhelming', 'Owing', 'Owning', 'Oxidizing', 'Oxygenating', 'Ozonizing', 'Obolizing',
+  'Pacing', 'Packaging', 'Packing', 'Padding', 'Paddling', 'Paging', 'Painting', 'Pairing', 'Palatalizing', 'Palling',
+  'Palming', 'Palpating', 'Pampering', 'Panelizing', 'Panicking', 'Pantomiming', 'Papering', 'Parachuting', 'Parading', 'Paragliding',
+  'Paralysing', 'Paraphrasing', 'Parceling', 'Pardoning', 'Parenting', 'Pariking', 'Parking', 'Parleying', 'Parodying', 'Paroling',
+  'Parrying', 'Parsing', 'Partaking', 'Partitioning', 'Partnering', 'Partying', 'Passing', 'Passivizing', 'Pasting', 'Pastoring',
+  'Patching', 'Patenting', 'Patrolling', 'Patronizing', 'Patterning', 'Paving', 'Pawing', 'Paying', 'Peaking', 'Pealing',
+  'Pecking', 'Pedaling', 'Peeking', 'Peeling', 'Peering', 'Pegging', 'Pelting', 'Penalizing', 'Penciling', 'Penetrating',
+  'Pensioning', 'Peppering', 'Perceiving', 'Perching', 'Perfecting', 'Perforating', 'Performing', 'Perfuming', 'Perishing', 'Permeating',
+  'Permitting', 'Permuting', 'Perpetuating', 'Perplexing', 'Persevering', 'Persisting', 'Personalizing', 'Personifying', 'Persuading', 'Perving',
+  'Pestering', 'Petitioning', 'Petrifying', 'Pettifogging', 'Phaseing', 'Philandering', 'Philosophizing', 'Phoneing', 'Photocopying', 'Photographing',
+  'Photosynthesizing', 'Phrasing', 'Picking', 'Picnicking', 'Picturing', 'Piecing', 'Piercing', 'Piggybacking', 'Pilfering', 'Piloting',
+  'Pinching', 'Pinging', 'Pinning', 'Pioneering', 'Piping', 'Pitching', 'Pitying', 'Pivoting', 'Placating', 'Placing',
+  'Plagiarizing', 'Plaiting', 'Planning', 'Planting', 'Plastering', 'Plating', 'Playing', 'Pleading', 'Pleasuring', 'Pledging',
+  'Plodding', 'Plotting', 'Ploughing', 'Plowing', 'Plucking', 'Plugging', 'Plumbing', 'Plummeting', 'Plumping', 'Plundering',
+  'Plunging', 'Pluralizing', 'Plying', 'Poaching', 'Pocketing', 'Podcasting', 'Poeticizing', 'Pointing', 'Poising', 'Poisoning',
+  'Poking', 'Polarizing', 'Policing', 'Polishing', 'Politicizing', 'Pollinating', 'Polling', 'Pondering', 'Pooling', 'Popping',
+  'Popularizing', 'Populating', 'Poring', 'Porting', 'Portioning', 'Portraying', 'Posing', 'Positioning', 'Positing', 'Possessing',
+  'Posting', 'Postponing', 'Postulating', 'Posturing', 'Potting', 'Pouncing', 'Pounding', 'Pouring', 'Pouting', 'Powdering',
+  'Powering', 'Practicing', 'Praising', 'Prancing', 'Prattling', 'Praying', 'Preaching', 'Preambleing', 'Preceding', 'Precipitating',
+  'Precluding', 'Precooking', 'Predicting', 'Predisposing', 'Prefacing', 'Preferring', 'Prefiguring', 'Prefixing', 'Preheating', 'Prejudging',
+  'Preluding', 'Premising', 'Preoccupying', 'Preordaining', 'Preparing', 'Prepaving', 'Prepaying', 'Preponderating', 'Prerecording', 'Prescribing',
+  'Presenting', 'Preserving', 'Presetting', 'Presiding', 'Pressuring', 'Pressurizing', 'Prestressing', 'Presuming', 'Pretending', 'Prettifying',
+  'Prevailing', 'Preventing', 'Previewing', 'Preying', 'Pricing', 'Pricking', 'Pridiing', 'Priming', 'Printing', 'Prioritizing',
+  'Privatizing', 'Privileging', 'Prizing', 'Probing', 'Proceeding', 'Processing', 'Proclaiming', 'Procrastinating', 'Procuring', 'Prodding',
+  'Producing', 'Profaning', 'Professing', 'Profiling', 'Profiting', 'Programming', 'Progressing', 'Prohibiting', 'Projecting', 'Proliferating',
+  'Prolonging', 'Promenading', 'Promising', 'Promoting', 'Prompting', 'Promulgating', 'Pronouncing', 'Proofing', 'Proofreading', 'Propagating',
+  'Propelling', 'Prophesying', 'Proposing', 'Propping', 'Proroguing', 'Prosecuting', 'Proselytizing', 'Prospecting', 'Prospering', 'Protecting',
+  'Protesting', 'Protruding', 'Proving', 'Providing', 'Provisioning', 'Provoking', 'Prowling', 'Pruning', 'Psyching', 'Publicizing',
+  'Publishing', 'Puckering', 'Puffing', 'Pulling', 'Pulping', 'Pulsating', 'Pulverizing', 'Pummeling', 'Pumping', 'Punching',
+  'Puncturing', 'Punishing', 'Punning', 'Purging', 'Purifying', 'Purloining', 'Purporting', 'Purring', 'Pursuing', 'Pushing',
+  'Putting', 'Puzzling', 'Pyramiding', 'Quacking', 'Quadrupling', 'Quaffing', 'Quailing', 'Qualifying', 'Quantifying', 'Quarreling',
+  'Quarrying', 'Quartering', 'Quashing', 'Quavering', 'Queening', 'Quelling', 'Quenching', 'Querying', 'Questing', 'Questioning',
+  'Queueing', 'Quickening', 'Quieting', 'Quilting', 'Quipping', 'Quivering', 'Quizzing', 'Quoting', 'Racing', 'Racking',
+  'Radiating', 'Raffling', 'Rafting', 'Raging', 'Raining', 'Raising', 'Rallying', 'Rambling', 'Ramifying', 'Ramping',
+  'Ransacking', 'Ransoming', 'Ranting', 'Rapping', 'Rapproching', 'Rapturing', 'Raring', 'Rasping', 'Ratifying', 'Rating',
+  'Rationalizing', 'Rationing', 'Rattling', 'Ravaging', 'Raving', 'Reaching', 'Reacting', 'Readjusting', 'Readying', 'Realigning',
+  'Realizing', 'Reallocating', 'Reanimating', 'Reaping', 'Reappearing', 'Reapplying', 'Rearranging', 'Reasoning', 'Reassembling', 'Reasserting',
+  'Reassessing', 'Reassigning', 'Reassuring', 'Rebalancing', 'Rebating', 'Rebelling', 'Rebooting', 'Rebounding', 'Rebranding', 'Rebuilding',
+  'Rebuking', 'Recalculating', 'Recalibrating', 'Recalling', 'Recanting', 'Recapping', 'Recapturing', 'Receding', 'Receiving', 'Recentering',
+  'Recharging', 'Rechecking', 'Rechristening', 'Recirculating', 'Reciting', 'Reclaiming', 'Reclassifying', 'Reclining', 'Recognizing', 'Recoiling',
+  'Recollecting', 'Recommending', 'Recommissioning', 'Recompiling', 'Reconciling', 'Reconfiguring', 'Reconsidering', 'Reconstituting', 'Reconstructing', 'Recording',
+  'Recounting', 'Recouping', 'Recreating', 'Recruiting', 'Rectifying', 'Recuperating', 'Recurring', 'Recycling', 'Redacting', 'Redefining',
+  'Redeploying', 'Redesigning', 'Redeveloping', 'Redialing', 'Redirecting', 'Rediscovering', 'Redistributing', 'Redoing', 'Redoubling', 'Redrafting',
+  'Reducing', 'Reeling', 'Refactoring', 'Referencing', 'Referring', 'Refilling', 'Refinancing', 'Refining', 'Refitting', 'Reflecting',
+  'Reformatting', 'Reforming', 'Refracting', 'Refraining', 'Refreshing', 'Refueling', 'Refunding', 'Refurbishing', 'Refuting', 'Regaining',
+  'Regaling', 'Regarding', 'Regenerating', 'Registering', 'Regressing', 'Regretting', 'Regrouping', 'Regulating', 'Rehabilitating', 'Rehearsing',
+  'Reigning', 'Reimbursing', 'Reinforcing', 'Reining', 'Reinstalling', 'Reinstating', 'Reintegrating', 'Reinterpreting', 'Reintroducing', 'Reinventing',
+  'Reinvesting', 'Reissuing', 'Reiterating', 'Rejecting', 'Rejoicing', 'Rejoining', 'Rejuvenating', 'Rekindling', 'Relating', 'Relaxing',
+  'Relaying', 'Releasing', 'Relegating', 'Relenting', 'Relieving', 'Relighting', 'Relishing', 'Reliving', 'Reloading', 'Relocating',
+  'Relying', 'Remaining', 'Remanding', 'Remarking', 'Remarrying', 'Remastering', 'Remedying', 'Remembering', 'Reminding', 'Reminiscing',
+  'Remitting', 'Remodeling', 'Remolding', 'Remonstrating', 'Removing', 'Rendering', 'Rendezvousing', 'Reneging', 'Renegotiating', 'Renewing',
+  'Renouncing', 'Renovating', 'Renting', 'Reopening', 'Reorganizing', 'Repacking', 'Repairing', 'Repaying', 'Repealing', 'Repeating',
+  'Repelling', 'Repenting', 'Repercussing', 'Replacing', 'Replaying', 'Replenishing', 'Replicating', 'Replying', 'Repointing', 'Reporting',
+  'Reposing', 'Repositioning', 'Representing', 'Repressing', 'Reprimanding', 'Reprinting', 'Reproaching', 'Reprocessing', 'Reproducing', 'Reprogramming',
+  'Reproving', 'Repulsing', 'Repurposing', 'Requesting', 'Requiring', 'Requisitioning', 'Requiting', 'Rescinding', 'Rescuing', 'Researching',
+  'Reselling', 'Resembling', 'Resenting', 'Reserving', 'Resetting', 'Resettling', 'Reshaping', 'Residing', 'Resigning', 'Resisting',
+  'Reskilling', 'Resoling', 'Resolving', 'Resonating', 'Resorting', 'Resounding', 'Respecting', 'Respiring', 'Responding', 'Restarting',
+  'Restating', 'Resting', 'Restocking', 'Restoring', 'Restraining', 'Restricting', 'Restructuring', 'Resulting', 'Resuming', 'Resurfacing',
+  'Resurging', 'Resurrecting', 'Retailing', 'Retaining', 'Retaliating', 'Retelling', 'Rethinking', 'Retiring', 'Retorting', 'Retouching',
+  'Retracing', 'Retracting', 'Retraining', 'Retranslating', 'Retreating', 'Retrieving', 'Retrofitting', 'Returning', 'Reunifying', 'Reuniting',
+  'Reusing', 'Revealing', 'Reveling', 'Revenging', 'Reverberating', 'Revering', 'Reversing', 'Reverting', 'Reviewing', 'Reviling',
+  'Revising', 'Revisiting', 'Revitalizing', 'Reviving', 'Revoking', 'Revolting', 'Revolutionizing', 'Revolving', 'Rewarding', 'Rewiring',
+  'Rewording', 'Reworking', 'Rewriting', 'Rhapsodizing', 'Rhyming', 'Ribbing', 'Ridding', 'Riding', 'Riffling', 'Rifling',
+  'Rigging', 'Righting', 'Rimming', 'Ringing', 'Rinsing', 'Rioting', 'Ripping', 'Rippling', 'Rising', 'Risking',
+  'Rivaling', 'Riveting', 'Roaming', 'Roaring', 'Roasting', 'Robbing', 'Robing', 'Rocking', 'Rolling', 'Romancing',
+  'Romanticizing', 'Roofing', 'Rooming', 'Rooting', 'Roping', 'Rorting', 'Rostering', 'Rotating', 'Roting', 'Roughening',
+  'Rounding', 'Rousing', 'Rousting', 'Roving', 'Rowing', 'Rubbing', 'Ruining', 'Ruling', 'Rumbling', 'Ruminating',
+  'Rummaging', 'Running', 'Ruptioning', 'Rushing', 'Rusticating', 'Rustling', 'Reticulating',
 ];
 
 // ---- ANSI helpers ----
@@ -1334,10 +1647,70 @@ export function expandPastes(text, pastes) {
 // style, so it also wiped the foreground the composer had already applied to the text AFTER the
 // chip — the rest of the line came out in the terminal's default grey instead of the prompt's
 // colour. `highlightSelection` below documents this exact hazard; this function was missing it.
-export function highlightPasteMarkers(row) {
+//
+// `hoverId` is the paste number the pointer is over, when it is over one. That chip keeps its
+// background and takes a BRIGHTER FOREGROUND instead — `C.hover` is a foreground (bold + bright), not a
+// background, so using it as one would collide with the chip's own `selBg` and the two would fight.
+// Without any change the chip looks like ordinary text and Ctrl+click stays undiscoverable.
+export function highlightPasteMarkers(row, hoverId = null) {
   const s = String(row);
   if (!s.includes('[paste #')) return s;
-  return s.replace(PASTE_MARKER_RE, (m) => C.selBg + m + C.bgReset);
+  return s.replace(PASTE_MARKER_RE, (m, id) => {
+    if (Number(id) === hoverId) return C.hover + C.selBg + m + C.bgReset + C.reset;
+    return C.selBg + m + C.bgReset;
+  });
+}
+/**
+ * Which paste number, if any, occupies this input index. Returns null when none does.
+ * Which paste number, if any, occupies this input index. Returns null when none does.
+ *
+ * The companion to `expandPasteMarkerAt`: that one acts on the chip under the pointer, this one merely
+ * names it so the row can be drawn differently. Both need the same bounds, and a chip is inclusive of its
+ * end because the caret index rounds to the position after the last character.
+ */
+export function pasteMarkerIdAt(input, idx) {
+  const cur = String(input == null ? '' : input);
+  if (!cur.includes('[paste #')) return null;
+  for (const m of cur.matchAll(PASTE_MARKER_RE)) {
+    const at = m.index;
+    if (idx >= at && idx <= at + m[0].length) return Number(m[1]);
+  }
+  return null;
+}
+
+
+/**
+ * Expand the collapsed paste the caret index lands on, in place. Returns true when one was expanded.
+ *
+ * Takes the ALREADY-CONVERTED index. An earlier version took the row and column and called
+ * `composerTextIndexAt` itself, which subtracts the row's prefix width — but the caller had already
+ * subtracted it, so every click landed two columns to the left of where the pointer was and a click on
+ * the chip's first character expanded nothing.
+ *
+ * `state.pastes` keeps its entry: `expandPastes` is a no-op for text with no marker, so leaving it costs
+ * nothing, and dropping it would break a later marker that still refers to the same paste.
+ */
+export function expandPasteMarkerAt(state, idx) {
+  const cur = state.input || '';
+  if (!cur.includes('[paste #')) return false;
+
+  for (const m of cur.matchAll(PASTE_MARKER_RE)) {
+    const at = m.index;
+    const end = at + m[0].length;
+    // The caret index is where the click landed, and clicking any character of the chip targets it —
+    // including the character after the last one, which is where a click on the closing bracket rounds to.
+    if (idx < at || idx > end) continue;
+    const entry = state.pastes && state.pastes.get(Number(m[1]));
+    if (!entry) return false;
+    state.input = cur.slice(0, at) + entry.text + cur.slice(end);
+    // The caret goes AFTER the expanded text, so the next keystroke continues where it ends rather than
+    // landing in the middle of the paste the user just revealed.
+    state.caret = at + entry.text.length;
+    state.composerSel = null;
+    refreshMenu(state);
+    return true;
+  }
+  return false;
 }
 
 // Apply selection background to the text portion of a composer row.
@@ -1642,9 +2015,28 @@ const KEY_ARG = {
   TaskStop: ['task_id'],
 };
 const MAX_ARG = 60;
-function keyArgument(name, args, workspace) {
+/**
+ * The one argument worth showing next to a tool's name. `expanded` lifts the length cut.
+ *
+ * The cut exists so the single `● Used Bash (…)` row stays readable: a `node -e "…"` one-liner is
+ * routinely hundreds of characters, and printing it whole wrapped the row across the screen for
+ * every call. Ctrl+O is the escape hatch — whoever expands tool output to read it wants to see the
+ * command they are reading the output OF, and the command is what they asked for in the first place.
+ */
+function keyArgument(name, args, workspace, expanded = false) {
   if (!args || typeof args !== 'object') return '';
   const keys = KEY_ARG[name] || Object.keys(args);
+  // Expanded: the whole value, with newlines kept, so a multi-line script shows as the lines it was
+  // written as rather than being flattened to its first line.
+  if (expanded) {
+    for (const k of keys) {
+      const v = args[k];
+      if (typeof v !== 'string' || !v.length) continue;
+      const full = sanitizeText(v).replace(/\r\n/g, '\n');
+      return (k === 'path' || k === 'file_path') ? full.replace(/\\/g, '/') : full;
+    }
+    return '';
+  }
   for (const k of keys) {
     const v = args[k];
     if (typeof v !== 'string' || !v.length) continue;
@@ -1683,95 +2075,68 @@ function keyArgument(name, args, workspace) {
   }
   return '';
 }
-export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge) {
+export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded = false) {
   const name = msg.toolName || '';
-  const arg = keyArgument(name, msg.toolArgs, workspace);
+  const arg = keyArgument(name, msg.toolArgs, workspace, expanded);
   const verb = msg.pending ? 'Using' : 'Used';
   // Pending tool calls have a sweep animation (like "Working...")
   // Once the tool finishes (pending=false) the name shows in plain cyan.
   let nameDisplay;
   if (msg.pending) {
-    // Multi-stage sweep animation for tool names (like the "Working..." line):
-    //   out to pale cyan, back; out to cyan-blue, back — one cycle.
-    // The tick counts come from SWEEP_TICKS so this row and the Working row share
-    // one smoothness budget (see the SWEEP_* block near the top of the file).
-    const SWEEP = SWEEP_TICKS;       // ticks per half-sweep
-    const HALF  = SWEEP + SWEEP;     // ticks per colour pair (sweep + sweep back)
-    const CYCLE = HALF * 2;          // ticks for the full loop
-    // Phase is measured from the tick the pulse BEGAN, so a spinner that has already
-    // been running does not drop the sweep into a mid-cycle colour.
+    // A light flashes across the tool name roughly once a second: the name stays plain
+    // cyan, and a lamp slightly whiter than cyan runs over it from left to right.
     //
-    // `??`, NOT `||`: `pulseStart` is legitimately 0 at the START of a turn (that is
-    // where the spinner begins), and `0 || spin` evaluates to `spin`, making
-    // `spin - spin === 0` forever — the name then held ONE flat colour and never
-    // animated at all. Only `null`/`undefined` mean "no anchor yet".
-    const anchor = pulseStart ?? spin;
-    const inCycle = ((spin - anchor) % CYCLE + CYCLE) % CYCLE;
-    const inHalf  = inCycle % HALF;       // position within this colour pair's half
-    const phase   = inCycle < HALF ? 0 : 1; // 0 = l↔c, 1 = c↔b
+    // This replaces a two-phase colour sweep (cyan → pale cyan → back, then cyan →
+    // cyan-blue → back) whose band was half the row wide. That band left every character
+    // changed colour behind it, so the name ended up entirely pale or entirely blue — a
+    // wash rather than a highlight, and on a long tool name the moving edge was hard to
+    // see at all because so much of the row was lit at once.
+    //
+    // The light is now a QUARTER of a character wide, which is what makes it read as a
+    // glint travelling along the name rather than a region changing colour.
+    //
+    // Phase is measured from the tick the row began on, so a spinner already running does
+    // not drop the light into the middle of its travel.
+    //
+    // `??`, NOT `||`: `pulseStart` is legitimately 0 at the START of a turn (that is where
+    // the spinner begins), and `0 || spin` evaluates to `spin`, making `spin - spin === 0`
+    // forever — the light would then sit still instead of moving. Only `null`/`undefined`
+    // mean "no anchor yet".
+    // The phase comes from a WALL CLOCK, not from the tick count.
+    //
+    // That is what makes the light smooth. The spinner advances `spin` every 80ms while the render path
+    // redraws far more often, so a phase derived from `spin` steps in 80ms jumps however often it is
+    // redrawn — which is exactly the per-cell hopping this replaced. The tick count still says WHERE the
+    // animation began (a spinner already running must not drop the light into mid-travel); it is turned
+    // once into a wall-clock origin that later frames measure against.
+    //
+    // The origin is held in a module-level WeakMap keyed by nothing but the anchor, rather than on
+    // `state`. This function is module-level and `state` lives inside startTUI's closure: reading it
+    // here threw "state is not defined" the moment a pending tool row painted, surfaced as an
+    // unhandledRejection that exited the whole TUI. The origin is the only per-row animation state, and
+    // it belongs to the module for exactly that reason.
+    //
+    // `??`, NOT `||`: tick 0 is a legitimate anchor, and `0 || spin` would collapse the elapsed time to
+    // zero so the light never moved at all.
+    const anchorSpin = pulseStart ?? spin;
+    // THE KEY MUST NOT REPEAT. `pulseStart` is a tick count within a turn, so two different rows can
+    // reach the same value; when that happened, the second row found the first one's origin still in the
+    // map and inherited an elapsed time far past its own start, snapping the light to a position mid-row.
+    //
+    // The message's own tool-call id is unique per row and stable across frames, which is exactly what a
+    // key needs. `anchorSpin` stays in it so the same message re-animated on a new tick gets a new origin.
+    const rowKey = msg && (msg.id || msg.toolId) ? `tool:${msg.id || msg.toolId}:${anchorSpin}` : `tool:${anchorSpin}`;
+    const elapsedMs = Math.max(0, Date.now() - lightOrigin(rowKey, anchorSpin, spin));
+    // ONE shimmer for both rows — see `shimmerText`.
+    const phaseMs = elapsedMs % cycleMs(name.length);
 
-    // Colours as plain RGB triples (mirroring Working's orange→yellow/red pattern).
-    // The orange pulse swings HARD — yellow is +100G/+120B off the base and red is
-    // -140G — but this sweep used to move only +64R / -35G, i.e. about a QUARTER of
-    // that amplitude, so "pale cyan" and "cyan-blue" were both nearly
-    // indistinguishable from plain cyan. Match the orange pulse's swing:
-    //   pale cyan = base + a strong red lift (toward white)
-    //   cyan-blue = base with the green pulled DOWN but not away: green 90 read as
-    //               plain blue and clashed with the cyan base, so it is kept at 150
-    //               — still clearly darker/cooler than the base, still cyan-family
-    // so each phase is a DIFFERENT colour, not a shade of the same one.
-    const c = [0, 215, 255];      // pure cyan (like ORANGE base)
-    const l = [150, 255, 255];    // pale cyan (like YELLOW: base + strong R/G lift)
-    const b = [0, 150, 255];      // cyan-blue (like RED: base with green pulled down)
-    const base = c;                       // always cyan, like Working's constant ORANGE
-    const target = phase === 0 ? l : b;   // pale cyan, then cyan-blue
+    // The same restraint as the Working row's glint: the light is the base colour with a small lift in
+    // the SAME hue, not a jump to white. `[150, 255, 255]` against `[0, 215, 255]` read as "the name is
+    // now pale" — a state change — where this reads as a sheen passing over it.
+    const BASE = [0, 215, 255];      // cyan: the name's resting colour
+    const GLINT = [110, 240, 255];   // the same hue, a shade brighter
 
-    const chars = name;
-    const n = chars.length;
-
-    // A character fades over a band this many characters wide. Same sizing rule as
-    // the Working row, so the two sweeps have the same feel.
-    const BAND = bandCharsFor(n) / n;
-
-    // Interpolate base ↔ target by `t` (0 = base, 1 = target).
-    const mix = (t) => {
-      const k = Math.max(0, Math.min(1, t));
-      return lerpColor(
-          base[0] + (target[0] - base[0]) * k,
-          base[1] + (target[1] - base[1]) * k,
-          base[2] + (target[2] - base[2]) * k,
-          base[0] + (target[0] - base[0]) * k,
-          base[1] + (target[1] - base[1]) * k,
-          base[2] + (target[2] - base[2]) * k,
-          0,
-      );
-    };
-
-    const out = [];
-    // The band SHAPE is shared with the Working row, and this sweep SETTLES: a
-    // character the head has passed stays at its target colour, which is what makes
-    // the name read as "filling in" left to right rather than a light passing over.
-    // The edge arrives as a PARAMETER, threaded from `state` by the render chain:
-    // formatToolLine is module-level and `state` lives in startTUI's closure, so
-    // reading `state.shimmerEdge` here threw "state is not defined" on the first
-    // pending tool row — the ReferenceError surfaced as an unhandledRejection and
-    // the process handler exited the TUI the moment a tool call started.
-    const edge = shimmerEdge || 'cosine';
-    for (let i = 0; i < n; i++) {
-      const charAt = n > 0 ? i / n : 0;
-      let t; // 0 = base, 1 = target
-      // Same geometry as the Working row's pulse: the head runs from BEHIND the name
-      // to past its end within each half, so the first frame of a half is the resting
-      // colour and the last frame is fully settled. Starting at `1/SWEEP` (already
-      // past the first character) made the name jump on the very first frame.
-      //   / (SWEEP - 1) so the FIRST frame is progress 0 and the LAST is 1.
-      const progress = (inHalf < SWEEP ? inHalf : inHalf - SWEEP) / (SWEEP - 1);
-      const head = -BAND + progress * (1 + BAND * SWEEP_TRAVEL_PAD);
-      const settled = sweepSettle(head - charAt, BAND, edge);
-      t = inHalf < SWEEP ? settled : 1 - settled;
-      out.push(col(chars[i], mix(t)));
-    }
-    nameDisplay = out.join('');
+    nameDisplay = shimmerText(name, phaseMs, BASE, GLINT, shimmerEdge || 'cosine');
   } else {
     // Non-pending: show in plain cyan
     nameDisplay = col(name, C.cyan);
@@ -1795,10 +2160,23 @@ export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge) {
       diffStr = ' ' + (adds ? col(`+${adds}`, C.green) : '') + ' ' + (deletes ? col(`-${deletes}`, C.red) : '');
     }
   }
-  // The `●` bullet carries the state (orange while running, green when done),
-  // so the verb itself stays plain white and the tool name keeps the theme
-  // colour.
-  const argText = arg ? ' ' + col(`(${arg})`, C.gray) : '';
+  // COLORED PER LINE, not around the whole string.
+  //
+  // `col(text)` writes one escape pair around everything, so a multi-line argument — exactly what Ctrl+O
+  // reveals, the body of a script — had its colour open on line 1 and, after the newline, no colour at all:
+  // the terminal's reset made every line below the first render in the DEFAULT foreground, one shade
+  // brighter than the grey the parentheses were given. Splitting on the newline and colouring each piece
+  // keeps the whole block the same grey. The parentheses still wrap the WHOLE value, so a multi-line script
+  // reads as one bracketed argument rather than as several.
+  let argText = '';
+  if (arg) {
+    const lines = `${arg}`.split('\n');
+    const painted = lines.map((l, i) => col(
+      (i === 0 ? '(' : '') + l + (i === lines.length - 1 ? ')' : ''),
+      C.gray,
+    ));
+    argText = ' ' + painted.join('\n');
+  }
   return col(verb, C.white) + ' ' + nameDisplay + argText + col(sizeStr, C.gray) + diffStr;
 }
 
@@ -1851,6 +2229,10 @@ function todoRow(todo, w) {
 function renderTodoPanel(state, w, hoverTop, dragTop) {
   const todos = state.todos || [];
   if (!todos.length) return [];
+  // A finished list draws NOTHING, matching `todoPanelHeight` returning 0 for the same state. Both ask
+  // the same question, so the reserved height and the drawn rows cannot disagree — a mismatch would
+  // shift every row below the panel.
+  if (todoListFinished(state)) return [];
   const out = [];
   const ruleColor = dragTop ? C.scrollThumbActive : (hoverTop ? C.hover : C.border);
   out.push(col('─'.repeat(w), ruleColor));
@@ -1947,9 +2329,31 @@ export function queuePanelHeight(state) {
 //   * `state.todoRows` (set by dragging the top rule) wins when present;
 //   * otherwise the automatic heuristic (selectVisibleTodos) decides.
 // Always clamped to [1, todos.length]: at least ONE row, never more than exist.
+/**
+ * Is this list FINISHED — every item done, and at least one item?
+ *
+ * A finished list is DROPPED, not merely hidden: it has stopped being a list of what is left to do, so
+ * the data goes as well as the panel. Hiding alone left the array to be persisted with the session and
+ * handed back to the model as `cfg.todoState`, which is a finished plan being described as current work.
+ *
+ * `every` on an EMPTY array is true, so the length check is load-bearing: this must not fire for "no
+ * todos", which is a different state with its own handling everywhere else.
+ */
+export function todosAllComplete(list) {
+  const todos = Array.isArray(list) ? list : [];
+  return todos.length > 0 && todos.every((t) => t && t.status === 'done');
+}
+
+/** The same question, asked of a TUI state object rather than a bare array. */
+export function todoListFinished(state) {
+  return todosAllComplete(state && state.todos);
+}
+
 export function todoRowCount(state) {
   const todos = state.todos || [];
   if (!todos.length) return 0;
+  // A finished list has no rows: see `todoListFinished`.
+  if (todoListFinished(state)) return 0;
   const manual = state.todoRows;
   let rows;
   if (typeof manual === 'number' && Number.isFinite(manual)) {
@@ -1964,6 +2368,10 @@ export function todoRowCount(state) {
 export function todoPanelHeight(state) {
   const todos = state.todos || [];
   if (!todos.length) return 0;
+  // Zero once everything is done, so the chrome shrinks by the panel's whole height rather than leaving
+  // a blank gap where it used to be. Both this and the renderer ask the same predicate, so the reserved
+  // height and the drawn rows cannot disagree — a mismatch there shifts every row below.
+  if (todoListFinished(state)) return 0;
   const rows = todoRowCount(state);
   const extra = todos.length > rows ? 1 : 0; // the "… +N more" hint
   return 2 + rows + extra; // rule + heading + rows (+ hint)
@@ -1989,20 +2397,33 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
   // Tool calls render as a single "● Using/Used Name (arg)" line (kimi style).
   // The body already carries its own ANSI colours, so mark it pre-colored.
   if (msg.role === 'tool') {
-    const body = formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge);
+    const body = formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded);
     // Red bullet for a failed call (a Bash non-zero exit / [error: …]).
     const failed = msg.failed === true || (msg.role === 'tool' && msg.failed === true);
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
     const bodyW = Math.max(1, width - visualCol('● '));
-    const wrapped = wrapAnsiWords(body, bodyW);
-    // Mark every CONTINUATION boundary with a trailing `…` so a wrapped command
-    // never looks like it ended at a quote or `;`. Without this, a command like
-    // `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest …` broke right
-    // after the closing quote, and the first row read as the whole command.
-    // The last row keeps whatever `keyArgument` already put there (its own `…`
-    // when the text itself was truncated).
+    // EXPANDED: break the body at the newlines the command actually has, so a multi-line script renders
+    // as the lines it was written as. `wrapAnsiWords` alone flattens a newline into a space, turning
+    // `set -e\nnpm ci\nnpm test` into one long reflowed line — and the reason to expand is to read the
+    // script, not a reflow of it.
+    //
+    // Collapsed, there are no newlines to honour: `keyArgument` already reduced the value to one line
+    // plus a count, so this is a single chunk and the wrap behaves exactly as before.
+    const segments = expanded && body.includes('\n') ? body.split('\n') : [body];
+    // Mark every CONTINUATION boundary with a trailing `…` so a wrapped command never looks like it
+    // ended at a quote or `;`. Without this, a command like
+    // `$ProgressPreference='SilentlyContinue'; Invoke-WebRequest …` broke right after the closing
+    // quote, and the first row read as the whole command. A boundary that is the command's OWN newline
+    // is not a continuation and gets no mark — the break is already unmistakable.
+    const wrapped = [];
+    for (const segment of segments) {
+      const parts = wrapAnsiWords(segment, bodyW);
+      for (let i = 0; i < parts.length; i++) {
+        wrapped.push(i < parts.length - 1 ? parts[i] + col('…', C.gray) : parts[i]);
+      }
+    }
     const out = wrapped.map((t, i) => ({
-      text: i < wrapped.length - 1 ? t + col('…', C.gray) : t,
+      text: t,
       ind: i === 0 ? pre : '  ',
       raw: true,   // text already contains ANSI; do not wrap in another colour
     }));
@@ -2073,16 +2494,24 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
       // one the trailing newline produced (an intentionally blank last line survives
       // as long as the content does not end with a newline).
       if (lines.length > 1 && lines[lines.length - 1] === '' && /\n$/.test(head)) lines.pop();
-      const MAX = 20;
+      // CTRL+O EXPANDS IT, like every other body in the transcript. This block was
+      // the one place that hard-coded a preview and never consulted `expanded`, so
+      // a 500-line file could only ever show its first 20 lines — the summary said
+      // "… 480 more lines" and there was no key that would reveal them.
+      //
+      // The expanded cap is the number of lines actually read, not `Infinity`: the
+      // 64 KB prefix above is what exists, and claiming more would print nothing
+      // extra while looking like it should.
+      const MAX = expanded ? lines.length : 20;
       // The TRUE line count comes from the message: `lines` only covers the scanned
       // prefix, so counting it would understate a large file's size.
-      const totalLines = msg._streamLineCount || lines.length;
+      const totalLines = expanded ? lines.length : (msg._streamLineCount || lines.length);
       const wNum = String(totalLines).length;
       lines.slice(0, MAX).forEach((ln, i) => {
         out.push({ text: col(`${String(i + 1).padStart(wNum)} ${ln}`, C.gray), ind: i === 0 ? '↳ ' : indent, raw: true });
       });
       const shown = Math.min(lines.length, MAX);
-      if (totalLines > shown) out.push({ text: col(`… ${totalLines - shown} more lines`, C.gray), ind: indent, raw: true });
+      if (totalLines > shown) out.push({ text: col(`… ${totalLines - shown} more lines, ctrl+o to expand`, C.gray), ind: indent, raw: true });
     }
 
     // The Edit diff is NOT drawn here: it rides on the tool_result message and is
@@ -2150,13 +2579,16 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
       const indent = '  ';
       const avail = Math.max(1, width - visualCol(indent));
       const lines = body.replace(/\r\n/g, '\n').split('\n');
-      const MAX = expanded ? 200 : 6;
+      // No cap once expanded. 200 was a silent ceiling: a long result stopped there with a hint telling
+      // the user to press the key they had already pressed.
+      const MAX = expanded ? lines.length : 6;
       for (const ln of lines.slice(0, MAX)) {
         for (const w of (ln === '' ? [''] : wrapWords(ln, avail))) {
           out.push({ text: col(w, C.gray), ind: indent, raw: true });
         }
       }
       if (lines.length > MAX) {
+        // Only reachable while COLLAPSED: expanded, `MAX` is the whole list and this cannot fire.
         out.push({ text: col(`… ${lines.length - MAX} more lines, ctrl+o to expand`, C.gray), ind: indent, raw: true });
       }
     }
@@ -2260,7 +2692,15 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
         });
       });
       if (visible.length > MAX_RESULT_LINES) {
-        diffRows.push({ text: `… ${visible.length - MAX_RESULT_LINES} more lines`, ind: cont, color: failed ? C.red : C.gray });
+        // The hint says HOW to see the rest. It used to read only "… N more lines", so a truncated
+        // result gave the user no way to know Ctrl+O would reveal it — the key existed and was
+        // undiscoverable from the one place that needed it. Only reachable while collapsed: expanded,
+        // `MAX_RESULT_LINES` is Infinity and this cannot fire.
+        diffRows.push({
+          text: `… ${visible.length - MAX_RESULT_LINES} more lines, ctrl+o to expand`,
+          ind: cont,
+          color: failed ? C.red : C.gray,
+        });
       }
     }
 
@@ -2444,6 +2884,24 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
     if (args) {
       const w = Math.max(1, width - 2);
       for (const seg of wrapWords(args, w)) lines.push({ text: seg, ind: '  ', color: C.gray });
+    }
+    return lines;
+  }
+  // A MESSAGE FROM A TEAMMATE.
+  //
+  // Drawn like a user row but labelled with the sender, because these arrive OUTSIDE the turn loop —
+  // a member writes whenever it has something to say, and the person must be able to read it without
+  // the model choosing to repeat it. `from` is the member's roster name.
+  //
+  // The body is wrapped to the same inner width the user boxes use, so a long answer does not run past
+  // the right edge and take the row's colour with it.
+  if (msg.role === 'team') {
+    const who = String(msg.from || 'team');
+    lines.push({ text: prefix + C.bold + col(who, C.cyan) + col(' → you', C.gray), ind: '', raw: true });
+    const w = Math.max(1, width - 2);
+    for (const ln of String(msg.text || '').replace(/\r\n/g, '\n').split('\n')) {
+      if (ln === '') { lines.push({ text: '', ind: '  ', raw: true }); continue; }
+      for (const seg of wrapWords(ln, w)) lines.push({ text: seg, ind: '  ', color: fg });
     }
     return lines;
   }
@@ -2702,7 +3160,7 @@ function markdownLineToRows(line, width, fg, codeFg, isContinuation) {
   const out = [];
   const t = line.replace(/\s+$/, '');
 
-  // Headings: `# 标题`
+  // Headings: `# Title`
   let m = /^(\s*)(#{1,6})\s+(.*)$/.exec(t);
   if (m && !isContinuation) {
     const hashCount = m[2].length;
@@ -3377,8 +3835,9 @@ export function renderChatLines(state, w, viewport) {
       let ccc = msg._cache;
       if (!ccc || !ccc.rows || ccc.rows.length !== len - (bordered ? (shared ? 1 : 2) : 0)) {
         const bw = bordered ? boxText : innerW;
-        const built = messageLines(msg, bw, state.cwd, expanded, state.spin, state.pulseStart, state.rawMode,
-          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge)).map(rowToLine);
+        const src = messageLines(msg, bw, state.cwd, expanded, state.spin, state.pulseStart, state.rawMode,
+          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge));
+        const built = src.map(rowToLine);
         ccc = { rows: built, spinRows: null };
         for (let i = 0; i < built.length; i++) {
           if (built[i].indexOf(SPIN_PLACEHOLDER) >= 0) {
@@ -3394,8 +3853,9 @@ export function renderChatLines(state, w, viewport) {
       if (bordered) {
         const pad = ' '.repeat(boxPad);
         const wall = col('│', boxColor);
-        for (let i = 0; i < ccc.rows.length; i++)
+        for (let i = 0; i < ccc.rows.length; i++) {
           out.push(PAD + wall + pad + fitAnsi(liveAt(ccc.rows[i], i), boxText) + pad + wall);
+        }
       } else {
         for (let i = 0; i < ccc.rows.length; i++) out.push(PAD + liveAt(ccc.rows[i], i));
       }
@@ -3405,6 +3865,10 @@ export function renderChatLines(state, w, viewport) {
     }
     cursor += len;
   }
+  // NO SELECTION HERE. `state.selection` is in SCREEN rows and this function does not know where its
+  // rows will land — the chat body starts below whatever a plan table or prompt box has already drawn.
+  // `composeFrame` paints the selection instead, at the point where both the body's origin and the
+  // selection's rows are known. See `applySelection`.
   return out;
 }
 
@@ -3414,7 +3878,12 @@ export function renderChatLines(state, w, viewport) {
 export function metricsSignature(state, n, w, expanded, innerW) {
   let h = 2166136261 >>> 0;
   const mix = (v) => { h ^= (v | 0); h = Math.imul(h, 16777619) >>> 0; };
-  mix(n); mix(w); mix(innerW); mix(expanded ? 1 : 0); mix(state.spin || 0);
+  // NOT `state.spin`. The spin changes four times a second and only ever picks which glyph an animation
+  // shows; it never changes the row count. Including it invalidated the memo on every tick, so each wheel
+  // event walked and re-rendered the whole transcript just to read back the total it already had — the
+  // stall when scrolling a long session. A spinner frame is a per-row concern, handled by the rows' own
+  // `valid` checks, which still run.
+  mix(n); mix(w); mix(innerW); mix(expanded ? 1 : 0);
   // THE PALETTE. This signature decides whether the WHOLE transcript is walked at all, so a
   // theme switch that left it alone skipped the per-message `valid` check too — every cached
   // row kept the colours it was rendered with, which is why the chrome repainted and the
@@ -3441,6 +3910,7 @@ export function metricsSignature(state, n, w, expanded, innerW) {
   }
   return h;
 }
+
 
 /**
  * Total transcript rows WITHOUT building a single rendered string. Reuses the
@@ -3759,10 +4229,41 @@ function proseSummary(value) {
   return `${lines.length} line${lines.length === 1 ? '' : 's'}, ${text.length} chars`;
 }
 
+/**
+ * The `[2s | ↓40]` tail shown at the end of the Working row.
+ *
+ * The arrow says which direction the count is: tokens this turn has RECEIVED, as opposed to the context
+ * gauge, which also counts what has been sent.
+ */
 function elapsedTail(ms, tokens) {
-  const time = fmtDuration(ms);
-  const tok = fmtTokensShort(tokens);
-  return `${time} | ${tok}`;
+  // The token count is shown FROM THE FIRST FRAME, with a downward arrow to say what it is: what the
+  // turn has received. It used to be hidden for thirty seconds, on the theory that a small number is
+  // noise on a short turn — but the row is the only place that number exists, and a count that appears
+  // partway through reads as something that just started rather than as a running total.
+  return `${fmtDuration(ms)} | ↓ ${fmtTokensShort(tokens)}`;
+}
+
+/**
+ * Has the turn gone quiet, and how much should that show?
+ *
+ * A turn that produces no tokens for a few seconds is either thinking, waiting on a tool, or stuck — and
+ * from outside those look identical. The one case that matters is the last: a request that hangs leaves
+ * the row cheerfully spinning forever with no way to tell it apart from a long answer.
+ *
+ * Mirrors Claude Code's `useStalledAnimation`: AFTER 3s with no new output, fade toward the warning colour
+ * over another 2s, and NEVER while a tool is running — a `npm install` that takes a minute is working, not
+ * stalled, and flashing red at it would train the user to ignore the signal.
+ *
+ * Returns 0 while healthy and 1 at full stall, so the caller can interpolate rather than switch abruptly.
+ */
+const STALL_AFTER_MS = 3000;
+const STALL_FADE_MS = 2000;
+
+function stallIntensity({ sinceLastTokenMs, hasActiveTools }) {
+  if (hasActiveTools) return 0;
+  const quiet = Number(sinceLastTokenMs) || 0;
+  if (quiet <= STALL_AFTER_MS) return 0;
+  return Math.min((quiet - STALL_AFTER_MS) / STALL_FADE_MS, 1);
 }
 
 // Left/right justify: left text, then padding, then right text flush to `w`.
@@ -3970,16 +4471,30 @@ function applySelectionToRow(lines, idx, sel, w) {
   return lines;
 }
 
-// Wrap the visible columns [c0, c1) of an ANSI string in the selection
-// background, preserving the existing foreground colours inside the range.
-// NOTE: pass (end.col + 1) as c1 — the end column is the cell under the pointer
-// and is part of the selection.
+/**
+ * Paint the selection background over visible columns [c0, c1) of one rendered row.
+ *
+ * COLUMN 0 IS NEVER SELECTION. Every chat row is drawn with one column of left margin — the `PAD` the
+ * renderer prepends — so a drag that begins at the left edge of the text paints that space too, and
+ * copying a reply puts a leading space on the clipboard on every line. Skipping exactly column 0 is the
+ * whole rule.
+ *
+ * It is one column and no more, and applied to every row regardless of what sits there. Measuring a
+ * per-row "indent width" instead — a tool row's ` ● ` bullet, a user box's `│ ❯ ` wall — was the first
+ * attempt and it was wrong: those columns are part of what the row DRAWS, and a selection that begins on
+ * one of them is a selection the user made deliberately. The margin is different only because it is not
+ * the content at all.
+ *
+ * The column is still drawn and still occupies its space; it is simply not selection.
+ */
 function highlightAnsiRange(row, c0, c1, w) {
   const s = String(row);
   let out = '';
   let col = 0;
   let i = 0;
   let inSel = false;
+  // A range that begins at the margin starts one column later.
+  const lo = Math.max(c0, 1);
 
   while (i < s.length) {
     if (s[i] === '\x1b') {
@@ -4000,7 +4515,7 @@ function highlightAnsiRange(row, c0, c1, w) {
     const cp = s.codePointAt(i);
     const ch = String.fromCodePoint(cp);
     const cw = visualWidth(ch);
-    const want = col >= c0 && col < c1;
+    const want = col >= lo && col < c1;
 
     if (want && !inSel) {
       // Selection changes only the BACKGROUND; the foreground (documented colour)
@@ -4025,6 +4540,44 @@ function highlightAnsiRange(row, c0, c1, w) {
   if (inSel) out += C.reset;
 
   return out;
+}
+
+/**
+ * Paint the mouse selection over a finished set of chat rows.
+ *
+ * `sel` is the selection ITSELF — `{ anchor: {row, col}, head: {row, col} }` — not `state`. It used to
+ * take `state` and read `state.selection` out of it while the only caller passed the selection
+ * directly, so `sel` was undefined and the function returned at its first line: the highlight silently
+ * never appeared. Taking the range as an argument also means the caller converts screen rows to body
+ * rows once, where both coordinate systems are known.
+ *
+ * Rows are indices into `rows`; a cross-row drag extends the first and last rows to the whole line,
+ * which is what a text selection in a terminal looks like.
+ */
+function applySelection(rows, sel) {
+  if (!sel || !sel.anchor || !sel.head) return rows;
+  const a = sel.anchor;
+  const h = sel.head;
+  if (!Number.isFinite(a.row) || !Number.isFinite(h.row)) return rows;
+
+  // Whichever end is earlier on screen, so dragging upwards works like dragging downwards.
+  const start = (h.row < a.row || (h.row === a.row && h.col < a.col)) ? h : a;
+  const end = start === a ? h : a;
+
+  for (let i = 0; i < rows.length; i++) {
+    if (i < start.row || i > end.row) continue;
+    let c0;
+    let c1;
+    // +1: the end column is the cell under the pointer and is selected too.
+    if (start.row === end.row) { c0 = start.col; c1 = end.col + 1; }
+    else if (i === start.row) { c0 = start.col; c1 = Infinity; }
+    else if (i === end.row) { c0 = 0; c1 = end.col + 1; }
+    else { c0 = 0; c1 = Infinity; }
+    // The width bound is the row's own length: `highlightAnsiRange` stops there anyway, and passing a
+    // number derived from the terminal would be wrong for a row rendered at a different width.
+    rows[i] = highlightAnsiRange(rows[i], c0, c1, Infinity);
+  }
+  return rows;
 }
 
 // Truncate an ANSI string to exactly `width` visible columns (no padding).
@@ -4335,9 +4888,14 @@ export function refreshGitInfo(state, opts = {}) {
   if (!cwd) return;
   const now = Date.now();
   const force = opts.force === true;
-  // Mid-turn the agent is about to write more files, so a poll would only produce
-  // a value that is stale on arrival. The turn-end refresh covers it. Explicit
-  // callers (the timer between turns, /git) still get through with force.
+  // Mid-turn the agent is about to write more files, so a POLL would only produce a value that is
+  // stale on arrival. The turn-end refresh covers it. Explicit callers (the timer between turns,
+  // /git) still get through with force.
+  //
+  // A step boundary is the exception, and it is deliberately the only one: the tool_result handler
+  // calls this with `force` once a step has finished, because at that moment the agent has stopped
+  // writing and the count is both current and worth looking at (see the call site in the event
+  // handler). Without it a long turn showed an unchanging `+0 -0` while files were being edited.
   if (!force && state.running) return;
   state._gitCwd = cwd;
   state._gitAt = now;
@@ -4941,30 +5499,17 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     const chat = state._forceFullRender
       ? renderChatLines(state, w)
       : renderChatLines(state, w, { bodyH, scroll: state.scroll || 0 });
-    if (state.selection && state.selection.anchor && state.selection.head) {
-      // Apply selection highlight directly on ANSI strings
-      for (let i = 0; i < chat.length; i++) {
-        const a = state.selection.anchor, h = state.selection.head;
-        if (!Number.isFinite(a.row) || !Number.isFinite(h.row)) { /* no range */ }
-        else {
-        const startIdx = (h.row < a.row || (h.row === a.row && h.col < a.col)) ? h : a;
-        const endIdx = startIdx === a ? h : a;
-        if (i < startIdx.row || i > endIdx.row) continue;
-        let c0, c1;
-        // +1: the end column is the cell under the pointer and is selected too.
-        if (startIdx.row === endIdx.row) { c0 = startIdx.col; c1 = endIdx.col + 1; }
-        else if (i === startIdx.row) { c0 = startIdx.col; c1 = Infinity; }
-        else if (i === endIdx.row) { c0 = 0; c1 = endIdx.col + 1; }
-        else { c0 = 0; c1 = Infinity; }
-        chat[i] = highlightAnsiRange(chat[i], c0, c1, cols);
-        }
-      }
-    }
-    if (process.env.HNCODE_DEBUG && state.selection) {
-      const _a = state.selection.anchor, _h = state.selection.head;
-      const _s = (_h.row < _a.row || (_h.row === _a.row && _h.col < _a.col)) ? _h : _a;
-      const _e = _s === _a ? _h : _a;
-    }
+    // THE SELECTION IS ALREADY PAINTED, inside `renderChatLines`.
+    //
+    // There used to be a second pass here that re-walked the rows and highlighted them again. It is
+    // gone, for two reasons. It re-painted rows `renderChatLines` had just painted, and its `cols`
+    // argument named a variable that does not exist in this scope — a `ReferenceError` waiting for the
+    // first user who dragged across a row. The body path never reached it because `chat` was empty in
+    // the tests that exercised the window, and the crash would have surfaced as the whole TUI exiting
+    // through the unhandledRejection handler.
+    //
+    // One place owns the selection now, which is also why `renderChatLines` takes no selection argument:
+    // it reads `state.selection` itself.
     const total = chat.length;
     const maxScroll = Math.max(0, total - bodyH);
     const scroll = Math.min(maxScroll, Math.max(0, state.scroll || 0));
@@ -4977,7 +5522,16 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
     // body, so `lines.length` here IS the body's origin; deriving it afterwards as
     // `lines.length - bodyH` assumes nothing came before it, which is false.
     const bodyScreenTop = lines.length;
-    chatOrigin = bodyScreenTop;
+    // The selection, in SCREEN rows. `state.selection` comes from mouse coordinates, which are screen
+    // `state.selection` rows are ALREADY transcript indices — `mouseToCell` converts the pointer's
+    // screen row into a body row before recording the anchor and head, subtracting the body's origin and
+    // adding the transcript's start.
+    //
+    // Converting again here is what broke the highlight completely: the row went negative, no row matched,
+    // and nothing was painted. The selection goes to `applySelection` unchanged.
+    if (state.selection && state.selection.anchor && state.selection.head) {
+      applySelection(chat, state.selection);
+    }
     for (let i = 0; i < bodyH; i++) {
       const idx = start + i;
       let row = '';
@@ -5285,11 +5839,11 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
   //
   // Layout:
   //   |Q1| Q2            <- question tabs (Tab switches), current lit
-  //   用哪种权限模式？      <- the question text
-  //   > A  读取自动执行…   <- option: marker + label + dim desc on the same row
-  //     B  什么都不问
+  //   Which permission mode?   <- the question text
+  //   > A  Run reads automatically  <- option: marker + label + dim desc on the same row
+  //     B  Ask about everything
   //     Other
-  //   ↑↓ 移动 · Enter 选择 · Esc 取消
+  //   up/down move · Enter select · Esc cancel
   // Single-select marker is `> `; multi-select uses an empty/filled square.
   if (state.question && !takeover) {
     const qs = state.question;
@@ -5417,7 +5971,14 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       : '';
     // The wording was chosen once at turn start; the gradient below loops
     // independently, so the phrase stays put while the colours sweep.
-    const workMsg = state.workMsg || WORKING_MESSAGES[0];
+    //
+    // A RUNNING COMPACTION OWNS THE PHRASE. The turn is not "working", it is compacting —
+    // one specific long operation — and saying so is the whole point of putting it here.
+    // `state.workMsg` is left untouched underneath, so the rotating phrase the turn began
+    // with comes back the moment compaction ends rather than being lost.
+    const workMsg = state.compacting
+      ? COMPACTING_MSG
+      : (state.workMsg || WORKING_MESSAGES[0]);
     const spin = state.spin || 0;
 
     // ---- reduced motion: the resting row ----
@@ -5433,14 +5994,18 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       );
     }
     // ---- turn-start animation ----
-    // 0.5s: type out "Working..." in grey (chars appear left→right)
-    // 0.5s: fill with orange (chars change colour left→right)
-    // After 1s total: start the normal pulse animation (yellow/red cycle)
+    // 0.25s: type out "Working..." in grey (chars appear left→right)
+    // 0.25s: fill with orange (chars change colour left→right)
+    // After 0.5s total: start the normal pulse animation
     else if (state.startAnim) {
-      // 1s total: 0.5s types `Working... [0s]` out in grey, then 0.5s sweeps the
+      // 0.5s total: 0.25s types `Working... [0s]` out in grey, then 0.25s sweeps the
       // PHRASE grey → orange. The `[0s]` tail types out WITH the phrase but is
       // EXCLUDED from the colour sweep — it stays grey the whole time.
-      const DUR = 1000;
+      //
+      // Halved from 0.5s each. A full second of the row still typing itself out delayed the point
+      // where the user could tell the turn had started, and the swaths of time are what the pulse
+      // below is for — the entry animation only has to get the phrase on screen.
+      const DUR = 500;
       const t = Math.min(1, (Date.now() - state.startAnim.start) / DUR);
       const phase = t < 0.5 ? 'type' : 'color';
       const phaseT = t < 0.5 ? t * 2 : (t - 0.5) * 2; // 0→1 within each phase
@@ -5488,7 +6053,10 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
         }
         lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
       }
-      if ((Date.now() - state.startAnim.start) >= 1000) {
+      // The cutoff has to be the SAME number as `DUR`. They were separate literals (1000 here, 1000
+      // above) and changing one alone left the preview exiting early or the animation running on into
+      // the pulse — the row would paint one frame of pulse with `startAnim` still set.
+      if ((Date.now() - state.startAnim.start) >= DUR) {
         state.startAnim = null;
         // The colour phase has just finished painting the phrase orange. Anchor
         // the pulse to THIS tick so its first frame is the orange start of the
@@ -5529,79 +6097,68 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       const animColor = lerpColor(r, g, b, r, g, b, 0);
       lines.push(col(frame, animColor) + ' ' + col('[', animColor) + col(word, animColor) + col(tail, greyEsc));
     } else {
+      // A light flashes across the phrase roughly once a second: the text stays orange and
+      // a yellow lamp runs over it from left to right.
+      //
+      // This replaces a four-phase colour pulse (orange → yellow → orange → red → orange)
+      // whose band was half the row wide. Two things were wrong with it. The band left every
+      // character changed colour behind it, so what the eye saw was the WHOLE PHRASE swinging
+      // between yellow and red — a slow breathing, not a movement. And the red half read as
+      // an error state on a row that only means "working".
+      //
+      //
+    // The light is a QUARTER OF THE PHRASE WIDE, over a yellow highlight running left to right.
+    // The phase comes from a WALL CLOCK, not the tick count — see the same block in formatToolLine.
+    // The render path redraws far more often than the 80ms spinner tick, and a phase derived from
+    // `spin` steps in 80ms jumps however often it is redrawn, which is the per-cell hopping this
+    // replaced.
+    //
+    // The anchor is prefixed so the Working row cannot share an origin with a tool row that happened to
+    // start on the same tick — the two animations are independent and must not be tied together.
+    //
+    // `??`, NOT `||`: tick 0 is a legitimate anchor, and `0 || spin` would collapse the elapsed time
+    // to zero so the light never moved at all.
+    const anchorSpin = state.pulseStart ?? spin;
+    // THE KEY MUST NOT REPEAT ACROSS TURNS.
+    //
+    // `pulseStart` is the tick count within a turn, so two turns can both reach `pulseStart = 6`. With the
+    // key built from the anchor alone, the second turn FOUND the first turn's origin still in the map and
+    // started its sweep from an origin minutes in the past — a phase far past the cycle, so the light
+    // snapped to a position mid-row. Keying on the turn's own start stamp makes every animation unique.
+    const turnKey = state.turnStart || 0;
+    const phaseMs = Math.max(0, Date.now() - lightOrigin(`work:${turnKey}:${anchorSpin}`, anchorSpin, spin)) % cycleMs(workMsg.length);
 
-      // Timing: SWEEP ticks per half-sweep, four halves per cycle (out to yellow,
-    // back, out to red, back). The tick count lives in SWEEP_TICKS so every animated
-    // row shares one smoothness budget — see the SWEEP_* block near the top.
-    const SWEEP = SWEEP_TICKS;       // ticks per half-sweep
-    const HALF  = SWEEP + SWEEP;     // ticks per colour (out + back)
-    const CYCLE = HALF * 2;          // ticks for the full loop
-    // Phase is measured from the tick the pulse BEGAN (state.pulseStart), not
-    // from 0: the spinner has been running since turn start, so a raw
-    // `spin % CYCLE` dropped the pulse into a mid-cycle colour (often the red
-    // half) the instant the start animation handed over.
-    // `??`, NOT `||` — the same trap as the tool-name sweep: a `pulseStart` of 0 is a
-    // real anchor (the turn's first tick), and `0 || spin` collapses the cycle to 0, so
-    // the row would sit on one colour forever instead of pulsing.
-    const inCycle = ((spin - (state.pulseStart ?? spin)) % CYCLE + CYCLE) % CYCLE;
-    const inHalf  = inCycle % HALF;       // position within this colour's half
-    const phase   = inCycle < HALF ? 0 : 1; // 0 = yellow, 1 = red
-
-    // Colours as plain RGB triples (never ANSI strings). ORANGE is the shared
-    // constant so the pulse starts exactly where the start animation ended.
-    const YELLOW = [255, 240, 120];
-    const RED    = [255, 0, 0];    // pure red
-    const target = phase === 0 ? YELLOW : RED;
+    // THE GLINT IS A STEP AWAY FROM THE BASE, not a jump to another colour.
+    //
+    // `[255, 240, 120]` against orange `[255, 140, 0]` is a different hue entirely — the eye reads it as
+    // "this text is yellow now", which is a status change rather than a ripple passing over. Claude Code
+    // keeps the two within a few percent of each other and lets the MOVEMENT carry the effect; measured
+    // against its `messageColor`/`shimmerColor` pair, the light is a shade brighter and nothing more.
+    //
+    // These are the base with a lift in the same hue, so the animation reads as a sheen travelling across
+    // the word rather than as the word changing colour.
+    const GLINT = [255, 205, 95];
 
     const chars = workMsg;
-    const n = chars.length;
-    // The band is sized once for this row; `framesPerChar(n)` is the resulting
-    // smoothness, and 3+ frames is where a fade stops looking like a snap.
-    const BAND = bandCharsFor(n) / n;
-
-    // Interpolate orange ↔ target by `t` (0 = orange, 1 = target).
-    const mix = (t) => {
-      const k = Math.max(0, Math.min(1, t));
-      return lerpColor(
-          ORANGE_RGB[0] + (target[0] - ORANGE_RGB[0]) * k,
-          ORANGE_RGB[1] + (target[1] - ORANGE_RGB[1]) * k,
-          ORANGE_RGB[2] + (target[2] - ORANGE_RGB[2]) * k,
-          ORANGE_RGB[0] + (target[0] - ORANGE_RGB[0]) * k,
-          ORANGE_RGB[1] + (target[1] - ORANGE_RGB[1]) * k,
-          ORANGE_RGB[2] + (target[2] - ORANGE_RGB[2]) * k,
-          0,
-      );
-    };
-
-    const out = [];
-    // The pulse is TWO settles, not a ramp: the first takes every character from
-    // orange to the phase's target (yellow or red), the second takes it back to
-    // orange. Each runs its head from the far edge of the band to the settle point,
-    // so:
+    const lightEdge = state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge) || 'cosine';
+    // ONE shimmer for both rows — see `shimmerText`.
+    const out = shimmerText(chars, phaseMs, ORANGE_RGB, GLINT, lightEdge);
+    // A QUIET TURN FADES TOWARD THE WARNING COLOUR.
     //
-    //   first frame of a phase -> head is behind everything -> nothing swept yet
-    //   last frame             -> head is past everything   -> every char settled
+    // `state.lastTokenAt` is stamped whenever output arrives; `state.hasActiveTools` is set while a tool
+    // is running. Both are read here rather than recomputed, because this is the paint path.
     //
-    // That geometry is what makes the boundary seamless. The previous version started
-    // the head at `1/SWEEP`, already PAST the first character, so the very first pulse
-    // frame painted char 0 at 50% of the target right after the row had been fully
-    // ORANGE — a visible jump on every handoff, and again at each half-cycle.
-    // `/ (SWEEP - 1)`, not `/ SWEEP`: the first frame of a half must be progress 0
-    // and its LAST frame progress 1, so every half starts untouched and ends fully
-    // settled. Dividing by SWEEP left the final frame at (SWEEP-1)/SWEEP = 0.9, so the
-    // sweep never quite completed and the row carried a 2% residue into the next half.
-    const progress = (inHalf < SWEEP ? inHalf : inHalf - SWEEP) / (SWEEP - 1);
-    const head = -BAND + progress * (1 + BAND * SWEEP_TRAVEL_PAD);
-    const pulseEdge = state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge) || 'cosine';
-    for (let i = 0; i < n; i++) {
-      const charAt = n > 0 ? i / n : 0;
-      // Settled amount toward the target; the back-sweep is the same shape mirrored,
-      // so it un-settles toward orange in the same left-to-right order.
-      const settled = sweepSettle(head - charAt, BAND, pulseEdge);
-      const t = inHalf < SWEEP ? settled : 1 - settled;
-      out.push(col(chars[i], mix(t)));
-    }
-    lines.push(col(frame, orangeEsc) + ' ' + out.join('') + elapsed);
+    // The intensity is interpolated into the base colour rather than switching, so a slow model does not
+    // look like a broken one for one frame and then fine the next.
+    const stall = stallIntensity({
+      sinceLastTokenMs: state.lastTokenAt ? Date.now() - state.lastTokenAt : 0,
+      hasActiveTools: !!state.hasActiveTools,
+    });
+    const baseFrame = stall > 0 ? col(frame, lerpColor(
+      ORANGE_RGB[0], ORANGE_RGB[1], ORANGE_RGB[2],
+      255, 90, 90, stall,
+    )) : col(frame, orangeEsc);
+    lines.push(baseFrame + ' ' + out + elapsed);
     }
   }
 
@@ -5705,7 +6262,10 @@ const queueH = takeover ? 0 : queuePanelHeight(state);
       // the typed TEXT white. The prefix is the first `❯ ` of the row (the
       // continuation rows are padded with spaces instead).
       const rawRow = composer.rows[ri];
-      const styledRow = highlightPasteMarkers(rawRow);
+      // Which chip the pointer is over, if any. `state.pasteHover` is the paste NUMBER, set by the
+      // mousehover handler from the same index maths the expand gesture uses, so the highlight and the
+      // click can never disagree about which chip they mean.
+      const styledRow = highlightPasteMarkers(rawRow, state.pasteHover);
       // One space of padding after the left wall (and before the right wall), the
       // same as the transcript's user/queue boxes, so the geometry is identical.
       const pre = composerInput(state).prefix;
@@ -6323,7 +6883,12 @@ export function makeState({ cfg, session, opts }) {
     reasoning: effort !== 'off',
     seenThinking: false,
     expanded: false,
-    todos: (session && Array.isArray(session.todos)) ? session.todos : [],
+    // A finished list is not restored. A session saved BEFORE this rule existed can still carry one,
+    // and bringing it back would show a panel for work that is already over — the case the drop on the
+    // update path cannot reach.
+    todos: (session && Array.isArray(session.todos) && !todosAllComplete(session.todos))
+      ? session.todos
+      : [],
     todosExpanded: false,
     cwd,
     cwdOverride: null,
@@ -7392,7 +7957,15 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       if (!opts.length) { appErr('The current model has no thinking control.'); return; }
       if (raw) {
         const v = raw.toLowerCase();
-        if (!opts.includes(v)) { appErr(`Unknown effort: ${raw} (expected ${opts.join(' / ')})`); return; }
+        // NO VALIDATION against `opts`. The list is what a model is KNOWN to accept — from the catalog,
+        // or from a user's own `efforts = [...]` — and a value outside it is not necessarily wrong: the
+        // catalog can be behind a model, and a proxy or gateway may take grades the entry never
+        // recorded. Rejecting those made `/effort xhigh` fail on a model that understands it, with no
+        // way to try.
+        //
+        // A wrong value now fails at the provider instead, which is where the truth lives and which
+        // reports what it did not like. `effortWire` already omits the field for a grade with no budget,
+        // so an unknown name is sent as the name itself rather than as a guessed number.
         setEffort(state, cfg, v);
         persist();
         app(`Thinking effort → ${v}`);
@@ -7833,9 +8406,15 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
               refreshGitInfo(state, { force: true });
             }
 
-            
             // Update context gauge based on restored session messages.
-            const approx = estimateMessagesTokens(session.messages, cfg);
+            //
+            // THE SAME FORMULA AS A LIVE STEP: messages PLUS the tool schemas. This used to count the
+            // messages alone, so the gauge stepped by a fixed amount whenever a restore and a live step
+            // alternated — a visible jump that was two formulas disagreeing, not noise.
+            //
+            // `dispatch` is module-level and cannot reach startTUI's `setCtxTokens`, so the expression is
+            // repeated here rather than the call. Keep the two identical.
+            const approx = estimateMessagesTokens(session.messages, cfg) + (cfg.toolDefTokens || 0);
             state.ctxTokens = approx;
             state.ctxMax = cfg.maxContextTokens || state.ctxMax;
             state.ctxPercent = usagePercent(approx, state.ctxMax);
@@ -8024,7 +8603,21 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         }
         if (ci >= cur.length) { app('Nothing to undo.'); return; }
         const removed = cur.slice(ci);
+        // TRUNCATE THE MODEL'S CONTEXT, not just the transcript on screen.
+        //
+        // `state.chat` is what the user sees; `session.messages` is what the model is sent. This used to
+        // shorten only the former, so /undo looked complete while the withdrawn prompt stayed in the
+        // request — and the model kept acting on text the user believed they had removed. Measured: after
+        // undoing a prompt that deleted a block of words, the next request still carried the deletion.
+        //
+        // `session.messages` is the array the agent sends, so it is the one that has to be cut. The
+        // `_ledger` is rebuilt from it on the next turn (see sync), and the cached prefix is dropped so a
+        // stale token count cannot describe a shorter history.
+        session.messages = cur.slice(0, ci);
         state.chat = state.chat.slice(0, Math.max(0, state.chat.length - removed.length));
+        if (state.agent && state.agent._ledger) {
+          try { state.agent._ledger.reset(); } catch { /* best-effort */ }
+        }
         saveSession(session);
         // Rewind the FILES too. This used to only truncate the transcript and then
         // say "Undid 1 prompt", while every Edit/Write the agent had made stayed on
@@ -8075,6 +8668,9 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       // same time — `state.running` is what submit() checks to queue instead.
       if (state.running) { app('Busy — wait for the current turn to finish.'); return; }
       state.running = true;
+      // The Working row takes over the progress display: it shows `Compacting Context...` for as
+      // long as this runs, so the summary round-trip is visible without adding a transcript row.
+      state.compacting = true;
       renderFrame();
 
       const maxCtx = cfg.maxContextTokens || state.ctxMax || 512000;
@@ -8084,16 +8680,14 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       const dropped = droppedMsgs.length;
 
 
-      // Summarize the dropped portion, so context survives the trim — that is the
-      // whole point of compaction. Rendered as the SAME live compaction block the
-      // automatic path uses (blinking bullet → "Compaction complete"), so the two
-      // look identical instead of one getting a spinner and the other a text line.
+      // Summarize the dropped portion, so context survives the trim — that is the whole point of
+      // compaction. The PROGRESS lives on the Working row (`state.compacting`, set above), and the
+      // transcript gets one row at the END recording what happened: the token counts and, behind
+      // Ctrl+O, the summary itself. That row is information; the blinking was state.
       let summary = '';
       const liveBlock = {
         role: 'compaction', phase: 'running', startedAt: Date.now(), instruction: '',
       };
-      addChat(liveBlock);
-      renderFrame();
       if (droppedMsgs.length > 0) {
         const llm = new LLM(cfg);
         // Let Esc abort the summary request (see the escape handler).
@@ -8113,16 +8707,18 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
         state._compactLlm = null;
       }
       // Interrupted (Esc): abort yields an empty summary; do NOT trim — that would
-      // drop history with nothing to replace it. Mark the block cancelled and stop.
+      // drop history with nothing to replace it. The Working row goes back to a
+      // rotating phrase and the transcript records that nothing was trimmed.
       if (state._compactAborted) {
         state._compactAborted = false;
+        state.compacting = false;
         liveBlock.phase = 'cancelled';
         liveBlock._cache = null;
+        addChat(liveBlock);
         state.running = false;
         renderFrame();
         return;
       }
-
       const compactedSummary = summary
         ? `[hncode] Earlier conversation context was compacted. ${dropped} older message(s) were replaced by this summary:\n\n${summary}`
         : `[hncode] ${dropped} earlier message(s) were compacted without a summary. Their detail is no longer available.`;
@@ -8149,7 +8745,8 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       ];
 
       saveSession(session);
-      state.tokens = estimateMessagesTokens(session.messages, cfg);
+      // Same formula as everywhere else: messages PLUS the tool schemas.
+      state.tokens = estimateMessagesTokens(session.messages, cfg) + (cfg.toolDefTokens || 0);
       state.ctxTokens = state.tokens;
       state.ctxPercent = usagePercent(state.tokens, state.ctxMax || maxCtx);
       // The transcript was just replaced with a much shorter one. Drop the scroll
@@ -8159,13 +8756,16 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       dropScrollPin(state);
       state.scroll = 0;
       state.running = false;
-      // Settle the live block into "Compaction complete (before → after tokens)",
-      // matching the automatic path.
+      state.compacting = false;
+      // One transcript row, at the END, recording what happened — "Compaction complete
+      // (before → after tokens)" with the summary behind Ctrl+O. The progress was on the
+      // Working row; this is the record.
       liveBlock.phase = 'done';
       liveBlock.tokensBefore = estimateMessagesTokens(msgs, cfg);
       liveBlock.tokensAfter = state.tokens;
       liveBlock.text = summary || '';
       liveBlock._cache = null;
+      addChat(liveBlock);
       renderFrame();
       return;
     }
@@ -8675,7 +9275,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
     }
     case 'usage': {
       const msgs = session.messages || [];
-      const approx = Math.round(JSON.stringify(msgs).length / 3.5);
+      // THE SAME ESTIMATOR AS THE GAUGE. This was `JSON.stringify(msgs).length / 3.5` — a third formula,
+      // and a wrong one: the serialised JSON carries every key, quote and brace, so it charged for the
+      // structure itself. Three formulas for one quantity is how a session reports three different
+      // numbers for the same request.
+      const approx = estimateMessagesTokens(msgs, cfg) + (cfg.toolDefTokens || 0);
       const g = C.gray, w = C.white, b = C.bold;
       const u = state.usage || {};
       const lines = [
@@ -8706,6 +9310,33 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       lines.push(w + b + 'Context window' + C.reset);
       lines.push('  ' + g + 'used          ' + C.reset + w + `${state.ctxPercent}% `
         + g + `(${fmtTokens(state.ctxTokens)} / ${fmtTokens(state.ctxMax)})` + C.reset);
+
+      // WHAT THE REQUEST IS MADE OF, itemised.
+      //
+      // A single number cannot answer "why does the provider report more than this?" — the gap could be
+      // the tool block, a cache read, framing, or one enormous tool result. Naming each part makes the
+      // answer visible instead of a theory: the biggest row is where the tokens are.
+      {
+        const sysTokens = msgs.filter((m) => m && m.role === 'system')
+          .reduce((n, m) => n + messageTokens(m, cfg), 0);
+        const convTokens = msgs.filter((m) => m && m.role !== 'system')
+          .reduce((n, m) => n + messageTokens(m, cfg), 0);
+        const toolTokens = cfg.toolDefTokens || 0;
+        const rows = [
+          ['system prompt', sysTokens],
+          ['conversation', convTokens],
+          ['tool schemas', toolTokens],
+        ].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+        if (rows.length) {
+          lines.push('');
+          lines.push(w + b + 'Where it goes' + C.reset);
+          for (const [label, v] of rows) {
+            const share = state.ctxTokens ? Math.round((v / state.ctxTokens) * 100) : 0;
+            lines.push('  ' + g + label.padEnd(14) + C.reset + w + fmtTokens(v).padStart(8) + C.reset
+              + g + `  ${share}%` + C.reset);
+          }
+        }
+      }
       // Trend of the request size across this session's steps: rises as history
       // accumulates and drops when a compaction trims it.
       const hist = Array.isArray(state.tokenHistory) ? state.tokenHistory : [];
@@ -9512,8 +10143,11 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
       // requests left it showing the pre-trim number until the next turn — the user
       // had to send a message to see the effect. `/trim` knows the exact count, so
       // push it into the same state fields the events would have set.
-      state.ctxTokens = after;
-      state.ctxPercent = usagePercent(after, state.ctxMax || cfg.maxContextTokens || 1);
+      //
+      // Plus the tool schemas, like every other writer: `/trim` counts messages, and the request also
+      // carries the tools, so leaving them out dropped the gauge by that much more than was freed.
+      state.ctxTokens = after + (cfg.toolDefTokens || 0);
+      state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || cfg.maxContextTokens || 1);
       if (session) {
         try {
           session.tokenHistory = Array.isArray(session.tokenHistory) ? session.tokenHistory : [];
@@ -11013,8 +11647,22 @@ export async function dispatch(cmdRaw, arg, state, cfg, session, h, submit, stdo
           return;
         }
       }
-      // Unknown command: show error message
-      appErr(`Unknown command: /${cmdRaw.replace(/^\//, '')}`);
+      // An unknown command is sent to the model AS TEXT rather than refused.
+      //
+      // The slash was already stripped by the composer's command path, so "unknown command" meant the
+      // user's message was swallowed and never reached the model — typing `/why is this slow` produced
+      // an error instead of a question. A leading slash is also how people write a path, a sed script or
+      // a regex, so a message that merely STARTS with one was the most likely casualty.
+      //
+      // Sending it is the honest default: the model can answer a question phrased oddly, and the
+      // alternative is losing the text entirely. The typo case is covered by the notice, so a
+      // near-miss like `/hlep` still says what was not found while its text goes through.
+      // `cmdRaw` is the whole line the user typed, arguments included, and it may or may not carry a
+      // leading slash depending on the caller. It goes out with ONE slash, so the model sees the message
+      // as the person wrote it rather than as a bare word the composer mangled.
+      const asTyped = `/${String(cmdRaw || '').replace(/^\/+/, '')}`.trim();
+      notice(`No such command: ${asTyped.split(/\s+/)[0]} — sent as a message instead`, 'info');
+      await sendPrompt(asTyped);
       return;
     }
   }
@@ -11590,18 +12238,22 @@ export function tokenize(str) {
           const mcol = parseInt(mm[2], 10);
           const mrow = parseInt(mm[3], 10);
           const press = mm[4] === 'M';
+          // SGR encodes the modifiers in the button parameter: 4 = Shift, 8 = Meta, 16 = Ctrl. Ctrl is
+          // carried on the token because Ctrl+click has its own meaning in the composer — see the
+          // mousedown handler, where it expands a collapsed paste rather than placing the caret.
+          const ctrl = (btn & 16) === 16;
           if ((btn & 64) === 64) {
-            out.push({ key: (btn & 1) ? 'wheeldown' : 'wheelup', col: mcol, row: mrow });
+            out.push({ key: (btn & 1) ? 'wheeldown' : 'wheelup', col: mcol, row: mrow, ctrl });
           } else if (press && (btn & 3) === 0 && (btn & 32) === 0) {
-            out.push({ key: 'mousedown', button: 'left', col: mcol, row: mrow });
+            out.push({ key: 'mousedown', button: 'left', col: mcol, row: mrow, ctrl });
           } else if (press && (btn & 32) === 32 && (btn & 3) === 3) {
-            out.push({ key: 'mousehover', col: mcol, row: mrow });
+            out.push({ key: 'mousehover', col: mcol, row: mrow, ctrl });
           } else if (press && (btn & 32) === 32) {
-            out.push({ key: 'mousemove', button: 'left', col: mcol, row: mrow });
+            out.push({ key: 'mousemove', button: 'left', col: mcol, row: mrow, ctrl });
           } else if (!press && (btn & 3) === 0) {
-            out.push({ key: 'mouseup', button: 'left', col: mcol, row: mrow });
+            out.push({ key: 'mouseup', button: 'left', col: mcol, row: mrow, ctrl });
           } else if (press && (btn & 3) === 2) {
-            out.push({ key: 'rightclick', col: mcol, row: mrow });
+            out.push({ key: 'rightclick', col: mcol, row: mrow, ctrl });
           }
           i += mm[0].length;
           continue;
@@ -11919,6 +12571,10 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // Delivered as ONE user message rather than a system message, and marked read only after
     // the text is built: the model has then genuinely seen it, and a format failure cannot
     // silently consume the mail.
+    //
+    // This does NOT become a transcript row. Team traffic belongs in the team PANEL — that is what it
+    // is for, and putting it in the main transcript interleaved another conversation into the one the
+    // user is having with the lead. The panel reads these same files, so nothing is hidden from them.
     const teamName = leadTeam();
     if (teamName) {
       try {
@@ -11937,7 +12593,6 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // text the status bar's `system prompt` segment collapses to zero columns and vanishes
     // mid-turn, then returns at turn end when the untrimmed request is assigned back.
     state.turnSystemPrompt = sysText;
-    Object.assign(session, { model: cfg.model, messages: messages.filter((m) => m.role !== 'system') });
     // The user's message is on disk before the agent has done anything. A crash
     // this early used to lose the entire prompt, because the first save was at
     // turn end.
@@ -12230,57 +12885,51 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           return;
         }
         if (e.type === 'compacting') {
-          // Open a LIVE compaction block (kimi's CompactionComponent): a blinking
-          // bullet while the summary round-trip runs, so the turn does not sit
-          // silent for seconds. The same row is upgraded in place on `compacted`.
-          // If a compaction block from a PREVIOUS (interrupted) turn is still in the
-          // transcript, settle it first so we never leave two blinking rows or let a
-          // stale cancelled block get re-promoted to running.
+          // The compaction shows up on the WORKING ROW, not as a transcript block. It is a state of
+          // the turn — the agent is busy doing this one long thing — and the row above the composer is
+          // where "busy" already lives. A transcript block duplicated that and left a blinking row
+          // scrolling away while the turn carried on underneath it.
+          //
+          // A block from a PREVIOUS (interrupted) turn is settled here for the same reason as before:
+          // two compaction rows in the transcript, one stale, is worse than none.
           const stale = state.compactionMsg;
           if (stale && state.chat.indexOf(stale) >= 0 && stale.phase !== 'running') {
             const idx = state.chat.indexOf(stale); if (idx >= 0) state.chat.splice(idx, 1);
-          } else if (stale && state.chat.indexOf(stale) < 0) {
-            for (let i = state.chat.length - 1; i >= 0; i--) {
-              if (state.chat[i] && state.chat[i].role === 'compaction') state.chat.splice(i, 1);
-            }
           }
-          state.compactionMsg = {
-            role: 'compaction', phase: 'running', startedAt: Date.now(),
-            instruction: e.instruction || '',
-          };
-          viewCur.addChat(state.compactionMsg);
+          state.compacting = true;
+          // Cleared so nothing tries to settle a block that was never added.
+          state.compactionMsg = null;
           viewCur.renderSoon();
           return;
         }
         if (e.type === 'compacted') {
           state.ctxTokens = e.after || state.ctxTokens;
           state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
-          // Settle the live block rather than pushing a second row: the header
-          // becomes "Compaction complete (X → Y tokens)" and the summary stays
-          // hidden behind Ctrl+O.
-          const block = state.compactionMsg;
-          if (block) {
-            block.phase = 'done';
-            block.tokensBefore = e.before;
-            block.tokensAfter = e.after;
-            block.text = e.summary || '';
-            block._cache = null;
-            state.compactionMsg = null;
-          } else {
-            viewCur.addChat({
-              role: 'compaction', phase: 'done',
-              tokensBefore: e.before, tokensAfter: e.after, text: e.summary || '',
-            });
-          }
+          // Compaction is over, so the Working row goes back to a rotating phrase.
+          //
+          // RE-ROLLED, not restored: an automatic compaction happens MID-TURN — the agent hit
+          // the window limit between steps and carries on afterwards — so the phrase the turn
+          // started with has been on screen for a while by now. Picking a new one marks the
+          // resume: the row visibly starts again rather than reading as the same stalled
+          // operation it was showing for the last few seconds.
+          state.compacting = false;
+          state.workMsg = WORKING_MESSAGES[Math.floor(Math.random() * WORKING_MESSAGES.length)];
+          // The transcript keeps a RECORD of what happened, with the token counts — that is
+          // information, not state, and it is what Ctrl+O expands to show the summary.
+          viewCur.addChat({
+            role: 'compaction', phase: 'done',
+            tokensBefore: e.before, tokensAfter: e.after, text: e.summary || '',
+          });
+          state.compactionMsg = null;
           viewCur.renderSoon();
           return;
         }
         if (e.type === 'compaction_cancelled') {
-          // The user interrupted an auto-compaction. Settle the live block so it
-          // stops blinking and reads as cancelled (nothing was trimmed).
-          const block = state.compactionMsg;
-          if (block) { block.phase = 'cancelled'; block._cache = null; state.compactionMsg = null; }
-          else viewCur.addChat({ role: 'compaction', phase: 'cancelled' });
+          // The user interrupted an auto-compaction: nothing was trimmed, so the transcript says so
+          // and the turn resumes with its phrase intact.
+          state.compacting = false;
+          state.compactionMsg = null;
+          viewCur.addChat({ role: 'compaction', phase: 'cancelled' });
           viewCur.renderSoon();
           return;
         }
@@ -12290,6 +12939,9 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           return;
         }
         if (e.type === 'data') {
+          // A token arrived, so the turn is not stalled. Stamped here rather than in the paint path
+          // because the paint path cannot tell "slow" from "quiet" — only the events can.
+          state.lastTokenAt = Date.now();
           // Feed the answer text into the paced buffer instead of painting it. The
           // buffer closes any open reasoning region itself, in arrival order, so the
           // block settles exactly when the provider moved on rather than when the next
@@ -12306,46 +12958,69 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           viewCur.renderSoon(); return;
         }
         if (e.type === 'context') {
-          // Live context gauge: the agent reports the estimated request size once
-          // per step, so the header and /usage track the growing history.
-          state.ctxTokens = e.tokens || 0;
-          state.ctxMax = e.max || state.ctxMax;
+          // Live context gauge: the agent reports the estimated request size once per step, so the
+          // header and /usage track the growing history.
+          //
+          // ONE FORMULA, inlined. Every writer of `ctxTokens` — this event, session restore, /trim,
+          // compaction — computes the same thing. Before that they disagreed: restore counted messages
+          // alone while a live step counted messages PLUS the tool schemas, so the gauge stepped by a
+          // fixed amount whenever the two paths alternated. A visible jump, caused by two formulas
+          // disagreeing rather than by any noise in either.
+          //
+          // Inlined rather than calling startTUI's `setCtxTokens`: `runTurn` is module-level and cannot
+          // see that closure, and `test/tui-scope.test.mjs` fails the build when it tries. The two must
+          // stay identical.
+          //
+
+          // THE ESTIMATE ONLY. No provider number is mixed in anywhere.
+          //
+          // `e.tokens` is what this app's own tokenizer model prices the request at, and it is the ONE
+          // source for the gauge. `usage.input` was wired in twice and removed twice: the two count
+          // different things (a report covers the request that already went out, the estimate covers the
+          // one about to), so whichever ran last won and the number jumped between formulas.
+          state.ctxTokens = Number(e.tokens) || 0;
+          if (Number.isFinite(e.max) && e.max > 0) state.ctxMax = e.max;
           state.ctxPercent = usagePercent(state.ctxTokens, state.ctxMax || 1);
-          // Keep a bounded series of step sizes so /usage can draw the trend.
           if (!Array.isArray(state.tokenHistory)) state.tokenHistory = [];
-          const h = state.tokenHistory;
-          if (h[h.length - 1] !== state.ctxTokens) h.push(state.ctxTokens);
-          if (h.length > 240) h.splice(0, h.length - 240);
-          // Mirror onto the session so saveSession (which persists the whole
-          // session object) captures it: a --resume restores the trend chart.
-          if (session) {
-            if (!Array.isArray(session.tokenHistory)) session.tokenHistory = [];
-            if (session.tokenHistory[session.tokenHistory.length - 1] !== state.ctxTokens) session.tokenHistory.push(state.ctxTokens);
-            if (session.tokenHistory.length > 240) session.tokenHistory.splice(0, session.tokenHistory.length - 240);
+          if (state.tokenHistory[state.tokenHistory.length - 1] !== state.ctxTokens) {
+            state.tokenHistory.push(state.ctxTokens);
+            if (state.tokenHistory.length > 240) state.tokenHistory.splice(0, state.tokenHistory.length - 240);
           }
+          if (session) session.ctxTokens = state.ctxTokens;
           viewCur.renderSoon(); return;
         }
         if (e.type === 'usage') {
-          // Real token accounting from the provider. Folded into a session total
           // that /usage and /cost report, and persisted with the session so a
           // --resume does not lose what the session has already spent.
           //
-          // The COST is recomputed from the total rather than accumulated per
           // event: switching models mid-session would otherwise price every
           // earlier request at the new model's rates.
           if (!state.usage) state.usage = {};
           state.usage = addUsage(state.usage, e.usage);
           if (session) session.usage = state.usage;
           state.lastUsage = e.usage;
-          // The provider's exact count for this request. It REPLACES the running estimate
-          // rather than adding to it, because it already covers everything the estimate was
-          // built from — and it also includes reasoning tokens, which the delta stream does
-          // not carry. `settled` accumulates the finished requests of this turn so a turn
-          // that calls tools sums its steps instead of showing only the last one.
+          // The gauge is NOT updated here. `usage.input` is what the provider charged, and it has caused
+          // two problems worth recording so it is not wired in a third time:
+          //
+          //   - it counts the request that ALREADY WENT OUT, while the `context` event counts the one
+          //     about to. The two alternate, so the number jumps between two definitions of "context".
+          //   - on a cache hit some providers report only the uncached remainder, which made the gauge
+          //     COLLAPSE mid-turn and then jump back.
+          //
+          // The estimate has its own correction for that: `calibrate` in agent.js learns the ratio from
+          // these very reports and applies it where the estimate is produced, so the gauge stays ONE
+          // coherent number while still converging on the truth.
+          //
+          // The turn's OUTPUT tokens are still taken from here — that figure has no other source.
+          // The TURN's output tokens, accumulated exactly from the provider rather than estimated from
+          // streamed characters. Kept separate from the context figure above: one counts what was sent,
+          // the other what came back.
           if (e.usage && Number.isFinite(e.usage.output)) {
             state.turnOutputSettled = (state.turnOutputSettled || 0) + e.usage.output;
-            state.turnOutputEstimate = 0;
-            state.turnOutputTokens = (state.turnOutputSettled || 0) + state.turnOutputEstimate;
+            state.turnOutputTokens = Math.max(
+              state.turnOutputTokens || 0,
+              (state.turnOutputSettled || 0) + (state.turnOutputEstimate || 0),
+            );
           }
           refreshCost(state, cfg);
           viewCur.renderSoon(); return;
@@ -12395,6 +13070,11 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           return;
         }
         if (e.type === 'tool_start') {
+          // A RUNNING TOOL IS WORK, NOT A STALL. An `npm install` that takes a minute produces no tokens
+          // and looks exactly like a hung request — the row must not fade to the warning colour while
+          // something is demonstrably happening.
+          state.hasActiveTools = true;
+          state.lastTokenAt = Date.now();
           // A tool call means the model finished this step's reasoning and is now
           // acting on it, so the turn's text has to be fully on screen first: the tool
           // row is drawn UNDER the reply, and text still trickling in afterwards would
@@ -12512,6 +13192,11 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           // as soon as they arrive instead of waiting for the next event.
           viewCur.renderSoon();
         } else if (e.type === 'tool_result') {
+          // The tool is done, so the stall clock starts again from here. Stamping `lastTokenAt` stops the
+          // row from fading the instant a long tool finishes — the fade should measure quiet AFTER the
+          // tool, not the tool's own duration.
+          state.hasActiveTools = false;
+          state.lastTokenAt = Date.now();
           const entry = [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.id === e.id)
             || [...state.chat].reverse().find((m) => m.role === 'tool' && m.pending && m.toolName === e.name);
           // A failed run must be visible on the TOOL line too: the status bullet
@@ -12589,6 +13274,19 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           // A finished tool result IS a completed step, so the transcript is
           // persisted here too — the other half of the step-boundary save above.
           persistTurnProgress(messages);
+          // The step just changed files, so refresh the status bar's diff.
+          //
+          // This is the ONLY mid-turn refresh, and the reason the 15s timer and the guard in
+          // refreshGitInfo keep out of a running turn is that a poll would return a value that is
+          // stale on arrival — the agent is about to write again. A STEP BOUNDARY is different: it is
+          // a moment when the agent has stopped writing and is about to think, so the count is both
+          // current and stable enough to look at. Waiting for the turn to end, which is what it used
+          // to do, meant a long turn showed an unchanging `+0 -0` while dozens of files were edited.
+          //
+          // `force` because the running-turn guard would otherwise drop it, and no `renderFrame()`
+          // here: the reply below already schedules one, and the async git result asks for a repaint
+          // of its own when it lands.
+          refreshGitInfo(state, { force: true });
         } else if (e.type === 'error') viewCur.addChat({ role: 'tool_result', text: (e.error && e.error.message) || String(e.error) });
         else if (e.type === 'truncation_recovery') {
           // The answer hit the output cap mid-way and the agent asked the model to
@@ -12603,7 +13301,19 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           // the user has no way to know the text is still readable.
           viewCur.addChat({ role: 'system', text: `Trimmed ${e.elided} old tool result(s) to free context (${fmtTokens(e.before)} → ${fmtTokens(e.after)}); the removed text is saved on disk. You can modify or disable this feature by using "/auto-trim"` });
         }
-        else if (e.type === 'todos') { state.todos = e.todos || []; if (session) session.todos = state.todos; try { viewCur.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ } } 
+        else if (e.type === 'todos') {
+          // A FINISHED list is dropped outright, not stored and hidden.
+          //
+          // The tool sends the whole list on every call, so "all done" arrives as an ordinary update.
+          // Keeping it would persist a completed plan into the session, hand it back to the model as
+          // `cfg.todoState` on the next turn, and restore it on resume — three descriptions of work
+          // that is already over. Emptying it here means every later reader sees "no todos", which is
+          // the truth.
+          const incoming = Array.isArray(e.todos) ? e.todos : [];
+          state.todos = todosAllComplete(incoming) ? [] : incoming;
+          if (session) session.todos = state.todos;
+          try { viewCur.pubStatusField('todos', [...state.todos]); } catch { /* best-effort */ }
+        }
         viewCur.render();
       },
     });
@@ -12746,7 +13456,8 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
       }
     }
 
-    const approx = estimateMessagesTokens(messages, cfg);
+    // Same formula as everywhere else: messages PLUS the tool schemas.
+    const approx = estimateMessagesTokens(messages, cfg) + (cfg.toolDefTokens || 0);
     state.ctxTokens = approx;
     state.ctxMax = cfg.maxContextTokens || state.ctxMax;
     state.ctxPercent = usagePercent(approx, state.ctxMax);
@@ -12799,6 +13510,18 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
     // row and behind whatever the next turn draws.
     sessHost.flushStream();
     state.running = false;
+    // Release the per-message markdown render caches. Each assistant message's
+    // `_mdCache` holds a full copy of its text, the block split, AND the rendered
+    // ANSI rows twice over — several times the transcript's size — and the chat
+    // array is never trimmed. The rows are re-derivable (the shared bounded row
+    // cache serves history), so all but the most recent messages drop theirs.
+    {
+      const KEEP_RECENT = 8;
+      const chat = state.chat || [];
+      for (let i = 0; i < chat.length - KEEP_RECENT; i++) {
+        if (chat[i] && chat[i]._mdCache) chat[i]._mdCache = null;
+      }
+    }
     // The agent may have written or edited files this turn: refresh the git badge
     // now so the diff totals reflect it immediately, instead of waiting for the
     // 15s timer.
@@ -12878,6 +13601,38 @@ export async function startTUI(opts) {
   // hands back a new object, and every later save would otherwise keep writing the old one —
   // which is how /move left the session stamped with the directory it was moved away from.
   let session = opts.session;
+
+  /**
+   * THE ONLY WRITER of the context gauge.
+   *
+   * Every source goes through here — a live `context` event, session restore, compaction, and the
+   * initial load. Before this existed the gauge had seven assignment sites and two different formulas:
+   * restore counted the messages alone while a live step counted messages PLUS the tool schemas, so the
+   * number stepped by a fixed amount whenever the two paths alternated — a visible jump caused by two
+   * formulas disagreeing, not by noise.
+   *
+   * Keeping one entry point is also what makes the number honest: there is exactly one definition of
+   * "how much context is in use", so a future caller cannot invent a third.
+   */
+  function setCtxTokens(tokens, max) {
+    const n = Math.max(0, Number(tokens) || 0);
+    state.ctxTokens = n;
+    if (Number.isFinite(max) && max > 0) state.ctxMax = max;
+    state.ctxPercent = usagePercent(n, state.ctxMax || 1);
+    // The trend /usage draws. Bounded, because a long session would otherwise grow it without limit.
+    if (!Array.isArray(state.tokenHistory)) state.tokenHistory = [];
+    const h = state.tokenHistory;
+    if (h[h.length - 1] !== n) h.push(n);
+    if (h.length > 240) h.splice(0, h.length - 240);
+    // Mirrored on the session so saveSession captures it and --resume restores the chart.
+    if (session) {
+      session.ctxTokens = n;
+      if (!Array.isArray(session.tokenHistory)) session.tokenHistory = [];
+      if (session.tokenHistory[session.tokenHistory.length - 1] !== n) session.tokenHistory.push(n);
+      if (session.tokenHistory.length > 240) session.tokenHistory.splice(0, session.tokenHistory.length - 240);
+    }
+  }
+
   
   // FIRST: Ensure model is initialized before restoring session
   if (!cfg.model || !cfg.innerModel) {
@@ -12933,11 +13688,13 @@ export async function startTUI(opts) {
     return null;
   });
   
-  // Calculate initial context usage from loaded session
+  // Calculate initial context usage from loaded session.
+  //
+  // Through `setCtxTokens` — this IS inside startTUI, where it is defined — and with the same formula as
+  // a live step: messages PLUS the tool schemas. Counting the messages alone here made the gauge read a
+  // different number on restore than on the first step.
   if (session && session.messages && session.messages.length) {
-    const approx = estimateMessagesTokens(session.messages, cfg);
-    state.ctxTokens = approx;
-    state.ctxPercent = usagePercent(approx, state.ctxMax);
+    setCtxTokens(estimateMessagesTokens(session.messages, cfg) + (cfg.toolDefTokens || 0), state.ctxMax);
   }
 
   // Warm the models.dev catalogue in the background. It is what supplies PRICES
@@ -13382,6 +14139,18 @@ export async function startTUI(opts) {
     noticeTimer = setTimeout(() => { state.notice = ''; renderFrame(); }, 4000);
   }
 
+  /**
+   * Take the notice row down early.
+   *
+   * `notice` leaves it up for four seconds, which is right for a message about something that HAPPENED.
+   * A hint tied to where the POINTER is has to go when the pointer moves away, or it stays up describing
+   * a chip the pointer has left — and its timer would then blank a notice the user raised meanwhile.
+   */
+  function clearNotice() {
+    if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+    if (state.notice) state.notice = '';
+  }
+
   function dims() {
     try {
       const [cols, rows] = stdout.getWindowSize();
@@ -13758,6 +14527,20 @@ export async function startTUI(opts) {
    * Not awaited by either caller: a teammate works in the background and reports by message,
    * which is the whole reason a team is more than a batch of subagents.
    */
+  /**
+   * Record a teammate's live action on the panel, if one is open.
+   *
+   * The panel is opened on demand, so most of the time there is nothing to write to and the stream is
+   * dropped — that is the intended behaviour, not a loss: the work is in the member's own record and
+   * the conversation is drawn on demand when the panel opens.
+   */
+  function teamPanelNoteActivity(stream) {
+    if (!state.teamPanel) return;
+    try {
+      noteActivity(state.teamPanel, stream);
+    } catch { /* a display hook must never fail a member's turn */ }
+  }
+
   async function spawnTeammates(teamName, members) {
     const { spawnMany } = await import('./team/spawn.js');
     const started = spawnMany(teamName, members, {
@@ -13768,6 +14551,61 @@ export async function startTUI(opts) {
         // panel, and so a failure is not silent.
         if (ev.type === 'start') notice(`Teammate ${ev.name} started (${ev.taskId}).`);
         if (ev.type === 'error') notice(`Teammate ${ev.name} failed: ${ev.error}`, 'error');
+        // LIVE OUTPUT. Without this a teammate was a black box: the roster said idle→working→idle and
+        // the person watching saw none of the work in between. The tool calls are the part that matters
+        // most — a member that has been running the same command for a minute is different from one that
+        // is idle, and the roster alone cannot show that.
+        if (ev.type === 'stream') {
+          teamPanelNoteActivity(ev.stream);
+          renderSoon();
+        }
+        if (ev.type === 'tool') {
+          teamPanelNoteActivity({ kind: 'tool', name: ev.name, tool: ev.tool });
+          renderSoon();
+        }
+        renderSoon();
+      },
+      // A member's message to the lead is the CONVERSATION, not a status line — so it goes straight
+      // into the transcript, in full, as it is sent.
+      //
+      // It used to go only to a file, and `formatLeadInbox` read that file at the START of a turn. The
+      // effect was that an answer arrived only if the person happened to type something else first:
+      // they would send an instruction, watch an empty screen, and conclude the team was dead while the
+      // reply sat on disk. Nothing about that is fixable by hiding it better — the message IS what the
+      // user asked to see.
+      onLeadMail: (mail) => {
+        // A PERMISSION REQUEST IS NOT CHAT. It becomes a prompt the person must answer; showing it as
+        // transcript text would leave it looking like a teammate's remark, with a member blocked behind
+        // it until its ten-minute timeout.
+        const ask = asPermissionRequest(mail.text);
+        if (ask) {
+          if (state.teamPanel) {
+            // The panel owns it while open: `y`/`n` there answer it.
+            state.teamPanel.pendingPermission = ask;
+          } else {
+            // With no panel there is nowhere to press `y`, so it is said out loud. Silently accepting
+            // would run the tool the person was never shown.
+            notice(`${ask.agentId} needs permission for ${ask.toolName}: ${ask.description}`, 'error');
+            try {
+              answerPermission({
+                teamName, memberName: ask.agentId, requestId: ask.requestId,
+                approved: false, error: 'no team panel open to approve it',
+              });
+            } catch { /* best-effort */ }
+          }
+          renderSoon();
+          return;
+        }
+        // Structured messages carry JSON, which is not worth showing a person: the tool that sent it has
+        // already reported its own outcome.
+        if (String(mail.text || '').trim().startsWith('{')) return;
+        addChat({
+          role: 'system',
+          text: `[${mail.from} → team-lead] ${mail.text}`,
+        });
+        // Also announced, because the transcript may be scrolled away and a teammate answering is the
+        // one event worth interrupting for.
+        notice(`${mail.from}: ${String(mail.text).split('\n')[0].slice(0, 100)}`);
         renderSoon();
       },
     });
@@ -14002,6 +14840,105 @@ export async function startTUI(opts) {
     }
     if (res.action === 'markRead') {
       try { markAllRead(p.teamName, res.name); } catch { /* nothing to mark */ }
+      renderFrame();
+      return;
+    }
+    if (res.action === 'permission') {
+      // The answer goes to the member that asked, and the request is cleared only after the write
+      // succeeds: a failure here would otherwise drop the prompt and leave the member blocking until its
+      // ten-minute timeout, with nothing on screen to explain why.
+      const req = p.pendingPermission;
+      if (req) {
+        try {
+          answerPermission({
+            teamName: p.teamName,
+            memberName: req.agentId,
+            requestId: req.requestId,
+            approved: res.approved,
+            error: res.approved ? undefined : 'denied by the user',
+          });
+          p.pendingPermission = null;
+          p.flash = res.approved ? `allowed for ${req.agentId}` : `denied for ${req.agentId}`;
+          setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 2500);
+        } catch (e) {
+          p.flash = `could not answer: ${(e && e.message) || e}`;
+        }
+      }
+      renderFrame();
+      return;
+    }
+
+    // `k` — kill the selected member. The abort controller fires and the run unwinds.
+    //
+    // Distinct from closing the panel: that left the member working in the background, which is the one
+    // thing a person watching a runaway agent most needs to stop.
+    if (res.action === 'kill') {
+      try {
+        const stopped = stopTeammate(p.teamName, res.name);
+        p.flash = stopped ? `killed ${res.name}` : `${res.name} was not running`;
+      } catch (e) {
+        p.flash = `could not kill: ${(e && e.message) || e}`;
+      }
+      setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 2500);
+      renderFrame();
+      return;
+    }
+
+    // `s` — ask it to stop GRACEFULLY. It may refuse if it is mid-task, which is the reason this exists
+    // beside `k`: killing a member halfway through a write leaves the file half-written.
+    if (res.action === 'shutdown') {
+      try {
+        mailMod.writeToMailbox(p.teamName, res.name, {
+          from: TEAM_LEAD_NAME,
+          text: JSON.stringify(protocolMod.shutdownRequest({
+            requestId: protocolMod.newRequestId('sd'),
+            from: TEAM_LEAD_NAME,
+            reason: 'shutdown requested from the team panel',
+          })),
+        });
+        p.flash = `asked ${res.name} to stop`;
+      } catch (e) {
+        p.flash = `could not ask: ${(e && e.message) || e}`;
+      }
+      setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 2500);
+      renderFrame();
+      return;
+    }
+
+    // `p` — prune every idle member. With five idle teammates the roster is mostly noise.
+    if (res.action === 'prune') {
+      const names = Array.isArray(res.names) ? res.names : [];
+      if (!names.length) {
+        p.flash = 'no idle members to prune';
+      } else {
+        try {
+          let killed = 0;
+          for (const n of names) if (stopTeammate(p.teamName, n)) killed++;
+          p.flash = `pruned ${killed} idle member(s)`;
+        } catch (e) {
+          p.flash = `could not prune: ${(e && e.message) || e}`;
+        }
+      }
+      setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 2500);
+      renderFrame();
+      return;
+    }
+
+    // `m` — cycle the selected member's permission mode: ask → auto → yolo → ask.
+    //
+    // The mode is recorded on the roster so a respawn honours it; a running member keeps its current
+    // setting until it restarts, since the hook is captured when the agent is built.
+    if (res.action === 'cycleMode') {
+      try {
+        const order = ['ask', 'auto', 'yolo'];
+        const cur = (teamMod.findMember(p.teamName, res.name) || {}).permissionMode || 'ask';
+        const next = order[(order.indexOf(cur) + 1) % order.length];
+        teamMod.setMemberMode(p.teamName, res.name, next);
+        p.flash = `${res.name}: ${next}${next === 'ask' ? '' : ' (takes effect on restart)'}`;
+      } catch (e) {
+        p.flash = `could not set mode: ${(e && e.message) || e}`;
+      }
+      setTimeout(() => { if (state.teamPanel === p) { p.flash = ''; renderFrame(); } }, 3000);
       renderFrame();
       return;
     }
@@ -14258,14 +15195,14 @@ export async function startTUI(opts) {
     return true;
   }
 
-  // Kill / abort one task by id. An agent task aborts through its controller; a
-  // process is killed as a tree (Windows) or by signal.
+  // Kill / abort one task by id. An agent OR teammate task aborts through its
+  // controller (`_abort`); a process is killed as a tree (Windows) or by signal.
   function stopTask(ctxLike, id) {
     if (!id) return;
     const tk = getTask(ctxLike, id) || (state.tasks || {})[id];
     if (!tk || tk.status !== 'running') return;
     try {
-      if (tk.kind === 'agent' && typeof tk._abort === 'function') {
+      if (typeof tk._abort === 'function') {
         tk._abort();
       } else if (tk.pid) {
         if (process.platform === 'win32') {
@@ -14331,6 +15268,10 @@ export async function startTUI(opts) {
   // is the flash this ordering exists to prevent.
   stdout.write(alternateScreen(true));
   stdout.write(clearScreen());
+  // From here the TUI owns stdout: every frame is painted as a whole screen, so a stray console.log from
+  // anywhere — a plugin's load-time output, a stray debug line — writes over the frame. Plugins report
+  // through the notice queue instead, which the TUI drains into its own transcript.
+  try { setPluginLoggerTui(true); } catch { /* the logger is best-effort */ }
   // Adopt the session's title immediately. A RESUMED session already has one, and without
   // this the terminal kept whatever the shell had put there — the title only appeared once
   // something CHANGED it (`/title`, or a fresh auto-naming), so reopening a named session
@@ -14343,13 +15284,36 @@ export async function startTUI(opts) {
   // `caps.kitty === null` (nothing answered) keeps the old default of ON, so a
   // terminal that simply says nothing is treated exactly as before.
   if (process.env.HNCODE_NO_KITTY_KEYS !== '1' && kittyKeysUsable()) stdout.write('\x1b[>1u');
-  // Mouse modes, split so that an UNSUPPORTED one cannot take the others down:
-  // a terminal that rejects `?1003h` (any-motion — the least widely supported)
-  // would, in a single write, often drop click/drag too. Bracket-paste + SGR +
-  // click/drag/sgr go first (universally supported); any-motion (hover) last,
-  // and skippable via HNCODE_NO_MOUSE_HOVER=1 when a terminal chokes on it.
-  stdout.write('\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h');
-  if (process.env.HNCODE_NO_MOUSE_HOVER !== '1') stdout.write('\x1b[?1003h');
+  // Mouse modes, enabled per mode and only when the terminal said it KNOWS that mode.
+  //
+  // THE PROBE IS THE POINT. These sequences were written unconditionally, so a terminal that does not
+  // implement one — or accepts it and never sends an event — left the application waiting for reports
+  // that never come. The symptom is a UI whose keyboard works and whose mouse does nothing: clicks,
+  // drags and the wheel all inert, with no error anywhere to explain it.
+  //
+  // `caps.mouseClick` and friends come from the DECRQM replies (`ESC[?1000$p` and so on). `undefined`
+  // means the terminal did not answer, which is treated as YES: silence is not a refusal, and a
+  // terminal that ignores DECRQM altogether has to keep working exactly as before. Only an explicit
+  // "not recognised" (status 0) turns a mode off.
+  //
+  //   HNCODE_NO_MOUSE_HOVER=1   drop any-motion regardless of the probe
+  //   HNCODE_NO_MOUSE=1         drop mouse reporting entirely, so the TERMINAL keeps the mouse: text
+  //                             selection, the right-click menu and file drag-and-drop work again and
+  //                             hncode's own click targets do not
+  //
+  // Bracket paste is NOT mouse reporting and stays on in every case — it is how a multi-line paste
+  // arrives as one token.
+  const mouseOff = process.env.HNCODE_NO_MOUSE === '1';
+  const wants = (name, cap) => !mouseOff && cap !== false
+    && !(name === 'hover' && process.env.HNCODE_NO_MOUSE_HOVER === '1');
+  stdout.write('\x1b[?2004h');
+  if (wants('click', caps.mouseClick) || wants('drag', caps.mouseDrag)) {
+    // SGR (`?1006`) is the coordinate encoding for everything above; it goes with them.
+    stdout.write('\x1b[?1006h');
+    if (wants('click', caps.mouseClick)) stdout.write('\x1b[?1000h');
+    if (wants('drag', caps.mouseDrag)) stdout.write('\x1b[?1002h');
+  }
+  if (wants('hover', caps.mouseHover)) stdout.write('\x1b[?1003h');
   // Start the PowerShell clipboard helper now: its cold start is seconds long,
   // and doing it lazily on the first Ctrl+Shift+V made the shortcut look dead.
   // Deferred by one turn of the event loop, though: `spawn` costs ~950ms here (the
@@ -14371,21 +15335,46 @@ export async function startTUI(opts) {
   // to the model on its next turn.
   if (typeof opts.mcpConnect === 'function') {
     Promise.resolve()
-      .then(() => opts.mcpConnect())
+      .then(() => opts.mcpConnect({
+        // Project-scope servers (the workspace's OWN .hncode/mcp.json) spawn
+        // whatever command that file names, so they ask here before starting —
+        // same promise-handshake as the tool-approval prompt. Esc refuses.
+        approveProjectServer: (name, def) => new Promise((resolve) => {
+          const target = def && def.url
+            ? def.url
+            : `${(def && def.command) || ''} ${((def && def.args) || []).join(' ')}`.trim();
+          state.approvalPending = {
+            toolName: 'MCP server',
+            args: {},
+            desc: `Start project MCP server "${name}" (${target})?`,
+            detail: [
+              'This server is defined by THIS WORKSPACE (.hncode/mcp.json), not by you.',
+              'Approving runs its command on this machine. Esc refuses for this launch.',
+            ],
+            resolve,
+          };
+          viewCur.render();
+        }),
+      }))
       .then((res) => {
         const servers = (res && res.servers) || [];
         if (!servers.length) return;
         // The notice line is a SINGLE status-line row, so report all servers in
         // one message — looping notice() per server only left the last one
         // visible. Failures are listed too, and the whole notice turns red when
-        // any server failed.
+        // any server failed. Project servers the user refused are REPORTED, not
+        // failures — they are a decision, not an error.
         const okServers = servers.filter((s) => s.ok);
-        const bad = servers.filter((s) => !s.ok);
+        const skipped = servers.filter((s) => s.skipped);
+        const bad = servers.filter((s) => !s.ok && !s.skipped);
         const parts = [];
         if (okServers.length) {
           const tools = okServers.reduce((n, s) => n + (s.toolCount || 0), 0);
           const names = okServers.map((s) => s.name).join(', ');
           parts.push(`MCP connected: ${names} (${tools} tool${tools === 1 ? '' : 's'})`);
+        }
+        if (skipped.length) {
+          parts.push(`MCP not started (needs approval): ${skipped.map((s) => s.name).join(', ')}`);
         }
         if (bad.length) {
           parts.push(`MCP failed: ${bad.map((s) => s.name).join(', ')}`);
@@ -14445,7 +15434,10 @@ export async function startTUI(opts) {
     // red phase. The SPINNER frame is derived with `% SPINNER.length` at the
     // call site instead.
     state.spin = (state.spin || 0) + 1;
-    renderFrame();
+    // Coalesced like every other repaint trigger: a direct paintNow here ran a
+    // full compose+diff on top of the 16ms stream ticks and the 33ms anim timer,
+    // up to ~90 recomposes a second during a turn.
+    renderSoon();
   }, 80);
 
   // Paced reveal tick. The 80ms spinner tick above is too coarse for this: at 12.5
@@ -14464,11 +15456,27 @@ export async function startTUI(opts) {
   }, STREAM_TICK_MS);
   if (streamTimer.unref) streamTimer.unref();
 
+  // Animation tick: every animated row redraws at FRAME_MS.
+  //
+  // The 80ms spinner tick above is far too coarse for a light that must APPEAR to travel — at that rate
+  // it lands a character apart and reads as cells being switched on one at a time, which is what the
+  // crossing looked like before this existed. The rate lives in one named constant because the crossing
+  // time is stated in frames: `CROSS_MS` at 30fps is six of them.
+  //
+  // It runs only while a turn is running, which is the only time the Working row or a pending tool row
+  // can be on screen, so an idle session and a finished turn pay nothing. The light takes its phase from
+  // the wall clock, so this timer does not advance any counter — it only asks for redraws.
+  const animTimer = setInterval(() => {
+    if (!state.running) return;
+    renderSoon();
+  }, FRAME_MS);
+  if (animTimer.unref) animTimer.unref();
+
   const TOK_WINDOW_MS = 1000;
   const tokTimer = setInterval(() => {
     const times = state._tokTimes;
     if (!times || !times.length) {
-      if (state.tokRate !== 0) { state.tokRate = 0; renderFrame(); }
+      if (state.tokRate !== 0) { state.tokRate = 0; renderSoon(); }
       return;
     }
     const cutoff = Date.now() - TOK_WINDOW_MS;
@@ -14476,7 +15484,7 @@ export async function startTUI(opts) {
     while (drop < times.length && times[drop] < cutoff) drop++;
     if (drop) times.splice(0, drop);
     const rate = times.length;
-    if (rate !== state.tokRate) { state.tokRate = rate; renderFrame(); }
+    if (rate !== state.tokRate) { state.tokRate = rate; renderSoon(); }
   }, 50);
 
   // ---- auto-update (background + SILENT, never blocks the TUI) --------------
@@ -14767,11 +15775,24 @@ export async function startTUI(opts) {
         const t = state._lastMouse;
         const clickCol = t ? (t.col || 1) - 1 : 1;
         // The column is measured from the row's PREFIX, because `composerTextIndexAt`
-        // subtracts `preWidth` itself. The row is ` 空│❯ text`: 0-based 0 is CPAD, 1 the wall,
+        // subtracts `preWidth` itself. The row is ` |❯ text`: 0-based 0 is CPAD, 1 the wall,
         // 2-3 the `❯ ` prefix, and the text starts at 5. For text[i] the terminal column is
         // 6 + i (1-based), so `clickCol` is 5 + i and this must pass 2 + i — an offset of 3.
         const colInContent = Math.max(0, clickCol - 3);
         const idx = composerTextIndexAt(layout, hb.rowIdx, colInContent);
+
+        // CTRL+CLICK on a collapsed paste expands it in place.
+        //
+        // A marker is a chip: the whole `[paste #1 +12 lines]` stands in for content the user cannot see,
+        // and until now the only way to read it back was to delete the chip. Ctrl+click is the gesture
+        // that says "show me what this is" without changing what the message will contain — `expandPastes`
+        // runs at submit either way, so the text that is SENT is identical.
+        if (t && t.ctrl) {
+          // `idx` is already the input index, so the helper does not convert again — see its comment.
+          const expanded = expandPasteMarkerAt(state, idx);
+          if (expanded) { renderFrame(); return true; }
+        }
+
         state.caret = idx;
         // Store mousedown position for potential drag selection in the composer.
         state._composerMouseDown = { row: hb.rowIdx, col: idx, caret: idx };
@@ -14858,8 +15879,8 @@ export async function startTUI(opts) {
         f.type = hb.option;
         // A click on the Type is the LAST decision in this form, so it submits — the
         // same thing Enter does on the Type row. Without this the click only selected
-        // the option and the user still had to reach for the keyboard, which is what
-        // "点对应的 type 就算完成" was about.
+        // the option and the user still had to reach for the keyboard — clicking a choice
+        // should complete it, the way pressing Enter on it would.
         if (f.typeClickSubmits) {
           const values = {};
           for (const fl of f.fields || []) values[fl.key] = String(fl.value || '').trim();
@@ -15039,8 +16060,33 @@ export async function startTUI(opts) {
       // The queue resize handle also gets a hover flag.
       const onQueueRule = !!(hb && hb.kind === 'queueResize');
       if (onQueueRule !== state.queueResizeHover) { state.queueResizeHover = onQueueRule; renderFrame(); }
+
+      // A COLLAPSED PASTE UNDER THE POINTER is highlighted and explained. This is the only hover cue in
+      // the composer: the chip is otherwise drawn exactly like the text around it, so nothing says it can
+      // be clicked at all, let alone with Ctrl.
+      //
+      // The index comes from the same conversion the Ctrl+click handler uses, so the chip that lights up
+      // is always the chip that would expand.
+      let pasteHover = null;
+      if (hb && hb.kind === 'composerRow') {
+        const { cols } = dims();
+        const insideW = Math.max(0, cols - 2);
+        const layout = composerLayout(state, insideW - 3);
+        const clickCol = Math.max(0, (t.col || 1) - 1 - 3);
+        pasteHover = pasteMarkerIdAt(state.input || '', composerTextIndexAt(layout, hb.rowIdx, clickCol));
+      }
+      if (pasteHover !== state.pasteHover) {
+        state.pasteHover = pasteHover;
+        // The notice line is the second half of the cue: the highlight says WHICH, the hint says WHAT a
+        // click would do. It is cleared when the pointer leaves, so it never outlives the pointer being
+        // on the chip.
+        if (pasteHover != null) notice('Ctrl+Click to expand it', 'info');
+        else clearNotice();
+        renderFrame();
+      }
+
       // The composer rows stay click targets (mousedown places the caret), but
-      // they are NOT highlighted on hover — tinting the prompt you are typing
+      // they are NOT otherwise highlighted on hover — tinting the prompt you are typing
       // is noise, not feedback.
       const next = (hb && hb.kind !== 'composerRow') ? { row: hb.row, col0: hb.col0, col1: hb.col1 } : null;
       const prev = state.hoverHit;
@@ -15189,16 +16235,34 @@ export async function startTUI(opts) {
       else if (r === end.row) { c0 = 0; c1 = end.col + 1; }
       else { c0 = 0; c1 = Infinity; }
 
-      const sliced = slicePlainByCol(plain, c0, c1);
+      // COLUMN 0 IS NEVER PART OF THE SELECTION, exactly as in the highlight — see `highlightAnsiRange`.
+      //
+      // A row is drawn with one column of left margin, so a drag that starts at the left edge paints it
+      // too, and copying a reply then puts a leading space on the clipboard on EVERY line. The highlight
+      // has skipped it all along; the copy was the half that did not, which made the two disagree about
+      // what "selected" meant — you could see it and then paste something wider.
+      const sliced = slicePlainByCol(plain, Math.max(c0, 1), c1);
       const clean = sliced
         .replace(/<\/?thinking\b[^>]*>/gi, '')
         .replace(/<\/?think\b[^>]*>/gi, '');
-      out.push(clean.replace(/\s+$/, ''));
+      // NO BLANKET TRAILING-WHITESPACE STRIP.
+      //
+      // It used to end with `.replace(/\s+$/, '')`, which made the copy disagree with the highlight: the
+      // selection painted the space the pointer ended on, and the clipboard came back one character
+      // shorter. Copying `foo ` gave `foo`, and a selection of nothing but spaces gave an empty line.
+      //
+      // What is highlighted is what gets copied — but only up to the selection's own end. A row is
+      // right-padded to the terminal width, so slicing to the end of a row would otherwise carry that
+      // padding onto the clipboard. `c1` is the bound, so the padding is already outside it.
+      out.push(clean);
     }
     return out.join('\n');
   }
   function slicePlainByCol(text, c0, c1) {
-    if (c0 === 0 && c1 === Infinity) return text;
+    // A full-row slice keeps its content but loses the RIGHT PADDING. The row is padded to the terminal
+    // width, and `c1 === Infinity` means "to the end of the row" — copying that padding would put
+    // invisible spaces on the clipboard that were never selected.
+    if (c0 === 0 && c1 === Infinity) return text.replace(/\s+$/, '');
     let out = '';
     let col = 0;
     const s = String(text || '');
@@ -15269,10 +16333,10 @@ export async function startTUI(opts) {
   // Async so the notice can be painted BEFORE the clipboard read: a cold
   // PowerShell took ~3s, which read as "the shortcut does nothing".
   async function pasteFromClipboard(fastPathOnly = false) {
-    notice('Pasting…', 'info');
-    // One probe handles every clipboard shape: copied FILES (→ paths), plain
-    // TEXT (→ text), or an IMAGE (→ a temp .png path). The async version runs it
-    // on the PRE-WARMED helper (~10ms) instead of a cold spawn (~2.9s).
+    // NO "Pasting…" FLASH. It was there to reassure during a cold PowerShell read (~3s), but the read is
+    // now 7-12ms warm, so the notice did nothing except paint a frame, get replaced a moment later, and
+    // make the paste feel like it was waiting for something. The text appears, or an error is reported —
+    // both are visible without an intermediate state.
     const { text, via } = await readClipboardContentAsync();
     if (text) {
       // An image collapses to a `[paste #N image]` chip, the same way a multi-line
@@ -15535,6 +16599,29 @@ export async function startTUI(opts) {
       }
       return;                        // swallow other keys while reviewing
     }
+
+    // ESC INTERRUPTS A RUNNING TURN.
+    //
+    // It did nothing during tool execution — only Ctrl+C interrupted, and Ctrl+C also arms the exit
+    // prompt, so the one key a person reaches for when a command is taking too long was the one that
+    // could quit the app instead. `interrupt()` aborts the tool (via `toolAbort`) and the model request,
+    // which is exactly what the user means by pressing it.
+    //
+    // Placed AFTER the overlay branches above so Esc still closes a picker, a form, or an approval
+    // prompt first — those own the keyboard while open, and interrupting the turn behind them would be
+    // the wrong answer to "close this dialog".
+    // Overlays own the keyboard while open, so Esc keeps its other job of closing them. The check is
+    // inline rather than a named local because `test/esc-interrupt.test.mjs` slices this branch to verify
+    // the exclusion list, and a local defined above the slice was invisible to it.
+    if (t.key === 'escape' && state.running && state.agent
+      && !state.menuOpen && !state.picker && !state.form && !state.panel
+      && !state.question && !state.editor && !state.approvalPending) {
+      try { state.agent.interrupt(); } catch { /* an already-finished turn */ }
+      notice('Interrupted', 'info');
+      renderFrame();
+      return;
+    }
+
     if (t.key === 'c-c') {
       // An open overlay consumes Ctrl+C: close it instead of interrupting the
       // turn that is still running behind it. The modal editor belongs here too:
@@ -15802,6 +16889,33 @@ export async function startTUI(opts) {
         renderFrame();
         return;
       }
+    }
+    // Ctrl+A — SELECT ALL of the composer. An ordinary editor key, and its absence was conspicuous:
+
+    // Ctrl+A — SELECT ALL of the composer. An ordinary editor key, and its absence was conspicuous:
+    // Ctrl+X, Ctrl+C and Ctrl+V all worked on a selection there was no keyboard way to make.
+    //
+    // Handled BEFORE the approval dialog's own `c-a` above, which is why that one tests
+    // `state.approvalPending` first — while a dialog is open it owns the keyboard, and there `c-a` means
+    // "approve for the rest of the session" rather than "select all".
+    //
+    // The selection uses the same `{anchor, head}` the mouse drag produces, so copy, cut and the
+    // right-click menu treat it identically.
+    if (t.key === 'c-a' && !state.approvalPending && !state.editor) {
+      const cur = state.input || '';
+      if (!cur) {
+        // Nothing to select: say so rather than silently doing nothing, which reads as a dead key.
+        notice('Nothing to select', 'error');
+        renderFrame();
+        return;
+      }
+      state.composerSel = { anchor: 0, head: cur.length };
+      // The caret goes to the END, which is where an editor leaves it: the next typed character then
+      // REPLACES the selection rather than being inserted at the start of it.
+      state.caret = cur.length;
+      refreshMenu(state);
+      renderFrame();
+      return;
     }
 
     // Ctrl+X / Ctrl+Shift+X — CUT. Removes the composer's selected text (or the
@@ -16854,6 +17968,48 @@ export async function startTUI(opts) {
     state.mentionOffset = 0;
     state.historyIdx = -1;
     if (!text) { renderFrame(); return; }
+    // `@name message` sends STRAIGHT to a teammate, without the model.
+    //
+    // This is Claude Code's `parseDirectMemberMessage`, and the reason it exists: routing a one-line
+    // instruction through the conversation costs a full model turn for the lead, and the lead may reword
+    // it. When you already know who should do it and what to say, the mailbox is the shorter path — and
+    // it is the only way to steer a member while the lead is mid-turn.
+    if (text.startsWith('@')) {
+      const m = /^@([\w-]+)\s+([\s\S]+)$/.exec(text);
+      if (!m) {
+        notice('Use `@name message` to send straight to a member.', 'error');
+        renderFrame();
+        return;
+      }
+      const [, who, body] = m;
+      const teamName = leadTeam();
+      if (!teamName) {
+        notice('No team. Create one: /team create <name>', 'error');
+        renderFrame();
+        return;
+      }
+      const roster = teamMod.readRoster(teamName);
+      const names = String(roster || '').split('\n').map((l) => l.trim().split(/\s+/)[0]).filter(Boolean);
+      // The user is not on the roster, so `@team-lead` would look unknown — it is accepted because a
+      // member's own sends use that alias and it is the box the person reads.
+      if (!names.includes(who) && who !== TEAM_LEAD_NAME) {
+        notice(`No member "${who}". On this team: ${names.join(', ') || '(nobody)'}`, 'error');
+        renderFrame();
+        return;
+      }
+      try {
+        mailMod.writeToMailbox(teamName, who, { from: TEAM_LEAD_NAME, text: body.trim() });
+        // Shown in the transcript so the instruction is part of the record: a message that only exists in
+        // someone's inbox is one the person cannot see themselves having sent.
+        addChat({ role: 'system', text: `[you → ${who}] ${body.trim()}` });
+        notice(`sent to ${who}`);
+      } catch (e) {
+        notice(`could not send: ${(e && e.message) || e}`, 'error');
+      }
+      renderFrame();
+      return;
+    }
+
     if (!state.running) {
       state.turnStart = Date.now();
       // The turn's own output tokens, summed across its requests. Reset HERE so the
@@ -16868,7 +18024,7 @@ export async function startTUI(opts) {
       // spinner happens to be in when the start animation ends.
       state.pulseStart = null;
     }
-    
+
     if (state.history[state.history.length - 1] !== text) {
       state.history.push(text);
       saveHistory(state.history);   // persist so ↑ survives a restart
@@ -17808,8 +18964,10 @@ export async function startTUI(opts) {
   }
 
   // The one-shot namer. Sentence-case, 3-7 words, with worked examples — a bare
-  // "at most 50 characters" let the model echo "你好" back as a title for a
-  // greeting, which is not a name anyone can find in a list.
+  // "at most 50 characters" let the model echo a bare greeting back as a title,
+  // which is not a name anyone can find in a list. The Chinese example is
+  // deliberate: in a Chinese conversation the failing case IS that greeting, and
+  // an English-only example did not stop it.
   const TITLE_PROMPT = 'You name coding-agent sessions. Reply with ONLY the title: one line, 3 to 7 words, sentence case (capitalize only the first word and proper nouns), at most 50 characters. No quotes, no trailing punctuation, no "Title:" label, no explanation.\n'
     + '\n'
     + 'Capture the main topic or goal so the user recognises the session in a list.\n'
@@ -17867,6 +19025,16 @@ export async function startTUI(opts) {
     if (spinTimer) clearInterval(spinTimer);
     if (streamTimer) clearInterval(streamTimer);
     if (tokTimer) clearInterval(tokTimer);
+    // The rest of the intervals created by startTUI. Leaving any of them armed
+    // kept the process alive — and worse, `animTimer` kept PAINTING after the
+    // alternate screen was released (diff frames onto the primary screen), and
+    // `gitTimer`/`autoCheckTimer` could spawn a child during shutdown.
+    if (gitTimer) clearInterval(gitTimer);
+    if (scheduleTimer) clearInterval(scheduleTimer);
+    if (animTimer) clearInterval(animTimer);
+    if (autoCheckTimer) clearInterval(autoCheckTimer);
+    if (noticeTimer) clearTimeout(noticeTimer);
+    if (escTimer) clearTimeout(escTimer);
     if (confirmTimer) clearTimeout(confirmTimer);
     // The /tasks panel owns a flash timer; leaving it armed keeps the process
     // alive until it fires after exit.
@@ -17882,6 +19050,9 @@ export async function startTUI(opts) {
     stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l');
     stdout.write(alternateScreen(false));
     stdout.write(showCursor());
+    // The TUI no longer owns stdout, so plugin logging goes back to the console. Without this a later
+    // load — a second /reload, or a command run after the screen is released — would be swallowed.
+    try { setPluginLoggerTui(false); } catch { /* the logger is best-effort */ }
     const id = session && session.id;
     const work = session && session.workspace;
     if (id) {
@@ -17913,6 +19084,10 @@ function quit() {
   bye();
 }
   process.on('SIGWINCH', () => renderFrame());
+  // Windows never delivers SIGWINCH — Node reports tty resizes there (and on
+  // every platform) as the stream's own 'resize' event. Without this a terminal
+  // resize left the screen stale until an unrelated repaint happened to fire.
+  if (process.stdout.isTTY) process.stdout.on('resize', () => renderFrame());
   process.on('SIGINT', () => quit());
 
   /**
@@ -17983,6 +19158,18 @@ function quit() {
     // delete them here so they cannot pile up in the temp dir. Synchronous, and it
     // runs on the graceful AND the crash path because 'exit' always fires.
     try { cleanupPastedImages(); } catch { /* never block the exit */ }
+    // The clipboard helper is a PowerShell child. Without this it would outlive the TUI, and worse, a
+    // helper that exits during shutdown would be respawned by the keep-alive in dropHelper.
+    try { stopClipboardHelper(); } catch { /* never block the exit */ }
+    // Language servers and MCP stdio children outlive the process unless they are
+    // killed here — the exit handler cannot await the polite shutdown handshake,
+    // so they are killed outright. Each can hold hundreds of MB.
+    try { killLspClientsSync(); } catch { /* never block the exit */ }
+    try {
+      for (const c of getLiveConnections()) {
+        if (c && c.transport && c.transport.child) { try { c.transport.child.kill(); } catch { /* gone */ } }
+      }
+    } catch { /* never block the exit */ }
     noteExit(`exit code=${code}`);
     if (stopped) return;
     try { stdout.write('\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l' + alternateScreen(false) + showCursor()); } catch {}

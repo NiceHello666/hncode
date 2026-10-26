@@ -17,6 +17,8 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// The alias the USER's own sends carry — the lead is the person typing, not a rostered member.
+const { TEAM_LEAD_NAME } = await import('../src/team/constants.js');
 
 /** Run `fn` with HNCODE_HOME pointed at a throwaway directory. */
 async function withHome(fn) {
@@ -82,10 +84,12 @@ test('create makes a team and records it as the lead\'s', async () => {
     assert.match(h.said.join(' '), /Team "demo" created/);
     assert.equal(coreMod.leadTeam(), 'demo', 'the lead knows which team it is on');
 
-    // The first member added becomes the lead, which is when the roster first has one.
+    // A member added with `/team add` is a MEMBER, never the lead. `leadOf` keeps answering with the
+    // user's own alias, because the person typing is the one in charge — that is what makes "report to
+    // the lead" resolve to a real recipient instead of to the member itself.
     await h.run('add alice model-a');
     assert.match(teamMod.readRoster('demo'), /alice/);
-    assert.equal(teamMod.leadOf('demo'), 'alice');
+    assert.equal(teamMod.leadOf('demo'), TEAM_LEAD_NAME, 'the lead is the user, not the member');
   });
 });
 
@@ -158,7 +162,10 @@ test('list prints the roster', async () => {
     await h.run('list');
     const text = h.said.join('\n');
     assert.match(text, /alice/, 'the member who joined first');
-    assert.match(text, /lead/, 'is shown as the lead');
+    // A member is NEVER the lead. `/team add` recruits someone to do the work; the person typing is
+    // already in charge. Marking the first recruit as lead made it believe nobody had assigned it
+    // anything and that no message could have arrived for it.
+    assert.doesNotMatch(text, /alice\s+lead/, 'a member is not shown as the lead');
   });
 });
 

@@ -18,6 +18,9 @@ const { formatToolLine } = await import('../src/tui.js');
 const strip = (s) => String(s).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
 /** The rendered row for a Bash call with the given arguments. */
 const row = (toolArgs) => strip(formatToolLine({ toolName: 'Bash', toolArgs, pending: false }, process.cwd(), 0, 0, 0));
+/** The same row with Ctrl+O's expanded state, which lifts the one-line cut. */
+const expandedRow = (toolArgs) => strip(formatToolLine(
+  { toolName: 'Bash', toolArgs, pending: false }, process.cwd(), 0, 0, undefined, true));
 
 test('the first line of a multi-line command is shown', () => {
   const out = row({ command: 'cd /d D:\\repo\nnpm test\nnpm run build' });
@@ -65,4 +68,66 @@ test('a path argument is unaffected by the line logic', () => {
   // The same function serves every tool; the multi-line rule must not disturb a plain path.
   const out = row({ path: '/tmp/a.txt' });
   assert.doesNotMatch(out, /\(\+\d/, `no count for a path: ${out}`);
+});
+
+// ---------------------------------------------------------------------------
+// Ctrl+O: the whole command
+// ---------------------------------------------------------------------------
+
+test('expanding shows a long single-line command in full', () => {
+  // The collapsed row cuts at MAX_ARG so a `node -e "…"` one-liner does not wrap across the screen.
+  // Ctrl+O is the escape hatch: whoever expands tool output to read it wants the command they are
+  // reading the output OF, and the command is what they asked for in the first place.
+  const cmd = "cd a && ls -la | grep foo | awk '{print $2}' && echo done && npm run build 2>&1 | tail -50 && git status --short";
+  const collapsed = row({ command: cmd });
+  const shown = expandedRow({ command: cmd });
+  assert.ok(collapsed.length < cmd.length, 'the collapsed row is cut');
+  assert.ok(shown.includes(cmd), 'the expanded row carries the whole command');
+  assert.doesNotMatch(shown, /\+\d+ lines?/, 'and no count of what is missing');
+});
+
+test('expanding keeps a multi-line command on its own lines', () => {
+  // Newlines are honoured rather than flattened. `wrapAnsiWords` alone turns them into spaces, so the
+  // script would come back as one reflowed line — and the reason to expand is to read the script.
+  const out = expandedRow({ command: 'set -e\nnpm ci\nnpm test' });
+  assert.ok(out.includes('set -e\nnpm ci\nnpm test'), 'the line breaks survive');
+  assert.doesNotMatch(out, /\(\+\d+ lines?\)/, 'and nothing is elided');
+});
+
+test('collapsing is unchanged, so the default row is still one line', () => {
+  // The expand path must not alter what a user sees without pressing anything.
+  const out = row({ command: 'set -e\nnpm ci\nnpm test' });
+  assert.doesNotMatch(out, /\n/, 'the collapsed row is a single line');
+  assert.match(out, /\+\d+ lines?/, 'and it still says how much is hidden');
+});
+
+// ---------------------------------------------------------------------------
+// the RENDERED rows
+// ---------------------------------------------------------------------------
+
+test('an expanded multi-line command renders as separate rows', async () => {
+  // The test above checks the STRING `formatToolLine` returns, which already carries newlines. What
+  // turns that string into rows is `messageLines`, and it is not exported — so the newline handling
+  // can only be checked by composing a frame and counting. That is also the honest check: the rows are
+  // what the user sees.
+  const { composeFrame } = await import('../src/tui.js');
+  const rowsFor = (expanded) => {
+    const state = {
+      expanded, running: false, spin: 0, cwd: process.cwd(),
+      cfg: { shimmerEdge: 'cosine' }, todos: [], queued: [],
+      chat: [{ role: 'tool', toolName: 'Bash', toolArgs: { command: 'set -e\nnpm ci\nnpm test' }, pending: false }],
+    };
+    const frame = composeFrame(state, 100, 30);
+    const lines = (Array.isArray(frame) ? frame : frame.lines || []).map(strip);
+    return lines.filter((l) => /npm|set -e/.test(l));
+  };
+
+  const collapsed = rowsFor(false);
+  assert.equal(collapsed.length, 1, `one row when collapsed: ${JSON.stringify(collapsed)}`);
+
+  const shown = rowsFor(true);
+  assert.equal(shown.length, 3, `one row per line of the script: ${JSON.stringify(shown)}`);
+  assert.match(shown[0], /set -e/, 'the first row carries the first line');
+  assert.match(shown[1], /npm ci/, 'the second row the second line');
+  assert.match(shown[2], /npm test\)/, 'and the last row closes the paren');
 });

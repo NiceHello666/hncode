@@ -97,17 +97,32 @@ function decodeChunks(chunks) {
 }
 
 
-function killTree(child) {
+/**
+ * Kill a child.
+ *
+ * `tree` is OFF for an interactive run, and that is not a style choice: a non-detached interactive child
+ * lives INSIDE our process tree, so `taskkill /t` walks up and kills the parent too — the TUI would die
+ * while stopping a background command. Both halves are pinned by `test/task-input.test.mjs`.
+ *
+ * A detached background job has no such risk: it was started as its own tree root, so `/t` reaches its
+ * children and nothing above it.
+ */
+function killTree(child, opts = {}) {
   try {
     const exit = child.exitCode !== null || child.signalCode !== null;
     if (exit || child.killed) return;
     if (process.platform === 'win32') {
-      try { cp.spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
+      const args = ['/pid', String(child.pid), '/f'];
+      if (opts.tree !== false) args.splice(2, 0, '/t');
+      try { cp.spawnSync('taskkill', args, { stdio: 'ignore' }); } catch {}
     } else {
       child.kill('SIGTERM');
     }
   } catch {}
-  setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000);
+  // The SIGKILL follow-up must not keep the process alive on its own: unref it,
+  // so a child that exits politely still lets the process quit on time.
+  const followUp = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000);
+  if (followUp.unref) followUp.unref();
 }
 
 export const spec = {
@@ -121,6 +136,7 @@ export const spec = {
       timeout: { type: 'integer', minimum: 1, description: 'Seconds before the command is killed. Foreground default 60s/max 300s; background default 600s/max 86400s.' },
       cwd: { type: 'string', description: 'Working directory (default: workspace/project root).' },
       run_in_background: { type: 'boolean', default: false, description: 'Run detached and return a task id instead of waiting.' },
+      interactive: { type: 'boolean', default: false, description: 'With run_in_background: keep stdin open so TaskInput can write to it — for a command that prompts.' },
       disable_timeout: { type: 'boolean', default: false, description: 'Disable the timeout (background only).' },
     },
     required: ['command'],
@@ -139,17 +155,24 @@ export const spec = {
     const def = bg ? DEFAULT_BACKGROUND_TIMEOUT_S : DEFAULT_TIMEOUT_S;
     const timeoutMs = args.disable_timeout ? undefined : Math.min(args.timeout ?? def, cap) * 1000;
 const command = args.command;
-    // stdin is 'ignore' (NUL / /dev/null): leaving it as an open pipe made any
-    // command that reads stdin (`cat`, `npm init`, …) block until the timeout.
+    // stdin is 'ignore' by default (NUL / /dev/null): leaving it as an open pipe made any command that
+    // reads stdin (`cat`, `npm init`, …) block until the timeout.
     //
-    // The shell is RESOLVED, not hardcoded: `spawn('pwsh', …)` failed outright on a
-    // box with only the built-in Windows PowerShell (see tools/shell.js). `env` is
-    // passed explicitly rather than relying on Node's implicit inheritance, which is
-    // what made the tool depend on pwsh having been added to PATH by hand.
+    // `interactive` OPTS INTO A PIPE, and only for a background run: a foreground command has nobody to
+    // type at it, while a background one can be fed through TaskInput. The pipe is closed by that tool
+    // when it is done, which is what keeps `cat` and friends from hanging.
+    if (args.interactive && !args.run_in_background) {
+      return 'Error: `interactive` requires `run_in_background: true` — a foreground run has no way to receive input.';
+    }
     let shell;
     try { shell = shellSpawnArgs(command); } catch (e) { return `Error: ${e.message}`; }
+    // Check the turn's signal BEFORE spawning. The check below ran only after the
+    // child existed: an abort landing in that window returned "Interrupted by user"
+    // while leaving the child RUNNING with open pipes until the timeout timer fired,
+    // and Esc could not stop it.
+    if (ctx.signal && ctx.signal.aborted) return 'Interrupted by user';
     const child = cp.spawn(shell.bin, shell.args, {
-      cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+      cwd, stdio: [args.interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'], env: { ...process.env },
     });
 
     const chunks = [];
@@ -298,17 +321,33 @@ function spawnBackground(args, cwd, ctx) {
   // task's output file instead, so the process survives and TaskOutput can
   // still read it. (In the TUI the parent rarely exits, but headless -p mode
   // does, and a background job should outlive the prompt.)
-let shell;
-  try { shell = shellSpawnArgs(command); } catch (e) { return `Error: ${e.message}`; }
+  //
+  // AN INTERACTIVE RUN CANNOT BE DETACHED. Measured on Windows: `detached: true` with piped stdout
+  // returns exit 0 and NO output, while the same command not detached returns its output normally — the
+  // detached process gets no working pipe back to us. Interactive needs that pipe in both directions, so
+  // it stays attached. The trade: it will not outlive the parent, which is the same lifetime its stdin
+  // already has.
+  let shell;
+  try { shell = shellSpawnArgs(command, { interactive: args.interactive }); } catch (e) { return `Error: ${e.message}`; }
   const child = cp.spawn(shell.bin, shell.args, {
-    cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+    cwd, detached: !args.interactive, stdio: [args.interactive ? 'pipe' : 'ignore', 'pipe', 'pipe'], env: { ...process.env },
   });
   const task = createTask(ctx, 'process', {
     description: args.description || args.command,
     command: args.command,
     pid: child.pid,
-    detached: true,
+    detached: !args.interactive,
   });
+  // The stdin pipe, when the caller asked for one. Kept on the TASK so `TaskInput` can reach it from a
+  // task id alone — a tool receives an id, not a handle. Only `interactive` gets here, so a plain
+  // background job is unaffected and cannot be fed input by accident.
+  if (args.interactive && child.stdin) {
+    task.stdin = child.stdin;
+    task.interactive = true;
+    // A closed pipe is normal at the end of a run; writing afterwards would throw EPIPE.
+    child.stdin.on('error', () => { task.stdin = null; });
+    child.on('close', () => { task.stdin = null; });
+  }
   defineOutput(task);
   const push = (d) => appendTaskOutput(task, d);
   if (child.stdout) child.stdout.on('data', push);

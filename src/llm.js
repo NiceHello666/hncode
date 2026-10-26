@@ -93,7 +93,7 @@ export function toOpenAi(messages) {
     } else if (m.role === 'assistant') {
       const hasText = typeof m.content === 'string' && m.content.trim();
       const hasCalls = Array.isArray(m.toolCalls) && m.toolCalls.length;
-      if (!hasText && !hasCalls) continue; // 上游不允许空 assistant，直接丢弃
+        if (!hasText && !hasCalls) continue; // the provider rejects an empty assistant turn; drop it
       const msg = { role: 'assistant', content: m.content || null };
       if (hasCalls) {
         msg.tool_calls = m.toolCalls.map((tc) => ({
@@ -296,7 +296,9 @@ function buildBody(cfg, messages, streaming = true, opts = {}) {
     model: cfg.innerModel, messages: toOpenAi(messages),
     ...common, ...wire,
   };
-  if (!opts.noTools) body.tools = defs;
+  // Only attach a NON-EMPTY tools array: `tools: []` is rejected by some strict
+  // gateways, and an instance that registered no list means "no tools here".
+  if (!opts.noTools && defs.length) body.tools = defs;
   return JSON.stringify(applyPromptCache('openai', body, {
     enabled: cfg.promptCache !== false,
     sessionKey: cfg.sessionId,
@@ -313,6 +315,12 @@ export class LLM {
   constructor(cfg) {
     this.cfg = cfg;
     this.controller = null;
+    // The tool defs THIS instance sends. Per-instance, NOT module-global: the
+    // global (`llmToolsList` below) was overwritten by every `new Agent()` in
+    // the process, so a subagent, swarm member or teammate constructed while a
+    // parent request was building its body silently swapped the parent's tool
+    // list mid-turn. The agent sets this via setTools() right after construction.
+    this._tools = null;
     // Inline-reasoning state carried ACROSS requests. Our system prompt tells the
     // model to put all its reasoning inside one <think> span, and tool calls happen
     // inside that span — so the span outlives a single request. Reset when the turn
@@ -320,6 +328,11 @@ export class LLM {
     this._inThink = false;
     this._tagPending = '';
   }
+
+  // Register the tool list this instance advertises (see `_tools`). Only ever
+  // store an array or null: a non-array would make every later request throw
+  // when the defs are built.
+  setTools(list) { this._tools = Array.isArray(list) ? list : null; }
 
   // Called by the agent at the end of a turn: the next turn starts a fresh
   // reasoning block, even if the previous one never saw its closing tag.
@@ -341,13 +354,29 @@ export class LLM {
   // a capped budget plus a reasoning model is what silently produced an empty
   // title (see buildBody), and an internal request has no tools to call.
   async requestText(messages, opts = {}) {
+    // One silent retry on FAILURE (null). These one-shot requests (title,
+    // compaction summary) have no outer retry loop, and a single transient
+    // 429/network blip used to come back as null — which the compaction path
+    // treated as "no summary" and trimmed the history over. `''` (capped-empty)
+    // is a meaningful verdict for the caller and is NOT retried here.
+    let out = await this._requestTextOnce(messages, opts);
+    if (out === null && !(this.controller && this.controller.signal.aborted)) {
+      await new Promise((r) => setTimeout(r, 400));
+      out = await this._requestTextOnce(messages, opts);
+    }
+    return out;
+  }
+
+  async _requestTextOnce(messages, opts = {}) {
     const cfg = this.cfg;
     this.controller = new AbortController();
+    // This instance's tools, unless the caller opted out (internal one-shots).
+    const bodyOpts = { ...opts, ...((this._tools && !opts.noTools) ? { tools: this._tools } : {}) };
     try {
       const res = await fetch(cfg.endpoint, {
         method: 'POST',
         headers: (() => { const h = authHeaders(cfg); try { const out = runPatchSync('llmHeaders', { headers: h }, (c) => c); if (out && out.headers) return out.headers; } catch (e) {} return h; })(),
-        body: (() => { let b = buildBody(cfg, messages, false, opts); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
+        body: (() => { let b = buildBody(cfg, messages, false, bodyOpts); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
         signal: this.controller.signal,
       });
       if (!res || !res.ok) {
@@ -397,7 +426,7 @@ export class LLM {
     }
   }
 
-  async request(messages, onEvent) {
+  async request(messages, onEvent, cacheEnd) {
     // Mixin seam: let plugins mutate the messages sent to the model.
     try { const out = await runPatch('llmRequest', { messages, cfg: this.cfg }, (c) => c); if (out && out.messages) messages = out.messages; } catch (e) { /* patch failed; proceed with original */ }
     const cfg = this.cfg;
@@ -418,6 +447,11 @@ export class LLM {
     // turns it off and the retry goes out without it — degrading to an estimate
     // rather than failing the request over an accounting nicety.
     const reqOpts = {};
+    // This instance's tools ride along on every attempt (per-instance; see the
+    // constructor note on `_tools`). `tools` is only included when set, so
+    // buildBody's hasOwnProperty probe falls through to the global for callers
+    // that never registered a list.
+    const instanceTools = this._tools ? { tools: this._tools } : {};
 
     for (let attempt = 1; attempt <= RETRIES; attempt++) {
       attempts = attempt;
@@ -435,7 +469,7 @@ export class LLM {
         res = await fetch(cfg.endpoint, {
           method: 'POST',
           headers: (() => { const h = authHeaders(cfg); try { const out = runPatchSync('llmHeaders', { headers: h }, (c) => c); if (out && out.headers) return out.headers; } catch (e) {} return h; })(),
-          body: (() => { let b = buildBody(cfg, messages, true, reqOpts); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
+          body: (() => { let b = buildBody(cfg, messages, true, { ...reqOpts, cacheEnd, ...instanceTools }); try { const out = runPatchSync('llmBody', { body: b, cfg }, (c) => c); if (out && out.body !== undefined) b = out.body; } catch (e) {} return b; })(),
           signal,
         });
       } catch (e) {
@@ -452,6 +486,10 @@ export class LLM {
         if (res.status === 400 && reqOpts.includeUsage !== false) reqOpts.includeUsage = false;
       }
       if (attempt < RETRIES) {
+        // Release the FAILED attempt's body so its socket returns to the pool.
+        // An unread body pins the connection until GC — under a sustained
+        // 429/5xx storm the retries accumulated one open connection per attempt.
+        if (res && res.body) { try { await res.body.cancel(); } catch { /* already gone */ } }
         // Small exponential backoff (200ms, 400ms). If the user hit Esc during
         // the wait, stop retrying.
         const tryingSignal = this.controller.signal;
@@ -475,7 +513,17 @@ export class LLM {
       return;
     }
     if (cfg.stream === false) {
-      const json = await res.json();
+      // A 200 with a malformed/empty body used to reject here, and the caller
+      // (an unawaited `runAgent`) turned that rejection into a process exit via
+      // the global unhandledRejection handler. Surface it as an error EVENT —
+      // the same channel every other failure on this path uses.
+      let json;
+      try {
+        json = await res.json();
+      } catch (e) {
+        onEvent({ type: 'error', error: new Error(`LLM returned a malformed non-streaming body: ${e && e.message}`) });
+        return;
+      }
       return consumeNonStreaming(cfg.protocol, json, onEvent);
     }
     if (!res.body) { onEvent({ type: 'end' }); return; }
