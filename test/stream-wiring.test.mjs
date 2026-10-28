@@ -42,7 +42,9 @@ test('every path that ends a turn drains the buffer first', () => {
   // Leaving text buffered past the end of its turn is the visible failure mode: the
   // reply keeps trickling out behind the tool row, or behind the next turn.
   const drains = [
-    [/if \(e\.type === 'tool_start'\) \{[\s\S]{0,900}?flushStream\(\)/, 'tool_start'],
+    // The window is generous because the handler carries a long comment explaining WHY the drain is here.
+    // A tight window made this assertion pass on the code being present and fail on it being documented.
+    [/if \(e\.type === 'tool_start'\) \{[\s\S]{0,2000}?flushStream\(\)/, 'tool_start'],
     [/if \(e\.type === 'aborted'\) \{[\s\S]{0,400}?flushStream\(\)/, 'aborted'],
     // The turn teardown: `finishAnim`/`startAnim` are cleared, then the buffer drains,
     // then `running` flips false.

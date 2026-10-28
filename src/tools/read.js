@@ -64,7 +64,8 @@ export const spec = {
     if (!isProbablyTextFile(buf)) {
       return `Cannot read: ${args.path} appears to be a binary file (use a tool suited for binary).`;
     }
-    let st;
+    let st = null;
+    try { st = fs.statSync(p); } catch { /* stat is advisory only */ }
     // NO truncation: the caller asked for the file, so the whole file is returned
     // (line ranges still work via line_offset / n_lines). The old 1000-line and
     // 128 KB caps silently cut the content, which also corrupted the

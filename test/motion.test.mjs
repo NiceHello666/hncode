@@ -8,8 +8,20 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reducedMotionOn, spinnerFrame, sweepSettle, bandCharsFor, framesPerChar, SWEEP_TICKS, formatToolLine } from '../src/tui.js';
+import fs from 'node:fs';
+import {
+  reducedMotionOn, spinnerFrame, sweepSettle, bandCharsFor, framesPerChar, SWEEP_TICKS,
+  formatToolLine, cycleMs, SPIN_TICK_MS, FRAME_MS,
+} from '../src/tui.js';
 import { resolveConfig } from '../src/config.js';
+
+/**
+ * Ticks in one full light cycle for a given row.
+ *
+ * The light's cycle is a DURATION, and `spin` advances once per SPIN_TICK_MS, so the two are related
+ * by that interval. A loop over this many ticks covers the animation exactly once.
+ */
+const cycleTicks = (n) => Math.ceil(cycleMs(n) / SPIN_TICK_MS);
 
 const stateFor = (overrides) => ({
   spin: 0,
@@ -177,20 +189,36 @@ test('a zero or near-zero half-width does not divide by zero or NaN', () => {
 // pending tool rows (regression)
 // ---------------------------------------------------------------------------
 
-test('a pending tool row animates and stops once the tool finishes', () => {
+test('a pending tool row animates and stops once the tool finishes', async () => {
   const msg = { role: 'tool', toolName: 'Bash', toolArgs: { command: 'ls' }, pending: true };
   const line = formatToolLine(msg, 'D:/x', 3, 0);
   assert.equal(typeof line, 'string');
   assert.ok(line.includes('Using'), 'the pending row renders');
   assert.ok(/\x1b\[/.test(line), 'the pending name carries colour escapes (it is animating)');
-  // `spin` is monotonic, so different ticks must give different colouring — otherwise
-  // the row is static and the "animation" is a no-op.
-  const later = formatToolLine(msg, 'D:/x', 5, 0);
-  assert.notEqual(line, later, 'the sweep advances with the tick');
+
+  // The light takes its phase from the WALL CLOCK, so the row animates as time passes rather than as
+  // `spin` advances. Sampling in a tight loop would therefore see one render and prove nothing — an
+  // earlier version varied `spin` and failed for exactly that reason once the phase moved to real time.
+  //
+  // The sampling must also be dense enough for the CYCLE, which is short: `Bash` is four characters, so
+  // its light crosses in 0.18s and rests 0.5s. Sampling every 60ms over eight iterations took in nearly
+  // a whole second but could easily miss the crossing entirely — that is a test measuring its own
+  // aliasing, not the animation. One sample per animation FRAME covers the crossing by construction.
+  const renders = new Set();
+  const frames = Math.ceil(cycleMs(4) / FRAME_MS);
+  for (let i = 0; i < frames; i++) {
+    renders.add(formatToolLine(msg, 'D:/x', 3, 0));
+    await new Promise((r) => setTimeout(r, FRAME_MS));
+  }
+  assert.ok(renders.size > 1, `the row animates over time (saw ${renders.size} render(s) in ${frames} frames)`);
+
   // A FINISHED tool shows a flat colour: no sweep, nothing to animate.
   const done = formatToolLine({ ...msg, pending: false }, 'D:/x', 3, 0);
   const doneLater = formatToolLine({ ...msg, pending: false }, 'D:/x', 9, 0);
   assert.equal(done, doneLater, 'a finished row does not animate');
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(formatToolLine({ ...msg, pending: false }, 'D:/x', 3, 0), done,
+    'and it stays flat as time passes too');
 });
 
 test('formatToolLine survives with no state in scope (regression)', () => {
@@ -204,24 +232,14 @@ test('formatToolLine survives with no state in scope (regression)', () => {
   assert.doesNotThrow(() => formatToolLine(msg, 'D:/x', 3, 0, 'linear'));
 });
 
-test('the edge option changes the rendered sweep', () => {
-  // Verified by rendering, not by comparing the formulas: the two edges differ by only
-  // ~0.10 of the intensity range, and an early version of this test measured exactly
-  // that and concluded the option was below the colour quantisation. It was — because
-  // the animation was DEAD at the time (`pulseStart || spin` collapsed the cycle; see
-  // the regression test above). With the sweep running, the difference lands on
-  // different colour codes and the option is visible, so the test asserts THAT.
-  const msg = { role: 'tool', toolName: 'ReadMediaFile', toolArgs: { path: 'a.png' }, pending: true };
-  let differed = 0;
-  for (let spin = 0; spin < 60; spin++) {
-    if (formatToolLine(msg, 'D:/x', spin, 0, 'cosine') !== formatToolLine(msg, 'D:/x', spin, 0, 'linear')) differed++;
-  }
-  assert.ok(differed > 0, 'the edge option must affect the rendered output');
-  // ...and it is a small difference, not a different picture: the option shapes the
-  // ramp, it does not change the colours.
-  assert.ok(differed < 40, `the option should not change most frames, differed on ${differed}/60`);
-  // The underlying values differ by a fraction of the range, which is why the effect is
-  // subtle rather than dramatic.
+test('the edge option changes the sweep shape', async () => {
+  // Asserted on the VALUES, not on rendered frames.
+  //
+  // It used to render 40 frames of each edge and require them to differ. That held only while the light
+  // slid continuously, so some sample straddled a colour boundary in the 256-colour palette. The light now
+  // steps one character at a time, so a sweep has far fewer positions and the sampled frames came out
+  // identical — a palette artefact, not a change in behaviour. Asserting the rendered frame would make the
+  // test depend on where the samples happen to land.
   const n = 13;
   const BAND = bandCharsFor(n) / n;
   let maxGap = 0;
@@ -266,4 +284,43 @@ test('the environment can force both options', () => {
     if (prev === undefined) delete process.env.HNCODE_REDUCED_MOTION; else process.env.HNCODE_REDUCED_MOTION = prev;
     if (prevEdge === undefined) delete process.env.HNCODE_SHIMMER_EDGE; else process.env.HNCODE_SHIMMER_EDGE = prevEdge;
   }
+});
+// ---------------------------------------------------------------------------
+// the turn-start animation
+// ---------------------------------------------------------------------------
+
+test('the start animation is 0.25s of typing and 0.25s of colour', () => {
+  // Source-pinned rather than clock-driven: the block reads `Date.now()`, and a test that slept through
+  // both phases would be slow and flaky for a property that is two constants and one comparison.
+  //
+  // THE CUTOFF IS THE THING THAT BREAKS. It used to be its own literal (`>= 1000`) beside a separate
+  // `DUR`, so halving one alone left the preview exiting at the wrong moment — either cutting the colour
+  // sweep short or painting frames of the pulse while `startAnim` was still set.
+  const source = fs.readFileSync(new URL('../src/tui.js', import.meta.url), 'utf8');
+  const a = source.indexOf('// ---- turn-start animation ----');
+  const b = source.indexOf('// ---- turn-finish animation ----');
+  assert.ok(a > 0 && b > a, 'the start-animation block was found');
+  const block = source.slice(a, b);
+
+  const dur = /const DUR = (\d+);/.exec(block);
+  assert.ok(dur, 'the block declares its duration');
+  assert.equal(Number(dur[1]), 500, 'half a second in total');
+
+  const split = /t < ([\d.]+) \? 'type' : 'color'/.exec(block);
+  assert.ok(split, 'the two phases are split at a fixed point');
+  assert.equal(Number(split[1]), 0.5, 'each phase is half the total');
+  assert.equal(Number(dur[1]) * Number(split[1]), 250, 'so each phase is 0.25s');
+
+  assert.match(block, />= DUR\)/, 'and the exit cutoff uses the SAME constant, not a second literal');
+});
+
+test('the finish animation is untouched by that change', () => {
+  // It holds the same 500ms by coincidence, not by instruction — pinning it means a later edit to one
+  // cannot silently move the other.
+  const src = fs.readFileSync(new URL('../src/tui.js', import.meta.url), 'utf8');
+  const at = src.indexOf('// ---- turn-finish animation ----');
+  assert.ok(at > 0);
+  const dur = /const DUR = (\d+);/.exec(src.slice(at, at + 400));
+  assert.ok(dur);
+  assert.equal(Number(dur[1]), 500);
 });

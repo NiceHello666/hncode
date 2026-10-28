@@ -142,3 +142,39 @@ test('every offered value maps to something, so the UI cannot offer a dead optio
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// values the list does not offer
+// ---------------------------------------------------------------------------
+
+test('a grade outside the declared list is still sendable', () => {
+  // `/effort <value>` used to REFUSE anything not in `effortOptions` for the current model. That list is
+  // what a model is KNOWN to accept — from the catalog, or from a user's own `efforts = [...]` — and the
+  // catalog can lag a model while a proxy or gateway may take grades the entry never recorded. Refusing
+  // those made `xhigh` fail on a model that understands it, with no way to try.
+  //
+  // What must NOT change when the check goes: the mapping stays honest about what it does not know.
+  const c = cfgFor('openai', { efforts: ['off', 'low', 'high'] });
+  assert.deepEqual(effortOptions(c, 'p/m'), ['off', 'low', 'high'], 'the list is what the picker offers');
+
+  // A known grade is sent by name...
+  assert.deepEqual(effortWire(c, 'high'), { reasoning_effort: 'high' });
+  // ...and an unknown one sends NOTHING rather than a number guessed from a neighbour. An earlier version
+  // fell back to 8000, which made every unknown grade byte-identical to `on` and `medium`.
+  assert.deepEqual(effortWire(c, 'xhigh'), {},
+    'an unknown grade is not turned into a number this side');
+});
+
+test('an unknown grade never invents a budget, on any protocol', () => {
+  // Measured across the three protocols, because each carries the grade differently and each could
+  // invent its own default:
+  //   openai      the field is omitted
+  //   responses   the field is omitted
+  //   anthropic   thinking is enabled WITHOUT a budget — enabling is honest, a number would not be
+  for (const protocol of PROTOCOLS) {
+    const c = cfgFor(protocol, { efforts: ['off', 'low'] });
+    const wire = effortWire(c, 'xhigh');
+    const budget = wire && wire.thinking ? wire.thinking.budget_tokens : undefined;
+    assert.equal(budget, undefined, `${protocol} invented a budget for an unknown grade: ${JSON.stringify(wire)}`);
+  }
+});

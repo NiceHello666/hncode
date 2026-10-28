@@ -37,11 +37,24 @@ function writeAtomic(file, text) {
 }
 
 /** Every task, oldest first. Never throws. */
+// Cached by (mtimeMs, size) — the team panel reads the task list every frame,
+// and a stat per read replaces the full readFileSync + JSON.parse. writeTasks
+// goes through writeAtomic (rename), which always changes the mtime.
+let _tasksCache = { key: '', tasks: null };
 export function readTasks(teamName) {
+  const file = tasksFile(teamName);
+  let st = null;
+  try { st = fs.statSync(file); } catch { /* absent */ }
+  if (!st) return [];
+  const key = `${st.mtimeMs}:${st.size}`;
+  if (_tasksCache.key === key) return _tasksCache.tasks.slice();
   try {
-    const parsed = JSON.parse(fs.readFileSync(tasksFile(teamName), 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const tasks = Array.isArray(parsed) ? parsed : [];
+    _tasksCache = { key, tasks };
+    return tasks.slice();
   } catch {
+    _tasksCache = { key: '', tasks: null };
     return [];
   }
 }

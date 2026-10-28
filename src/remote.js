@@ -23,10 +23,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { skillsDir, normalizeSkillName } from './skills.js';
 
-// TLS verification is ON by default. If a local proxy / AV breaks the cert
-// chain, set HNCODE_DISABLE_TLS_VERIFY to skip verification for GitHub fetches.
-if (process.env.HNCODE_DISABLE_TLS_VERIFY) {
-  // Node prints an "insecure TLS" warning for this intentional opt-out. Replace the
+// TLS verification is ON by default — and that must include every OTHER connection
+// the process makes (the LLM API carrying the key, MCP HTTP transports). If a local
+// proxy / AV breaks the cert chain, HNCODE_DISABLE_TLS_VERIFY skips verification for
+// THESE GitHub fetches ONLY: the flag is scoped per request in tlsFetch below, never
+// set process-wide.
+const INSECURE_TLS = !!process.env.HNCODE_DISABLE_TLS_VERIFY;
+if (INSECURE_TLS) {
+  // Node prints an "insecure TLS" warning when the override applies. Replace the
   // default `warning` handler with one that swallows only that message, so the rest
   // of Node's warnings still come through.
   process.removeAllListeners('warning');
@@ -38,7 +42,21 @@ if (process.env.HNCODE_DISABLE_TLS_VERIFY) {
     if (warning && warning.detail) line += `\n${warning.detail}`;
     process.stderr.write(line + '\n');
   });
+}
+
+// undici reads NODE_TLS_REJECT_UNAUTHORIZED when EACH TLS connection is made
+// (verified: setting it at runtime changes the very next fetch), so the flag can be
+// held only for the duration of one request and restored after — the LLM and MCP
+// connections elsewhere in the process keep full verification.
+async function tlsFetch(url, opts = {}) {
+  if (!INSECURE_TLS) return fetch(url, opts);
+  const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  try { return await fetch(url, opts); }
+  finally {
+    if (prev === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev;
+  }
 }
 
 // The canonical source. Overridable so a fork (or a test) can point elsewhere.
@@ -59,7 +77,7 @@ async function ghJson(url, { timeoutMs = 15000 } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await tlsFetch(url, {
       signal: ctl.signal,
       headers: { accept: 'application/vnd.github+json', 'user-agent': USER_AGENT },
     });
@@ -82,7 +100,7 @@ async function fetchText(url, { timeoutMs = 20000 } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctl.signal, headers: { 'user-agent': USER_AGENT } });
+    const res = await tlsFetch(url, { signal: ctl.signal, headers: { 'user-agent': USER_AGENT } });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, text: await res.text() };
   } catch (e) {

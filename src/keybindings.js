@@ -110,13 +110,35 @@ const isCommand = (s) => typeof s === 'string' && s.trim().startsWith('/');
  * Read and validate the bindings file.
 
 /**
- * Read and validate the bindings file.
+ * Read and validate the bindings file, cached by mtime+size.
  *
- * @returns {{bindings: Map<string, {key?:string, command?:string}>, errors: string[], file: string}}
- *   `bindings` maps a NORMALISED source key to exactly one target.
+ * The TUI resolves EVERY special keystroke through this, and a readFileSync per key
+ * (an ENOENT open is still a syscall; with AV scanning on Windows it is milliseconds)
+ * sat directly in the input path. The cache returns the parsed result unchanged while
+ * the file's stat is unchanged, so an edit still takes effect immediately — the stat
+ * is the only thing a keystroke pays for.
  */
+let _kbCache = null;   // { file, mtimeMs, size, out }
 export function loadKeybindings(home) {
   const file = keybindingsFile(home);
+  try {
+    const st = fs.statSync(file);
+    if (_kbCache && _kbCache.file === file && _kbCache.mtimeMs === st.mtimeMs && _kbCache.size === st.size) {
+      return _kbCache.out;
+    }
+    const out = readKeybindingsFile(file);
+    _kbCache = { file, mtimeMs: st.mtimeMs, size: st.size, out };
+    return out;
+  } catch {
+    // Absent/unstatable: parse anyway so the error reporting below still runs,
+    // and drop the cache — the file may have just been deleted.
+    _kbCache = null;
+    return readKeybindingsFile(file);
+  }
+}
+
+/** The uncached parse (the body of the old loadKeybindings). */
+function readKeybindingsFile(file) {
   const out = { bindings: new Map(), errors: [], file };
   let raw;
   try { raw = fs.readFileSync(file, 'utf8'); }

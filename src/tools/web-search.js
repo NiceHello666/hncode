@@ -6,7 +6,7 @@
 // silently stopped: the request still returned 200 with the query echoed in `<title>`, but the
 // page contained no results — the two or three `b_algo` blocks it did have were
 // `translate.google.cn` and similar chrome, unrelated to the query. Measured over five identical
-// requests for one query: five different first results (Yandex, GitHub, 知乎, PixelOS, Nature),
+// requests for one query: five different first results (Yandex, GitHub, a Q&A site, PixelOS, Nature),
 // none of them related. Adding a market parameter, warming up cookies, and sending a full set of
 // browser headers all changed nothing.
 //

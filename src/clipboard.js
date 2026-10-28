@@ -40,6 +40,8 @@ let helperBuf = '';     // stdout accumulated since the last sentinel
 let helperQueue = [];   // pending read() resolvers, ONE per sentinel written
 let helperBusy = false; // one command in flight at a time
 let helperReady = false; // the warm sequence has answered: the shell can take commands
+let keepAliveTimer = null; // a scheduled respawn, after the helper died
+let _shuttingDown = false; // set by the exit handler so a dead shell is not respawned during cleanup
 
 /** How long a read will wait for the helper to finish warming. It is already coming
  *  up, and waiting for a ~10ms answer beats the multi-second cold fallback. */
@@ -135,7 +137,22 @@ function runPowershell(args, opts) {
 // ------------------------------------------------------- PowerShell helper
 export function warmClipboard() {
   if (!win() || helper) return;
+  _shuttingDown = false;   // an explicit warm cancels a shutdown in progress
   startHelper(_psExe);
+}
+
+/**
+ * Stop the keep-alive respawn and let the helper die with the process.
+ *
+ * Called from the exit handler. Without it a helper that exits during shutdown would be respawned by
+ * `dropHelper`, leaving a PowerShell child running after the TUI is gone.
+ */
+export function stopClipboardHelper() {
+  _shuttingDown = true;
+  if (keepAliveTimer) { clearTimeout(keepAliveTimer); keepAliveTimer = null; }
+  const h = helper;
+  dropHelper();
+  if (h) { try { h.stdin.end(); } catch { /* already closed */ } }
 }
 
 /** Spawn the long-lived shell. `exe` is tried first; if that exe does not exist,
@@ -189,6 +206,18 @@ function dropHelper() {
   const waiting = helperQueue;
   helperQueue = [];
   for (const w of waiting) w(null);
+  // RESPAWN, unless this is a deliberate shutdown.
+  //
+  // The helper can die without anyone noticing — a shell that exits on its own, a resource hiccup — and
+  // nothing restarted it. The next paste then paid the cold path: a fresh spawn plus the warm-up
+  // sentinel, measured at 1.2 seconds, on a keypress that is supposed to be instant.
+  //
+  // A respawn is scheduled rather than immediate so a crash loop cannot spin: the shell gets a moment to
+  // be gone before a new one is asked for. `_shuttingDown` stops it after cleanup.
+  if (!_shuttingDown) {
+    if (keepAliveTimer) clearTimeout(keepAliveTimer);
+    keepAliveTimer = setTimeout(() => { if (!_shuttingDown) warmClipboard(); }, 200);
+  }
 }
 
 /** Resolve once the shell can take commands, or false when it never got there. */
@@ -278,6 +307,24 @@ export async function readText(timeoutMs = HELPER_CMD_MS) {
 // in use here), so it silently failed everywhere and image paste never worked.
 // `[Windows.Forms.Clipboard]::GetImage()` exists on Windows PowerShell 5.1 AND
 // pwsh 7 — verified on 5.1 — so it is the portable way to read a copied image.
+/**
+ * The TEXT-ONLY probe, run first.
+ *
+ * The full probe below checks three clipboard formats in order — files, text, image — so a plain text
+ * paste pays for two failed checks before the one that answers. Text is overwhelmingly the common case,
+ * and the two other checks are the slow ones: `Get-Clipboard -Format FileDropList` round-trips through
+ * the shell's COM clipboard, and `Clipboard::GetImage()` decodes an image.
+ *
+ * So the text check is split out and run alone. Only when it comes back EMPTY — no text on the clipboard,
+ * so it must be a file or an image — does the caller run the full probe. A text paste now costs one
+ * clipboard call instead of three.
+ */
+const CLIP_PROBE_TEXT = [
+  "$ErrorActionPreference='SilentlyContinue'",
+  "$t=Get-Clipboard -Raw",
+  "if($t){'T::'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t))}",
+].join('; ');
+
 const CLIP_PROBE = [
   "$ErrorActionPreference='SilentlyContinue'",
   "$f=Get-Clipboard -Format FileDropList",
@@ -351,9 +398,29 @@ async function readViaHelper() {
     await new Promise((r) => setTimeout(r, 25));
   }
   if (helperBusy || !helper) return null;
+
+  // TEXT FIRST. One clipboard call instead of the full probe's three, so the common paste answers in a
+  // third of the round-trips.
   helperBusy = true;
-  const out = await helperRun(CLIP_PROBE, HELPER_CMD_MS);
-  return out == null ? null : parseClipResult(out);
+  let out;
+  try {
+    out = await helperRun(CLIP_PROBE_TEXT, HELPER_CMD_MS);
+  } finally {
+    helperBusy = false;
+  }
+  const parsed = out == null ? null : parseClipResult(out);
+  // Text found — done. An EMPTY answer means there is no text, so the clipboard holds a file or an
+  // image and the full probe is worth its cost.
+  if (parsed) return parsed;
+
+  helperBusy = true;
+  let out2;
+  try {
+    out2 = await helperRun(CLIP_PROBE, HELPER_CMD_MS);
+  } finally {
+    helperBusy = false;
+  }
+  return out2 == null ? null : parseClipResult(out2);
 }
 
 export function readClipboardContent() {

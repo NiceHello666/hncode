@@ -158,7 +158,13 @@ test('the compacted event payload uses a value the trim actually returns', () =>
   assert.ok(at > 0, 'the compacted event exists');
   const around = src.slice(at, at + 400);
   assert.match(around, /dropped: droppedCount/, 'the payload names the dropped count');
-  // It must come from the trim's return value, which is the binding that has to exist.
-  assert.match(src, /const \{ split, dropped: droppedCount \} = this\.applyCompactionSplit/,
-    'and it is destructured from applyCompactionSplit');
+  // Both counts must come from the trim's RETURN VALUE. `kept` used to be read as `keep.length` at this
+  // call site, where `keep` is a local of `applyCompactionSplit` — a ReferenceError raised inside `run()`,
+  // which reached unhandledRejection and exited the whole TUI the moment compaction fired.
+  assert.match(src, /const \{ split, dropped: droppedCount, kept \} = this\.applyCompactionSplit/,
+    'both counts are destructured from applyCompactionSplit');
+  assert.match(src, /return \{ split, dropped, kept: keep\.length \}/,
+    'and applyCompactionSplit returns them');
+  assert.doesNotMatch(around, /kept: keep\.length/,
+    'the call site does not reach into the callee\'s locals');
 });

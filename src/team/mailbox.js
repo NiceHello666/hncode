@@ -40,12 +40,34 @@ function writeAtomic(file, text) {
   }
 }
 
-/** Every message in a member's inbox, oldest first. Never throws. */
+/** Every message in a member's inbox, oldest first. Never throws.
+ *
+ *  Cached by (mtimeMs, size): the panel renders rosters and traffic per frame,
+ *  and waitForMail polls 4x/second — a stat per read replaces the full
+ *  readFileSync + JSON.parse. Writes go through writeAtomic (rename), which
+ *  always changes the mtime, so nothing stale survives. The cached array is
+ *  copied on the way out: a caller that mutates the result without writing
+  *  back must not corrupt the cache. */
+const _mbCache = new Map();   // inbox file -> { key, box }
 export function readMailbox(teamName, agentName) {
+  const file = inboxPath(teamName, agentName);
+  let st = null;
+  try { st = fs.statSync(file); } catch { /* absent */ }
+  if (!st) return [];
+  const key = `${st.mtimeMs}:${st.size}`;
+  const hit = _mbCache.get(file);
+  if (hit && hit.key === key) return hit.box.slice();
   try {
-    const parsed = JSON.parse(fs.readFileSync(inboxPath(teamName, agentName), 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const box = Array.isArray(parsed) ? parsed : [];
+    _mbCache.set(file, { key, box });
+    if (_mbCache.size > 64) { // bounded: one entry per inbox ever read
+      const first = _mbCache.keys().next().value;
+      _mbCache.delete(first);
+    }
+    return box.slice();
   } catch {
+    _mbCache.delete(file);
     return [];
   }
 }
@@ -56,6 +78,19 @@ export function readUnread(teamName, agentName) {
 }
 
 /**
+ * A monotonic counter for ordering messages ACROSS mailboxes.
+ *
+ * `timestamp` cannot do it: it has millisecond resolution, and two messages written in the same
+ * millisecond in two different inbox files compare equal — the sort then falls back to file position,
+ * which is only meaningful WITHIN one file. That is how a user's two messages appeared above the reply
+ * that answered the first of them.
+ *
+ * Process-local is enough: every inbox write in a team goes through this module in one process.
+ */
+let seqCounter = 0;
+
+
+/**
  * Deliver a message.
  *
  * The sender's name and colour are stamped here rather than passed by the call site, so every
@@ -64,10 +99,14 @@ export function readUnread(teamName, agentName) {
 export function writeToMailbox(teamName, recipientName, { from, text, summary, color }) {
   const file = inboxPath(teamName, recipientName);
   const box = readMailbox(teamName, recipientName);
+  seqCounter += 1;
   const msg = {
     from: String(from || 'unknown'),
     text: String(text == null ? '' : text),
     timestamp: new Date().toISOString(),
+    // Ordering key. Milliseconds alone leave two boxes' messages tied, and the panel then interleaves
+    // them wrongly.
+    seq: seqCounter,
     read: false,
   };
   if (summary) msg.summary = String(summary);
@@ -83,9 +122,10 @@ export function writeToMailbox(teamName, recipientName, { from, text, summary, c
 /**
  * Mark the given messages read. Returns how many changed.
  *
- * `ids` are timestamps, not array positions: the box is re-read here, and a message
- * delivered in between would shift every later index — marking by position would then
- * silence the wrong message, or one that was never delivered at all.
+ * `ids` are MESSAGE IDENTITIES (seq, falling back to timestamp for pre-seq boxes), not
+ * array positions: the box is re-read here, and a message delivered in between would
+ * shift every later index — marking by position would then silence the wrong message,
+ * or one that was never delivered at all.
  *
  * When called with no `ids` every message is marked, which is what a caller that
  * genuinely drained the whole box wants. A caller that PROCESSED a specific batch must
@@ -94,11 +134,28 @@ export function writeToMailbox(teamName, recipientName, { from, text, summary, c
  */
 export function markAllRead(teamName, agentName, ids = null) {
   const box = readMailbox(teamName, agentName);
-  const want = Array.isArray(ids) ? new Set(ids.map((m) => (m && m.timestamp) || m)) : null;
   let n = 0;
+  // Keyed by `seq` — the same identity removeMail uses. Two messages delivered in
+  // the same millisecond share a timestamp (a broadcast and a direct mail landing
+  // together), and keying on the timestamp marked the sibling read too, so it was
+  // never delivered to the model. Timestamps remain a fallback for boxes written
+  // by an older build, whose messages carry no seq.
+  const wantSeq = new Set();
+  const wantTs = new Set();
+  if (Array.isArray(ids)) {
+    for (const id of ids) {
+      if (id && typeof id === 'object') {
+        if (id.seq != null) wantSeq.add(Number(id.seq));
+        else if (id.timestamp) wantTs.add(id.timestamp);
+      } else if (id != null) wantTs.add(id);
+    }
+  }
   for (const m of box) {
     if (m.read) continue;
-    if (want && !want.has(m.timestamp)) continue;
+    if (Array.isArray(ids)) {
+      const bySeq = m.seq != null && wantSeq.has(Number(m.seq));
+      if (!bySeq && !wantTs.has(m.timestamp)) continue;
+    }
     m.read = true;
     n++;
   }
@@ -109,6 +166,26 @@ export function markAllRead(teamName, agentName, ids = null) {
 /** Empty a member's inbox. Used when a teammate is removed from the team. */
 export function clearMailbox(teamName, agentName) {
   try { fs.unlinkSync(inboxPath(teamName, agentName)); return true; } catch { return false; }
+}
+
+/**
+ * Delete specific messages from a box, by `seq`. Returns how many went.
+ *
+ * A permission RESPONSE is addressed to one member and answers one request, so it must be CONSUMED: a
+ * plain read flag is not enough, because the member polls in a loop and would see the same answer again
+ * on its next request — authorising a call the person never approved.
+ *
+ * By `seq`, not by index or timestamp: the box is re-read here and a message delivered in between would
+ * shift every later index, while two messages in the same millisecond share a timestamp.
+ */
+export function removeMail(teamName, agentName, seqs) {
+  const want = new Set((seqs || []).map(Number));
+  if (!want.size) return 0;
+  const box = readMailbox(teamName, agentName);
+  const kept = box.filter((m) => !want.has(Number(m.seq)));
+  const removed = box.length - kept.length;
+  if (removed) writeAtomic(inboxPath(teamName, agentName), JSON.stringify(kept, null, 2));
+  return removed;
 }
 
 /**

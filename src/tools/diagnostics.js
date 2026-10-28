@@ -54,6 +54,19 @@ export async function stopLspClients() {
   for (const c of all) { try { await c.stop(); } catch { /* going away anyway */ } }
 }
 
+/**
+ * Synchronous best-effort kill for the `exit` handler, which cannot await: a
+ * polite shutdown needs a round-trip the process no longer has time for, so the
+ * child is killed outright. rust-analyzer/pyright each hold hundreds of MB —
+ * leaving them running after hncode quits is the leak this closes.
+ */
+export function killLspClientsSync() {
+  const all = [...clients.values()];
+  clients.clear();
+  for (const c of all) { try { c._child && c._child.kill(); } catch { /* already gone */ }
+  }
+}
+
 /** For tests and for the TUI: which servers are live right now. */
 export function liveLspClients() {
   return [...clients.entries()].map(([k, c]) => ({ key: k, serverId: c.serverId, root: c.root }));

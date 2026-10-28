@@ -5,7 +5,7 @@
 import { LLM, setToolsList } from './llm.js';
 import { tools, combinedTools, getTool, llmTools } from './tools/index.js';
 import { DELEGATION_TOOLS } from './subagent-types.js';
-import { estimateMessagesTokens, estimateRequestOverhead, estimateTokens, messageTokens, TokenLedger, forgetMessageTokens } from './term.js';
+import { estimateMessagesTokens, estimateRequestOverhead, estimateTokens, measureToolDefTokens, messageTokens, TokenLedger, forgetMessageTokens } from './term.js';
 import { runHooks, runPatch, runPatchSync } from './plugin.js';
 import { loadHooks, runShellHooks } from './hooks.js';
 import {
@@ -101,7 +101,9 @@ function clipToTokens(text, maxTokens) {
 //   * it is an assistant message that still has tool calls, or
 //   * the message after the cut is a tool result, or
 //   * the prefix ends inside an open tool exchange (more results to come).
-function canSplitAfter(messages, index) {
+// Exported for the headless -p path (index.js), which must trim a resumed
+// history on the same legal boundaries the compaction logic uses.
+export function canSplitAfter(messages, index) {
   if (index < 0 || index >= messages.length) return false;
   const m = messages[index];
   if (!m) return false;
@@ -230,6 +232,33 @@ function toolResultLimitsEnabled() {
  * Normalised here, at the single point every tool result passes through, rather than in the
  * team tools: a second tool family making the same choice cannot reintroduce the bug.
  */
+/**
+ * Settle `promise`, or reject as soon as `signal` aborts — whichever happens first.
+ *
+ * A tool is GIVEN the abort signal but cannot be forced to observe it. Built-ins do (Bash kills its
+ * process tree); a plugin tool that ignores it kept running, and the caller's `await` kept waiting, so
+ * pressing Esc during a slow plugin tool changed nothing on screen until the plugin finished on its own.
+ *
+ * Racing ends the WAIT regardless. The abandoned promise is left to settle detached — an unobserved
+ * rejection would otherwise surface as an unhandled rejection — and the turn moves on, which is what
+ * the key was asking for. It cannot stop the plugin's work, and this comment says so rather than
+ * implying otherwise.
+ */
+function raceWithAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
+    );
+    // A tool that resolves AFTER the abort must not become an unhandled rejection.
+    Promise.resolve(promise).catch(() => {});
+  });
+}
+
 function toolResultText(value) {
   if (typeof value === 'string') return value;
   if (value == null) return '';
@@ -333,7 +362,26 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       // backed by anything. Off unless /swarm turned the mode on; the Agent tool
       // stays available for a single, deliberate delegation.
       .filter((t) => !(t.name === 'AgentSwarm' && !cfg.swarm));
+    // Kept as the process-wide FALLBACK for LLM instances that never register
+    // their own list (doctor's connectivity probe). Every real agent registers
+    // its list on its own LLM below — requests no longer read whichever Agent
+    // happened to be constructed last.
     setToolsList(filtered);
+    // THE REAL COST OF THE TOOLS, measured once per agent.
+    //
+    // The context gauge charged a flat 8 tokens per tool, which is short by an order of magnitude — the
+    // schemas of these 68 tools come to about 15 900 tokens. That figure was missing from every
+    // usage estimate, so the app's own count ran tens of thousands below the provider's.
+    //
+    // Measured here because this is the only place that knows the FINAL set: `toolFilter`, the
+    // subagent block and the swarm gate above all change what is sent, and a number derived from
+    // `cfg.toolFilter` alone would price tools the model never sees.
+    this.toolDefTokens = measureToolDefTokens(filtered);
+    // ALSO on `cfg`, because the TUI's gauge writers live outside this object and price a request as
+    // `estimateMessagesTokens(...) + cfg.toolDefTokens`. Without this line those readers saw `undefined`
+    // and silently fell back to zero, so every restore and every /trim reported a number short by the
+    // whole tool block — the same fixed gap, from a different cause.
+    if (this.cfg && typeof this.cfg === 'object') this.cfg.toolDefTokens = this.toolDefTokens;
     // A block for the direct-call path too: the model can still emit a tool call
     // for a tool that is not exposed, so refuse it here rather than at execution.
     this.noDelegation = !!cfg.noDelegation;
@@ -385,10 +433,20 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       this.cfg = cfg;
     }
     this.llm = new LLM(cfg);
+    // THIS agent's tool defs ride on THIS instance. The module-global was overwritten
+    // by every `new Agent()` in the process — a subagent, swarm member or teammate
+    // constructed while a parent request was being built swapped the parent's tool
+    // list mid-turn, silently stripping Edit/Bash from its next request.
+    this.llm.setTools(filtered);
     this.stopRequested = false;
     // Auto-compaction is allowed at most once per TURN (not per step). Reset here so
     // a caller that reuses one Agent across turns still gets a fresh allowance.
     this._compactedThisTurn = false;
+    // THE PROMPT-CACHE BOUNDARY: how many messages an earlier request of this turn
+    // has already sent. Everything below that index is stable and can carry a cache
+    // breakpoint. Reset per turn because a new turn opens with a new user message, so
+    // the previous turn's boundary would describe a prefix this one never sent.
+    this._stableEnd = 0;
     // Rolling context-token total for `this.messages` (see usedTokens). It holds no
     // messages of its own, only the count of what it has already priced, so a
     // compaction that replaces the array simply falls out of the fast path.
@@ -441,9 +499,18 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
     // rescan priced the entire transcript — Read results included — several times per
     // step for a number that changes by one message.
     let total = this._ledger.sync(this.messages, null);
-    if (Array.isArray(this.cfg.toolFilter)) total += this.cfg.toolFilter.length * 8;
+    // THE TOOL DEFINITIONS ARE PART OF WHAT IS SENT, and they are not messages.
+    //
+    // This charged `toolFilter.length * 8` — and only when a filter was set, so an ordinary turn
+    // added NOTHING at all. Measured, the schemas of the 68 registered tools come to about 15 900
+    // tokens, which is why the app's own gauge ran tens of thousands below the provider's report.
+    //
+    // `toolDefTokens` is measured once in the constructor, from the FINAL filtered set.
+    total += Number.isFinite(this.toolDefTokens) ? this.toolDefTokens : 0;
     return total;
   }
+
+
 
   // Where to cut the history for compaction. Walks back from the end accumulating a
   // token budget, but only accepts indices the boundary rule allows (so the kept
@@ -531,11 +598,14 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       { role: 'user', _harness: true, content: wrapSystemReminder(summaryText) },
       { role: 'user', _harness: true, content: wrapSystemReminder(COMPACTION_CONTINUATION_TEXT) },
     ];
-    return { split, dropped };
+    // `kept` is returned, not just its length: the caller reports how many messages survived, and it
+    // has no other way to know. It was `keep.length` at the call site referring to a local that lives
+    // only in here — a ReferenceError raised inside `run()`, which reached unhandledRejection and exited
+    // the whole TUI at the moment compaction fired.
+    return { split, dropped, kept: keep.length };
   }
 
   async run() {
-    // Clear any interrupt flag left from a previous (interrupted) turn. This runs at
     // Clear any interrupt flag left from a previous (interrupted) turn. This runs at
     // the start of EVERY turn, so a stalled Esc/Ctrl-C from an earlier compaction can
     // never suppress auto-compaction on the next message. (The constructor also
@@ -591,10 +661,15 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
           this._truncated = true;
           break;
         case 'usage':
-          // Real token accounting from the provider, as opposed to the estimates
-          // usedTokens() produces. Accumulated on the AGENT (so it survives across
-          // the steps of one turn and can be read by anything holding the agent)
-          // and forwarded for the TUI to fold into the session totals.
+          // Provider accounting, accumulated on the AGENT so it survives across the steps of one turn.
+          //
+          // IT DOES NOT FEED THE CONTEXT GAUGE. `usage.input` was wired into both the gauge and a
+          // calibration here, and removed from both: it counts the request that already went out while the
+          // estimate counts the one about to, so the number jumped between two definitions depending on
+          // which ran last.
+          //
+          // What it IS used for: cost and `/usage`, where it is the only honest source, and the turn's
+          // output counter.
           this.usage = addUsage(this.usage, e.usage);
           this.onEvent({ type: 'usage', usage: e.usage, total: this.usage });
           break;
@@ -667,9 +742,38 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       // below 85%, so the reply has room to be generated.
       const maxCtx = this.cfg.maxContextTokens || 512000;
       let usedNow = this.usedTokens();
+      // THE MESSAGE THAT TRIGGERED THIS TURN IS NOT YET IN A REQUEST.
+      //
+      // The user's message is appended before `run()` is entered, so a fresh turn that pushes the
+      // history over the threshold would compact FIRST and then send — summarising a conversation that
+      // now includes the message it is about to answer, and paying a summary round-trip before the model
+      // has seen the request at all.
+      //
+      // Excluding the trailing user message from the TRIGGER means the decision is made on what the
+      // previous turn left behind, which is the history the message is joining. If adding it would still
+      // overflow, `needsRoom` catches that on the NEXT pass — after the model has answered something —
+      // and `clipToTokens` bounds the request itself in the meantime.
+      //
+      // Counted as a subtraction rather than by pruning the array: the message must stay in `messages`,
+      // it just must not decide whether to compact.
+      let triggerTokens = usedNow;
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        const m = this.messages[i];
+        if (!m) continue;
+        // Only skip a TRAILING run of user messages — a steering note queued mid-turn, or the prompt that
+        // opened this turn. A user message further back is part of the history being measured.
+        if (m.role !== 'user' || m._harness) break;
+        triggerTokens -= messageTokens(m, this.cfg);
+      }
+      triggerTokens = Math.max(0, triggerTokens);
       // `reservedContextSize` (kimi): a request leaving less than this much headroom
       // is compacted even below the trigger ratio, so the REPLY has room to be
       // generated. A request just under the trigger could otherwise still fail.
+      //
+      // Measured on `usedNow`, NOT on `triggerTokens`: the headroom question is about the request that
+      // will actually be sent, and that one does include the new message. The two thresholds ask
+      // different things — "is the history full" versus "will this request fit" — so they read different
+      // numbers on purpose.
       const reserved = this.cfg.reservedContextTokens || 50_000;
       const needsRoom = reserved > 0 && reserved < maxCtx && usedNow + reserved >= maxCtx;
       // Trigger ratio is configurable (/auto-compact threshold, config.toml
@@ -682,7 +786,8 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
       // kept shrinking.
       const shouldCompact = this.cfg.autoCompact !== false && maxCtx > 0
         && !this._compactedThisTurn
-        && (usedNow >= maxCtx * trigger || needsRoom);
+        // `triggerTokens`, not `usedNow`: the history WITHOUT the message that opened this turn.
+        && (triggerTokens >= maxCtx * trigger || needsRoom);
       if (shouldCompact) {
         const before = usedNow;
         this._compactedThisTurn = true;
@@ -748,8 +853,18 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
           this.onEvent({ type: 'stopped' });
           break;
         }
+        // The summarizer FAILED (requestText swallowed a network/429 error — even
+        // after its retry — and returned null) or came back capped-empty. Trimming
+        // now would replace real history with "(no summary available)": the exact
+        // silent data loss the comment above warns about. Leave the history intact
+        // and let the turn continue un-compacted; if the fat request genuinely
+        // cannot fit, the provider's context-length error is an honest, recoverable
+        // failure instead of a vanished transcript.
+        if (!summary && this.messages.length > 0) {
+          this.onEvent({ type: 'compaction_cancelled' });
+        } else {
         // NOW trim, at a split point the boundary rule allows.
-        const { split, dropped: droppedCount } = this.applyCompactionSplit(maxCtx, summary);
+        const { split, dropped: droppedCount, kept } = this.applyCompactionSplit(maxCtx, summary);
         // The array was REPLACED, so every count the ledger held describes messages
         // that no longer exist. `sync` would notice on its own (the first/last
         // identities no longer match), but resetting here states the intent at the
@@ -757,13 +872,14 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
         this._ledger.reset();
         usedNow = this.usedTokens();
         this.onEvent({
-          type: 'compacted', before, after: usedNow, kept: keep.length,
+          type: 'compacted', before, after: usedNow, kept,
           dropped: droppedCount, summary,
         });
         // SHELL HOOK: PostCompact. Fires after the trim, so a hook can archive the
         // summary or record the shrink. Never blocks.
         await runShellHooks(this.hookConfig, 'PostCompact',
-          { before, after: usedNow, kept: keep.length, dropped: droppedCount, summary }, this.cfg.workspace);
+          { before, after: usedNow, kept, dropped: droppedCount, summary }, this.cfg.workspace);
+        }
       }
       // ---- tool-result trimming ----
       // The cheap pass, and the one that actually runs in practice: a history is
@@ -820,11 +936,31 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
         }
       }
 
+      // THE CACHE BOUNDARY: everything BEFORE this index was already sent in an
+      // earlier request of this turn and has not changed since. It is captured
+      // here — AFTER the previous step's tool results are committed, BEFORE the
+      // steering drain appends anything new — so it marks exactly the prefix the
+      // provider can reuse.
+      //
+      // This used to be derived from the message COUNT ("keep the last two"), which
+      // is the wrong question. One agent step appends an assistant message plus one
+      // tool result PER call, so a step that read four files left five fresh
+      // messages; a breakpoint two back sat in the middle of that and the provider
+      // had to re-prefill all of it. Counting the boundary from the previous
+      // request instead means a step of any size leaves exactly one stable prefix.
+      // A COMPACTION REPLACED THE ARRAY, so the boundary measured against the old
+      // one no longer describes anything in this one. Clamping would place the
+      // breakpoint at a message that never existed when the value was taken.
+      if (this._stableEnd > this.messages.length) this._stableEnd = 0;
+      if (this._stableEnd !== this.messages.length) this._stableEnd = this.messages.length;
+      const cacheEnd = this._stableEnd - 1;
+
+
       // Plugin hooks around the model round-trip. `onBeforeRequest` sees the exact
-      // message array being sent (and may mutate it); `onAfterRequest` fires once
+      // message array being sent (and may mutate it); `onAfterResponse` fires once
       // the stream has been consumed.
       await runHooks('onBeforeRequest', this.messages, this.cfg);
-      await this.llm.request(this.messages, handle);
+      await this.llm.request(this.messages, handle, cacheEnd);
       await runHooks('onAfterRequest', this.messages, this.cfg);
 
       // An abort ends the turn: keep whatever text arrived, then stop.
@@ -961,13 +1097,20 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
           return { ok: false, result, editDiff: null, media: false };
         }
 
-        // Permission check before executing each tool
+        // Permission check before executing each tool.
+        //
+        // The hook may answer with a BOOLEAN (the original contract) or with `{ approved, error }`. The
+        // object form exists for the team mailbox, where a refusal travels with a reason the model can act
+        // on: "Blocked by user" tells it nothing about what to try instead, and a member that has been
+        // refused for a specific reason can re-plan.
         let result = null;
         let ok = true;
         if (this.onApproval) {
-          const approved = await this.onApproval(tc.name, tc.args);
+          const verdict = await this.onApproval(tc.name, tc.args);
+          const approved = verdict && typeof verdict === 'object' ? verdict.approved : verdict;
           if (!approved) {
-            result = `Blocked by user: tool "${tc.name}" was rejected.`;
+            const why = verdict && typeof verdict === 'object' && verdict.error ? `: ${verdict.error}` : '.';
+            result = `Blocked by user: tool "${tc.name}" was rejected${why}`;
             this.onEvent({ type: 'tool_use', id: tc.id, name: tc.name, args: tc.args });
             return { ok: false, result, editDiff: null, media: false };
           }
@@ -1004,7 +1147,17 @@ const filtered = (Array.isArray(cfg.toolFilter) && cfg.toolFilter.length
         try { const out = await runPatch('toolDispatch', { name: tc.name, args: tc.args, ctx: this.ctx }, (c) => c); if (out) { _args = out.args !== undefined ? out.args : tc.args; if (out.skip) _skip = true; } } catch (e) { console.error('[hncode-plugin] toolDispatch error:', e.message); }
         if (_skip) { result = '[skipped by plugin: ' + tc.name + ']'; ok = true; }
         else {
-          const raw = await tool.execute(_args, this.ctx);
+          // RACE THE ABORT SIGNAL, do not merely pass it.
+          //
+          // `ctx.signal` is handed to every tool, but nothing enforces that a tool LISTENS. A built-in
+          // does — Bash kills its process tree — while a plugin tool that ignores it kept running, and
+          // this `await` kept waiting for it: Esc reached `interrupt()`, aborted the controller, and the
+          // row still said "Using …" until the plugin happened to finish.
+          //
+          // Aborting the signal now ends the wait immediately whatever the tool is doing. The abandoned
+          // promise keeps running detached — a plugin that ignores the signal cannot be forced to stop —
+          // but the TURN is no longer held by it, which is what pressing Esc actually asked for.
+          const raw = await raceWithAbort(tool.execute(_args, this.ctx), this.toolAbort.signal);
           // `null` means the tool returned a structured MEDIA result: keep the object so the
           // image blocks can be built from it. Only a plain value is stringified.
           const text = toolResultText(raw);

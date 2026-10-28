@@ -69,21 +69,29 @@ export function addMember(teamName, { name, agentType = 'general', model = '', t
     return { ok: false, error: `team "${teamName}" already has ${others.length} members (max ${MAX_TEAMMATES})` };
   }
 
-  // THE FIRST MEMBER IS THE LEAD.
-  //
-  // A team with no leader is not a team — nothing can be reported TO — so the first member takes
-  // the role, and the team records its name and id. Every later member is a peer.
-  const isFirst = team.members.length === 0;
+  // One sanitized name is one inbox FILE: `Bob` and `bob`, or `a-b` and `a_b`,
+  // fold to the same path and would silently SHARE a mailbox, receiving each
+  // other's mail. A new member whose folded name collides with an existing one
+  // is refused — the caller picks a distinct name instead.
+  const folded = sanitizeName(memberName);
+  const clash = others.find((m) => sanitizeName(m.name) === folded);
+  if (clash) {
+    return { ok: false, error: `"${memberName}" folds to the same mailbox file as "${clash.name}" — pick a name that differs beyond case, dashes and underscores` };
+  }
 
   const color = pickColor(memberName, others.map((m) => m.color));
   const member = {
     agentId: formatAgentId(memberName, teamName),
     name: memberName,
     agentType,
-    // RANK, not trade. `agentType` says what a member does; this says where it sits. Kept as a
-    // field rather than derived from the name, so a lead can be renamed and a team can name its
-    // own leader.
-    role: isFirst ? 'lead' : 'member',
+    // RANK, not trade. `agentType` says what a member does; this says where it sits.
+    //
+    // ALWAYS `member`. The first person added was made `lead`, on the reasoning that a team with no
+    // leader is not a team — but that got it backwards for the only caller there is: `/team add`
+    // recruits someone to DO the work, and the person typing is already in charge. Labelling the first
+    // recruit a lead made it believe nobody had assigned it anything and that no message could have
+    // arrived, which is exactly what it then reported.
+    role: 'member',
     model,
     color,
     joinedAt: Date.now(),
@@ -95,10 +103,6 @@ export function addMember(teamName, { name, agentType = 'general', model = '', t
     // time blocked on the model, and a member that has never run is not working either.
     phase: 'starting',
   };
-  if (isFirst) {
-    team.leadName = memberName;
-    team.leadAgentId = member.agentId;
-  }
   team.members = [...others, member];
   writeTeamFile(teamName, team);
   return { ok: true, member };
@@ -164,6 +168,27 @@ export function findMember(teamName, name) {
   const team = readTeamFile(teamName);
   if (!team) return null;
   return team.members.find((m) => m.name === name) || null;
+}
+
+/**
+ * Record a member's permission mode: `ask` | `auto` | `yolo`.
+ *
+ * Stored on the roster rather than broadcast as a message, because the mode is a property of the member
+ * that has to survive a restart — a respawn reads it here. A running member keeps the hook it was built
+ * with, so a change takes effect next time it starts; that is stated in the panel's flash message rather
+ * than left to surprise someone.
+ *
+ * `ask` is the default and the safe one: every tool call is a question. `auto` and `yolo` run without
+ * asking, which is what makes them worth an explicit, per-member switch.
+ */
+export function setMemberMode(teamName, name, mode) {
+  const team = readTeamFile(teamName);
+  if (!team) return false;
+  const m = team.members.find((x) => x.name === name);
+  if (!m) return false;
+  m.permissionMode = String(mode || 'ask');
+  writeTeamFile(teamName, team);
+  return true;
 }
 
 /** Everyone except `except`, used for broadcast. */
@@ -234,7 +259,7 @@ export function readLeadInbox(teamName) {
     for (const m of readUnread(teamName, n)) {
       // Skip the USER'S OWN sends. Every message the user writes from the panel or `/team msg` is
       // stamped `from: TEAM_LEAD_NAME`, so it must not come back as mail from the team: typing
-      // "你好" to the lead and being handed `team-lead: 你好` as unread team traffic is the model
+      // "hello" to the lead and being handed `team-lead: hello` as unread team traffic is the model
       // reading the person's own instruction as though an agent had sent it.
       //
       // The test is the SENDER being the alias — NOT the lead being the user. The lead is a
@@ -271,8 +296,18 @@ export function formatLeadInbox(teamName, { mark = false } = {}) {
   const unread = readLeadInbox(teamName);
   if (!unread.length) return '';
   if (mark) markLeadInboxRead(teamName, unread);
-  const body = unread.map((m) => `${m.from}: ${String(m.text || '').trim()}`).join('\n');
-  return `${unread.length} unread message(s) for the team lead. Answer with the SendMessage tool.\n\n${body}`;
+  // One block per message, delimited.
+  //
+  // Joined with nothing but a newline, two messages from the same sender read as one wall of text: a
+  // reply that happens to begin with a number was indistinguishable from a list index, which is exactly
+  // how "1: ..." twice in a row looked like broken numbering rather than two separate answers.
+  const body = unread
+    .map((m) => {
+      const who = String(m.from || 'unknown');
+      return `--- from ${who} ---\n${String(m.text || '').trim()}`;
+    })
+    .join('\n\n');
+  return `${unread.length} unread message(s) for the team lead. Answer each with the SendMessage tool.\n\n${body}`;
 }
 
 export function readRoster(teamName) {

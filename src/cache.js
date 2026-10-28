@@ -33,7 +33,6 @@ export function supportsCaching(protocol) {
 }
 
 // Index (into `messages`) of the last message that belongs to the STABLE prefix.
-//
 // The prefix is only cacheable while it cannot change between turns. The system
 // prompt and tool list are fixed for a session; the conversation then grows by
 // APPENDING. So the prefix is "everything except the recent tail", and the tail
@@ -52,11 +51,38 @@ export function stablePrefixEnd(messages, keepTail = 2) {
 }
 
 // Attach Anthropic `cache_control` breakpoints to a request body IN PLACE-safe
+// Total character length of the prefix's content. `.length` is O(1) per string,
+// so this is O(#messages) — versus the full-string join plus the per-character
+// token walk the decision below used to make on EVERY request (and on every
+// retry attempt): ~1 MB of building and ~1M loop iterations on a 200k-token
+// history.
+function prefixContentLength(messages, end) {
+  let n = 0;
+  for (let i = 0; i <= end; i++) {
+    const c = messages[i] && messages[i].content;
+    if (typeof c === 'string') n += c.length;
+    else if (Array.isArray(c)) {
+      for (const b of c) if (b && typeof b.text === 'string') n += b.text.length;
+    }
+  }
+  return n;
+}
+
+// Memo of the last decision, keyed by `end:totalLength`. Tool-result trimming
+// rewrites content in place, which changes the length and so invalidates it.
+let _prefixDecision = { key: '', cacheable: false };
+
+// Attach Anthropic `cache_control` breakpoints to a request body IN PLACE-safe
 // fashion (returns a new body). Breakpoints are placed:
 //   1. on the LAST tool definition (caches the whole tool block),
 //   2. on the system prompt (caches tools + system together),
 //   3. on the last message of the stable prefix (caches the conversation head).
 // Marking the tail first and working backwards keeps the total <= MAX_BREAKPOINTS.
+//
+// `cacheEnd` is the index of the last message that belongs to the stable prefix,
+// counted by the CALLER. The agent loop knows it exactly — everything before that
+// index was already sent in an earlier request of this turn — so passing it beats
+// any guess made from the message count here.
 export function withAnthropicCache(body, opts = {}) {
   if (!body || typeof body !== 'object') return body;
   const minTokens = opts.minTokens || MIN_CACHEABLE_TOKENS;
@@ -82,14 +108,33 @@ export function withAnthropicCache(body, opts = {}) {
 
   // Conversation head: mark the stable prefix's last message.
   if (Array.isArray(out.messages) && out.messages.length) {
-    const end = stablePrefixEnd(out.messages, opts.keepTail);
-    if (end >= 0 && end < out.messages.length) {
-      // Only worth a breakpoint once the prefix is long enough to cache.
-      const prefixText = out.messages.slice(0, end + 1)
-        .map((m) => (typeof m.content === 'string' ? m.content
-          : Array.isArray(m.content) ? m.content.map((b) => b.text || '').join('') : ''))
-        .join('\n');
-      if (estimateTokens(prefixText) >= minTokens) {
+    // The caller's boundary when it has one; otherwise fall back to counting off
+    // the tail. A caller's value ABOVE the last index means the array grew after it
+    // was taken, so it is clamped to the end rather than rejected — the prefix it
+    // describes is still the stable one, it just no longer reaches the tail.
+    const n = out.messages.length;
+    const end = Number.isInteger(opts.cacheEnd)
+      ? Math.min(n - 1, opts.cacheEnd)
+      : stablePrefixEnd(out.messages, opts.keepTail);
+    // An EMPTY prefix is not worth marking. With `cacheEnd === -1` the caller is
+    // saying "nothing has been sent yet", so every message in this request is new.
+    if (end >= 0 && end < n) {
+      // Only worth a breakpoint once the prefix is long enough to cache. Memoized
+      // on the length fingerprint; a cold decision uses ~4 chars/token — exact for
+      // ASCII code and prose, conservative for CJK (whose real token count is
+      // HIGHER than chars/4, so a marked prefix is always truly cacheable). Being
+      // wrong on the other side is a harmless no-op: the provider ignores a
+      // breakpoint on a sub-minimum prefix.
+      const plen = prefixContentLength(out.messages, end);
+      const key = `${end}:${plen}`;
+      let cacheable;
+      if (_prefixDecision.key === key) cacheable = _prefixDecision.cacheable;
+      else {
+        cacheable = plen / 4 >= minTokens;
+        _prefixDecision.key = key;
+        _prefixDecision.cacheable = cacheable;
+      }
+      if (cacheable) {
         const msgs = out.messages.slice();
         const msg = { ...msgs[end] };
         if (typeof msg.content === 'string') {

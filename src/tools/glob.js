@@ -4,7 +4,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { normalizeInput } from './utils.js';
+import { resolvePath } from './utils.js';
 import { walkFiles } from './ignore.js';
 import { globToRegexSource, expandBraces } from './matchers.js';
 
@@ -29,9 +29,11 @@ export const spec = {
       return 'Error: `pattern` is required (e.g. "src/**/*.ts").';
     }
     const fromDir = typeof args.path === 'string' && args.path ? args.path : '.';
-    const p = normalizeInput(fromDir);
     let base;
-    try { base = path.resolve(ctx.cwd || ctx.workspace, p); } catch (e) { return `Error: ${e.message}`; }
+    // Same workspace boundary as Read/Write/Edit. Glob resolved `path` directly,
+    // so `Glob { pattern: '**', path: 'C:\\Users\\...' }` walked any directory on
+    // disk with no permission gate at all.
+    try { base = resolvePath(fromDir, ctx); } catch (e) { return `Error: ${e.message}`; }
     if (!fs.existsSync(base)) return `Error: path does not exist: ${fromDir}`;
     if (!fs.statSync(base).isDirectory()) return `Error: --path is not a directory: ${fromDir}`;
 

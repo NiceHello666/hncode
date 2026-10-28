@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import cp from 'node:child_process';
-import { normalizeInput, isProbablyTextFile, truncateBuf } from './utils.js';
+import { isProbablyTextFile, truncateBuf, resolvePath } from './utils.js';
 import { walkFiles } from './ignore.js';
 import { matchGlob } from './matchers.js';
 
@@ -33,8 +33,11 @@ export const spec = {
     required: ['pattern'],
   },
   async execute(args, ctx) {
-    const p = normalizeInput(args.path || '.');
-    const base = path.resolve(ctx.cwd || ctx.workspace, p);
+    // Same workspace boundary as Read/Write/Edit. Grep resolved `path` directly,
+    // so `Grep { pattern: 'KEY', path: 'C:/Users/...' }` searched any directory
+    // on disk — the search tools had no gate at all.
+    let base;
+    try { base = resolvePath(args.path || '.', ctx); } catch (e) { return `Error: ${e.message}`; }
     if (!fs.existsSync(base)) return `Error: path does not exist: ${args.path}`;
     if (!args.multiline && hasRg()) return await grepRg(args, base, ctx);
     return grepJs(args, base, ctx);
@@ -58,7 +61,11 @@ function hasRg() {
 }
 
 function buildRgArgs(args, base) {
-  const a = ['--no-heading', '--line-number', '--no-config', '-e', args.pattern];
+  // --crlf: an end anchor (`;$`) must match a line that ends `\r\n`, exactly as
+  // it does in an LF file — and as the JS fallback already does. Without it the
+  // rg path reported "No matches found" for patterns the user could SEE ending
+  // the line, on this repo's own CRLF files.
+  const a = ['--no-heading', '--line-number', '--no-config', '--crlf', '-e', args.pattern];
   if (args['-i']) a.push('-i');
   const before = args['-B'] || (args['-C'] || 0);
   const after = args['-A'] || (args['-C'] || 0);
@@ -99,6 +106,13 @@ function grepRg(args, base, ctx) {
     child.on('error', () => done(() => resolve(grepJs(args, base, ctx))));
     child.on('close', (code) => done(() => {
       if (code > 1 && stderr) resolve(`rg error: ${stderr.trim()}`);
+      else if (!stdout.trim() && args.pattern.includes('$')) {
+        // A zero-match END-ANCHORED query may be a LONE-CR file (old-Mac endings),
+        // which rg cannot treat as line breaks at all. The JS walker handles every
+        // ending, so it gets the final word — only for `$` patterns that found
+        // nothing, so ordinary searches never pay for the extra pass.
+        resolve(grepJs(args, base, ctx));
+      }
       else resolve(paginate(stdout, args));
     }));
     // Honour an aborted turn (Esc): kill rg instead of leaving it running.
@@ -113,7 +127,7 @@ function grepRg(args, base, ctx) {
 function grepJs(args, base, ctx) {
   const flags = 'g' + (args['-i'] ? 'i' : '') + (args.multiline ? 's' : '');
   const re = new RegExp(args.pattern, flags);
-  const files = walkFiles(base, { includeIgnored: !!args.include_ignored, includeDirs: false });
+  const files = walkFiles(base, { includeIgnored: !!args.include_ignored, includeDirs: false, limit: 0 });
   const filtered = files.filter((abs) => {
     if (args.glob) {
       const rel = path.relative(base, abs).split(path.sep).join('/');

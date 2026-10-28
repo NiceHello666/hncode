@@ -77,16 +77,28 @@ export function matchPattern(pat, relPath, isDir) {
 // duplication, since the information was already available as each entry was
 // visited. One stat per file now, reused for both.
 export function walkFiles(base, opts = {}) {
-  const { includeIgnored = false, includeDirs = false } = opts;
+  // `limit` caps the RESULT. Glob keeps the default (newest 100); Grep passes 0 —
+  // truncating the WALK by mtime made the search silently skip older files and
+  // report "No matches found" for text that was right there.
+  const { includeIgnored = false, includeDirs = false, limit = 1000 } = opts;
   const baseAbs = path.resolve(base);
   /** @type {{path:string, mtime:number, isFile:boolean}[]} */
   const found = [];
   _walk(baseAbs, '', [], found, { includeIgnored, includeDirs });
-  // Newest first. Sort before truncating so the newest 1000 survive the cap.
+  // Newest first. Sort before truncating so the newest entries survive the cap.
   found.sort((a, b) => b.mtime - a.mtime);
-  if (found.length > 1000) found.length = 1000;
+  if (limit > 0 && found.length > limit) found.length = limit;
   return found.filter((e) => includeDirs || e.isFile).map((e) => e.path);
 }
+
+// Directories that are never worth walking. `.git` holds the object database —
+// hundreds of thousands of files on an old repo, none of them source, and no
+// .gitignore ever lists it. `node_modules` is pruned for the JS walker unless the
+// caller explicitly asked for ignored files: walking it was a multi-second stall
+// of the event loop (everything here is readdirSync/statSync) for results nobody
+// wanted.
+const PRUNED_DIRS = new Set(['.git']);
+const PRUNED_UNLESS_IGNORED = new Set(['node_modules']);
 
 function _walk(dir, relPrefix, parentPatterns, found, opts) {
   const { includeIgnored, includeDirs } = opts;
@@ -98,6 +110,8 @@ function _walk(dir, relPrefix, parentPatterns, found, opts) {
     const abs = path.join(dir, ent.name);
     let isDir;
     try { isDir = ent.isDirectory(); } catch { try { isDir = fs.statSync(abs).isDirectory(); } catch { isDir = false; } }
+    if (isDir && (PRUNED_DIRS.has(ent.name)
+      || (!includeIgnored && PRUNED_UNLESS_IGNORED.has(ent.name)))) continue;
     // ignore decision
     let ignored = false;
     for (const pat of acc) {

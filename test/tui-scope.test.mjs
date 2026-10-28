@@ -61,11 +61,16 @@ function moduleLevelFunctions() {
   return out;
 }
 
-/** A function body with comments removed, so a comment naming an identifier is not a match. */
-function bodyOf(fn) {
-  return lines.slice(fn.from, fn.to).join('\n')
+/** A source string with comments removed, so a comment naming an identifier is not a match. */
+function codeOnly(text) {
+  return String(text)
     .replace(/^\s*\/\/.*$/gm, '')
     .replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+/** A function body with comments removed. */
+function bodyOf(fn) {
+  return codeOnly(lines.slice(fn.from, fn.to).join('\n'));
 }
 
 test('the harness found the two scopes it asserts about', () => {
@@ -203,4 +208,79 @@ test('the scan would have caught the crashes it guards', () => {
   assert.equal(rule(inner, none, none, 'h.refreshKeybindings();', 'dispatch'), '', 'a host method is fine');
   assert.equal(rule(inner, new Set(['submit']), none, 'submit(next);', 'other'), '', 'a local shadows it');
   assert.equal(rule(inner, none, new Set(['submit']), 'submit(next);', 'other'), '', 'a module binding is fine');
+});
+
+test('a function NESTED in startTUI cannot read a runTurn local either', () => {
+  // The hole in the scan above: it covers module-level functions, but `spawnTeammates` is nested
+  // inside `startTUI`, so it was never examined. That is exactly where the crash was — it read
+  // `viewCur`, a local of `runTurn`, and threw from inside the tool relay.
+  //
+  // A nested function sees startTUI's locals plus the module scope, and NOTHING else: not another
+  // function's locals, however close it sits in the file.
+  const startBody = src.slice(src.indexOf('export async function startTUI('));
+  const runTurnBody = src.slice(src.indexOf('async function runTurn('), src.indexOf('export async function startTUI('));
+
+  // What runTurn binds that startTUI does not — those are the unreachable ones.
+  const theirs = new Set();
+  const params = /async function runTurn\(([\s\S]*?)\)\s*\{/.exec(runTurnBody);
+  if (params) for (const p of params[1].split(',')) {
+    const name = p.trim().split('=')[0].trim();
+    if (/^\w+$/.test(name)) theirs.add(name);
+  }
+  for (const m of runTurnBody.matchAll(/^\s*(?:const|let|var|function|async function)\s+(\w+)/gm)) theirs.add(m[1]);
+
+  // What startTUI binds: its parameters, its own declarations, and the module scope.
+  const ours = new Set();
+  const startParams = /export async function startTUI\(([\s\S]*?)\)\s*\{/.exec(startBody);
+  if (startParams) for (const p of startParams[1].split(',')) {
+    const name = p.trim().split('=')[0].split(':').pop().trim();
+    if (/^\w+$/.test(name)) ours.add(name);
+  }
+  for (const m of startBody.matchAll(/^\s*(?:const|let|var|function|async function)\s+(\w+)/gm)) ours.add(m[1]);
+  for (const m of startBody.matchAll(/^\s{2,4}(\w+)\s*[,=]/gm)) ours.add(m[1]);
+  for (const m of src.matchAll(/^(?:export )?(?:async )?function ([A-Za-z0-9_]+)/gm)) ours.add(m[1]);
+  for (const m of src.matchAll(/^(?:export )?(?:const|let|var|class) ([A-Za-z0-9_]+)/gm)) ours.add(m[1]);
+
+  // A name is only a problem when startTUI does NOT bind it AND the reference is a MEMBER ACCESS —
+  // `viewCur.renderSoon()` — rather than a call. That is the shape of the real crash, and restricting
+  // to it is what keeps the scan quiet: a bare `messages(` or `agent(` is a local call far more often
+  // than a scope leak.
+  const exclusive = [...theirs].filter((n) => n.length >= 5 && !ours.has(n) && n !== 'runTurn');
+
+  // A member access is `name.something`. Built by concatenation, not a template literal: inside a
+  // template, `\\s` becomes `\s` and the pattern stops matching a space.
+  //
+  // COMMENTS ARE STRIPPED FIRST. Without that the scan matches the full stops in English prose — a
+  // comment reading "the user bubble." or "agent.run()" is a sentence, not a scope leak. Four names
+  // were flagged this way and none of them was a bug.
+  const leaks = exclusive
+    .map((name) => {
+      const re = new RegExp('(^|[^A-Za-z0-9_$.])' + name + '\\s*\\.', 'g');
+      return { name, count: (codeOnly(startBody).match(re) || []).length };
+    })
+    .filter((x) => x.count > 0);
+
+  assert.deepEqual(leaks, [],
+    `runTurn locals read inside startTUI, where they are undefined: ${leaks.map((l) => l.name).join(', ')}`);
+});
+
+test('the scan would have caught the viewCur crash', () => {
+  // The control for the test above: feed it the bug that actually shipped, and check it flags it.
+  const startBody = 'async function spawnTeammates(t, m) { spawnMany(t, m, { onEvent: (ev) => { if (ev.type === "tool") { viewCur.renderSoon(); } } }); }';
+  const runTurnLocals = new Set(['deps', 'text', 'opts', 'viewArg', 'viewCur']);
+  const startTUILocals = new Set(['spawnTeammates', 'spawnMany', 'notice']);
+
+  const rule = (inner, ours, body) => {
+    const problems = [];
+    for (const n of inner) {
+      if (ours.has(n)) continue;
+      if (new RegExp(`(^|[^A-Za-z0-9_$.])${n}\\s*\\.`).test(body)) problems.push(n);
+    }
+    return problems;
+  };
+  assert.deepEqual(rule(runTurnLocals, startTUILocals, startBody), ['viewCur'],
+    'the scan flags the crash that shipped');
+  // And it must not flag a name startTUI binds itself.
+  assert.deepEqual(rule(runTurnLocals, startTUILocals, 'notice("hi"); spawnMany(x);'), [],
+    'a local of startTUI is fine');
 });

@@ -226,6 +226,19 @@ export const SendMessageSpec = {
     // reaches the person, and it is why the box exists.
     if (args.to === TEAM_LEAD_NAME) {
       writeToMailbox(teamName, TEAM_LEAD_NAME, { from: me.name, text, summary: args.summary, color });
+      // Tell the running TUI at once, so the message appears in the user's transcript as it is sent
+      // rather than waiting for their next turn.
+      //
+      // Without this the reply was only ever written to a file: `formatLeadInbox` runs at the START of
+      // a turn, so a member's answer sat unread until the person happened to type something else. From
+      // the user's side that is indistinguishable from the team being dead — they send an instruction,
+      // nothing appears, and the answer is already on disk.
+      //
+      // The callback reaches here through `ctx`, which the Agent builds by spreading the teammate's
+      // config, so the spawner only has to put it there.
+      if (typeof ctx?.onLeadMail === 'function') {
+        try { ctx.onLeadMail({ from: me.name, text, summary: args.summary, color }); } catch { /* never fail a send over a display hook */ }
+      }
       return { content: 'Sent to the lead (the user).' };
     }
 

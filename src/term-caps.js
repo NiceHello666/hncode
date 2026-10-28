@@ -64,14 +64,31 @@ export const PROBE_TIMEOUT_MS = 250;
  *  opcode, and 14/18 were what an earlier version matched on and therefore never read.
  */
 export const PROBE_QUERY = '\x1b]11;?\x07' + '\x1b[?u' + '\x1b[?2026$p'
+  // The three mouse-reporting modes, asked with DECRQM so a terminal that does not implement one can
+  // SAY SO rather than being sent it blind. This is the fix for a UI whose keyboard works and whose
+  // mouse does nothing: the mode was accepted and no event ever arrived.
+  //
+  //   1000  click and release
+  //   1002  button-motion (drag)
+  //   1003  any-motion (hover) — the least widely supported, and the one worth dropping alone
+  + '\x1b[?1000$p' + '\x1b[?1002$p' + '\x1b[?1003$p'
   + '\x1b_Gi=31,s=1,v=1,a=q,t=d,f=32,o=z;eAFjYGBgAAAABAAB\x1b\\'
   + '\x1b[16t' + '\x1b[14t' + '\x1b[c';
+
+/**
+ * The mouse-reporting modes hncode asks for, by name.
+ *
+ * Kept as a map rather than three magic numbers at the call site so the query, the parser and the
+ * enable step all name the same mode.
+ */
+export const MOUSE_MODES = Object.freeze({ click: 1000, drag: 1002, hover: 1003 });
 
 /** Synchronized output (BEGIN/END SYNCHRONIZED UPDATE). */
 export const SYNC_OUTPUT_MODE = 2026;
 
 /** DECRPM `status` values for a mode. 0 means "not recognised", which is the one that
  *  says the terminal has never heard of the mode. */
+const DECRPM_NOT_RECOGNISED = 0;
 const DECRPM_SET = 1;
 const DECRPM_RESET = 2;
 
@@ -103,6 +120,12 @@ function emptyCaps() {
     kitty: null,       // true/false: does it speak the Kitty keyboard protocol
     kittyGraphics: null, // true/false: does it speak the Kitty GRAPHICS protocol
     sync: null,        // true/false: synchronized output usable
+    // Mouse reporting, per mode: true = the terminal recognises it, false = it said it does not
+    // (DECRPM status 0), null = it did not answer. The last is treated as YES by the caller, because
+    // silence is not a refusal — a terminal that ignores DECRQM entirely must keep working.
+    mouseClick: null,  // ?1000, click and release
+    mouseDrag: null,   // ?1002, button-motion
+    mouseHover: null,  // ?1003, any-motion
     level: null,       // 'vt220', …
     extensions: [],    // ['sixel', 'ansi-color', …]
     textArea: null,    // { w, h } in PIXELS: the terminal's text area, or null
@@ -301,6 +324,17 @@ export function parseProbeReplies(buf) {
       // and either state is something the wrapper can work with.
       found.sync = status === DECRPM_SET || status === DECRPM_RESET;
     }
+    // A mouse mode: `true` only when the terminal RECOGNISES it. Status 0 means it has never heard of
+    // the mode, and asking anyway is what leaves the application waiting for reports that never come —
+    // a UI where the keyboard works and the mouse does nothing.
+    //
+    // A mode the terminal did not answer for stays `undefined`, which the caller reads as UNKNOWN
+    // rather than as "no": silence is not a refusal, and a terminal that ignores DECRQM altogether has
+    // to keep the previous behaviour.
+    const known = status !== DECRPM_NOT_RECOGNISED;
+    if (mode === MOUSE_MODES.click) found.mouseClick = known;
+    if (mode === MOUSE_MODES.drag) found.mouseDrag = known;
+    if (mode === MOUSE_MODES.hover) found.mouseHover = known;
   });
   // Kitty GRAPHICS: a supported query answers `OK`; a terminal without the protocol says
   // nothing at all. Silence is resolved in probeTerminal (a sentinel arriving means every
@@ -385,6 +419,19 @@ export function probeTerminal({ stdin, stdout, timeoutMs = PROBE_TIMEOUT_MS } = 
       // is supported, so silence means NO, and sending `>1u` anyway is exactly what
       // mangles input. Only inferred when the sentinel arrived; without it, unknown.
       if (sawSentinel && found.kitty === undefined) found.kitty = false;
+      // THE SAME INFERENCE FOR THE MOUSE MODES, and making it is the point of this change. A terminal
+      // that answers the sentinel and then says nothing about `?1003` does NOT implement it: DECRQM is
+      // mandatory for a mode the terminal knows, so silence in that position is a refusal.
+      //
+      // Without this, an unsupported mode was read as "unknown" and enabled anyway — the sequences went
+      // out, the terminal ignored them, and the mouse was dead with nothing to explain it. Leaving it
+      // unknown is right only when the sentinel never arrived, where the silence means the terminal does
+      // not speak DECRQM at all rather than that it declined.
+      if (sawSentinel) {
+        if (found.mouseClick === undefined) found.mouseClick = false;
+        if (found.mouseDrag === undefined) found.mouseDrag = false;
+        if (found.mouseHover === undefined) found.mouseHover = false;
+      }
       resolve({ caps: setTerminalCaps(found), rest, complete: sawSentinel });
     };
 

@@ -3,7 +3,7 @@
 // kimi does NOT render a swarm as a tool line plus a text dump. It renders a live
 // BLOCK in the transcript:
 //
-//   ─ Agent Swarm ─ 两个子代理各回你好 ─ coder
+//   ─ Agent Swarm ─ two subagents each replied hi ─ coder
 //
 //     001 [#---------------] Working…   Inspecting src/tui.js
 //     002 [###-------------] Queued…

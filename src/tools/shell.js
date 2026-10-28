@@ -116,7 +116,15 @@ export function resetShellCache() {
  * (see detectShell). Throws a message naming the fix only when no shell at all
  * was found, instead of letting the caller hit a bare ENOENT.
  */
-export function shellSpawnArgs(command) {
+/**
+ * The spawn argv for a command.
+ *
+ * `interactive` drops `-NonInteractive`, and that is not cosmetic: PowerShell in non-interactive mode
+ * treats stdin as an already-finished stream and closes it, so a child started that way reads EOF
+ * immediately and exits — before anything can be written to it. The flag has to come off for
+ * `Bash {interactive: true}` to mean anything.
+ */
+export function shellSpawnArgs(command, opts = {}) {
   const shell = getShell();
   if (!shell) {
     throw new Error(
@@ -130,5 +138,8 @@ export function shellSpawnArgs(command) {
     // quoting and we do not wrap it ourselves.
     return { bin: shell.path, args: ['/d', '/s', '/c', command], shell };
   }
-  return { bin: shell.path, args: ['-NoProfile', '-NonInteractive', '-Command', command], shell };
+  const args = ['-NoProfile'];
+  if (!opts.interactive) args.push('-NonInteractive');
+  args.push('-Command', command);
+  return { bin: shell.path, args, shell };
 }

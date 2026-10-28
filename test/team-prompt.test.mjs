@@ -18,7 +18,7 @@
 //      belong in the system prompt, which is rebuilt each request.
 //
 //   4. THE USER'S OWN MESSAGE GOT NO ANSWER. The rules covered finishing, being blocked and
-//      asking for work — none of which is "the person said 你好 to you". A teammate that answered
+//      asking for work — none of which is "the person said hello to you". A teammate that answered
 //      only under those conditions treated a direct message as nothing to reply to, so a lead
 //      that was perfectly alive looked dead. Answering `team-lead` is now stated as its own case.
 import assert from 'node:assert/strict';
@@ -169,7 +169,7 @@ test('the runner builds the system prompt from the live roster', () => {
 test('a teammate is told to answer the person, by the name their messages carry', () => {
   // The report was "the lead never replies". The lead WAS alive and DID read the message — its
   // rules covered finishing, being blocked and asking for work, none of which is "the user said
-  // 你好". So it treated a direct message as nothing to answer.
+  // hello". So it treated a direct message as nothing to answer.
   const sys = teammateSystemPrompt(team, lead);
   assert.match(sys, /WHO YOU ANSWER/, 'the routing is stated explicitly');
   assert.match(sys, /a message from the person using hncode carries the name `team-lead`/,

@@ -166,6 +166,28 @@ export function readUpdateStamp() {
   try { return JSON.parse(fs.readFileSync(updateStampFile(), 'utf8')); } catch { return null; }
 }
 
+// npm's own stderr from the background install, beside the stamp. A FILE because
+// the install outlives this process: a pipe belonged to hncode, and quitting
+// mid-install closed it under npm — the install died on EPIPE partway through.
+function updateLogFile() {
+  const dir = process.env.HNCODE_HOME || path.join(os.homedir(), '.hncode');
+  return path.join(dir, 'update-log.txt');
+}
+
+/** Last `n` bytes of a file, or ''. Never throws. */
+function tailOfFile(p, n = 4000) {
+  try {
+    const st = fs.statSync(p);
+    const fh = fs.openSync(p, 'r');
+    try {
+      const start = Math.max(0, st.size - n);
+      const buf = Buffer.alloc(st.size - start);
+      fs.readSync(fh, buf, 0, buf.length, start);
+      return buf.toString('utf8');
+    } finally { fs.closeSync(fh); }
+  } catch { return ''; }
+}
+
 /** Forget it, once it has been reported. Never throws. */
 export function clearUpdateStamp() {
   try { fs.unlinkSync(updateStampFile()); return true; } catch { return false; }
@@ -202,13 +224,23 @@ export function updateBackground(version = '') {
       return;
     }
 
+    // stderr lands in a file (survives this process); when the file cannot be
+    // opened, fall back to a pipe and the in-memory capture below.
+    const logFile = updateLogFile();
+    let logFd = null;
+    try {
+      fs.mkdirSync(path.dirname(logFile), { recursive: true });
+      logFd = fs.openSync(logFile, 'w');
+    } catch { logFd = null; }
+
     let child;
     try {
       child = spawnNpm(['install', '-g', `${PKG_NAME}@latest`], {
         detached: true,
-        stdio: ['ignore', 'ignore', 'pipe'],
+        stdio: ['ignore', 'ignore', logFd == null ? 'pipe' : logFd],
       });
     } catch (e) {
+      if (logFd != null) { try { fs.closeSync(logFd); } catch { /* already gone */ } }
       releaseInstallLock();
       const error = (e && e.message) || String(e);
       writeUpdateStamp({ status: 'error', version, error });
@@ -217,7 +249,7 @@ export function updateBackground(version = '') {
     }
 
     let stderr = '';
-    if (child.stderr) {
+    if (logFd == null && child.stderr) {
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (d) => {
         stderr += d;
@@ -230,17 +262,20 @@ export function updateBackground(version = '') {
     // it prevents.
     child.on('error', (e) => {
       releaseInstallLock();
+      if (logFd != null) { try { fs.closeSync(logFd); } catch { /* already gone */ } }
       writeUpdateStamp({ status: 'error', version, error: (e && e.message) || String(e) });
     });
     child.on('close', (code) => {
       releaseInstallLock();
+      if (logFd != null) { try { fs.closeSync(logFd); } catch { /* already gone */ } }
       // Exit code 0 is the only thing that means the files were replaced. Anything else —
       // no permission, an unreachable registry, a killed process — is recorded with npm's
       // own last words, which is what makes the next launch's message actionable.
       if (code === 0) {
         writeUpdateStamp({ status: 'installed', version });
       } else {
-        const tail = stderr.trim().split(/\r?\n/).slice(-6).join('\n');
+        const raw = logFd != null ? tailOfFile(logFile) : stderr;
+        const tail = raw.trim().split(/\r?\n/).slice(-6).join('\n');
         writeUpdateStamp({ status: 'error', version, code, error: tail || `npm exited ${code}` });
       }
     });

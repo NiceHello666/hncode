@@ -274,6 +274,54 @@ export function applyTrim(messages, plan, sessionId) {
 // so a caller can skip its UI event entirely.
 export function trimToolResults(messages, opts = {}) {
   const plan = planTrim(messages, opts.keepRatio, opts.mustKeep);
-  if (!plan.elide.length) return null;
-  return { ...applyTrim(messages, plan, opts.sessionId), plan };
+  const mediaPlan = planMediaTrim(messages, opts.mediaKeep ?? 2);
+  if (!plan.elide.length && !mediaPlan.elide.length) return null;
+  const applied = plan.elide.length
+    ? applyTrim(messages, plan, opts.sessionId)
+    : { elided: 0, elidedBytes: 0, kept: plan.keep.length, keptBytes: plan.keepBytes };
+  const mediaApplied = applyMediaTrim(messages, mediaPlan, opts.sessionId);
+  return {
+    ...applied,
+    elided: applied.elided + mediaApplied.elided,
+    elidedBytes: applied.elidedBytes + mediaApplied.elidedBytes,
+    plan,
+  };
+}
+
+// ---- media results ----------------------------------------------------------
+// A media tool result keeps its base64 payload IN the history object — and unlike
+// a string body, planTrim cannot elide it, so every screenshot was re-serialized
+// into every request body, every session save and every cache-prefix walk until a
+// full compaction dropped it. Keep only the newest `mediaKeep` media results;
+// older ones spill their text (if any) and lose the bytes, same contract as the
+// string path: saved to disk first, pointer left behind.
+
+function planMediaTrim(messages, keep) {
+  const idx = [];
+  if (Array.isArray(messages)) {
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m && m.role === 'tool' && m.content && typeof m.content === 'object'
+        && Array.isArray(m.content.media) && m.content.media.length) idx.push(i);
+    }
+  }
+  const elide = idx.slice(0, Math.max(0, idx.length - Math.max(0, keep)));
+  return { elide };
+}
+
+function applyMediaTrim(messages, mediaPlan, sessionId) {
+  const out = { elided: 0, elidedBytes: 0 };
+  for (const i of mediaPlan.elide) {
+    const m = messages[i];
+    let bytes = 0;
+    for (const part of m.content.media) bytes += (part && part.data ? part.data.length : 0);
+    const text = String(m.content.text || '');
+    const spilled = spillResult(sessionId, `trim-${m.toolCallId || i}`, text || '[media only]');
+    m.content = `[Media result elided to save context — ${fmtBytes(bytes)} of image data from ${m.name || 'tool'}`
+      + (spilled ? `; the description was saved to: ${spilled.file}` : '; the description could not be saved')
+      + '. Re-run the tool if you need the image again.]';
+    out.elided++;
+    out.elidedBytes += bytes;
+  }
+  return out;
 }

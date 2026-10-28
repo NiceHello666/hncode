@@ -15,7 +15,22 @@ import { runTeammate } from './runner.js';
 import { addMember, setMemberActive } from './team.js';
 import { updateMember } from './store.js';
 import { readTeamFile } from './store.js';
-import { TEAMMATE_MAX_STEPS } from './constants.js';
+import { TEAMMATE_MAX_STEPS, TEAM_LEAD_NAME } from './constants.js';
+import { requestPermission } from './permission.js';
+import { leadOf } from './team.js';
+
+/**
+ * One line describing what a tool call would do, for the permission prompt.
+ *
+ * A tool NAME tells the person nothing — "Bash" could be `ls` or `rm -rf`. These are the fields Claude
+ * Code checks, in the same order, because they are what the common tools put their intent in.
+ */
+function describeCall(toolName, args) {
+  const a = args && typeof args === 'object' ? args : {};
+  const desc = a.description || a.command || a.prompt || a.query || a.pattern || a.file_path || a.path;
+  if (desc) return String(desc).split('\n')[0].slice(0, 120);
+  return `${toolName} with no description`;
+}
 
 /** Live teammates, by agent id. The abort handle and the running promise. */
 const running = new Map();
@@ -51,7 +66,14 @@ export function spawnTeammate({
   maxSteps = TEAMMATE_MAX_STEPS,
   cwd,
   onEvent,
+  // Called when this teammate sends a message to the lead — that is, to the person using hncode. The
+  // TUI passes one so the text lands in their transcript as it is sent; see `SendMessage` for what went
+  // wrong without it.
+  onLeadMail,
   tasks,
+  // 'ask' installs the permission round trip (see below). Anything else leaves the member able to
+  // run tools unattended — what a headless spawn wants.
+  permissionMode = '',
 }) {
   const team = readTeamFile(teamName);
   if (!team) return { ok: false, error: `no team "${teamName}"` };
@@ -107,6 +129,10 @@ export function spawnTeammate({
     abort() { abort.aborted = true; for (const l of abort.listeners) { try { l(); } catch { /* best effort */ } } },
     get signal() { return abort; },
   };
+  // TaskStop reaches a teammate through this handle. Without it the task had
+  // neither `_abort` nor `pid`, so a stop settled the task as 'killed' while
+  // the member kept polling its inbox forever.
+  task._abort = () => controller.abort();
 
   appendTaskOutput(task, `[${name}] started on team "${teamName}"\n`);
   onEvent && onEvent({ type: 'start', name, teamName, taskId: task.taskId, color: member.color });
@@ -120,6 +146,10 @@ export function spawnTeammate({
   const runCfg = {
     ...cfg,
     model: member.model || cfg.subagentModel || cfg.model,
+    // Carried on the config so the teammate's own `SendMessage` can reach the TUI. This is the
+    // channel that makes a reply appear in the user's transcript the moment it is sent, instead of
+    // waiting for their next turn (see the tool's handler for what went wrong without it).
+    onLeadMail,
   };
   let ok = false;
   const promise = runAs(identity, async () => {
@@ -138,6 +168,30 @@ export function spawnTeammate({
         shouldStop: () => abort.aborted,
         onStart: () => onEvent && onEvent({ type: 'working', name }),
         onFinish: () => onEvent && onEvent({ type: 'idle', name }),
+        // Relay the member's live output upward. The UI decides what to do with it; spawning only
+        // carries it, which keeps the display policy in one place.
+        onStream: (s) => onEvent && onEvent({ type: 'stream', name, stream: s }),
+        // THE PERMISSION ROUND TRIP: the member blocks here until the person answers through the lead's
+        // mailbox, and `requestPermission` polls for the matching `request_id`.
+        //
+        // Only installed when someone can actually answer — a headless spawn has no panel, and blocking
+        // for ten minutes on a question nobody can see would look like a hang.
+        askPermission: permissionMode === 'ask'
+          ? async (toolName, args) => {
+            const lead = leadOf(teamName) || TEAM_LEAD_NAME;
+            const verdict = await requestPermission({
+              teamName,
+              memberName: name,
+              leadName: lead,
+              toolName,
+              description: describeCall(toolName, args),
+              input: args && typeof args === 'object' ? args : {},
+              shouldStop: () => abort.aborted,
+            });
+            onEvent && onEvent({ type: 'permission', name, toolName, approved: verdict.approved });
+            return verdict;
+          }
+          : undefined,
       });
       ok = true;
       appendTaskOutput(task, `[${name}] finished${result.idle ? ' (idle timeout)' : ''}\n`);
@@ -177,9 +231,6 @@ export function spawnTeammate({
     teamName,
     taskId: task.taskId,
     controller,
-    teamName,
-    taskId: task.taskId,
-    controller,
     promise,
     color: member.color,
   });
@@ -197,7 +248,14 @@ export function spawnMany(teamName, members, opts) {
   const started = [];
   const failed = [];
   for (const m of members) {
-    const r = spawnTeammate({ teamName, cwd: opts.cwd, cfg: opts.cfg, toolNote: opts.toolNote, onEvent: opts.onEvent, ...m });
+    const r = spawnTeammate({
+      teamName, cwd: opts.cwd, cfg: opts.cfg, toolNote: opts.toolNote, onEvent: opts.onEvent,
+      onLeadMail: opts.onLeadMail,
+      // Carried through from the caller. `ask` installs the permission round trip; anything else leaves
+      // the member able to run tools unattended, which is what a headless spawn wants.
+      permissionMode: opts.permissionMode,
+      ...m,
+    });
     if (r.ok) started.push({ name: m.name, taskId: r.taskId });
     else failed.push({ name: m.name, error: r.error });
   }
