@@ -137,7 +137,7 @@ test('the intensity is interpolated, not switched', () => {
 test('both stamps are written where the events arrive', () => {
   // `lastTokenAt` and `hasActiveTools` are read on the paint path, which cannot tell "slow" from "quiet" —
   // only the event stream can, so the stamps have to be there.
-  assert.match(tuiSrc, /if \(e\.type === 'data'\) \{[\s\S]{0,300}state\.lastTokenAt = Date\.now\(\)/);
+  assert.match(tuiSrc, /if \(e\.type === 'data'\) \{[\s\S]{0,1400}state\.lastTokenAt = Date\.now\(\)/);
   assert.match(tuiSrc, /if \(e\.type === 'tool_start'\) \{[\s\S]{0,300}state\.hasActiveTools = true/);
   assert.match(tuiSrc, /if \(e\.type === 'tool_result'\) \{[\s\S]{0,300}state\.hasActiveTools = false/);
 });

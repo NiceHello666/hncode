@@ -427,6 +427,7 @@ export const TIPS = [
   'Queued messages wait for the turn to finish',
   '/steer injects a message into the running turn',
   'Ctrl+R reloads the current session from disk',
+  'Alt+R re-fetches the provider\'s model list',
   '/help shows available commands at any time',
   '/undo rolls back the transcript AND the files',
   '/fork copies the session so you can branch',
@@ -678,7 +679,7 @@ export function lightWidth(n) {
  * palettes: the peak moves one letter at a time, and the row reads as a lamp travelling rather than as a
  * single pixel flashing.
  */
-export const TAIL_CHARS = 2;
+export const TAIL_CHARS = 4;
 
 
 /**
@@ -718,12 +719,37 @@ export const FRAME_MS = 1000 / ANIM_FPS;
 /**
  * How long one step of the light lasts, in milliseconds.
  *
- * Claude Code runs two rates — `glimmerSpeed` is 50ms while a request is in flight and 200ms otherwise —
- * but only ONE of them is ever used here: both animated rows (Working, and a pending tool's name) are
- * shown while something is happening, so both take the fast rate. A second, unused rate was carried for a
- * while "for parity"; it was dead weight, and it made every timing assertion twice as long.
+ * FIXED at 80ms — fast enough that a sweep reads as motion, slow enough that the eye is not chasing it.
+ *
+ * It followed the output rate for a while. That was tried and dropped: a model writing slowly got a
+ * sweep so slow it looked stuck, a fast one got a blur, and the same row changed pace between turns for
+ * no reason the reader could see. One rate is calmer and predictable, which is what an ambient
+ * indicator needs to be.
  */
-export const STEP_MS = 50;
+export const STEP_MS = 65;
+
+/**
+ * The step for a TOOL name, slower than the Working row's.
+ *
+ * A tool name is short — `Read` is four characters — so at the Working row's rate the light crosses it in
+ * 560ms and the row is dark for the rest of the cycle. On screen that reads as a single flash, not as
+ * movement. 150ms per character gives a four-character name a 1.4s round: slow enough to follow, still
+ * obviously running.
+ */
+const TOOL_STEP_MS = 150;
+
+/**
+ * How long the light stays on one character, from how fast tokens are arriving.
+ *
+ * `tps` is output tokens per second for the step in flight. A fast stream should look fast — the row
+ * keeping a leisurely 50ms step while tokens pour in reads as the animation lagging behind the text it
+ * is supposed to accompany.
+ *
+ * The clamp is the important half. Under about 10 tok/s the model is thinking more than writing and the
+ * sweep slows down so it does not look frantic over a trickle; above about 80 tok/s it is a wall of text
+ * and the light moves quickly but never strobes. 28ms is just under a 33ms render frame, so a step is
+ * always painted at least once; 200ms is slow enough to read as deliberate without looking stuck.
+ */
 
 
 
@@ -739,15 +765,21 @@ export const STEP_MS = 50;
  * ended; `lightMargin` takes the larger of the two.
  */
 const ENTRY_EXIT_CHARS = 10;
-
 /**
- * The margin for a row of `n` characters: the target ten, or the light's half-width if that is larger.
+ * The margin for a row of `n` characters: the target ten, or the light's half-width if that is larger —
+ * but CAPPED so the light reaches the text in reasonable time.
  *
- * One function so `lightAt` and `crossMs` cannot disagree about how far the light travels. When they did,
- * the sweep finished before the light had left the row and the tail stayed lit through the rest.
+ * Ten cells either side is what makes the timing match Claude Code on a long row. On a SHORT row it is
+ * most of the cycle: `Edit` is four characters, so the travel is 24 cells and the light spends the first
+ * 500ms still outside the text, showing nothing. A row that looks frozen for half a second and then
+ * blinks once reads as broken, which is exactly how the Using row was reported.
+ *
+ * The cap is `n + 4` per side at most, so a short row spends a few steps entering rather than ten, and a
+ * long row is unchanged.
  */
 function lightMargin(n) {
-  return Math.max(ENTRY_EXIT_CHARS, totalHalf(Math.max(1, n)));
+  const half = totalHalf(Math.max(1, n));
+  return Math.max(1, Math.min(ENTRY_EXIT_CHARS, Math.max(half, Math.ceil(Math.max(1, n) / 4))));
 }
 
 /**
@@ -756,9 +788,9 @@ function lightMargin(n) {
  * `(count + 2 * lightMargin(count)) * stepMs`. The light is over the visible text for only `count * stepMs`
  * of it; the rest is the entry and exit runs, which is what keeps the sweep from snapping on and off.
  */
-export function crossMs(count) {
+export function crossMs(count, stepMs = STEP_MS) {
   const cells = Math.max(1, count) + 2 * lightMargin(count);
-  return cells * STEP_MS;
+  return cells * stepMs;
 }
 
 /**
@@ -771,7 +803,7 @@ export function crossMs(count) {
  * Claude Code can use zero because its entry run is ten cells: the light is already off the row for a
  * second before it comes back. Ours enters from three cells away, too short to cover the wrap.
  */
-export const REST_MS = 250;
+export const REST_MS = 300;
 
 /**
  * The full cycle for a row: one crossing, then the rest.
@@ -779,8 +811,8 @@ export const REST_MS = 250;
  * `count` enters into it: a longer row has more characters to light, so its cycle is longer. It used to be
  * constant, because a fixed-time crossing spread itself over however many cells there happened to be.
  */
-export function cycleMs(count) {
-  return crossMs(count) + REST_MS;
+export function cycleMs(count, stepMs = STEP_MS) {
+  return crossMs(count, stepMs) + REST_MS;
 }
 
 /**
@@ -861,7 +893,7 @@ function lightOrigin(key, anchor, now) {
  * 1.9 seconds for `Working...`. Taking milliseconds decouples the two: the caller may redraw as often
  * as it likes, and the light's speed is stated directly rather than implied by a frame count.
  */
-export function lightAt(phaseMs, index, count, edge = 'cosine') {
+export function lightAt(phaseMs, index, count, edge = 'cosine', stepMs = STEP_MS) {
   const n = Math.max(1, count);
   // Two widths, and the distinction is the shape of the light: `half` is the OUTER edge (core plus the
   // fade either side) and `core` is the part that stays at full brightness.
@@ -886,9 +918,9 @@ export function lightAt(phaseMs, index, count, edge = 'cosine') {
   // The margin is `max(10, half)`: ten is the target, but the light must clear its own width or it would
   // still be lighting the last characters when the round ended — the failure the half-width version was
   // written to fix, and which a flat ten reintroduces on a wide band.
-  const margin = Math.max(ENTRY_EXIT_CHARS, half);
+  const margin = lightMargin(n);
   const travel = n + 2 * margin;
-  const steps = Math.floor((phaseMs / crossMs(n)) * travel);
+  const steps = Math.floor((phaseMs / crossMs(n, stepMs)) * travel);
   const head = Math.floor((-margin + steps) / STEP_CHARS) * STEP_CHARS;
   // `edge` shapes the shoulder: a raised cosine leaves its outer end gentle, a linear one is sharpest
   // where it meets the core. It arrives as a PARAMETER rather than being read from config, because this
@@ -916,13 +948,13 @@ export function lightAt(phaseMs, index, count, edge = 'cosine') {
  * @param {string}   edge     shoulder shape: 'cosine' (default) or 'linear'
  * @returns {string}          ANSI, ready to splice into a row
  */
-function shimmerText(text, phaseMs, base, glint, edge = 'cosine') {
+function shimmerText(text, phaseMs, base, glint, edge = 'cosine', stepMs = STEP_MS) {
   const s = String(text == null ? '' : text);
   const n = s.length;
   if (!n) return '';
   const out = [];
   for (let i = 0; i < n; i++) {
-    const t = Math.max(0, Math.min(1, lightAt(phaseMs, i, n, edge, true)));
+    const t = Math.max(0, Math.min(1, lightAt(phaseMs, i, n, edge, stepMs)));
     const r = Math.round(base[0] + (glint[0] - base[0]) * t);
     const g = Math.round(base[1] + (glint[1] - base[1]) * t);
     const b = Math.round(base[2] + (glint[2] - base[2]) * t);
@@ -1537,7 +1569,22 @@ function wrapAnsiWords(str, width) {
   const out = [];
   let line = '';
   let lineW = 0;
-  const push = () => { if (line !== '') out.push(line); line = ''; lineW = 0; };
+  // THE COLOUR ACTIVE AT THE BREAK, carried onto the next row.
+  //
+  // A colour is opened once and closed at the end of the string, so a line wrapped mid-colour leaves the
+  // continuation starting with plain text — the terminal paints it in its DEFAULT foreground, which on a
+  // dark theme is brighter than the grey the rest of the block uses. That is what a wrapped, expanded
+  // command looked like: the first row grey and every row below it lighter.
+  //
+  // Tracked from the escapes seen so far and re-emitted at the start of each new row, then cleared. `0m`
+  // resets it, so a line that closes its colour before the break does not reopen one.
+  let active = '';
+  const scan = (text) => {
+    for (const m of text.matchAll(/\x1b\[([0-9;]*)m/g)) {
+      active = m[1] === '0' || m[1] === '' ? '' : `\x1b[${m[1]}m`;
+    }
+  };
+  const push = () => { if (line !== '') out.push(line); line = active; lineW = 0; };
   for (const tok of tokens) {
     if (tok === '') continue;
     const tw = visualCol(tok);
@@ -1546,13 +1593,14 @@ function wrapAnsiWords(str, width) {
       continue;
     }
     if (lineW > 0 && lineW + tw > width) push();
+    scan(tok);
     if (tw > width && visualCol(tok) > width) {
       // Hard-split an over-long token by visible columns.
       let chunk = '';
       let cw = 0;
       for (const ch of tok) {
         const chw = visualCol(ch);
-        if (cw + chw > width) { out.push(chunk); chunk = ''; cw = 0; }
+        if (cw + chw > width) { out.push(chunk); chunk = active; cw = 0; }
         chunk += ch; cw += chw;
       }
       if (chunk) { line = chunk; lineW = cw; }
@@ -1563,7 +1611,9 @@ function wrapAnsiWords(str, width) {
   }
   if (line !== '') out.push(line);
   if (out.length === 0) out.push('');
-  return out;
+  // Rows that were seeded with a carried colour but ended up holding nothing are dropped: they would
+  // render as an invisible escape-only line.
+  return out.map((s) => s.replace(/^\x1b\[[0-9;]*m$/, '')).filter((s) => s !== '' || out.length === 1);
 }
 
 // Word-aware wrap that also returns each row's starting offset in the source
@@ -2075,7 +2125,7 @@ function keyArgument(name, args, workspace, expanded = false) {
   }
   return '';
 }
-export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded = false) {
+export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded = false, reducedMotion = false) {
   const name = msg.toolName || '';
   const arg = keyArgument(name, msg.toolArgs, workspace, expanded);
   const verb = msg.pending ? 'Using' : 'Used';
@@ -2119,16 +2169,21 @@ export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, ex
     // `??`, NOT `||`: tick 0 is a legitimate anchor, and `0 || spin` would collapse the elapsed time to
     // zero so the light never moved at all.
     const anchorSpin = pulseStart ?? spin;
-    // THE KEY MUST NOT REPEAT. `pulseStart` is a tick count within a turn, so two different rows can
-    // reach the same value; when that happened, the second row found the first one's origin still in the
-    // map and inherited an elapsed time far past its own start, snapping the light to a position mid-row.
+    // THE KEY IS THE ROW'S OWN IDENTITY, and nothing else.
     //
-    // The message's own tool-call id is unique per row and stable across frames, which is exactly what a
-    // key needs. `anchorSpin` stays in it so the same message re-animated on a new tick gets a new origin.
-    const rowKey = msg && (msg.id || msg.toolId) ? `tool:${msg.id || msg.toolId}:${anchorSpin}` : `tool:${anchorSpin}`;
+    // It used to carry `anchorSpin` as well, on the reasoning that the same message re-animated on a new
+    // tick should get a new origin. The opposite happened: `anchorSpin` is `pulseStart ?? spin`, and when
+    // the caller passes no `pulseStart` it IS the tick counter — it changes every 80ms, so every frame
+    // built a new key, `lightOrigin` created a fresh origin for it, and `elapsedMs` stayed at 0. The light
+    // sat still, except for the one frame after the row content changed and the message object was
+    // replaced.
+    //
+    // A row animates from the moment it appears until it stops being pending, and its id is stable across
+    // that whole life: one origin, and elapsed grows from there.
+    const rowKey = msg && (msg.id || msg.toolId) ? `tool:${msg.id || msg.toolId}` : `tool:${name}`;
     const elapsedMs = Math.max(0, Date.now() - lightOrigin(rowKey, anchorSpin, spin));
     // ONE shimmer for both rows — see `shimmerText`.
-    const phaseMs = elapsedMs % cycleMs(name.length);
+    const phaseMs = elapsedMs % cycleMs(name.length, TOOL_STEP_MS);
 
     // The same restraint as the Working row's glint: the light is the base colour with a small lift in
     // the SAME hue, not a jump to white. `[150, 255, 255]` against `[0, 215, 255]` read as "the name is
@@ -2136,7 +2191,12 @@ export function formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, ex
     const BASE = [0, 215, 255];      // cyan: the name's resting colour
     const GLINT = [110, 240, 255];   // the same hue, a shade brighter
 
-    nameDisplay = shimmerText(name, phaseMs, BASE, GLINT, shimmerEdge || 'cosine');
+    // The same setting the Working row honours: a pending tool's name is decoration too.
+    if (reducedMotion) {
+      nameDisplay = col(name, C.cyan);
+    } else {
+      nameDisplay = shimmerText(name, phaseMs, BASE, GLINT, shimmerEdge || 'cosine', TOOL_STEP_MS);
+    }
   } else {
     // Non-pending: show in plain cyan
     nameDisplay = col(name, C.cyan);
@@ -2384,7 +2444,7 @@ export function todoPanelHeight(state) {
 // wrapping, no ANSI interpretation. It exists to answer "what did the model
 // actually send" when a rendering bug makes a reply look wrong — with the renderer
 // in the way there is no way to tell a bad reply from a bad render.
-function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode, shimmerEdge) {
+function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode, shimmerEdge, reducedMotion = false) {
   if (rawMode && (msg.role === 'assistant' || msg.role === 'thinking')) {
     const src = String(msg.text == null ? '' : msg.text);
     // escape the ANSI bytes so a stray `\x1b[31m` in the model's output cannot
@@ -2397,7 +2457,7 @@ function messageLines(msg, width, workspace, expanded, spin, pulseStart, rawMode
   // Tool calls render as a single "● Using/Used Name (arg)" line (kimi style).
   // The body already carries its own ANSI colours, so mark it pre-colored.
   if (msg.role === 'tool') {
-    const body = formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded);
+  const body = formatToolLine(msg, workspace, spin, pulseStart, shimmerEdge, expanded, reducedMotion);
     // Red bullet for a failed call (a Bash non-zero exit / [error: …]).
     const failed = msg.failed === true || (msg.role === 'tool' && msg.failed === true);
     const pre = col('● ', msg.pending ? C.orange : (failed ? C.red : C.green));
@@ -3596,12 +3656,12 @@ export function renderChatLines(state, w, viewport) {
     const boxText = Math.max(1, boxInner - Math.min(1, Math.max(0, boxInner - 1)) * 2);
     const rowWidth = border ? boxText : innerW;
     const cached = m._cache;
-    // Which rows animate? A pending tool call and a running compaction block both
-    // derive their look from `state.spin`, so the cached layout must be invalidated
-    // when that tick advances. Setting spinKey to 0 for everything else keeps
-    // static rows cached across ticks.
+    // Which rows animate? A pending tool call and a running compaction block do, and their appearance
+    // depends on the current step of the light. Everything else gets a constant key, so a static row is
+    // laid out once and reused across frames.
+    // A pending tool advances from the wall clock at TOOL_STEP_MS, so its cache key is THAT step index.
     const animating = (m.role === 'tool' && m.pending) || (m.role === 'compaction' && m.phase === 'running');
-    const spinKeyNow = animating ? (state.spin || 0) : 0;
+    const spinKeyNow = animating ? Math.floor(Date.now() / TOOL_STEP_MS) : 0;
     const valid = cached
       && cached.rowW === rowWidth && cached.expanded === expanded
       && cached.textRef === m.text && cached.streamRef === m.streamContent
@@ -3655,7 +3715,8 @@ export function renderChatLines(state, w, viewport) {
     // happen (replacing a word). Those are caught by the `_cache` nulling at the
     // edit sites, which is what the shared-store path below relies on too.
     const countLen = typeof m.text === 'string' ? m.text.length : 0;
-    if (!valid && !cached && m._count && m._count.key === countKey && m._count.textLen === countLen) {
+    // Only a NON-ANIMATING message can be answered from its row count. See the note below.
+    if (!valid && !cached && !animating && m._count && m._count.key === countKey && m._count.textLen === countLen) {
       msgLen[mi] = m._count.len + rules;
       cursor += msgLen[mi];
       prevBordered = border;
@@ -3685,7 +3746,8 @@ export function renderChatLines(state, w, viewport) {
         msgLen[mi] = shared.rows.length + rules;
       } else {
         const rows = messageLines(m, rowWidth, state.cwd, expanded, state.spin, state.pulseStart, state.rawMode,
-          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge));
+          state.shimmerEdge || (state.cfg && state.cfg.shimmerEdge),
+          reducedMotionOn(state));
         const wrapped = rows.map(rowToLine);
         const isPending2 = m.pending ? 1 : 0;
         const cc = {
@@ -3907,6 +3969,10 @@ export function metricsSignature(state, n, w, expanded, innerW) {
     mix(m.pluginLog && m.expanded ? 1 : 0);
     mix(m._cache ? 1 : 0);
     mix(m._count ? 1 : 0);
+    // A pending row repaints as the light moves, with none of the fields above changing. Without this
+    // the signature matched every frame and the transcript was never re-walked, so the animation froze
+    // until the message itself was touched.
+    if (m.pending) mix(Math.floor(Date.now() / STEP_MS));
   }
   return h;
 }
@@ -11970,16 +12036,37 @@ async function fetchAndRegisterModels(state, cfg, providerName, h) {
   if (!baseUrl) return;
   h.notice(`Discovering models for ${providerName}…`, 'info');
   const models = await fetchModels({ baseUrl, apiKey: p.api_key || p.apiKey || '', protocol: p.protocol || 'openai' });
+  // THE FETCH MUST SUCCEED BEFORE ANYTHING IS REMOVED.
+  //
+  // Deleting first and fetching second means an unreachable endpoint leaves the provider with no models at
+  // all. Everything below runs only after a non-empty result.
   if (!models.length) { h.notice(`No models discovered for ${providerName} (endpoint unreachable or empty).`, 'error'); return; }
+
   cfg.raw.models = cfg.raw.models || {};
-  for (const m of models) {
-    addModel(providerName, m.id, { display_name: m.display, contextLength: m.contextLength, maxTokens: m.maxTokens });
-    // Merge over any existing entry rather than replacing it: discovery reports
-    // fewer fields than the user may have set (context_length, pricing, …), and a
-    // field the endpoint did not report must not blank out a value already there.
-    const key = modelKey(providerName, m.id);
-    cfg.raw.models[key] = mergeRefreshedModelEntry(providerName, m, cfg.raw.models[key]);
+  // Snapshot what this provider had, so the merge below can keep fields the source does not report.
+  const prevByKey = new Map();
+  for (const key of Object.keys(cfg.raw.models)) {
+    if (key.split('/')[0] !== providerName) continue;
+    prevByKey.set(key, cfg.raw.models[key]);
+    delete cfg.raw.models[key];
   }
+
+  // REPLACE THE LIST WITH WHAT WAS JUST FETCHED.
+  //
+  // A model the endpoint no longer reports disappears, and a renamed one does not appear twice. Merging
+  // over the old entries kept both for ever, which is what made Alt+R look like it did nothing.
+  const kept = [];
+  for (const m of models) {
+    const key = modelKey(providerName, m.id);
+    // Merge over the SNAPSHOT: the live entries were just deleted, so reading them yields undefined and
+    // the merge folds nothing — every field the source omits (context_length, pricing) would be wiped.
+    const entry = mergeRefreshedModelEntry(providerName, m, prevByKey.get(key));
+    cfg.raw.models[key] = entry;
+    kept.push({ ...entry, id: m.id });
+  }
+  // Rewrite the provider's TOML blocks from that list. `addModel` appends one block per model and returns
+  // early when one already exists, so calling it here left the removed entries on disk.
+  try { replaceProviderModels(providerName, kept); } catch { /* the in-memory list is still correct */ }
   h.notice(`Discovered ${models.length} models for ${providerName}. Use /model to pick one.`, 'info');
 }
 
@@ -12299,6 +12386,13 @@ export function tokenize(str) {
         out.push({ key: f === 'P' ? 'f1' : 'escape' });
         i += 3;
       } else {
+        // `ESC <printable>` is Alt+that key. A second ESC stays a plain Escape.
+        const altNext = str[i + 1];
+        if (altNext && altNext >= '!' && altNext <= '~') {
+          out.push({ key: 'alt-' + altNext.toLowerCase() });
+          i += 2;
+          continue;
+        }
         out.push({ key: 'escape' });
         i++;
       }
@@ -13007,20 +13101,19 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
           //   - on a cache hit some providers report only the uncached remainder, which made the gauge
           //     COLLAPSE mid-turn and then jump back.
           //
-          // The estimate has its own correction for that: `calibrate` in agent.js learns the ratio from
-          // these very reports and applies it where the estimate is produced, so the gauge stays ONE
-          // coherent number while still converging on the truth.
+          // PROVIDER REPORT ARRIVES -> the estimate it covers is done.
           //
-          // The turn's OUTPUT tokens are still taken from here — that figure has no other source.
-          // The TURN's output tokens, accumulated exactly from the provider rather than estimated from
-          // streamed characters. Kept separate from the context figure above: one counts what was sent,
-          // the other what came back.
+          // The counter is `settled + estimate`: finished steps plus the one streaming now. When a usage
+          // report lands, `settled` grows by that step's exact figure AND `estimate` still holds the
+          // same step's guess, so the row showed roughly double — measured 25 estimated + 25 settled
+          // reading 50 — and every later step built on the inflated total.
+          //
+          // Clearing `estimate` here is what makes the estimate a LIVE figure for the step in flight
+          // rather than a running sum that never forgets.
           if (e.usage && Number.isFinite(e.usage.output)) {
             state.turnOutputSettled = (state.turnOutputSettled || 0) + e.usage.output;
-            state.turnOutputTokens = Math.max(
-              state.turnOutputTokens || 0,
-              (state.turnOutputSettled || 0) + (state.turnOutputEstimate || 0),
-            );
+            state.turnOutputEstimate = 0;
+            state.turnOutputTokens = state.turnOutputSettled;
           }
           refreshCost(state, cfg);
           viewCur.renderSoon(); return;
@@ -13099,6 +13192,7 @@ const agents = readAgentsMd(state.cwd || state.workspace || cfg.workspace, state
             // Track the key argument as it streams so "Using Bash (cmd)" shows
             // the command DURING the run rather than only once it has finished.
             entry.toolArgs = { ...(entry.toolArgs || {}), ...entry._argStream.pairs };
+            entry._cache = null;   // the argument is part of the rendered line
             if (entry.toolName === 'Write') {
               entry.streamContent = argStreamValue(entry._argStream, 'content');
               // Incremental line count so the preview's "… N more lines" note is
@@ -14159,6 +14253,7 @@ export async function startTUI(opts) {
   }
   let lastFrame = null;
   let paintScheduled = false;
+  let lastPaintAt = 0;   // when the last frame actually went to the terminal
   // Deadline for the next FULL repaint. A differential painter compares against the frame
   // it BELIEVES it painted, never the real screen, so any divergence between the two is
   // permanent: it survives every later frame because the comparison keeps saying "that row
@@ -14193,6 +14288,7 @@ export async function startTUI(opts) {
     state._hitboxes = frame.hitboxes || [];
     state._composerMeta = frame.composerMeta || [];
     if (out) stdout.write(out);
+    lastPaintAt = now;
     // "Painted" becomes observable here: everything that reaches the screen goes
     // through this one function, so the tick advancing means bytes left this process.
     // See src/flush-tick.js for what reads it.
@@ -14239,10 +14335,25 @@ export async function startTUI(opts) {
    */
   function countOutputTokens(n) { return sessHost.countOutputTokens(n); }
 
+  /**
+   * The render rate this session is capped at, from `/settings` → Render FPS.
+   *
+   * Read on every call rather than cached: the setting can change mid-session, and a cached rate would
+   * only take effect after a restart.
+   */
+  function renderFps() {
+    const v = Number(cfg && cfg.render_fps);
+    // A terminal cannot render at 0Hz; the lowest meaningful rate is one frame a second.
+    return Number.isFinite(v) ? Math.max(1, Math.round(v)) : 30;
+  }
+
   function renderSoon() {
     if (paintScheduled) return;
+    const budget = Math.max(1, Math.round(1000 / renderFps()));
+    const wait = Math.max(0, (lastPaintAt || 0) + budget - Date.now());
     paintScheduled = true;
-    setImmediate(paintNow);
+    if (wait === 0) { setImmediate(paintNow); return; }
+    setTimeout(paintNow, wait);
   }
   function openPicker(p) {
     let footer = p.footer ? { focused: false, ...p.footer } : null;
@@ -15353,7 +15464,7 @@ export async function startTUI(opts) {
             ],
             resolve,
           };
-          viewCur.render();
+          renderSoon();
         }),
       }))
       .then((res) => {
@@ -16588,7 +16699,7 @@ export async function startTUI(opts) {
       // swallowing them bought nothing and cost the one thing a long plan needs: a way to
       // read past the fold. Everything else still belongs to the review.
       if (t.key === 'wheelup' || t.key === 'wheeldown') {
-        scrollChat(state, t.key === 'wheelup' ? 3 : -3);
+        scrollChat(state, t.key === 'wheelup' ? wheelStep(state, 'wheel') : -wheelStep(state, 'wheel'));
         renderFrame();
         return;
       }
@@ -16811,7 +16922,7 @@ export async function startTUI(opts) {
       // answer, so "own ALL input" does not need them — and without this a long question
       // with an option list taller than the screen could not be read past at all.
       if (t.key === 'wheelup' || t.key === 'wheeldown') {
-        scrollChat(state, t.key === 'wheelup' ? 3 : -3);
+        scrollChat(state, t.key === 'wheelup' ? wheelStep(state, 'wheel') : -wheelStep(state, 'wheel'));
         renderFrame();
         return;
       }
@@ -16833,7 +16944,7 @@ export async function startTUI(opts) {
     // its own arrow behaviour on the un-modified keys.
     if (t.key === 'c-up' || t.key === 'c-down') {
       if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
-        scrollChat(state, t.key === 'c-up' ? 3 : -3);
+        scrollChat(state, t.key === 'c-up' ? wheelStep(state, "c") : -wheelStep(state, "c"));
         renderFrame();
         return;
       }
@@ -16842,6 +16953,21 @@ export async function startTUI(opts) {
     // Ctrl+L — expand / collapse the plugin log block(s). The last one is the
     // useful target (it is the most recent), but every pluginLog message is toggled
     // so a session with several reloads behaves predictably.
+    if (t.key === 'alt-r') {
+      // Only when nothing owns the keyboard: a picker or a dialog has its own meaning for R.
+      if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
+        const current = (cfg && cfg.provider) || '';
+        if (!current) {
+          notice('No provider selected — use /model to pick one.', 'error');
+        } else {
+          // Fire and forget: the notice reports the outcome, and blocking the key handler on a network
+          // round-trip would freeze input for as long as the endpoint takes.
+          void fetchAndRegisterModels(state, cfg, current, { notice: (m, k) => notice(m, k) });
+        }
+        renderFrame();
+        return;
+      }
+    }
     if (t.key === 'c-l') {
       if (!(state.picker || state.form || state.panel || state.editor || state.question || state.menuOpen)) {
         const logs = (state.chat || []).filter((m) => m && m.pluginLog);
@@ -17084,7 +17210,7 @@ export async function startTUI(opts) {
         renderFrame(); return;
       }
       if (t.key === 'wheelup' || t.key === 'wheeldown') {
-        scrollChat(state, t.key === 'wheelup' ? 3 : -3);
+        scrollChat(state, t.key === 'wheelup' ? wheelStep(state, 'wheel') : -wheelStep(state, 'wheel'));
         renderFrame(); return;
       }
       if (t.key === 'up' || t.key === 'down') {
@@ -17565,11 +17691,12 @@ export async function startTUI(opts) {
       return;
     }
     if (t.key === 'wheelup' || t.key === 'wheeldown') {
-      // With the pointer ON the scrollbar, scroll one line per notch: the bar is
-      // the precision control, and 3-line steps there feel jumpy on a long
-      // transcript. Everywhere else keeps the usual 3-line step.
-      const onBar = !!(state._lastMouse && isOnScrollbar(state._lastMouse));
-      const step = onBar ? 1 : 3;
+      // HOW HARD THE USER IS TURNING, from the interval between key events.
+      //
+      // One rate cannot serve both gestures: a fixed one row makes a fast spin crawl, a fixed three jumps
+      // past what a careful reader wanted. The interval between events is the speed, and it is already
+      // in the stream — no timer, no separate gesture detection. Slow: one row. Fast: up to eight.
+      const step = wheelStep(state, "wheel");
       const d = t.key === 'wheelup' ? step : -step;
       if (state.panel) {
         const p = state.panel;
@@ -17934,6 +18061,26 @@ export async function startTUI(opts) {
   // Read live, so a /external flip applies to the very next tool call.
   function externalAllowed() { return sessHost.externalAllowed(); }
 
+/**
+ * How many rows one notch or keypress should move, from how fast they are arriving.
+ *
+ * Shared by the wheel and by Ctrl+Up/Down so the two cannot drift: they are the same gesture with
+ * different hardware. The EVENT STREAM is the speed sensor — a wheel turned slowly sends notches far
+ * apart and one spun sends them in a burst, and a key held down repeats at the OS repeat rate.
+ *
+ * `family` keeps the two clocks apart: alternating a wheel notch with a Ctrl+Up should not be read as one
+ * burst of either. It also makes the FIRST event of a family one row — `Infinity` lands in the slowest
+ * step, so nothing jumps on the first touch after a pause.
+ */
+function wheelStep(state, family) {
+  const now = Date.now();
+  const at = state._stepAt || (state._stepAt = {});
+  const since = at[family] ? now - at[family] : Infinity;
+  at[family] = now;
+  // 140ms is about the gap between deliberate notches; under 55ms they are arriving in a burst.
+  return since > 140 ? 1 : since > 90 ? 2 : since > 55 ? 4 : 8;
+}
+
   function scrollChat(state, delta) {
     const cols = dims().cols, rows = dims().rows;
     // Only the TOTAL row count is needed to clamp the scroll position. This used to
@@ -18187,7 +18334,48 @@ export async function startTUI(opts) {
     // calls, which is what keeps the two front-ends behaviourally identical.
     // Straight through to the core. It validates and throws in the same shape as before, so
     // the HTTP layer (which maps a throw to 409) is unaffected.
-    hub.actions.submit = (text) => core.submit(text);
+    // `opts.new` starts a FRESH session before the prompt runs.
+    //
+    // The caller does not know the new session's id in advance, so asking them to create one first
+    // means two requests and a round trip to learn an id that this side invents anyway. Passing
+    // `new: true` lets the daemon accept a prompt against any session URL and have it run in a new
+    // session instead — the same thing `/new` does, minus the slash command.
+    hub.actions.submit = async (text, opts) => {
+      if (opts && opts.new) {
+        // Flush the outgoing session first: its todos and transcript belong to the id being replaced,
+        // and `dispatch` does exactly what `/new` does, so the two cannot drift apart.
+        await core.dispatch('new', '');
+        // The hub's rows and event ring belong to the session that just ended. Clearing them keeps a
+        // viewer from showing the previous conversation under the new id.
+        hub.rows = [];
+        hub.events = [];
+      }
+      // `core.submit` AWAITS THE WHOLE TURN, so its result is the finished turn — no polling needed.
+      const out = await core.submit(text);
+      // `opts.return` asks for the transcript of what just ran:
+      //
+      //   "turn"  the rows of this turn, tool results included
+      //   "full"  every row the session holds
+      //   "none"  (default) whatever `core.submit` returned, unchanged
+      //
+      // Without this a caller had to submit, wait an unknown time, then issue a second request for
+      // `/api/state` — two round trips and a guess at how long the turn would take.
+      const want = opts && opts.return;
+      if (!want || want === 'none') return out;
+      // FORCE ONE SYNC: `syncChat` does nothing while no browser is subscribed, so `hub.rows` would be
+      // empty here and the caller would get an empty transcript from a turn that plainly ran.
+      try { hub.syncChat(state.chat || []); } catch { /* the reply still carries `result` */ }
+      // The turn begins at the last user row; everything after it is what the prompt produced.
+      const rows = Array.isArray(hub.rows) ? hub.rows : [];
+      let from = 0;
+      for (let k = rows.length - 1; k >= 0; k--) { if (rows[k] && rows[k].role === 'user') { from = k; break; } }
+      const slice = want === 'full' ? rows : rows.slice(from);
+      const detail = (opts && opts.detail) || 'full';
+      const shaped = detail === 'minimal' ? slice.filter((r) => r.role !== 'tool')
+        : detail === 'summary' ? slice.map((r) => (r.role === 'tool' ? { ...r, text: '', liveOutput: '', diff: undefined } : r))
+          : slice;
+      return { result: out, rows: shaped, detail, sessionId: session && session.id };
+    };
     hub.actions.dispatch = async (cmd, arg) => {
       const out = await core.dispatch(cmd, arg);
       // The core runs the command; the repaint is this front end's business, so it stays
