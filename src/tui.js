@@ -6918,6 +6918,8 @@ export function makeState({ cfg, session, opts }) {
   // was re-picked (setEffort is the only other writer, and it sets both).
   const effort = (session && session.effort) || cfg.effort || (cfg.reasoning ? 'on' : 'off');
   return {
+    // No model chosen yet: the interface says so instead of refusing to start.
+    modelMissing: !!(opts && opts.modelMissing),
     workspace: cwd,
     cfg,
     // The SAME session local this function already reads for `effort`, kept on the state
@@ -13728,16 +13730,20 @@ export async function startTUI(opts) {
   }
 
   
+  // Set when the config has no model, so the interface can say so without blocking startup.
+  let modelMissing = false;
+
   // FIRST: Ensure model is initialized before restoring session
   if (!cfg.model || !cfg.innerModel) {
     // Model not set yet - use default or prompt user
     if (!cfg.model) {
-      console.log('No model configured. Please run /model to select one.');
-      return 1;
+    // NOT a return: a fresh install has no model yet, and the advice is `/model` — which needs the
+    // prompt this function is about to build. Flagged instead, and reported once the TUI is up.
+    modelMissing = true;
     }
   }
 
-  const state = makeState({ cfg, session, opts });
+  const state = makeState({ cfg, session, opts: { ...opts, modelMissing } });
   // Mirror the session on the state so `/move` can rebind ONE binding and have every
   // consumer follow (see `replaceSession`).
   state.session = session;
