@@ -339,7 +339,14 @@ const b = baseUrl.replace(/\/+$/, '');
   // An empty base URL produces a relative endpoint like "/chat/completions",
   // which fetch() rejects with a URL-scheme error the model can't decode. Leave
   // the endpoint empty instead so the caller can show "not set".
-  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${b}/messages`
+  // ANTHROPIC ALWAYS SPEAKS /v1/messages. A base of `https://api.anthropic.com` (which is what the
+  // provider table stores, and what people type) produced `…/messages` and 404'd; adding /v1 only when
+  // the base does not already carry a version segment makes both spellings work.
+  //
+  // The trailing slashes are stripped above, which is what kept `https://api.anthropic.com/v1/` from
+  // becoming `…/v1//messages`.
+  const versioned = protocol === 'anthropic' && !/\/v\d+$/.test(b) ? `${b}/v1` : b;
+  const endpoint = !b ? '' : (protocol === 'anthropic' ? `${versioned}/messages`
     : protocol === 'responses' ? `${b}/responses`
     : `${b}/chat/completions`);
 

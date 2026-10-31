@@ -79,6 +79,8 @@ export const SETTINGS_SCHEMA = [
     ui: { tab: 'appearance', group: 'Display', label: 'Calm mode', hint: 'Fewer decorative flourishes; keeps the information, drops the animation' } },
   { key: 'reduced_motion', ...bool(false),
     ui: { tab: 'appearance', group: 'Motion', label: 'Reduced motion', hint: 'No sweeps or pulses — for a terminal over a slow link, or a preference' } },
+  { key: 'render_fps', kind: 'int', default: '30',
+    ui: { tab: 'appearance', group: 'Performance', label: 'Render FPS', hint: 'How often the screen is repainted. 0 means 1 — a terminal cannot render at zero. Higher is smoother and costs more CPU' } },
   { key: 'shimmer_edge', ...bool(true),
     ui: { tab: 'appearance', group: 'Motion', label: 'Shimmer edge', hint: 'The travelling highlight on a running tool name' } },
   { key: 'show_tool_details', ...bool(true),

@@ -1,38 +1,72 @@
-// WebSearch tool — search the web through puri.li's JSON API.
+// WebSearch tool — Tavily's keyless search endpoint.
+//
+// WHY NOT THE PREVIOUS BACKEND
+// ----------------------------
+// puri.li/api/search answered, but it is a small crawler index, not a search engine: every hit reported
+// `source: "crawled"`. Measured, `GitHub Actions` returned 677 documents and answered well, while
+// `doutula 表情包` returned 6 — none about doutula — because that site is not in the index at all. A query
+// with no real match still returned a full page of the documents that merely shared a word with it, and
+// those were directory farms and unrelated pages.
+//
+// Tavily's keyless mode answers the same query with fabiaoqing.com, github.com/sunimp/doutula and
+// huaban.com — pages that are actually about the site. That is the difference worth the change.
 //
 // WHY NOT A SCRAPED SEARCH PAGE
 // -----------------------------
-// This used to fetch Bing's HTML and parse `<li class="b_algo">` blocks. That worked until it
-// silently stopped: the request still returned 200 with the query echoed in `<title>`, but the
-// page contained no results — the two or three `b_algo` blocks it did have were
-// `translate.google.cn` and similar chrome, unrelated to the query. Measured over five identical
-// requests for one query: five different first results (Yandex, GitHub, a Q&A site, PixelOS, Nature),
-// none of them related. Adding a market parameter, warming up cookies, and sending a full set of
-// browser headers all changed nothing.
-//
-// The failure mode is what made this urgent. A scraper that returns junk does not look broken to
-// the model — the results arrive in the normal shape, so they get used and cited. A JSON API that
-// answers with `results: []` can at least be reported honestly.
+// This started as a Bing HTML scraper. It worked until the page still returned 200 with the query echoed
+// in `<title>` but contained no results — the two or three `b_algo` blocks it did have were
+// `translate.google.cn` and similar chrome. A scraper that returns junk does not look broken to the model:
+// the results arrive in the normal shape, so they get used and cited.
 
-const ENDPOINT = 'https://puri.li/api/search';
+const ENDPOINT = 'https://api.tavily.com/search';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+
+/**
+ * How much of a result's text is worth showing.
+ *
+ * The API returns the page's opening text — often several hundred characters of navigation and boilerplate
+ * before anything useful. Eight results of that size spend a few thousand tokens of context on text the
+ * model reads once and discards. A couple of sentences are enough to judge whether the page is about the
+ * query, and that judgement is the only thing the snippet is for.
+ */
+const SNIPPET_MAX = 200;
+
+/**
+ * A result's text, shortened and stripped of decoding damage.
+ *
+ * "MOJIBAKE" is upstream: a page served as UTF-8 and decoded as Latin-1 comes back with its smart quotes
+ * as `鈥` and its Chinese as `鍦熻眴`. That is the crawler's bug, not this tool's, but the damage ends up in
+ * the model's context, where it looks like the page is about something else. Any snippet carrying this
+ * much of it is dropped rather than shown, because a result whose text cannot be read is not a result.
+ */
+function cleanSnippet(raw) {
+  const text = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  // A run of two or more of these characters is the signature of a UTF-8 page read as Latin-1. One could
+  // be a legitimate transliteration; a run cannot.
+  const damaged = (text.match(/[\u00c0-\u00ff]{2,}/g) || []).length;
+  if (damaged >= 3) return '';
+  return text.length > SNIPPET_MAX ? text.slice(0, SNIPPET_MAX - 1).trimEnd() + '…' : text;
+}
 
 /**
  * The API's payload, as a list of results.
  *
- * Tolerant on purpose: this is a third-party service with no published schema, so a missing or
- * renamed field must degrade to "fewer results" rather than throw. `description` is the snippet;
- * an entry without a URL is dropped, because a result the model cannot open is not usable.
+ * Tolerant on purpose: this is a third-party service with no published schema, so a missing or renamed
+ * field must degrade to "fewer results" rather than throw. An entry without a URL is dropped, because a
+ * result the model cannot open is not usable.
  */
 export function parseSearchResults(json, limit = 8) {
   const list = json && Array.isArray(json.results) ? json.results : [];
   const out = [];
   for (const r of list) {
     if (!r || typeof r.url !== 'string' || !r.url) continue;
+    const snippet = cleanSnippet(r.content || r.description || r.snippet || '');
+    // A result whose text cannot be read is not a result: the model has nothing to judge it by.
+    if (!snippet && r.content) continue;
     out.push({
-      title: String(r.title || r.url).trim(),
+      title: cleanSnippet(String(r.title || r.url)) || r.url,
       url: r.url,
-      snippet: String(r.description || r.snippet || '').replace(/\s+/g, ' ').trim(),
+      snippet,
     });
     if (out.length >= limit) break;
   }
@@ -41,27 +75,43 @@ export function parseSearchResults(json, limit = 8) {
 
 export const spec = {
   name: 'WebSearch',
-  description: 'Search the web. Results are title/URL/snippet; snippets are summaries, so fetch a promising URL with FetchURL. Cite sources.',
+  description: [
+    'Search the web. Results are title/URL/snippet; snippets are summaries, so fetch a promising URL with',
+    'FetchURL. Cite sources.',
+    '',
+    'Use FEW words: two or three that name the thing. Adding generic terms ("下载", "热门", "官网",',
+    '"tutorial") does not narrow the search — it matches more unrelated pages, because those are the words',
+    'junk pages stuff into their titles.',
+  ].join('\n'),
   parameters: {
     type: 'object',
     properties: {
-      query: { type: 'string', description: 'Search query.' },
-      page: { type: 'integer', description: 'Page number, 1-based. Defaults to 1.' },
+      query: { type: 'string', description: 'Search query. Two or three words that name the thing.' },
     },
     required: ['query'],
   },
   async execute(args, ctx) {
     const query = String(args.query || '').trim();
     if (!query) return 'Error: query must not be empty.';
-    const page = Math.max(1, Math.trunc(Number(args.page)) || 1);
     const signal = (ctx && ctx.signal) || undefined;
-    const url = `${ENDPOINT}?q=${encodeURIComponent(query)}&page=${page}`;
     try {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': UA, Accept: 'application/json' },
+      // POST with a JSON body — the keyless mode is not offered on a GET. `X-Tavily-Access-Mode: keyless`
+      // is what selects it; without the header the request is rejected for a missing API key.
+      const res = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Tavily-Access-Mode': 'keyless',
+          'User-Agent': UA,
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ query, max_results: 8 }),
         signal,
       });
-      if (!res.ok) return `Error: search failed (${res.status} ${res.statusText}).`;
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        return `Error: search failed (${res.status} ${res.statusText}).${body ? ' ' + body.slice(0, 200) : ''}`;
+      }
       // The endpoint answers with JSON. If it ever does not, say so rather than parsing a page.
       const text = await res.text();
       let json;
@@ -70,16 +120,17 @@ export const spec = {
 
       const results = parseSearchResults(json, 8);
       if (!results.length) {
-        // A genuine empty result set, NOT an error. The old scraper could not tell the two apart,
-        // which is why a broken page looked like a successful search with odd results.
-        return page > 1
-          ? `No search results found for: ${query} (page ${page}).`
-          : `No search results found for: ${query}`;
+        // A genuine empty result set, NOT an error. A broken page must not look like a successful search.
+        return `No search results found for: ${query}`;
       }
-      const more = json && json.hasNext ? `\n\nMore results available: call WebSearch again with page=${page + 1}.` : '';
-      return results
+      // The API also returns a written `answer` for some queries. It is its own summary, so it is labelled
+      // as such — the model should cite the sources, not this paragraph.
+      const answer = typeof json.answer === 'string' && json.answer.trim()
+        ? `Summary (from the search API, not a source):\n${json.answer.trim()}\n\n`
+        : '';
+      return answer + results
         .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
-        .join('\n\n') + more;
+        .join('\n\n');
     } catch (e) {
       const msg = e && e.name === 'AbortError' ? 'interrupted' : (e.message || String(e));
       return `Error searching "${query}": ${msg}`;

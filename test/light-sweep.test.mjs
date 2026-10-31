@@ -218,15 +218,18 @@ test('the crossing takes longer on a longer row', () => {
     const steps = crossMsResting(n) / STEP_MS;
     assert.ok(Number.isInteger(steps) && steps > 0,
       `a ${n}-character row crosses in ${steps} whole steps`);
-    // The margin is `max(10, halfWidth)`, so the run is `n` plus twice that.
+    // The margin is `min(10, max(halfWidth, n/4))`: a long row gets the full ten cells (so its travel is
+    // Claude Code's `width + 20`), a short one gets much less so the light reaches the text quickly.
     const band = lightWidth(n) + 2 * TAIL_CHARS;
     const half = Math.min(band, Math.max(2, n - 1)) / 2;
-    const margin = Math.max(10, half);
+    const margin = Math.max(1, Math.min(10, Math.max(half, Math.ceil(n / 4))));
     assert.equal(steps, n + 2 * margin,
       `a ${n}-character row travels ${n + 2 * margin} cells`);
   }
-  // And the headline number: a 10-character row is the same 1500ms Claude Code takes.
-  assert.equal(crossMsResting(10), 1500, 'a ten-character row crosses in 1500ms, as Claude Code does');
+  // A long row reaches the full ten-cell margin, so it matches Claude Code exactly.
+  assert.equal(crossMsResting(40), 40 * STEP_MS + 2 * 10 * STEP_MS, 'a 40-character row uses the full margin');
+  // A short row caps the margin, so the light is visible almost immediately.
+  assert.ok(crossMsResting(4) < 4 * STEP_MS + 8 * STEP_MS, 'a 4-character row caps its margin');
 });
 
 test('the crossing is a whole number of steps', () => {
@@ -245,14 +248,17 @@ test('the step is long enough to see', () => {
   // And the pace matches Claude Code: `messageWidth + 20` steps, so a 10-character row takes 1500ms —
   // long enough to read as a deliberate sweep rather than a twitch, short enough that the next round
   // arrives while the row is still on screen.
-  assert.equal(crossMsResting(10), 1500, 'a 10-character row crosses in 1500ms, as Claude Code does');
+  // A LONG row reaches the full ten-cell margin, so its travel matches Claude Code's `width + 20`.
+  assert.equal(crossMsResting(40), 40 * STEP_MS + 2 * 10 * STEP_MS, 'a 40-character row uses the full margin');
+  // A SHORT row caps the margin, so it finishes sooner — the light must reach the text quickly.
+  assert.ok(crossMsResting(4) < 1000, 'a 4-character row crosses inside 800ms');
 });
 
 test('the cycle is short enough to repeat while a row is on screen', () => {
   // The rest is half a second, so even a long line repeats well inside the time a turn stays on screen.
   // A cycle of many seconds stops reading as a working indicator and starts reading as decoration.
   for (const n of [4, 10, 13, 30]) {
-    assert.ok(cycleMs(n) <= 3000, `a ${n}-character row cycles in ${cycleMs(n)}ms`);
+    assert.ok(cycleMs(n) <= 60 * STEP_MS, `a ${n}-character row cycles in ${cycleMs(n)}ms`);
   }
 });
 

@@ -270,7 +270,53 @@ attachWebSocket(server, {
     }
 
     // --- API ------------------------------------------------------------------
-    if (p === '/api/state') return json(res, 200, { ok: true, ...hub.snapshot() });
+    if (p === '/api/state') {
+      // WHAT TO SEND, decided by the caller.
+      //
+      // `/api/state` used to answer with one fixed shape: every row, every tool result, the whole
+      // transcript. That is what a browser wants and the wrong answer for a script asking "what did the
+      // last turn do", which pays for the entire session to read the last few rows.
+      //
+      //   ?detail=full      every row, tool results included (the default: unchanged behaviour)
+      //   ?detail=summary   drop tool RESULTS, keep the "Used Bash (cmd)" rows and the assistant text
+      //   ?detail=minimal   assistant and user text only — no tool rows at all
+      //   ?turn=last        only the most recent turn (a turn starts at a user message)
+      //   ?turn=<n>         only turn n, counting from 1
+      //   ?limit=<n>        at most n rows, taken from the end
+      //
+      // All of them compose, so `/api/state?detail=summary&turn=last` is one request for "what just
+      // happened, and with which tools" without the payload of the results themselves.
+      const detail = String(url.searchParams.get('detail') || 'full');
+      const turn = url.searchParams.get('turn');
+      const limit = Number(url.searchParams.get('limit'));
+      const snap = hub.snapshot();
+      let rows = snap.rows;
+      // A turn begins at a user message; splitting on those is what makes "the last turn" mean the same
+      // thing here as it does in the transcript.
+      if (turn === 'last' || (turn && /^\d+$/.test(turn))) {
+        const starts = [];
+        rows.forEach((r, idx) => { if (r.role === 'user') starts.push(idx); });
+        const which = turn === 'last' ? starts.length - 1 : Number(turn) - 1;
+        if (which >= 0 && which < starts.length) {
+          const from = starts[which];
+          const to = which + 1 < starts.length ? starts[which + 1] : rows.length;
+          rows = rows.slice(from, to);
+        } else {
+          rows = [];   // no such turn: an empty list is the honest answer
+        }
+      }
+      if (detail === 'summary' || detail === 'minimal') {
+        // `summary` keeps the tool ROWS but clears their output: the caller wants to know which tools
+        // ran, not what they printed. `minimal` drops the rows entirely.
+        rows = rows.filter((r) => r.role !== 'tool' || detail === 'summary');
+        if (detail === 'summary') {
+          rows = rows.map((r) => (r.role === 'tool' ? { ...r, text: '', liveOutput: '', diff: undefined } : r));
+        }
+      }
+      // Any row carrying a `card` is an interactive prompt; those are never trimmed by `minimal`.
+      if (Number.isFinite(limit) && limit > 0) rows = rows.slice(-Math.floor(limit));
+      return json(res, 200, { ok: true, ...snap, rows, hidden: snap.totalRows - rows.length, detail, turn: turn || null });
+    }
 
     // The session list for the left rail. `listSavedSessions` already powers the
     // daemon's landing page, so a session page shows the same names in the same

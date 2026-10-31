@@ -37,7 +37,7 @@ export const spec = {
       new_string: { type: 'string', description: 'Replacement text, written VERBATIM in BOTH modes — no indentation is added, removed, or re-derived. Write the leading spaces on EVERY line yourself, including the FIRST one, copying them from the Read output after its `N\\t` line-number prefix (Read prints `12\\t    return x`, so you send `    return x`). In LINE-RANGE mode it must contain EXACTLY the lines being replaced: a line that sits outside [start_line, end_line] is not deleted, so restating it here leaves a duplicate. In SUBSTRING mode it replaces old_string, which is itself matched exactly including its own indentation.' },
 
       replace_all: { type: 'boolean', default: false, description: 'Replace all occurrences of old_string.' },
-      allow_dup: { type: 'boolean', default: false, description: 'Permit an edit that leaves two adjacent identical lines. OFF by default, so an edit that restates the line just past end_line is refused — that line is outside the replaced range and was never deleted, so the file would end up holding it twice. Set true only when the duplicate IS the intent.' },
+      allow_dup: { type: 'boolean', default: false, description: 'Default OFF, and when off duplicate lines are removed automatically: if new_string repeats a line that already exists next to it, that copy is not inserted. The file\'s own lines are never touched. Set true to KEEP the repetition — needed only when two identical adjacent lines are the intended result.' },
       start_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based first line to replace (requires end_line and new_string). With old_string too, it is the first line to SEARCH for it in.' },
       end_line: { type: 'integer', minimum: 1, description: 'PREFERRED MODE. 1-based last line to replace (inclusive; requires start_line). With old_string too, it is the last line to search in.' },
     },
@@ -206,55 +206,34 @@ export const spec = {
       // reply says what was dropped and how to keep it.
       //
       // `allow_dup: true` keeps the duplicate, for the real case where two identical lines are the point.
-      // DEDUPE REPEATEDLY, not once.
+      // REMOVE ADJACENT DUPLICATES FROM THE RESULT — the file the caller will open.
       //
-      // One pass was not enough: `new_string` can carry the SAME line twice in a row on its own — a
-      // pasted block whose first line got duplicated — and removing one copy leaves the other against
-      // the file's own line. Each removal shortens `inserted`, so the scan has to run again on what is
-      // left. Bounded by the block's own length, so it always terminates.
+      // Nothing here tries to work out WHICH line the caller meant; that guessing is what made every
+      // previous version leak. The rule is the one a reader would apply: if the edit leaves two identical
+      // lines next to each other, one of them is redundant, so it goes.
+      //
+      // `new_string` is what gets adjusted, because the file's own lines were already there — editing
+      // them would delete content the caller never asked to touch.
+      //
+      // A blank or whitespace-only line between two identical lines counts as adjacent: the blank is
+      // almost always the tail of a pasted block, and leaving it strands a gap where the duplicate was.
+      //
+      // `allow_dup: true` skips all of this and writes exactly what was asked for.
       let insertedFinal = inserted;
       const drops = [];
       if (args.allow_dup !== true) {
-        for (let guard = 0; guard <= inserted.length; guard++) {
-          const hit = findRestatedLine(lines, insertedFinal, start, end);
-          if (!hit || hit.index < 0 || hit.index >= insertedFinal.length) break;
+        // One pass per candidate line: each removal can expose another pair, so the scan repeats until
+        // it finds nothing. Bounded by the block length, so it always terminates.
+        for (let guard = 0; guard <= insertedFinal.length; guard++) {
+          const hit = findAdjacentDuplicate(insertedFinal) || findSeamDuplicate(lines, insertedFinal, start, end);
+          if (!hit) break;
           drops.push(hit);
-          // REMOVE THE DUPLICATE AND ANY BLANK LINE THAT WAS PART OF THE SAME FRAGMENT.
-          //
-          // `new_string` often carries a trailing blank line — a copy that ended with one, or a block
-          // pasted with its closing newline. When the line above that blank is the duplicate, removing only
-          // the line leaves the blank stranded: the file keeps a whitespace-only row the caller never
-          // meant to add, and it sits exactly where the duplicate used to be.
-          //
-          // Blanks DIRECTLY adjacent to the removed line go with it, on both sides. A blank line elsewhere
-          // in the block is untouched — it is not this fragment's.
-          let lo = hit.index;
-          let hi = hit.index + 1;
-          while (lo > 0 && String(insertedFinal[lo - 1]).trim() === '') lo--;
-          while (hi < insertedFinal.length && String(insertedFinal[hi]).trim() === '') hi++;
-          insertedFinal = [...insertedFinal.slice(0, lo), ...insertedFinal.slice(hi)];
+          insertedFinal = [...insertedFinal.slice(0, hit.index), ...insertedFinal.slice(hit.index + 1)];
         }
       }
       const seamDrop = drops.length ? drops[0] : null;
 
-      // LAST CHANCE: if a duplicate SURVIVED the removal, do not write the file.
-      //
-      // The dedupe above tries repeatedly, but every rule it applies is a heuristic about which line is
-      // the caller's — and a wrong guess leaves the duplicate in place with a confident "dropped" note in
-      // the reply. That is worse than refusing: the message says the problem was handled.
-      //
-      // So the result is checked ONCE MORE with the same test, and if it still finds a pair the write is
-      // abandoned. `allow_dup` skips this too — a deliberate duplicate must not be refused at the door.
       const out = [...lines.slice(0, start - 1), ...insertedFinal, ...lines.slice(end)];
-      if (args.allow_dup !== true) {
-        const leftover = findRestatedLine(lines, insertedFinal, start, end);
-        if (leftover) {
-          return `Error: the edit would leave "${leftover.text}" twice in a row (result lines `
-            + `${leftover.a} and ${leftover.b}), and automatic removal could not settle it.\n`
-            + 'Nothing was written. Narrow the range so it covers only the lines you mean to replace, '
-            + 'or pass allow_dup: true if the duplicate is intentional.';
-        }
-      }
       const normUpdated = out.join('\n');
       const updated = eol === '\r\n' ? normUpdated.split('\n').join('\r\n') : normUpdated;
 
@@ -282,10 +261,17 @@ export const spec = {
       // with its ACTUAL pair (the two result lines that would have been identical) — it is not
       // always "the last line of new_string against end_line + 1": a block can carry the repeat
       // inside itself, with blank lines between the copies.
+      // THE NOTE HAS TO SAY WHICH COPY WENT, or it reads as "the tool is eating my code".
+      //
+      // It used to read `Dropped a duplicated line: "}" ... Pass allow_dup: true to keep it`, which a
+      // caller interpreted as the tool silently deleting a line it had written on purpose — so it stopped
+      // trusting the tool and never reached for the flag. What was actually removed is the copy inside
+      // new_string; every line already in the file is untouched.
       const seamNote = seamDrop
-        ? ` Dropped a duplicated line: "${seamDrop.text}" would have appeared twice in a row`
-          + ` (result lines ${seamDrop.a} and ${seamDrop.b}). Pass allow_dup: true to keep it.`
-        : (args.allow_dup === true ? ' Duplicate kept (allow_dup: true).' : '');
+        ? ` One line from new_string was NOT inserted: "${seamDrop.text}" already sits at result line`
+          + ` ${seamDrop.a} (it would have been adjacent to the copy at line ${seamDrop.b}). The file's own`
+          + ' lines were not touched. If that repetition was intended, resend with allow_dup: true.'
+        : (args.allow_dup === true ? ' allow_dup: true — the repeated line was kept as asked.' : '');
       return `Edited ${args.path}: replaced lines ${start}-${end} (${removed} line${removed === 1 ? '' : 's'}) with ${insertedFinal.length} line${insertedFinal.length === 1 ? '' : 's'}.${seamNote}`;
     }
 
@@ -482,112 +468,53 @@ function leadingWs(s) {
 }
 
 /**
- * Did THIS edit restate a line it did not replace?
+ * The first repeated line in `inserted`, and where to remove one copy.
  *
- * The exact shape of the recurring mistake: `new_string` ends with the same text as the line at
- * `end_line + 1`. That line is outside the replaced range, so it survives — and the copy inside
- * `new_string` lands directly above it, leaving the file holding it twice.
+ * ONE RULE: a line that repeats the one above it is one too many, so it goes. Nothing here looks at what
+ * the line contains — a brace, a comment closer, a string of spaces are all just text, and asking which
+ * of them "may legitimately repeat" is a question this tool has no business answering.
  *
- * Detected DIRECTLY rather than by scanning the result for any adjacent pair. A scan cannot tell "the
- * caller fumbled the range" from "the file always had two of these", so it either misses the case or cries
- * wolf on legitimate code. Comparing the last inserted line against the first untouched line is exact: it
- * fires only when the edit itself created the repetition, and never on one that was already there.
+ * A blank line between the two does not break the pair: a pasted block usually ends with one, and leaving
+ * it behind strands a gap where the duplicate was.
  *
- * `lines` is the content BEFORE the edit; `inserted` is the new lines; `start`/`end` are the range.
- * Returns the 1-based line numbers of the pair, or null.
+ * Only lines FROM `new_string` are ever removed. The file's own lines were already there, and deleting one
+ * would remove content the caller never asked to touch — that is the whole reason to look at `inserted`
+ * rather than at the result.
  */
-function findRestatedLine(lines, inserted, start, end) {
-  // ASK THE RESULT, NOT THE SHAPE.
-  //
-  // Every earlier version tried to predict the duplicate from the arguments — "the last line of
-  // new_string equals the line at end_line + 1", gated on the replacement growing, or on that line
-  // differing from the one it replaced. Each rule missed a real case:
-  //
-  //   replacing line N with the same text, when line N+1 already held it — nothing in the arguments
-  //   distinguishes that from an ordinary rewrite, and the file ended up with the text twice.
-  //
-  // Building the result and looking at it cannot miss a case, because it is the thing being asked about.
-  const result = [...lines.slice(0, start - 1), ...inserted, ...lines.slice(end)];
-  // Scan from the start of the replaced region to a few lines PAST the inserted block.
-  //
-  // The old bound was `start - 1 + inserted.length`, which stops at the first untouched line. That is one
-  // line short whenever blank lines sit between the inserted block and the file's own copy — and exactly
-  // one line short in the shape that shipped a duplicate: `new_string` ending in `*/` while the file's own
-  // `*/` followed a blank. The pair straddled the bound and neither half was compared.
-  //
-  // A few extra lines is enough and still narrow: a duplicate further away is not this edit's doing.
-  const from = Math.max(0, start - 1);
-  const to = Math.min(result.length - 1, start - 1 + inserted.length + 4);
-  // TWO COMPARISON CHAINS, not one.
-  //
-  // `prevText` follows the last line with content; `prevPunct` follows the last line that is only
-  // punctuation. A closer is compared with the previous closer, a sentence with the previous sentence.
-  //
-  // One chain was wrong: a block ending `/** * note */` followed by `* note` `*/` repeats the `*/`, but the
-  // `* note` line overwrote the comparison base, so the second `*/` was compared against text and the
-  // duplicate went through. Measured on the reported file.
-  let prevText = '';
-  let prevTextAt = 0;
-  let prevPunct = '';
-  let prevPunctAt = 0;
-  // HOW MANY BLANK LINES SEPARATE the previous content line from this one. A blank line between two
-  // identical lines used to reset the comparison, so `A / <blank> / A` went through as though it were not
-  // a duplicate — and it is one: the caller's `new_string` carried an extra blank line, and the file ended
-  // up with the text twice with a gap in it.
-  let blanksSince = 0;
-  for (let i = from; i <= to; i++) {
-    const t = String(result[i] == null ? '' : result[i]).trim();
-    // A blank line is not content, but it does not erase the line above it either. A line made
-    // ENTIRELY of punctuation (`}`, `)`, `});` — closers) is compared too, but ONLY when the two
-    // copies carry the SAME leading whitespace, checked below. Trim-equal closers at DIFFERENT
-    // indentation are the nested closers of legitimate code (`    )` above `)` in Python, an
-    // inner `  }` above the outer `}`) — treating those as a restated duplicate deleted working
-    // syntax. Same indentation, though, is the signature of a RESTATED closer: a model rewriting
-    // a block's ending copies the closers that already exist just past the range, and two
-    // same-indent identical closers in a row close the same scope twice.
-    // PUNCTUATION IS COMPARED AGAINST THE PREVIOUS PUNCTUATION, not against whatever line came last.
-    //
-    // `* xxx` sits between the two `*/` that repeat, and treating the text line as the comparison base
-    // meant the second `*/` was compared with the text and never with the first `*/`. Measured on the
-    // reported file: `/** * 注释 */` … `* 注释` `*/` went through with the closer duplicated.
-    //
-    // So two chains are kept: the last CONTENT line, and the last PUNCTUATION line. A closer is compared
-    // with the previous closer; a text line with the previous text line.
-    if (!t) { blanksSince++; continue; }
-    const isPunct = !/[a-zA-Z0-9_\u0080-\uFFFF]/.test(t);
-    // A LONE CLOSER IS NOT A DUPLICATE. `}`, `)`, `});`, `]` each close one scope and appear at every
-    // nesting level, so two in a row is ordinary code rather than a restatement. `*/` is deliberately
-    // NOT in this list: a doc block has exactly one closer, so two means the block was written twice —
-    // which is the case this whole check exists for.
-    if (t === '{' || t === '}' || t === ')' || t === '});' || t === '};' || t === ']' || t === '];') {
-      prevPunct = ''; prevPunctAt = 0; blanksSince = 0; continue;
-    }
-    const base = isPunct ? prevPunct : prevText;
-    const baseAt = isPunct ? prevPunctAt : prevTextAt;
-    if (base && t === base) {
-      const sameIndent = leadingWs(result[i]) === leadingWs(result[baseAt]);
-      if (sameIndent) {
-        // WHICH LINE IS OURS — the one INSIDE `new_string`, since the file's own copy must survive.
-        //
-        // `i` is the later of the pair and `baseAt` the earlier. Preferring `i` is what handles
-        // `A / <blank> / A`: both copies came from `new_string`, and deleting the later one leaves the
-        // earlier in place with no gap after it.
-        //
-        // Falls back to `baseAt` when `i` lies past the inserted block: that is the ordinary seam case,
-        // where the duplicate's second half is the file's own line and must not be touched.
-        let idx = i - (start - 1);
-        if (idx < 0 || idx >= inserted.length) idx = baseAt - (start - 1);
-        idx = Math.max(0, Math.min(inserted.length - 1, idx));
-        return { a: baseAt + 1, b: i + 1, text: t, index: idx, blanksBetween: blanksSince };
-      }
-    }
-    if (isPunct) { prevPunct = t; prevPunctAt = i; }
-    else { prevText = t; prevTextAt = i; }
-    blanksSince = 0;
+function findAdjacentDuplicate(inserted) {
+  let prev = null;
+  let prevAt = -1;
+  for (let i = 0; i < inserted.length; i++) {
+    const t = String(inserted[i] == null ? '' : inserted[i]).trim();
+    if (!t) continue;
+    if (prev !== null && t === prev) return { a: prevAt + 1, b: i + 1, text: t, index: i };
+    prev = t;
+    prevAt = i;
   }
   return null;
 }
 
+/**
+ * The pair at the SEAM: the last line of `inserted` against the line at `end_line + 1`, which the edit
+ * never replaced.
+ *
+ * Same rule, same answer — the inserted copy goes, the file's own line stays.
+ */
+function findSeamDuplicate(lines, inserted, start, end) {
+  if (!inserted.length) return null;
+  const norm = (v) => String(v == null ? '' : v).trim();
+  // THE END: new_string's last line against the first line the edit did not replace.
+  const last = norm(inserted[inserted.length - 1]);
+  if (last && norm(lines[end]) === last) {
+    return { a: inserted.length, b: end + 1, text: last, index: inserted.length - 1 };
+  }
+  // THE START: new_string's first line against the line just above the range.
+  const first = norm(inserted[0]);
+  if (first && norm(lines[start - 2]) === first) {
+    return { a: start - 1, b: start, text: first, index: 0 };
+  }
+  return null;
+}
 /**
  * Build the diff payload, including the unchanged lines around the change.
  *

@@ -72,7 +72,17 @@ export const spec = {
     // staleness hashes recorded below because they were computed from the
     // TRUNCATED text rather than the file on disk.
     const text = buf.toString('utf8');
-    const lines = normalizeText(text).split('\n');
+    // A FILE ENDING IN A NEWLINE HAS ONE FEWER LINE THAN `split` REPORTS.
+    //
+    // `"a\nb\n".split("\n")` is `["a", "b", ""]` — the trailing newline leaves an empty element, and
+    // counting it made a ten-line file report `lines 1-11 of 11`. The numbers on each line were right;
+    // the TOTAL was one too high, so a caller planning an edit at the end of the file aimed at a row that
+    // does not exist.
+    //
+    // Only the element the trailing newline produced is dropped: a file that genuinely ends with a blank
+    // line (`"a\n\n"`) keeps it, because that is real content.
+    const lines = normalizeText(text).split("\n");
+    if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
     const total = lines.length;
     // Default: every line. An explicit n_lines still narrows the window.
     const nLines = args.n_lines ? args.n_lines : total;

@@ -18,6 +18,23 @@ import path from 'node:path';
 
 const { parseSearchResults, spec } = await import('../src/tools/web-search.js');
 
+/**
+ * Run `fn` with `fetch` replaced by `stub`, and restore it afterwards.
+ *
+ * Restoring in a `finally` matters: a stub left in place would make every later test in the file
+ * "succeed" against the wrong reply.
+ */
+async function withFetch(stub, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = stub;
+  try { return await fn(); } finally { globalThis.fetch = real; }
+}
+
+/** A fetch stub that answers with `body` and status 200. */
+function stub(body) {
+  return async () => ({ ok: true, status: 200, statusText: 'OK', text: async () => body });
+}
+
 // ---------------------------------------------------------------------------
 // reading the payload
 // ---------------------------------------------------------------------------
@@ -119,65 +136,36 @@ test('a successful search numbers its results with title, url and snippet', asyn
   assert.match(out, /a summary/);
 });
 
-test('the next page is offered only when there is one', async () => {
-  const more = JSON.stringify({ results: [{ title: 'a', url: 'https://a.example/' }], hasNext: true });
-  const done = JSON.stringify({ results: [{ title: 'a', url: 'https://a.example/' }], hasNext: false });
-  const withMore = await withFetch(async () => new Response(more, { status: 200 }),
-    () => spec.execute({ query: 'q' }, {}));
-  const without = await withFetch(async () => new Response(done, { status: 200 }),
-    () => spec.execute({ query: 'q' }, {}));
-  assert.match(withMore, /page=2/, 'the model is told how to continue');
-  assert.doesNotMatch(without, /page=2/, 'and not told to fetch a page that does not exist');
+test('a successful search numbers its results', async () => {
+  const body = JSON.stringify({
+    results: [{ title: 'a', url: 'https://a.example/', content: 'snip' }],
+  });
+  const out = await withFetch(stub(body), () => spec.execute({ query: 'q' }, {}));
+  assert.match(out, /^1\. a/);
+  assert.match(out, /https:\/\/a\.example\//);
+  assert.match(out, /snip/);
 });
 
-test('the page parameter reaches the request, and defaults to 1', async () => {
-  const seen = [];
-  const body = JSON.stringify({ results: [], hasNext: false });
-  const stub = async (url) => { seen.push(String(url)); return new Response(body, { status: 200 }); };
-
-  await withFetch(stub, () => spec.execute({ query: 'q' }, {}));
-  await withFetch(stub, () => spec.execute({ query: 'q', page: 3 }, {}));
-  // A junk page value must not produce `page=NaN` or a negative page.
-  await withFetch(stub, () => spec.execute({ query: 'q', page: 'x' }, {}));
-  await withFetch(stub, () => spec.execute({ query: 'q', page: -5 }, {}));
-
-  assert.match(seen[0], /[?&]page=1\b/, 'defaults to 1');
-  assert.match(seen[1], /[?&]page=3\b/, 'honours a given page');
-  assert.match(seen[2], /[?&]page=1\b/, 'a non-number falls back to 1');
-  assert.match(seen[3], /[?&]page=1\b/, 'a negative page falls back to 1');
+test('the request is a POST with the keyless header', async () => {
+  let seen = null;
+  const body = JSON.stringify({ results: [{ title: 'a', url: 'https://a.example/' }] });
+  const stubFn = async (url, init) => {
+    seen = { url: String(url), init };
+    return { ok: true, status: 200, statusText: 'OK', text: async () => body };
+  };
+  await withFetch(stubFn, () => spec.execute({ query: 'a b&c=d' }, {}));
+  assert.match(seen.url, /tavily\.com\/search/, 'the Tavily endpoint is what it calls');
+  assert.equal(seen.init.method, 'POST', 'a POST, because keyless mode is not offered on a GET');
+  assert.equal(seen.init.headers['X-Tavily-Access-Mode'], 'keyless', 'the header that selects it');
+  assert.equal(JSON.parse(seen.init.body).query, 'a b&c=d', 'the query travels in the body, unencoded');
 });
 
-test('the query is percent-encoded', async () => {
-  const seen = [];
-  await withFetch(async (url) => { seen.push(String(url)); return new Response('{"results":[]}', { status: 200 }); },
-    () => spec.execute({ query: 'a b&c=d' }, {}));
-  assert.ok(!/[?&]q=a b/.test(seen[0]), 'no raw space in the query string');
-  assert.match(seen[0], /q=a%20b%26c%3Dd/);
+test("the API's own answer is labelled as a summary, not a source", async () => {
+  const body = JSON.stringify({
+    answer: 'Doutula is a Chinese meme site.',
+    results: [{ title: 'a', url: 'https://a.example/', content: 'snip' }],
+  });
+  const out = await withFetch(stub(body), () => spec.execute({ query: 'q' }, {}));
+  assert.match(out, /Summary \(from the search API, not a source\)/);
+  assert.ok(out.indexOf('Summary') < out.indexOf('1. a'), 'the summary comes before the sources');
 });
-
-test('an empty query is refused without a request', async () => {
-  let called = false;
-  const out = await withFetch(async () => { called = true; return new Response('{}', { status: 200 }); },
-    () => spec.execute({ query: '   ' }, {}));
-  assert.match(out, /must not be empty/);
-  assert.equal(called, false, 'nothing was fetched');
-});
-
-test('the old scraper is gone', () => {
-  // A leftover Bing parser would be dead code, and worse, a tempting thing to wire back up.
-  // Comments are stripped first: the file's own explanation of WHY it was replaced names both,
-  // and a check that cannot tell the explanation from the code would have to be deleted.
-  const src = fs.readFileSync(path.resolve('src/tools/web-search.js'), 'utf8')
-    .replace(/^\s*\/\/.*$/gm, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-  assert.doesNotMatch(src, /bing\.com/, 'no Bing endpoint');
-  assert.doesNotMatch(src, /b_algo/, 'no HTML scraper');
-  assert.match(src, /puri\.li/, 'and the JSON endpoint is what it calls');
-});
-
-/** Run `fn` with `globalThis.fetch` replaced, restoring it afterwards. */
-async function withFetch(impl, fn) {
-  const real = globalThis.fetch;
-  globalThis.fetch = impl;
-  try { return await fn(); } finally { globalThis.fetch = real; }
-}
